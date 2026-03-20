@@ -237,8 +237,8 @@ fn choose_mode(device: &DeviceConfig, connection: ConnectionPreference) -> Resul
 
 fn choose_connection() -> Result<ConnectionPreference> {
     let options = vec![
-        "等待别人连接，我这边显示 PIN".to_string(),
-        "连接局域网中的设备，输入对方显示的 PIN".to_string(),
+        "等待别人连接，收到请求后显示本次 PIN".to_string(),
+        "连接局域网中的设备，收到提示后输入对方当前显示的 PIN".to_string(),
     ];
     let index = prompt_select("请选择本次连接方式", &options)?;
     Ok(match index {

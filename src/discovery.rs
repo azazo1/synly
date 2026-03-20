@@ -12,7 +12,6 @@ pub const SERVICE_TYPE: &str = "_synly._tcp.local.";
 
 #[derive(Clone, Debug)]
 pub struct Advertisement {
-    pub session_id: String,
     pub port: u16,
     pub device: DeviceConfig,
     pub mode: SyncMode,
@@ -34,7 +33,6 @@ pub struct DiscoveredPeer {
     pub device_name: String,
     pub device_id: String,
     pub mode: SyncMode,
-    pub session_id: String,
     pub port: u16,
     pub addresses: Vec<Ipv4Addr>,
 }
@@ -67,7 +65,7 @@ pub fn advertise(advertisement: &Advertisement) -> Result<DiscoveryRegistration>
     let instance = format!(
         "{}-{}",
         sanitize_label(&advertisement.device.device_name),
-        &advertisement.session_id[..8.min(advertisement.session_id.len())]
+        advertisement.device.short_id()
     );
     let hostname = format!(
         "synly-{}.local.",
@@ -84,7 +82,6 @@ pub fn advertise(advertisement: &Advertisement) -> Result<DiscoveryRegistration>
         advertisement.device.device_name.clone(),
     );
     properties.insert("mode".to_string(), advertisement.mode.as_wire().to_string());
-    properties.insert("session_id".to_string(), advertisement.session_id.clone());
     properties.insert("protocol".to_string(), "1".to_string());
 
     let ip_addrs = addresses
@@ -145,7 +142,6 @@ pub fn browse(timeout: Duration) -> Result<Vec<DiscoveredPeer>> {
 
 fn discovered_peer_from_info(info: &mdns_sd::ResolvedService) -> Option<DiscoveredPeer> {
     let mode = SyncMode::from_wire(info.get_property_val_str("mode")?)?;
-    let session_id = info.get_property_val_str("session_id")?.to_string();
     let device_name = info.get_property_val_str("device_name")?.to_string();
     let device_id = info.get_property_val_str("device_id")?.to_string();
     let addresses = info.get_addresses_v4().into_iter().collect::<Vec<_>>();
@@ -159,7 +155,6 @@ fn discovered_peer_from_info(info: &mdns_sd::ResolvedService) -> Option<Discover
         device_name,
         device_id,
         mode,
-        session_id,
         port: info.get_port(),
         addresses,
     })

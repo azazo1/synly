@@ -6,7 +6,7 @@ use crate::crypto;
 use crate::discovery::{self, Advertisement, DiscoveredPeer};
 use crate::protocol::{
     ControlMessage, DeviceIdentity, FileChunkHeader, Frame, FrameReader, FrameWriter,
-    PairHelloPayload, SessionAgreement,
+    PairRequestPayload, SessionAgreement,
 };
 use crate::sync::{
     DeletePolicy, WorkspaceSpec, apply_file_metadata, build_apply_plan, build_incoming_snapshot,
@@ -63,7 +63,7 @@ struct IncomingFileState {
 
 struct PairDecisionParams<'a> {
     exporter: &'a [u8],
-    session_id: &'a str,
+    request_id: &'a str,
     pin: &'a str,
     accepted: bool,
     message: String,
@@ -84,30 +84,19 @@ async fn run_host(device: DeviceConfig, options: RuntimeOptions) -> Result<()> {
         .await
         .context("failed to bind TCP listener")?;
     let port = listener.local_addr()?.port();
-    let session_id = Uuid::new_v4().to_string();
-    let pin = crypto::random_pin();
     let acceptor = crypto::build_server_acceptor()?;
     let _advertisement = discovery::advertise(&Advertisement {
-        session_id: session_id.clone(),
         port,
         device: device.clone(),
         mode: options.mode,
     })?;
 
-    print_host_ready(&device, &options, port, &pin);
+    print_host_ready(&device, &options, port);
 
     loop {
         let (socket, address) = listener.accept().await?;
-        match handle_incoming_connection(
-            socket,
-            address.to_string(),
-            &acceptor,
-            &device,
-            &options,
-            &session_id,
-            &pin,
-        )
-        .await
+        match handle_incoming_connection(socket, address.to_string(), &acceptor, &device, &options)
+            .await
         {
             Ok(Some(session)) => {
                 run_sync_session(session, &options.workspace, options.interval_secs).await?;
@@ -126,8 +115,7 @@ async fn run_host(device: DeviceConfig, options: RuntimeOptions) -> Result<()> {
 async fn run_client(device: DeviceConfig, options: RuntimeOptions) -> Result<()> {
     loop {
         let peer = choose_peer()?;
-        let pin = prompt_secret("请输入对方屏幕上显示的 6 位 PIN")?;
-        match connect_to_peer(&peer, &device, &options, &pin).await {
+        match connect_to_peer(&peer, &device, &options).await {
             Ok(session) => {
                 run_sync_session(session, &options.workspace, options.interval_secs).await?;
                 break;
@@ -150,18 +138,14 @@ async fn handle_incoming_connection(
     acceptor: &tokio_rustls::TlsAcceptor,
     device: &DeviceConfig,
     options: &RuntimeOptions,
-    session_id: &str,
-    pin: &str,
 ) -> Result<Option<AuthenticatedSession>> {
-    let server_stream = acceptor.accept(socket).await?;
-    let exporter = crypto::export_keying_material_from_server(&server_stream, session_id)?;
-    let mut tls_stream: TlsStream<TcpStream> = server_stream.into();
+    let mut server_stream = acceptor.accept(socket).await?;
     let pair_result = {
-        let frame = FrameReader::new(&mut tls_stream).read_frame().await?;
-        let (payload, proof) = match frame {
-            Frame::Control(ControlMessage::PairHello { payload, proof }) => (payload, proof),
+        let frame = FrameReader::new(&mut server_stream).read_frame().await?;
+        let payload = match frame {
+            Frame::Control(ControlMessage::PairRequest { payload }) => payload,
             _ => {
-                FrameWriter::new(&mut tls_stream)
+                FrameWriter::new(&mut server_stream)
                     .write_frame(Frame::Control(ControlMessage::Error {
                         message: "连接建立了，但请求格式不正确".to_string(),
                     }))
@@ -170,34 +154,16 @@ async fn handle_incoming_connection(
             }
         };
 
-        if crypto::verify_pair_hello(&exporter, session_id, pin, &payload, &proof).is_err() {
-            FrameWriter::new(&mut tls_stream)
+        if payload.protocol_version != 1 {
+            FrameWriter::new(&mut server_stream)
                 .write_frame(Frame::Control(ControlMessage::Error {
-                    message: "PIN 校验失败，或连接不属于当前会话".to_string(),
+                    message: format!("不支持的协议版本: {}", payload.protocol_version),
                 }))
                 .await?;
             return Ok(None);
         }
 
         let agreement = negotiate(options.mode, payload.requested_mode);
-        if !agreement.any_direction() {
-            let message = "双方模式不兼容，本次请求无法建立同步。".to_string();
-            let control = signed_pair_decision(PairDecisionParams {
-                exporter: &exporter,
-                session_id,
-                pin,
-                accepted: false,
-                message: message.clone(),
-                device,
-                workspace: &options.workspace,
-                agreement: &agreement,
-            })?;
-            FrameWriter::new(&mut tls_stream)
-                .write_frame(Frame::Control(control))
-                .await?;
-            return Ok(None);
-        }
-
         println!();
         println!("{}", style("收到同步请求").bold());
         println!(
@@ -209,24 +175,85 @@ async fn handle_incoming_connection(
         for line in payload.workspace.human_lines() {
             println!("{line}");
         }
+        for line in options.workspace.local_human_lines() {
+            println!("本机 {line}");
+        }
         println!(
             "协商结果: {}",
             agreement_label(SessionRole::Host, &agreement)
         );
 
+        if !agreement.any_direction() {
+            FrameWriter::new(&mut server_stream)
+                .write_frame(Frame::Control(ControlMessage::Error {
+                    message: "双方模式不兼容，本次请求无法建立同步。".to_string(),
+                }))
+                .await?;
+            return Ok(None);
+        }
+
+        let request_id = Uuid::new_v4().to_string();
+        let pin = crypto::random_pin();
+        println!("本次 PIN: {}", style(&pin).bold());
+        println!("请让对方输入这个 PIN。该 PIN 只适用于这一次请求。");
+
+        FrameWriter::new(&mut server_stream)
+            .write_frame(Frame::Control(ControlMessage::PinChallenge {
+                request_id: request_id.clone(),
+                server: device_identity(device),
+                message: "请求信息已送达对端，请查看服务端屏幕上的本次 PIN。".to_string(),
+            }))
+            .await?;
+
+        let exporter = crypto::export_keying_material_from_server(&server_stream, &request_id)?;
+        let frame = FrameReader::new(&mut server_stream).read_frame().await?;
+        let proof = match frame {
+            Frame::Control(ControlMessage::PairAuth {
+                request_id: incoming_request_id,
+                proof,
+            }) if incoming_request_id == request_id => proof,
+            Frame::Control(ControlMessage::PairAuth { .. }) => {
+                FrameWriter::new(&mut server_stream)
+                    .write_frame(Frame::Control(ControlMessage::Error {
+                        message: "收到的 PIN 请求标识与当前连接不匹配。".to_string(),
+                    }))
+                    .await?;
+                return Ok(None);
+            }
+            _ => {
+                FrameWriter::new(&mut server_stream)
+                    .write_frame(Frame::Control(ControlMessage::Error {
+                        message: "客户端没有按预期提交 PIN 校验信息。".to_string(),
+                    }))
+                    .await?;
+                return Ok(None);
+            }
+        };
+
+        if crypto::verify_pair_auth(&exporter, &request_id, &pin, &payload, &proof).is_err() {
+            FrameWriter::new(&mut server_stream)
+                .write_frame(Frame::Control(ControlMessage::Error {
+                    message: "PIN 校验失败，本次连接未被接受。".to_string(),
+                }))
+                .await?;
+            return Ok(None);
+        }
+
+        println!("PIN 校验通过，等待本机确认。");
+
         if !prompt_confirm("是否接受该同步请求", true)? {
             let message = "服务端拒绝了本次同步请求。".to_string();
             let control = signed_pair_decision(PairDecisionParams {
                 exporter: &exporter,
-                session_id,
-                pin,
+                request_id: &request_id,
+                pin: &pin,
                 accepted: false,
                 message: message.clone(),
                 device,
                 workspace: &options.workspace,
                 agreement: &agreement,
             })?;
-            FrameWriter::new(&mut tls_stream)
+            FrameWriter::new(&mut server_stream)
                 .write_frame(Frame::Control(control))
                 .await?;
             return Ok(None);
@@ -235,15 +262,15 @@ async fn handle_incoming_connection(
         let message = "服务端已接受同步请求。".to_string();
         let control = signed_pair_decision(PairDecisionParams {
             exporter: &exporter,
-            session_id,
-            pin,
+            request_id: &request_id,
+            pin: &pin,
             accepted: true,
             message,
             device,
             workspace: &options.workspace,
             agreement: &agreement,
         })?;
-        FrameWriter::new(&mut tls_stream)
+        FrameWriter::new(&mut server_stream)
             .write_frame(Frame::Control(control))
             .await?;
 
@@ -251,6 +278,7 @@ async fn handle_incoming_connection(
     }?;
 
     let (remote, agreement, remote_workspace) = pair_result;
+    let tls_stream: TlsStream<TcpStream> = server_stream.into();
     Ok(Some(AuthenticatedSession {
         role: SessionRole::Host,
         stream: tls_stream,
@@ -264,7 +292,6 @@ async fn connect_to_peer(
     peer: &DiscoveredPeer,
     device: &DeviceConfig,
     options: &RuntimeOptions,
-    pin: &str,
 ) -> Result<AuthenticatedSession> {
     let address = peer
         .addresses
@@ -275,30 +302,62 @@ async fn connect_to_peer(
         .await
         .with_context(|| format!("failed to connect to {}:{}", address, peer.port))?;
     let connector = crypto::build_client_connector()?;
-    let client_stream = connector.connect(crypto::server_name()?, socket).await?;
-    let exporter = crypto::export_keying_material_from_client(&client_stream, &peer.session_id)?;
-    let mut tls_stream: TlsStream<TcpStream> = client_stream.into();
+    let mut client_stream = connector.connect(crypto::server_name()?, socket).await?;
 
     let remote_info = {
-        let payload = PairHelloPayload {
+        let payload = PairRequestPayload {
             protocol_version: 1,
             client: device_identity(device),
             requested_mode: options.mode,
             workspace: options.workspace.summary(),
         };
-        let proof = crypto::sign_pair_hello(&exporter, &peer.session_id, pin, &payload)?;
-        FrameWriter::new(&mut tls_stream)
-            .write_frame(Frame::Control(ControlMessage::PairHello { payload, proof }))
+        FrameWriter::new(&mut client_stream)
+            .write_frame(Frame::Control(ControlMessage::PairRequest {
+                payload: payload.clone(),
+            }))
             .await?;
 
-        let reply = match FrameReader::new(&mut tls_stream).read_frame().await? {
+        let reply = match FrameReader::new(&mut client_stream).read_frame().await? {
+            Frame::Control(message) => message,
+            _ => bail!("peer sent a non-control response during pairing"),
+        };
+
+        let (request_id, server, prompt_message) = match reply {
+            ControlMessage::PinChallenge {
+                request_id,
+                server,
+                message,
+            } => (request_id, server, message),
+            ControlMessage::Error { message } => bail!("{}", message),
+            other => bail!("unexpected pairing response: {other:?}"),
+        };
+
+        println!();
+        println!("{}", style("同步请求已送达").bold());
+        println!(
+            "对端: {} ({})",
+            server.device_name,
+            short_uuid(&server.device_id)
+        );
+        println!("{prompt_message}");
+        let pin = prompt_secret("请输入服务端当前显示的 6 位 PIN")?;
+        let exporter = crypto::export_keying_material_from_client(&client_stream, &request_id)?;
+        let proof = crypto::sign_pair_auth(&exporter, &request_id, &pin, &payload)?;
+        FrameWriter::new(&mut client_stream)
+            .write_frame(Frame::Control(ControlMessage::PairAuth {
+                request_id: request_id.clone(),
+                proof,
+            }))
+            .await?;
+
+        let reply = match FrameReader::new(&mut client_stream).read_frame().await? {
             Frame::Control(message) => message,
             _ => bail!("peer sent a non-control response during pairing"),
         };
 
         match &reply {
             ControlMessage::PairDecision { accepted, .. } => {
-                crypto::verify_pair_decision(&reply, &exporter, &peer.session_id, pin)?;
+                crypto::verify_pair_decision(&reply, &exporter, &request_id, &pin)?;
                 if !accepted && let ControlMessage::PairDecision { message, .. } = &reply {
                     bail!("{}", message);
                 }
@@ -321,6 +380,7 @@ async fn connect_to_peer(
     }?;
 
     let (remote, remote_workspace, agreement) = remote_info;
+    let tls_stream: TlsStream<TcpStream> = client_stream.into();
     println!();
     println!("{}", style("连接已建立").bold());
     println!(
@@ -476,7 +536,9 @@ async fn run_sync_session(
                 eprintln!("对端报告错误: {}", message);
             }
             Frame::Control(ControlMessage::Goodbye) => break,
-            Frame::Control(ControlMessage::PairHello { .. })
+            Frame::Control(ControlMessage::PairRequest { .. })
+            | Frame::Control(ControlMessage::PinChallenge { .. })
+            | Frame::Control(ControlMessage::PairAuth { .. })
             | Frame::Control(ControlMessage::PairDecision { .. }) => {
                 bail!("received an unexpected pairing message after session start")
             }
@@ -842,7 +904,7 @@ fn signed_pair_decision(params: PairDecisionParams<'_>) -> Result<ControlMessage
     let summary = params.workspace.summary();
     let proof = crypto::sign_pair_decision(
         params.exporter,
-        params.session_id,
+        params.request_id,
         params.pin,
         params.accepted,
         &params.message,
@@ -866,13 +928,12 @@ fn device_identity(device: &DeviceConfig) -> DeviceIdentity {
     }
 }
 
-fn print_host_ready(device: &DeviceConfig, options: &RuntimeOptions, port: u16, pin: &str) {
+fn print_host_ready(device: &DeviceConfig, options: &RuntimeOptions, port: u16) {
     println!("{}", style("Synly 已就绪").bold());
     println!("设备: {} ({})", device.device_name, device.short_id());
     println!("模式: {}", options.mode.label());
     println!("监听端口: {}", port);
-    println!("PIN: {}", style(pin).bold());
-    println!("把这 6 位 PIN 告诉对方，然后等待同步请求。");
+    println!("等待同步请求。收到请求后会为该请求单独显示 6 位 PIN。");
 }
 
 fn agreement_label(role: SessionRole, agreement: &SessionAgreement) -> &'static str {

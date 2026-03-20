@@ -1,4 +1,4 @@
-use crate::protocol::{ControlMessage, PairHelloPayload, SessionAgreement};
+use crate::protocol::{ControlMessage, PairRequestPayload, SessionAgreement};
 use crate::sync::WorkspaceSummary;
 use anyhow::{Result, bail};
 use base64::Engine;
@@ -93,26 +93,26 @@ pub fn server_name() -> Result<ServerName<'static>> {
 
 pub fn export_keying_material_from_client<T>(
     stream: &tokio_rustls::client::TlsStream<T>,
-    session_id: &str,
+    binding_id: &str,
 ) -> Result<[u8; 32]> {
     let mut output = [0u8; 32];
     stream.get_ref().1.export_keying_material(
         &mut output,
         b"synly-pin-binding",
-        Some(session_id.as_bytes()),
+        Some(binding_id.as_bytes()),
     )?;
     Ok(output)
 }
 
 pub fn export_keying_material_from_server<T>(
     stream: &tokio_rustls::server::TlsStream<T>,
-    session_id: &str,
+    binding_id: &str,
 ) -> Result<[u8; 32]> {
     let mut output = [0u8; 32];
     stream.get_ref().1.export_keying_material(
         &mut output,
         b"synly-pin-binding",
-        Some(session_id.as_bytes()),
+        Some(binding_id.as_bytes()),
     )?;
     Ok(output)
 }
@@ -121,33 +121,33 @@ pub fn random_pin() -> String {
     format!("{:06}", rand::thread_rng().gen_range(0..1_000_000))
 }
 
-pub fn sign_pair_hello(
+pub fn sign_pair_auth(
     exporter: &[u8],
-    session_id: &str,
+    request_id: &str,
     pin: &str,
-    payload: &PairHelloPayload,
+    payload: &PairRequestPayload,
 ) -> Result<String> {
     let payload_bytes = serde_json::to_vec(payload)?;
     Ok(sign_payload(
         exporter,
-        session_id,
+        request_id,
         pin,
         b"synly-client-proof",
         &payload_bytes,
     ))
 }
 
-pub fn verify_pair_hello(
+pub fn verify_pair_auth(
     exporter: &[u8],
-    session_id: &str,
+    request_id: &str,
     pin: &str,
-    payload: &PairHelloPayload,
+    payload: &PairRequestPayload,
     proof: &str,
 ) -> Result<()> {
     let payload_bytes = serde_json::to_vec(payload)?;
     verify_payload(
         exporter,
-        session_id,
+        request_id,
         pin,
         b"synly-client-proof",
         &payload_bytes,
@@ -157,7 +157,7 @@ pub fn verify_pair_hello(
 
 pub fn sign_pair_decision(
     exporter: &[u8],
-    session_id: &str,
+    request_id: &str,
     pin: &str,
     accepted: bool,
     message: &str,
@@ -172,7 +172,7 @@ pub fn sign_pair_decision(
     })?;
     Ok(sign_payload(
         exporter,
-        session_id,
+        request_id,
         pin,
         b"synly-server-proof",
         &payload,
@@ -182,7 +182,7 @@ pub fn sign_pair_decision(
 pub fn verify_pair_decision(
     message: &ControlMessage,
     exporter: &[u8],
-    session_id: &str,
+    request_id: &str,
     pin: &str,
 ) -> Result<()> {
     match message {
@@ -202,7 +202,7 @@ pub fn verify_pair_decision(
             })?;
             verify_payload(
                 exporter,
-                session_id,
+                request_id,
                 pin,
                 b"synly-server-proof",
                 &payload,
@@ -223,12 +223,12 @@ struct DecisionProofPayload<'a> {
 
 fn sign_payload(
     exporter: &[u8],
-    session_id: &str,
+    request_id: &str,
     pin: &str,
     label: &[u8],
     payload: &[u8],
 ) -> String {
-    let key = derive_pin_key(session_id, pin);
+    let key = derive_pin_key(request_id, pin);
     let mut mac = HmacSha256::new_from_slice(&key).expect("valid HMAC key");
     mac.update(label);
     mac.update(exporter);
@@ -238,13 +238,13 @@ fn sign_payload(
 
 fn verify_payload(
     exporter: &[u8],
-    session_id: &str,
+    request_id: &str,
     pin: &str,
     label: &[u8],
     payload: &[u8],
     proof: &str,
 ) -> Result<()> {
-    let key = derive_pin_key(session_id, pin);
+    let key = derive_pin_key(request_id, pin);
     let expected = STANDARD_NO_PAD.decode(proof.as_bytes())?;
     let mut mac = HmacSha256::new_from_slice(&key).expect("valid HMAC key");
     mac.update(label);
@@ -254,13 +254,13 @@ fn verify_payload(
     Ok(())
 }
 
-fn derive_pin_key(session_id: &str, pin: &str) -> [u8; 32] {
+fn derive_pin_key(request_id: &str, pin: &str) -> [u8; 32] {
     let mut key = [0u8; 32];
     let iterations = NonZeroU32::new(PBKDF2_ITERATIONS).expect("non zero iteration count");
     pbkdf2::derive(
         pbkdf2::PBKDF2_HMAC_SHA256,
         iterations,
-        session_id.as_bytes(),
+        request_id.as_bytes(),
         pin.trim().as_bytes(),
         &mut key,
     );
@@ -271,13 +271,13 @@ fn derive_pin_key(session_id: &str, pin: &str) -> [u8; 32] {
 mod tests {
     use super::*;
     use crate::cli::SyncMode;
-    use crate::protocol::{DeviceIdentity, PairHelloPayload};
+    use crate::protocol::{DeviceIdentity, PairRequestPayload};
     use crate::sync::WorkspaceSummary;
     use uuid::Uuid;
 
     #[test]
-    fn pair_hello_sign_and_verify_roundtrip() {
-        let payload = PairHelloPayload {
+    fn pair_auth_sign_and_verify_roundtrip() {
+        let payload = PairRequestPayload {
             protocol_version: 1,
             client: DeviceIdentity {
                 device_id: Uuid::new_v4(),
@@ -293,8 +293,8 @@ mod tests {
             },
         };
         let exporter = [7u8; 32];
-        let proof = sign_pair_hello(&exporter, "session", "123456", &payload).unwrap();
-        verify_pair_hello(&exporter, "session", "123456", &payload, &proof).unwrap();
-        assert!(verify_pair_hello(&exporter, "session", "654321", &payload, &proof).is_err());
+        let proof = sign_pair_auth(&exporter, "request", "123456", &payload).unwrap();
+        verify_pair_auth(&exporter, "request", "123456", &payload, &proof).unwrap();
+        assert!(verify_pair_auth(&exporter, "request", "654321", &payload, &proof).is_err());
     }
 }

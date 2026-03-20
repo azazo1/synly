@@ -17,7 +17,7 @@ pub struct DeviceIdentity {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PairHelloPayload {
+pub struct PairRequestPayload {
     pub protocol_version: u16,
     pub client: DeviceIdentity,
     pub requested_mode: SyncMode,
@@ -43,8 +43,16 @@ impl SessionAgreement {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ControlMessage {
-    PairHello {
-        payload: PairHelloPayload,
+    PairRequest {
+        payload: PairRequestPayload,
+    },
+    PinChallenge {
+        request_id: String,
+        server: DeviceIdentity,
+        message: String,
+    },
+    PairAuth {
+        request_id: String,
         proof: String,
     },
     PairDecision {

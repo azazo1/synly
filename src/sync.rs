@@ -159,6 +159,28 @@ impl WorkspaceSpec {
                 .map(|path| path.display().to_string()),
         }
     }
+
+    pub fn local_human_lines(&self) -> Vec<String> {
+        let mut lines = vec![format!("模式: {}", self.mode.label())];
+
+        match &self.outgoing {
+            Some(OutgoingSpec::RootContents { root }) => {
+                lines.push(format!("发送目录: {}", root.display()));
+            }
+            Some(OutgoingSpec::SelectedItems { items }) => {
+                for item in items {
+                    lines.push(format!("发送条目: {}", item.path.display()));
+                }
+            }
+            None => {}
+        }
+
+        if let Some(root) = &self.incoming_root {
+            lines.push(format!("接收目录: {}", root.display()));
+        }
+
+        lines
+    }
 }
 
 impl WorkspaceSummary {
