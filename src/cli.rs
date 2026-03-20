@@ -208,8 +208,7 @@ pub fn prompt_secret(label: &str) -> Result<String> {
     let term = Term::stdout();
     loop {
         term.write_line(label)?;
-        term.write_str("PIN: ")?;
-        let value = term.read_secure_line()?.trim().to_string();
+        let value = prompt_input("PIN", None)?;
         if !value.is_empty() {
             return Ok(value);
         }
