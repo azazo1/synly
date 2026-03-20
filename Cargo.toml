@@ -12,7 +12,8 @@ filetime = "0.2.26"
 hmac = "0.12.1"
 if-addrs = "0.15.0"
 mdns-sd = "0.18.2"
-rand = "0.8.5"
+notify = "8.2.0"
+rand = "0.10.0"
 rcgen = { version = "0.14.7", default-features = false, features = ["crypto", "ring"] }
 ring = "0.17.14"
 rustls = { version = "0.23.37", default-features = false, features = ["std", "ring"] }

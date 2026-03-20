@@ -85,6 +85,12 @@ pub struct ApplyPlan {
     pub delete_paths: Vec<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WatchTarget {
+    pub path: PathBuf,
+    pub recursive: bool,
+}
+
 impl WorkspaceSpec {
     pub fn for_send(paths: Vec<PathBuf>) -> Result<Self> {
         if paths.is_empty() {
@@ -252,6 +258,41 @@ pub fn build_incoming_snapshot(root: &Path) -> Result<ManifestSnapshot> {
     build_snapshot(&OutgoingSpec::RootContents {
         root: root.to_path_buf(),
     })
+}
+
+pub fn watch_targets(spec: &OutgoingSpec) -> Result<Vec<WatchTarget>> {
+    let mut targets = BTreeMap::<PathBuf, bool>::new();
+
+    match spec {
+        OutgoingSpec::RootContents { root } => {
+            targets.insert(root.clone(), true);
+        }
+        OutgoingSpec::SelectedItems { items } => {
+            for item in items {
+                let (path, recursive) = if item.is_dir {
+                    (item.path.clone(), true)
+                } else {
+                    let parent = item.path.parent().with_context(|| {
+                        format!(
+                            "shared file {} has no parent directory",
+                            item.path.display()
+                        )
+                    })?;
+                    (parent.to_path_buf(), false)
+                };
+
+                targets
+                    .entry(path)
+                    .and_modify(|existing| *existing |= recursive)
+                    .or_insert(recursive);
+            }
+        }
+    }
+
+    Ok(targets
+        .into_iter()
+        .map(|(path, recursive)| WatchTarget { path, recursive })
+        .collect())
 }
 
 pub fn build_apply_plan(
@@ -863,6 +904,52 @@ mod tests {
 
         let plan = build_apply_plan(&remote, &local, DeletePolicy::Never);
         assert_eq!(plan.file_requests, vec!["bin/tool".to_string()]);
+    }
+
+    #[test]
+    fn root_contents_watch_target_is_recursive() {
+        let root = PathBuf::from("/tmp/workspace");
+        let targets = watch_targets(&OutgoingSpec::RootContents { root: root.clone() }).unwrap();
+
+        assert_eq!(
+            targets,
+            vec![WatchTarget {
+                path: root,
+                recursive: true,
+            }]
+        );
+    }
+
+    #[test]
+    fn selected_items_watch_targets_use_parent_for_files() {
+        let targets = watch_targets(&OutgoingSpec::SelectedItems {
+            items: vec![
+                NamedItem {
+                    name: "workspace".to_string(),
+                    path: PathBuf::from("/tmp/workspace"),
+                    is_dir: true,
+                },
+                NamedItem {
+                    name: "notes.txt".to_string(),
+                    path: PathBuf::from("/tmp/workspace/notes.txt"),
+                    is_dir: false,
+                },
+                NamedItem {
+                    name: "todo.txt".to_string(),
+                    path: PathBuf::from("/tmp/workspace/todo.txt"),
+                    is_dir: false,
+                },
+            ],
+        })
+        .unwrap();
+
+        assert_eq!(
+            targets,
+            vec![WatchTarget {
+                path: PathBuf::from("/tmp/workspace"),
+                recursive: true,
+            }]
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@ use anyhow::{Result, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
 use hmac::{Hmac, Mac};
-use rand::Rng;
+use rand::RngExt;
 use rcgen::generate_simple_self_signed;
 use ring::pbkdf2;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
@@ -118,7 +118,7 @@ pub fn export_keying_material_from_server<T>(
 }
 
 pub fn random_pin() -> String {
-    format!("{:06}", rand::thread_rng().gen_range(0..1_000_000))
+    format!("{:06}", rand::rng().random_range(0..1_000_000))
 }
 
 pub fn sign_pair_auth(

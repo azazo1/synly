@@ -24,7 +24,11 @@ pub struct Cli {
     pub sync_delete: bool,
     #[arg(long, conflicts_with = "sync_delete")]
     pub no_sync_delete: bool,
-    #[arg(long, default_value_t = 3)]
+    #[arg(
+        long,
+        default_value_t = 3,
+        help = "兜底全量重扫间隔（秒），目录变化仍会实时监听"
+    )]
     pub interval_secs: u64,
 }
 

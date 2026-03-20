@@ -12,11 +12,12 @@ use crate::protocol::{
 use crate::sync::{
     DeletePolicy, WorkspaceSpec, apply_file_metadata, build_apply_plan, build_incoming_snapshot,
     build_snapshot, delete_paths, ensure_directories, resolve_incoming_path, resolve_outgoing_path,
-    snapshot_contains_file,
+    snapshot_contains_file, watch_targets,
 };
 use anyhow::{Context, Result, bail};
 use console::style;
-use rand::Rng;
+use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
+use rand::RngExt;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -24,7 +25,7 @@ use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
-use tokio::time::interval;
+use tokio::time::{self, Instant};
 use tokio_rustls::TlsStream;
 use uuid::Uuid;
 
@@ -621,22 +622,99 @@ async fn snapshot_loop(
     tx: mpsc::Sender<Frame>,
     interval_secs: u64,
 ) -> Result<()> {
-    let mut ticker = interval(Duration::from_secs(interval_secs));
+    let (watch_tx, mut watch_rx) = mpsc::unbounded_channel::<notify::Result<Event>>();
+    let mut watcher = RecommendedWatcher::new(
+        move |event| {
+            let _ = watch_tx.send(event);
+        },
+        NotifyConfig::default(),
+    )
+    .context("failed to start filesystem watcher")?;
+
+    for target in watch_targets(&outgoing)? {
+        let mode = if target.recursive {
+            RecursiveMode::Recursive
+        } else {
+            RecursiveMode::NonRecursive
+        };
+        watcher
+            .watch(&target.path, mode)
+            .with_context(|| format!("failed to watch shared path {}", target.path.display()))?;
+    }
+
+    let mut ticker = time::interval(Duration::from_secs(interval_secs.max(1)));
     let mut last_snapshot = None;
     let mut revision = 1u64;
+    let debounce = Duration::from_millis(300);
+
+    publish_snapshot_if_changed(&outgoing, &tx, &mut last_snapshot, &mut revision).await?;
+    ticker.tick().await;
 
     loop {
-        let snapshot = build_snapshot(&outgoing)?;
-        if last_snapshot.as_ref() != Some(&snapshot) {
-            tx.send(Frame::Control(ControlMessage::SnapshotAdvert {
-                revision,
-                snapshot: snapshot.clone(),
-            }))
-            .await?;
-            last_snapshot = Some(snapshot);
-            revision += 1;
+        tokio::select! {
+            maybe_event = watch_rx.recv() => {
+                let event = match maybe_event {
+                    Some(event) => event,
+                    None => bail!("filesystem watcher channel closed unexpectedly"),
+                };
+
+                if let Err(err) = event {
+                    eprintln!("文件监视出错，将等待下一次重扫: {err}");
+                    continue;
+                }
+
+                drain_watch_events(&mut watch_rx, debounce).await;
+                publish_snapshot_if_changed(&outgoing, &tx, &mut last_snapshot, &mut revision).await?;
+            }
+            _ = ticker.tick() => {
+                publish_snapshot_if_changed(&outgoing, &tx, &mut last_snapshot, &mut revision).await?;
+            }
         }
-        ticker.tick().await;
+    }
+}
+
+async fn publish_snapshot_if_changed(
+    outgoing: &crate::sync::OutgoingSpec,
+    tx: &mpsc::Sender<Frame>,
+    last_snapshot: &mut Option<crate::sync::ManifestSnapshot>,
+    revision: &mut u64,
+) -> Result<()> {
+    let snapshot = build_snapshot(outgoing)?;
+    if last_snapshot.as_ref() == Some(&snapshot) {
+        return Ok(());
+    }
+
+    tx.send(Frame::Control(ControlMessage::SnapshotAdvert {
+        revision: *revision,
+        snapshot: snapshot.clone(),
+    }))
+    .await?;
+    *last_snapshot = Some(snapshot);
+    *revision += 1;
+    Ok(())
+}
+
+async fn drain_watch_events(
+    watch_rx: &mut mpsc::UnboundedReceiver<notify::Result<Event>>,
+    debounce: Duration,
+) {
+    let sleep = time::sleep(debounce);
+    tokio::pin!(sleep);
+
+    loop {
+        tokio::select! {
+            _ = &mut sleep => break,
+            maybe_event = watch_rx.recv() => match maybe_event {
+                Some(Ok(_)) => {
+                    sleep.as_mut().reset(Instant::now() + debounce);
+                }
+                Some(Err(err)) => {
+                    eprintln!("文件监视出错，将继续等待变更稳定: {err}");
+                    sleep.as_mut().reset(Instant::now() + debounce);
+                }
+                None => break,
+            }
+        }
     }
 }
 
@@ -993,7 +1071,7 @@ fn agreement_label(role: SessionRole, agreement: &SessionAgreement) -> &'static 
 }
 
 fn temp_file_path(destination: &Path) -> PathBuf {
-    let suffix = rand::thread_rng().gen_range(1000..9999);
+    let suffix = rand::rng().random_range(1000..9999);
     let file_name = destination
         .file_name()
         .and_then(|name| name.to_str())
