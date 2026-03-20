@@ -860,7 +860,7 @@ fn choose_peer() -> Result<DiscoveredPeer> {
         }
 
         let options = peers.iter().map(DiscoveredPeer::label).collect::<Vec<_>>();
-        let index = prompt_select("请选择要连接的设备", &options)?;
+        let index = prompt_select("请选择要连接的设备", &options, None)?;
         return Ok(peers[index].clone());
     }
 }

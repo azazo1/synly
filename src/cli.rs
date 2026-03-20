@@ -5,7 +5,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use console::{Term, style};
 use serde::{Deserialize, Serialize};
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -135,28 +135,56 @@ pub fn collect_runtime_options(cli: Cli, device: &DeviceConfig) -> Result<Runtim
     })
 }
 
-pub fn prompt_select(title: &str, options: &[String]) -> Result<usize> {
+pub fn prompt_select(
+    title: &str,
+    options: &[String],
+    default_index: Option<usize>,
+) -> Result<usize> {
     if options.is_empty() {
         bail!("no options available for selection");
+    }
+    if let Some(default_index) = default_index
+        && default_index >= options.len()
+    {
+        bail!("default selection index out of range");
     }
 
     let term = Term::stdout();
     term.write_line("")?;
     term.write_line(&style(title).bold().to_string())?;
     for (idx, option) in options.iter().enumerate() {
-        term.write_line(&format!("  {}. {}", idx + 1, option))?;
+        let default_suffix = if default_index == Some(idx) {
+            " [默认]"
+        } else {
+            ""
+        };
+        term.write_line(&format!("  {}. {}{}", idx + 1, option, default_suffix))?;
     }
 
     loop {
-        let raw = prompt_input("请输入编号", None)?;
-        let number = raw
-            .trim()
-            .parse::<usize>()
-            .with_context(|| format!("`{}` 不是有效编号", raw.trim()))?;
-        if (1..=options.len()).contains(&number) {
-            return Ok(number - 1);
+        let prompt = match default_index {
+            Some(index) => format!("请输入编号，直接回车选择默认项 {}", index + 1),
+            None => "请输入编号".to_string(),
+        };
+        let raw = prompt_input(&prompt, None)?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            if let Some(index) = default_index {
+                return Ok(index);
+            }
+            term.write_line("请输入编号。")?;
+            continue;
         }
-        term.write_line("编号超出范围，请重新输入。")?;
+
+        match trimmed.parse::<usize>() {
+            Ok(number) if (1..=options.len()).contains(&number) => return Ok(number - 1),
+            Ok(_) => {
+                term.write_line("编号超出范围，请重新输入。")?;
+            }
+            Err(_) => {
+                term.write_line("请输入有效编号。")?;
+            }
+        }
     }
 }
 
@@ -179,21 +207,30 @@ pub fn prompt_input(label: &str, default: Option<&str>) -> Result<String> {
 
 pub fn prompt_secret(label: &str) -> Result<String> {
     let term = Term::stdout();
-    term.write_str(&format!("{}: ", label))?;
-    Ok(term.read_secure_line()?.trim().to_string())
+    loop {
+        term.write_str(&format!("{}: ", label))?;
+        let value = term.read_secure_line()?.trim().to_string();
+        if !value.is_empty() {
+            return Ok(value);
+        }
+        term.write_line("输入不能为空，请重新输入。")?;
+    }
 }
 
 pub fn prompt_confirm(label: &str, default: bool) -> Result<bool> {
     let suffix = if default { "[Y/n]" } else { "[y/N]" };
-    let raw = prompt_input(&format!("{} {}", label, suffix), None)?;
-    let trimmed = raw.trim().to_ascii_lowercase();
-    if trimmed.is_empty() {
-        return Ok(default);
-    }
-    match trimmed.as_str() {
-        "y" | "yes" => Ok(true),
-        "n" | "no" => Ok(false),
-        _ => bail!("请输入 y 或 n"),
+    let term = Term::stdout();
+    loop {
+        let raw = prompt_input(&format!("{} {}", label, suffix), None)?;
+        let trimmed = raw.trim().to_ascii_lowercase();
+        if trimmed.is_empty() {
+            return Ok(default);
+        }
+        match trimmed.as_str() {
+            "y" | "yes" => return Ok(true),
+            "n" | "no" => return Ok(false),
+            _ => term.write_line("请输入 y 或 n。")?,
+        }
     }
 }
 
@@ -218,7 +255,11 @@ fn choose_mode(device: &DeviceConfig, connection: ConnectionPreference) -> Resul
         device.device_name,
         device.short_id()
     );
-    let index = prompt_select("请选择当前设备的同步模式", &options)?;
+    let default_index = match connection {
+        ConnectionPreference::Host => Some(0),
+        ConnectionPreference::Join => Some(3),
+    };
+    let index = prompt_select("请选择当前设备的同步模式", &options, default_index)?;
     Ok(match connection {
         ConnectionPreference::Host => match index {
             0 => SyncMode::Auto,
@@ -240,7 +281,7 @@ fn choose_connection() -> Result<ConnectionPreference> {
         "等待别人连接，收到请求后显示本次 PIN".to_string(),
         "连接局域网中的设备，收到提示后输入对方当前显示的 PIN".to_string(),
     ];
-    let index = prompt_select("请选择本次连接方式", &options)?;
+    let index = prompt_select("请选择本次连接方式", &options, Some(0))?;
     Ok(match index {
         0 => ConnectionPreference::Host,
         _ => ConnectionPreference::Join,
@@ -276,78 +317,114 @@ fn resolve_send_paths(initial: Option<Vec<PathBuf>>) -> Result<Vec<PathBuf>> {
     }
 
     let cwd = std::env::current_dir().context("failed to determine current directory")?;
-    let raw = prompt_input(
-        &format!(
-            "未指定同步源。直接回车同步当前文件夹 `{}`，或输入要同步的路径，多个路径用英文逗号分隔",
-            cwd.display()
-        ),
-        None,
-    )?;
-    if raw.trim().is_empty() {
-        return Ok(vec![cwd]);
+    loop {
+        let raw = prompt_input(
+            &format!(
+                "未指定同步源。直接回车同步当前文件夹 `{}`，或输入要同步的路径，多个路径用英文逗号分隔",
+                cwd.display()
+            ),
+            None,
+        )?;
+        if raw.trim().is_empty() {
+            return Ok(vec![cwd.clone()]);
+        }
+        match parse_csv_paths(&raw) {
+            Ok(paths) => return Ok(paths),
+            Err(err) => Term::stdout().write_line(&format!("输入无效，请重新输入: {err:#}"))?,
+        }
     }
-
-    parse_csv_paths(&raw)
 }
 
 fn resolve_receive_path(initial: Option<PathBuf>) -> Result<PathBuf> {
-    if let Some(path) = initial {
-        return expand_pathbuf(path);
-    }
-
     let cwd = std::env::current_dir().context("failed to determine current directory")?;
-    let raw = prompt_input(
+    resolve_directory_path(
+        initial,
         &format!(
             "未指定接收目录。直接回车使用当前文件夹 `{}`，或直接输入目标目录",
             cwd.display()
         ),
-        None,
-    )?;
-    if raw.trim().is_empty() {
-        return Ok(cwd);
-    }
-
-    expand_path_string(&raw)
+        &cwd,
+    )
 }
 
 fn resolve_both_path(initial: Option<PathBuf>) -> Result<PathBuf> {
-    if let Some(path) = initial {
-        return expand_pathbuf(path);
-    }
-
     let cwd = std::env::current_dir().context("failed to determine current directory")?;
-    let raw = prompt_input(
+    resolve_directory_path(
+        initial,
         &format!(
             "未指定双向同步目录。直接回车使用当前文件夹 `{}`，或直接输入目标目录",
             cwd.display()
         ),
-        None,
-    )?;
-    if raw.trim().is_empty() {
-        return Ok(cwd);
-    }
-
-    expand_path_string(&raw)
+        &cwd,
+    )
 }
 
 fn resolve_auto_path(initial: Option<PathBuf>) -> Result<PathBuf> {
-    if let Some(path) = initial {
-        return expand_pathbuf(path);
-    }
-
     let cwd = std::env::current_dir().context("failed to determine current directory")?;
-    let raw = prompt_input(
+    resolve_directory_path(
+        initial,
         &format!(
             "自动协商模式需要一个共享目录。直接回车使用当前文件夹 `{}`，或直接输入目标目录",
             cwd.display()
         ),
-        None,
-    )?;
-    if raw.trim().is_empty() {
-        return Ok(cwd);
-    }
+        &cwd,
+    )
+}
 
-    expand_path_string(&raw)
+fn resolve_directory_path(
+    initial: Option<PathBuf>,
+    prompt: &str,
+    default_path: &Path,
+) -> Result<PathBuf> {
+    let term = Term::stdout();
+    let mut next_candidate = initial;
+
+    loop {
+        let path = if let Some(candidate) = next_candidate.take() {
+            match expand_pathbuf(candidate) {
+                Ok(path) => path,
+                Err(err) => {
+                    term.write_line(&format!("路径无效，请重新输入: {err:#}"))?;
+                    continue;
+                }
+            }
+        } else {
+            let raw = prompt_input(prompt, None)?;
+            if raw.trim().is_empty() {
+                default_path.to_path_buf()
+            } else {
+                match expand_path_string(&raw) {
+                    Ok(path) => path,
+                    Err(err) => {
+                        term.write_line(&format!("路径无效，请重新输入: {err:#}"))?;
+                        continue;
+                    }
+                }
+            }
+        };
+
+        if path.exists() {
+            match std::fs::metadata(&path) {
+                Ok(metadata) if metadata.is_dir() => return Ok(path),
+                Ok(_) => {
+                    term.write_line("该路径存在，但不是目录，请重新输入。")?;
+                }
+                Err(err) => {
+                    term.write_line(&format!("无法访问该路径，请重新输入: {err:#}"))?;
+                }
+            }
+            continue;
+        }
+
+        if prompt_confirm(
+            &format!("目录 `{}` 不存在，要自动创建吗", path.display()),
+            true,
+        )? {
+            return Ok(path);
+        }
+
+        term.write_line("请重新输入目录。")?;
+    }
 }
 
 fn parse_csv_paths(raw: &str) -> Result<Vec<PathBuf>> {
