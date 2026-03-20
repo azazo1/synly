@@ -34,10 +34,6 @@ impl SessionAgreement {
     pub fn any_direction(&self) -> bool {
         self.host_to_client || self.client_to_host
     }
-
-    pub fn bidirectional(&self) -> bool {
-        self.host_to_client && self.client_to_host
-    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

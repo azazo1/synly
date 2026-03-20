@@ -231,6 +231,7 @@ synly both . --join
 
 ```bash
 synly receive ./incoming --join --sync-delete
+synly both . --host --sync-delete
 synly both . --host --no-sync-delete
 ```
 
@@ -242,8 +243,9 @@ synly both . --host --no-sync-delete
 
 双向同步时：
 
-- 当前版本默认不自动传播删除
-- 这样做是为了先避免误删，行为更保守
+- 默认仍不自动传播删除；只有当前设备开启“删除同步”后，才会应用对端删除
+- 如果希望双方的删除都能互相传播，需要两边都开启删除同步
+- 这里的“删除”同样不会直接抹掉文件，而是移动到接收目录下的 `.synly/deleted/`
 
 自动协商模式时：
 

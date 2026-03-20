@@ -464,8 +464,6 @@ async fn run_sync_session(
     let mut reader = FrameReader::new(read_half);
     let mut pending_revisions = BTreeMap::<u64, PendingRevision>::new();
     let mut incoming_files = HashMap::<(u64, String), IncomingFileState>::new();
-    let agreement = session.agreement.clone();
-
     loop {
         let frame = match reader.read_frame().await {
             Ok(frame) => frame,
@@ -490,15 +488,15 @@ async fn run_sync_session(
                     "session negotiated receiving, but local workspace has no destination",
                 )?;
                 let local_snapshot = build_incoming_snapshot(root)?;
-                let skipped_delete_count = if !sync_delete && !agreement.bidirectional() {
-                    let preview_policy = delete_policy(&agreement, snapshot.layout, true);
+                let skipped_delete_count = if !sync_delete {
+                    let preview_policy = delete_policy(snapshot.layout, true);
                     build_apply_plan(&snapshot, &local_snapshot, preview_policy)
                         .delete_paths
                         .len()
                 } else {
                     0
                 };
-                let delete_policy = delete_policy(&agreement, snapshot.layout, sync_delete);
+                let delete_policy = delete_policy(snapshot.layout, sync_delete);
                 let plan = build_apply_plan(&snapshot, &local_snapshot, delete_policy);
                 ensure_directories(root, &snapshot)?;
 
@@ -990,12 +988,8 @@ fn negotiate(host_mode: SyncMode, client_mode: SyncMode) -> SessionAgreement {
     }
 }
 
-fn delete_policy(
-    agreement: &SessionAgreement,
-    layout: crate::sync::SnapshotLayout,
-    sync_delete: bool,
-) -> DeletePolicy {
-    if agreement.bidirectional() || !sync_delete {
+fn delete_policy(layout: crate::sync::SnapshotLayout, sync_delete: bool) -> DeletePolicy {
+    if !sync_delete {
         return DeletePolicy::Never;
     }
 
@@ -1092,4 +1086,38 @@ fn is_executable(metadata: &std::fs::Metadata) -> bool {
 #[cfg(not(unix))]
 fn is_executable(_metadata: &std::fs::Metadata) -> bool {
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::delete_policy;
+    use crate::sync::{DeletePolicy, SnapshotLayout};
+
+    #[test]
+    fn delete_policy_stays_disabled_when_sync_delete_is_off() {
+        assert!(matches!(
+            delete_policy(SnapshotLayout::RootContents, false),
+            DeletePolicy::Never
+        ));
+        assert!(matches!(
+            delete_policy(SnapshotLayout::SelectedItems, false),
+            DeletePolicy::Never
+        ));
+    }
+
+    #[test]
+    fn delete_policy_mirrors_root_contents_when_enabled() {
+        assert!(matches!(
+            delete_policy(SnapshotLayout::RootContents, true),
+            DeletePolicy::MirrorAll
+        ));
+    }
+
+    #[test]
+    fn delete_policy_limits_selected_items_when_enabled() {
+        assert!(matches!(
+            delete_policy(SnapshotLayout::SelectedItems, true),
+            DeletePolicy::MirrorSelectedItems
+        ));
+    }
 }
