@@ -87,6 +87,19 @@ pub struct ApplyPlan {
     pub delete_paths: Vec<String>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct DeleteReport {
+    pub archived_count: usize,
+    pub failures: Vec<DeleteFailure>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DeleteFailure {
+    pub wire_path: String,
+    pub local_path: Option<PathBuf>,
+    pub reason: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WatchTarget {
     pub path: PathBuf,
@@ -431,6 +444,28 @@ pub fn delete_paths(root: &Path, wire_paths: &[String]) -> Result<()> {
     Ok(())
 }
 
+pub fn delete_paths_best_effort(root: &Path, wire_paths: &[String]) -> DeleteReport {
+    let mut report = DeleteReport::default();
+
+    for wire_path in wire_paths {
+        match try_delete_path(root, wire_path) {
+            Ok(DeleteDisposition::Archived) => {
+                report.archived_count += 1;
+            }
+            Ok(DeleteDisposition::NotFound) => {}
+            Err((local_path, err)) => {
+                report.failures.push(DeleteFailure {
+                    wire_path: wire_path.clone(),
+                    local_path,
+                    reason: format!("{err:#}"),
+                });
+            }
+        }
+    }
+
+    report
+}
+
 pub fn apply_file_metadata(path: &Path, modified_ms: u64, executable: bool) -> Result<()> {
     let secs = (modified_ms / 1_000) as i64;
     let nanos = ((modified_ms % 1_000) * 1_000_000) as u32;
@@ -482,6 +517,32 @@ where
     }
 
     collapsed
+}
+
+enum DeleteDisposition {
+    Archived,
+    NotFound,
+}
+
+fn try_delete_path(
+    root: &Path,
+    wire_path: &str,
+) -> std::result::Result<DeleteDisposition, (Option<PathBuf>, anyhow::Error)> {
+    let path = match resolve_incoming_path(root, wire_path) {
+        Ok(path) => path,
+        Err(err) => return Err((None, err)),
+    };
+
+    match fs::symlink_metadata(&path) {
+        Ok(_) => archive_deleted_path(root, wire_path, &path)
+            .map(|_| DeleteDisposition::Archived)
+            .map_err(|err| (Some(path), err)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(DeleteDisposition::NotFound),
+        Err(err) => Err((
+            Some(path.clone()),
+            anyhow::Error::from(err).context(format!("failed to inspect path {}", path.display())),
+        )),
+    }
 }
 
 fn remote_selected_scopes(snapshot: &ManifestSnapshot) -> BTreeSet<String> {

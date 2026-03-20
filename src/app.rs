@@ -11,10 +11,11 @@ use crate::protocol::{
 };
 use crate::sync::{
     DeletePolicy, WorkspaceSpec, apply_file_metadata, build_apply_plan, build_incoming_snapshot,
-    build_snapshot, delete_paths, ensure_directories, filter_snapshot_for_incoming_root,
-    resolve_incoming_path, resolve_outgoing_path, snapshot_contains_file, watch_targets,
+    build_snapshot, delete_paths_best_effort, ensure_directories,
+    filter_snapshot_for_incoming_root, resolve_incoming_path, resolve_outgoing_path,
+    snapshot_contains_file, watch_targets,
 };
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use console::style;
 use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use rand::RngExt;
@@ -50,6 +51,7 @@ struct AuthenticatedSession {
 struct PendingRevision {
     requested_files: usize,
     remaining_files: BTreeSet<String>,
+    failed_files: BTreeSet<String>,
     delete_paths: Vec<String>,
     transfer_done: bool,
 }
@@ -509,21 +511,16 @@ async fn run_sync_session(
                 }
 
                 if plan.file_requests.is_empty() {
-                    delete_paths(root, &plan.delete_paths)?;
-                    if !plan.delete_paths.is_empty() {
-                        println!(
-                            "已归档对端删除项，共 {} 项，位置: .synly/deleted",
-                            plan.delete_paths.len()
-                        );
-                    } else {
-                        println!("本地已是最新状态。");
-                    }
+                    let delete_report = delete_paths_best_effort(root, &plan.delete_paths);
+                    print_delete_failures(&delete_report);
+                    print_standalone_delete_result(&delete_report);
                 } else {
                     pending_revisions.insert(
                         revision,
                         PendingRevision {
                             requested_files: plan.file_requests.len(),
                             remaining_files: plan.file_requests.iter().cloned().collect(),
+                            failed_files: BTreeSet::new(),
                             delete_paths: plan.delete_paths,
                             transfer_done: false,
                         },
@@ -562,7 +559,7 @@ async fn run_sync_session(
                 if let Some(pending) = pending_revisions.get_mut(&revision) {
                     pending.transfer_done = true;
                 }
-                maybe_finalize_revision(&incoming_root, &mut pending_revisions, revision)?;
+                maybe_finalize_revision(&incoming_root, &mut pending_revisions, revision);
             }
             Frame::Control(ControlMessage::TransferAborted { revision, message }) => {
                 eprintln!("对端中止了修订版 {revision} 的传输: {message}");
@@ -817,62 +814,128 @@ async fn handle_file_chunk(
     header: FileChunkHeader,
     data: Vec<u8>,
 ) -> Result<()> {
+    if pending_revisions
+        .get(&header.revision)
+        .is_some_and(|pending| pending.failed_files.contains(&header.path))
+    {
+        return Ok(());
+    }
+
     let key = (header.revision, header.path.clone());
     if header.offset == 0 {
-        let final_path = resolve_incoming_path(root, &header.path)?;
-        if let Some(parent) = final_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
+        match begin_incoming_file(root, &header).await {
+            Ok(state) => {
+                incoming_files.insert(key.clone(), state);
+            }
+            Err((final_path, err)) => {
+                report_incoming_file_failure(
+                    root,
+                    incoming_files,
+                    pending_revisions,
+                    header.revision,
+                    &header.path,
+                    final_path,
+                    None,
+                    err,
+                )
+                .await;
+                return Ok(());
+            }
         }
-        let temp_path = temp_file_path(&final_path);
-        let _ = tokio::fs::remove_file(&temp_path).await;
-        let file = File::create(&temp_path).await?;
-        incoming_files.insert(
-            key.clone(),
-            IncomingFileState {
-                file,
-                temp_path,
-                final_path,
-                modified_ms: header.modified_ms,
-                executable: header.executable,
-                expected_size: header.total_size,
-                written: 0,
-            },
-        );
     }
 
-    let state = incoming_files
-        .get_mut(&key)
-        .with_context(|| format!("missing transfer state for {}", header.path))?;
-    if state.written != header.offset {
-        bail!(
-            "unexpected file chunk offset for {}: expected {}, got {}",
-            header.path,
-            state.written,
-            header.offset
-        );
-    }
+    let write_result = {
+        let state = match incoming_files.get_mut(&key) {
+            Some(state) => state,
+            None => {
+                report_incoming_file_failure(
+                    root,
+                    incoming_files,
+                    pending_revisions,
+                    header.revision,
+                    &header.path,
+                    None,
+                    None,
+                    anyhow!("missing transfer state for {}", header.path),
+                )
+                .await;
+                return Ok(());
+            }
+        };
 
-    state.file.write_all(&data).await?;
-    state.written += data.len() as u64;
+        if state.written != header.offset {
+            Err((
+                Some(state.final_path.clone()),
+                Some(state.temp_path.clone()),
+                anyhow!(
+                    "unexpected file chunk offset for {}: expected {}, got {}",
+                    header.path,
+                    state.written,
+                    header.offset
+                ),
+            ))
+        } else if let Err(err) = state.file.write_all(&data).await {
+            Err((
+                Some(state.final_path.clone()),
+                Some(state.temp_path.clone()),
+                err.into(),
+            ))
+        } else {
+            state.written += data.len() as u64;
+            Ok(())
+        }
+    };
+
+    if let Err((final_path, temp_path, err)) = write_result {
+        report_incoming_file_failure(
+            root,
+            incoming_files,
+            pending_revisions,
+            header.revision,
+            &header.path,
+            final_path,
+            temp_path,
+            err,
+        )
+        .await;
+        return Ok(());
+    }
 
     if header.final_chunk {
-        let mut state = incoming_files
-            .remove(&key)
-            .with_context(|| format!("missing final transfer state for {}", header.path))?;
-        state.file.flush().await?;
-        drop(state.file);
+        let state = match incoming_files.remove(&key) {
+            Some(state) => state,
+            None => {
+                report_incoming_file_failure(
+                    root,
+                    incoming_files,
+                    pending_revisions,
+                    header.revision,
+                    &header.path,
+                    None,
+                    None,
+                    anyhow!("missing final transfer state for {}", header.path),
+                )
+                .await;
+                return Ok(());
+            }
+        };
+        let final_path = Some(state.final_path.clone());
+        let temp_path = Some(state.temp_path.clone());
 
-        if state.written != state.expected_size {
-            bail!(
-                "received size mismatch for {}: expected {}, got {}",
-                header.path,
-                state.expected_size,
-                state.written
-            );
+        if let Err(err) = finalize_incoming_file(state).await {
+            report_incoming_file_failure(
+                root,
+                incoming_files,
+                pending_revisions,
+                header.revision,
+                &header.path,
+                final_path,
+                temp_path,
+                err,
+            )
+            .await;
+            return Ok(());
         }
-
-        replace_destination(&state.final_path, &state.temp_path).await?;
-        apply_file_metadata(&state.final_path, state.modified_ms, state.executable)?;
 
         if let Some(pending) = pending_revisions.get_mut(&header.revision) {
             pending.remaining_files.remove(&header.path);
@@ -881,7 +944,7 @@ async fn handle_file_chunk(
             &Some(root.to_path_buf()),
             pending_revisions,
             header.revision,
-        )?;
+        );
     }
 
     Ok(())
@@ -891,7 +954,7 @@ fn maybe_finalize_revision(
     incoming_root: &Option<PathBuf>,
     pending_revisions: &mut BTreeMap<u64, PendingRevision>,
     revision: u64,
-) -> Result<()> {
+) {
     let should_finalize = pending_revisions
         .get(&revision)
         .is_some_and(|pending| pending.transfer_done && pending.remaining_files.is_empty());
@@ -900,18 +963,13 @@ fn maybe_finalize_revision(
         && let Some(pending) = pending_revisions.remove(&revision)
         && let Some(root) = incoming_root
     {
-        delete_paths(root, &pending.delete_paths)?;
+        let delete_report = delete_paths_best_effort(root, &pending.delete_paths);
+        print_delete_failures(&delete_report);
         let updated_files = pending
             .requested_files
-            .saturating_sub(pending.remaining_files.len());
-        println!(
-            "已完成一次同步，更新 {} 个文件，归档删除 {} 项。",
-            updated_files,
-            pending.delete_paths.len()
-        );
+            .saturating_sub(pending.failed_files.len());
+        print_revision_result(updated_files, pending.failed_files.len(), &delete_report);
     }
-
-    Ok(())
 }
 
 async fn discard_superseded_revisions(
@@ -964,6 +1022,159 @@ async fn replace_destination(destination: &Path, temp_path: &Path) -> Result<()>
     }
     tokio::fs::rename(temp_path, destination).await?;
     Ok(())
+}
+
+async fn begin_incoming_file(
+    root: &Path,
+    header: &FileChunkHeader,
+) -> std::result::Result<IncomingFileState, (Option<PathBuf>, anyhow::Error)> {
+    let final_path = match resolve_incoming_path(root, &header.path) {
+        Ok(path) => path,
+        Err(err) => return Err((None, err)),
+    };
+
+    if let Some(parent) = final_path.parent()
+        && let Err(err) = tokio::fs::create_dir_all(parent).await
+    {
+        return Err((Some(final_path), err.into()));
+    }
+
+    let temp_path = temp_file_path(&final_path);
+    let _ = tokio::fs::remove_file(&temp_path).await;
+    let file = match File::create(&temp_path).await {
+        Ok(file) => file,
+        Err(err) => return Err((Some(final_path), err.into())),
+    };
+
+    Ok(IncomingFileState {
+        file,
+        temp_path,
+        final_path,
+        modified_ms: header.modified_ms,
+        executable: header.executable,
+        expected_size: header.total_size,
+        written: 0,
+    })
+}
+
+async fn finalize_incoming_file(state: IncomingFileState) -> Result<()> {
+    let IncomingFileState {
+        mut file,
+        temp_path,
+        final_path,
+        modified_ms,
+        executable,
+        expected_size,
+        written,
+    } = state;
+
+    file.flush().await?;
+    drop(file);
+
+    if written != expected_size {
+        bail!(
+            "received size mismatch for {}: expected {}, got {}",
+            final_path.display(),
+            expected_size,
+            written
+        );
+    }
+
+    replace_destination(&final_path, &temp_path).await?;
+    apply_file_metadata(&final_path, modified_ms, executable)?;
+    Ok(())
+}
+
+async fn report_incoming_file_failure(
+    root: &Path,
+    incoming_files: &mut HashMap<(u64, String), IncomingFileState>,
+    pending_revisions: &mut BTreeMap<u64, PendingRevision>,
+    revision: u64,
+    wire_path: &str,
+    final_path: Option<PathBuf>,
+    temp_path: Option<PathBuf>,
+    err: anyhow::Error,
+) {
+    let key = (revision, wire_path.to_string());
+    let mut final_path = final_path;
+    let mut temp_path = temp_path;
+
+    if let Some(state) = incoming_files.remove(&key) {
+        if final_path.is_none() {
+            final_path = Some(state.final_path);
+        }
+        if temp_path.is_none() {
+            temp_path = Some(state.temp_path);
+        }
+    }
+
+    if let Some(temp_path) = temp_path {
+        let _ = tokio::fs::remove_file(temp_path).await;
+    }
+
+    if let Some(pending) = pending_revisions.get_mut(&revision) {
+        pending.remaining_files.remove(wire_path);
+        pending.failed_files.insert(wire_path.to_string());
+    }
+
+    let target = final_path
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| wire_path.to_string());
+    eprintln!("无法更新文件 {}: {err:#}", target);
+
+    maybe_finalize_revision(&Some(root.to_path_buf()), pending_revisions, revision);
+}
+
+fn print_delete_failures(report: &crate::sync::DeleteReport) {
+    for failure in &report.failures {
+        let target = failure
+            .local_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| failure.wire_path.clone());
+        eprintln!("无法归档删除项 {}: {}", target, failure.reason);
+    }
+}
+
+fn print_standalone_delete_result(report: &crate::sync::DeleteReport) {
+    match (report.archived_count, report.failures.len()) {
+        (0, 0) => println!("本地已是最新状态。"),
+        (archived, 0) => {
+            println!("已归档对端删除项，共 {} 项，位置: .synly/deleted", archived);
+        }
+        (0, failed) => {
+            println!("有 {} 项对端删除未能归档，已保留本地文件。", failed);
+        }
+        (archived, failed) => {
+            println!(
+                "已归档对端删除项 {} 项，另有 {} 项未能归档，已保留本地文件。",
+                archived, failed
+            );
+        }
+    }
+}
+
+fn print_revision_result(
+    updated_files: usize,
+    failed_updates: usize,
+    delete_report: &crate::sync::DeleteReport,
+) {
+    if failed_updates == 0 && delete_report.failures.is_empty() {
+        println!(
+            "已完成一次同步，更新 {} 个文件，归档删除 {} 项。",
+            updated_files, delete_report.archived_count
+        );
+        return;
+    }
+
+    println!(
+        "已完成一次同步，更新 {} 个文件，文件更新失败 {} 个，归档删除 {} 项，删除失败 {} 项。",
+        updated_files,
+        failed_updates,
+        delete_report.archived_count,
+        delete_report.failures.len()
+    );
 }
 
 fn choose_peer() -> Result<DiscoveredPeer> {
