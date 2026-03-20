@@ -1,6 +1,7 @@
 use crate::cli::SyncMode;
 use anyhow::{Context, Result, bail};
 use filetime::{FileTime, set_file_mtime};
+use ignore::gitignore::Gitignore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -9,10 +10,11 @@ use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use walkdir::{DirEntry, WalkDir};
+use walkdir::WalkDir;
 
 const SYNLY_INTERNAL_DIR: &str = ".synly";
 const SYNLY_DELETED_DIR: &str = "deleted";
+const SYNLY_IGNORE_FILE: &str = ".synlyignore";
 
 #[derive(Clone, Debug)]
 pub struct WorkspaceSpec {
@@ -89,6 +91,18 @@ pub struct ApplyPlan {
 pub struct WatchTarget {
     pub path: PathBuf,
     pub recursive: bool,
+}
+
+#[derive(Debug)]
+struct SynlyIgnoreMatcher {
+    root: PathBuf,
+    matchers: Vec<ScopedIgnoreMatcher>,
+}
+
+#[derive(Debug)]
+struct ScopedIgnoreMatcher {
+    directory: PathBuf,
+    matcher: Gitignore,
 }
 
 impl WorkspaceSpec {
@@ -214,16 +228,7 @@ pub fn build_snapshot(spec: &OutgoingSpec) -> Result<ManifestSnapshot> {
     let mut entries = BTreeMap::new();
     match spec {
         OutgoingSpec::RootContents { root } => {
-            for entry in WalkDir::new(root)
-                .min_depth(1)
-                .sort_by_file_name()
-                .into_iter()
-                .filter_entry(should_keep_entry)
-            {
-                let entry = entry?;
-                add_entry(root, entry.path(), None, &mut entries)?;
-            }
-
+            add_walk_entries(root, None, 1, &mut entries)?;
             Ok(ManifestSnapshot {
                 layout: SnapshotLayout::RootContents,
                 entries,
@@ -232,16 +237,8 @@ pub fn build_snapshot(spec: &OutgoingSpec) -> Result<ManifestSnapshot> {
         OutgoingSpec::SelectedItems { items } => {
             for item in items {
                 if item.is_dir {
-                    for entry in WalkDir::new(&item.path)
-                        .min_depth(0)
-                        .sort_by_file_name()
-                        .into_iter()
-                        .filter_entry(should_keep_entry)
-                    {
-                        let entry = entry?;
-                        add_entry(&item.path, entry.path(), Some(&item.name), &mut entries)?;
-                    }
-                } else {
+                    add_walk_entries(&item.path, Some(&item.name), 0, &mut entries)?;
+                } else if should_keep_path(&item.path) {
                     add_entry(&item.path, &item.path, Some(&item.name), &mut entries)?;
                 }
             }
@@ -258,6 +255,13 @@ pub fn build_incoming_snapshot(root: &Path) -> Result<ManifestSnapshot> {
     build_snapshot(&OutgoingSpec::RootContents {
         root: root.to_path_buf(),
     })
+}
+
+pub fn filter_snapshot_for_incoming_root(
+    root: &Path,
+    snapshot: &ManifestSnapshot,
+) -> Result<ManifestSnapshot> {
+    SynlyIgnoreMatcher::discover(root)?.filter_snapshot(snapshot)
 }
 
 pub fn watch_targets(spec: &OutgoingSpec) -> Result<Vec<WatchTarget>> {
@@ -489,6 +493,25 @@ fn remote_selected_scopes(snapshot: &ManifestSnapshot) -> BTreeSet<String> {
         .collect()
 }
 
+fn add_walk_entries(
+    base: &Path,
+    prefix: Option<&str>,
+    min_depth: usize,
+    entries: &mut BTreeMap<String, ManifestEntry>,
+) -> Result<()> {
+    if !should_keep_path(base) {
+        return Ok(());
+    }
+
+    if min_depth == 0 {
+        add_entry(base, base, prefix, entries)?;
+    }
+
+    let mut active_matchers = Vec::new();
+    visit_snapshot_directory(base, base, prefix, &mut active_matchers, entries)?;
+    Ok(())
+}
+
 fn add_entry(
     base: &Path,
     actual_path: &Path,
@@ -674,8 +697,199 @@ fn ensure_directory(path: PathBuf) -> Result<PathBuf> {
     Ok(absolute)
 }
 
-fn should_keep_entry(entry: &DirEntry) -> bool {
-    let name = entry.file_name().to_string_lossy();
+impl SynlyIgnoreMatcher {
+    fn discover(root: &Path) -> Result<Self> {
+        let mut matchers = Vec::new();
+        let mut active_indices = Vec::new();
+        collect_ignore_matchers(root, &mut active_indices, &mut matchers)?;
+
+        Ok(Self {
+            root: root.to_path_buf(),
+            matchers,
+        })
+    }
+
+    fn filter_snapshot(&self, snapshot: &ManifestSnapshot) -> Result<ManifestSnapshot> {
+        let mut entries = BTreeMap::new();
+        for (path, entry) in &snapshot.entries {
+            let is_dir = entry.kind == EntryKind::Dir;
+            if !self.is_ignored_wire_path(path, is_dir)? {
+                entries.insert(path.clone(), entry.clone());
+            }
+        }
+
+        Ok(ManifestSnapshot {
+            layout: snapshot.layout,
+            entries,
+        })
+    }
+
+    fn is_ignored_wire_path(&self, wire_path: &str, is_dir: bool) -> Result<bool> {
+        let relative = wire_to_relative_path(wire_path)?;
+        Ok(self.is_ignored_path(&self.root.join(relative), is_dir))
+    }
+
+    fn is_ignored_path(&self, path: &Path, is_dir: bool) -> bool {
+        let mut decision = None;
+        for matcher in &self.matchers {
+            if !path.starts_with(&matcher.directory) {
+                continue;
+            }
+
+            let matched = matcher.matcher.matched_path_or_any_parents(path, is_dir);
+            if matched.is_ignore() {
+                decision = Some(true);
+            } else if matched.is_whitelist() {
+                decision = Some(false);
+            }
+        }
+        decision.unwrap_or(false)
+    }
+}
+
+fn visit_snapshot_directory(
+    directory: &Path,
+    base: &Path,
+    prefix: Option<&str>,
+    active_matchers: &mut Vec<ScopedIgnoreMatcher>,
+    entries: &mut BTreeMap<String, ManifestEntry>,
+) -> Result<()> {
+    let previous_len = active_matchers.len();
+    if let Some(matcher) = load_directory_ignore_matcher(directory)? {
+        active_matchers.push(matcher);
+    }
+
+    for child in sorted_directory_children(directory)? {
+        let metadata = fs::symlink_metadata(&child)
+            .with_context(|| format!("failed to inspect {}", child.display()))?;
+        if metadata.file_type().is_symlink() || !should_keep_path(&child) {
+            continue;
+        }
+
+        let is_dir = metadata.is_dir();
+        if is_ignored_by_matchers(&child, is_dir, active_matchers) {
+            continue;
+        }
+
+        add_entry(base, &child, prefix, entries)?;
+        if is_dir {
+            visit_snapshot_directory(&child, base, prefix, active_matchers, entries)?;
+        }
+    }
+
+    active_matchers.truncate(previous_len);
+    Ok(())
+}
+
+fn collect_ignore_matchers(
+    directory: &Path,
+    active_indices: &mut Vec<usize>,
+    matchers: &mut Vec<ScopedIgnoreMatcher>,
+) -> Result<()> {
+    let previous_len = active_indices.len();
+    if let Some(matcher) = load_directory_ignore_matcher(directory)? {
+        matchers.push(matcher);
+        active_indices.push(matchers.len() - 1);
+    }
+
+    for child in sorted_directory_children(directory)? {
+        let metadata = fs::symlink_metadata(&child)
+            .with_context(|| format!("failed to inspect {}", child.display()))?;
+        if metadata.file_type().is_symlink() || !should_keep_path(&child) {
+            continue;
+        }
+
+        let is_dir = metadata.is_dir();
+        if is_ignored_by_active_indices(&child, is_dir, active_indices, matchers) {
+            continue;
+        }
+
+        if is_dir {
+            collect_ignore_matchers(&child, active_indices, matchers)?;
+        }
+    }
+
+    active_indices.truncate(previous_len);
+    Ok(())
+}
+
+fn load_directory_ignore_matcher(directory: &Path) -> Result<Option<ScopedIgnoreMatcher>> {
+    let path = directory.join(SYNLY_IGNORE_FILE);
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_file() => {
+            let (matcher, error) = Gitignore::new(&path);
+            if let Some(error) = error {
+                return Err(error).with_context(|| format!("failed to parse {}", path.display()));
+            }
+            Ok(Some(ScopedIgnoreMatcher {
+                directory: directory.to_path_buf(),
+                matcher,
+            }))
+        }
+        Ok(_) => Ok(None),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| format!("failed to inspect {}", path.display())),
+    }
+}
+
+fn sorted_directory_children(directory: &Path) -> Result<Vec<PathBuf>> {
+    let mut children = fs::read_dir(directory)
+        .with_context(|| format!("failed to read directory {}", directory.display()))?
+        .map(|entry| {
+            entry
+                .map(|entry| entry.path())
+                .with_context(|| format!("failed to read entry under {}", directory.display()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    children.sort();
+    Ok(children)
+}
+
+fn is_ignored_by_matchers(path: &Path, is_dir: bool, matchers: &[ScopedIgnoreMatcher]) -> bool {
+    let mut decision = None;
+    for matcher in matchers {
+        if !path.starts_with(&matcher.directory) {
+            continue;
+        }
+
+        let matched = matcher.matcher.matched_path_or_any_parents(path, is_dir);
+        if matched.is_ignore() {
+            decision = Some(true);
+        } else if matched.is_whitelist() {
+            decision = Some(false);
+        }
+    }
+    decision.unwrap_or(false)
+}
+
+fn is_ignored_by_active_indices(
+    path: &Path,
+    is_dir: bool,
+    active_indices: &[usize],
+    matchers: &[ScopedIgnoreMatcher],
+) -> bool {
+    let mut decision = None;
+    for &index in active_indices {
+        let matcher = &matchers[index];
+        if !path.starts_with(&matcher.directory) {
+            continue;
+        }
+
+        let matched = matcher.matcher.matched_path_or_any_parents(path, is_dir);
+        if matched.is_ignore() {
+            decision = Some(true);
+        } else if matched.is_whitelist() {
+            decision = Some(false);
+        }
+    }
+    decision.unwrap_or(false)
+}
+
+fn should_keep_path(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy();
     !is_ignored_name(&name)
 }
 
@@ -809,6 +1023,26 @@ mod tests {
     use super::*;
     use std::env;
     use uuid::Uuid;
+
+    fn file_entry(hash: &str) -> ManifestEntry {
+        ManifestEntry {
+            kind: EntryKind::File,
+            size: 1,
+            modified_ms: 1,
+            hash: Some(hash.to_string()),
+            executable: false,
+        }
+    }
+
+    fn dir_entry() -> ManifestEntry {
+        ManifestEntry {
+            kind: EntryKind::Dir,
+            size: 0,
+            modified_ms: 1,
+            hash: None,
+            executable: false,
+        }
+    }
 
     #[test]
     fn wire_path_validation_rejects_parent_segments() {
@@ -989,6 +1223,92 @@ mod tests {
                 .keys()
                 .any(|path| path.starts_with(".synly"))
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn root_contents_snapshot_respects_synlyignore() {
+        let root = test_dir("root-synlyignore");
+        fs::create_dir_all(root.join("dist")).unwrap();
+        fs::create_dir_all(root.join("docs")).unwrap();
+        fs::write(root.join(".synlyignore"), "dist/\n*.tmp\n!keep.tmp\n").unwrap();
+        fs::write(root.join("dist/bundle.js"), "bundle").unwrap();
+        fs::write(root.join("docs/readme.txt"), "readme").unwrap();
+        fs::write(root.join("drop.tmp"), "drop").unwrap();
+        fs::write(root.join("keep.tmp"), "keep").unwrap();
+
+        let snapshot = build_snapshot(&OutgoingSpec::RootContents { root: root.clone() }).unwrap();
+
+        assert!(snapshot.entries.contains_key(".synlyignore"));
+        assert!(snapshot.entries.contains_key("docs/readme.txt"));
+        assert!(snapshot.entries.contains_key("keep.tmp"));
+        assert!(!snapshot.entries.contains_key("drop.tmp"));
+        assert!(!snapshot.entries.keys().any(|path| path.starts_with("dist")));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn nested_synlyignore_is_respected() {
+        let root = test_dir("nested-synlyignore");
+        fs::create_dir_all(root.join("docs/sub")).unwrap();
+        fs::write(root.join("docs/.synlyignore"), "draft.txt\nsub/\n").unwrap();
+        fs::write(root.join("docs/draft.txt"), "draft").unwrap();
+        fs::write(root.join("docs/keep.txt"), "keep").unwrap();
+        fs::write(root.join("docs/sub/hidden.txt"), "hidden").unwrap();
+
+        let snapshot = build_snapshot(&OutgoingSpec::RootContents { root: root.clone() }).unwrap();
+
+        assert!(snapshot.entries.contains_key("docs/.synlyignore"));
+        assert!(snapshot.entries.contains_key("docs/keep.txt"));
+        assert!(!snapshot.entries.contains_key("docs/draft.txt"));
+        assert!(
+            !snapshot
+                .entries
+                .keys()
+                .any(|path| path.starts_with("docs/sub"))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn incoming_filter_respects_synlyignore_for_requests_and_deletes() {
+        let root = test_dir("incoming-synlyignore");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(".synlyignore"), "secret.txt\ncache/\n").unwrap();
+        fs::write(root.join("secret.txt"), "local-only").unwrap();
+
+        let remote = ManifestSnapshot {
+            layout: SnapshotLayout::RootContents,
+            entries: BTreeMap::from([
+                (".synlyignore".to_string(), file_entry("ignore")),
+                ("cache".to_string(), dir_entry()),
+                ("cache/data.bin".to_string(), file_entry("cache")),
+                ("keep.txt".to_string(), file_entry("keep")),
+                ("secret.txt".to_string(), file_entry("secret")),
+            ]),
+        };
+
+        let filtered_remote = filter_snapshot_for_incoming_root(&root, &remote).unwrap();
+        let local = build_incoming_snapshot(&root).unwrap();
+        let plan = build_apply_plan(&filtered_remote, &local, DeletePolicy::MirrorAll);
+
+        assert!(filtered_remote.entries.contains_key(".synlyignore"));
+        assert!(filtered_remote.entries.contains_key("keep.txt"));
+        assert!(!filtered_remote.entries.contains_key("secret.txt"));
+        assert!(
+            !filtered_remote
+                .entries
+                .keys()
+                .any(|path| path.starts_with("cache"))
+        );
+        assert_eq!(
+            plan.file_requests,
+            vec![".synlyignore".to_string(), "keep.txt".to_string()]
+        );
+        assert!(plan.delete_paths.is_empty());
 
         let _ = fs::remove_dir_all(root);
     }

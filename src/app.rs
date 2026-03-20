@@ -11,8 +11,8 @@ use crate::protocol::{
 };
 use crate::sync::{
     DeletePolicy, WorkspaceSpec, apply_file_metadata, build_apply_plan, build_incoming_snapshot,
-    build_snapshot, delete_paths, ensure_directories, resolve_incoming_path, resolve_outgoing_path,
-    snapshot_contains_file, watch_targets,
+    build_snapshot, delete_paths, ensure_directories, filter_snapshot_for_incoming_root,
+    resolve_incoming_path, resolve_outgoing_path, snapshot_contains_file, watch_targets,
 };
 use anyhow::{Context, Result, bail};
 use console::style;
@@ -487,6 +487,7 @@ async fn run_sync_session(
                 let root = incoming_root.as_ref().context(
                     "session negotiated receiving, but local workspace has no destination",
                 )?;
+                let snapshot = filter_snapshot_for_incoming_root(root, &snapshot)?;
                 let local_snapshot = build_incoming_snapshot(root)?;
                 let skipped_delete_count = if !sync_delete {
                     let preview_policy = delete_policy(snapshot.layout, true);
