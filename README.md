@@ -155,6 +155,8 @@ Commands:
 Options:
   --host
   --join
+  --sync-delete
+  --no-sync-delete
   --interval-secs <SECONDS>
 ```
 
@@ -217,14 +219,25 @@ synly both . --join
 - 文件修改时间和可执行位变化也会触发重新同步
 - 目录会在传输前自动创建
 - 临时文件使用 `.synly.part` 后缀，完成后原子替换目标文件
+- 接收目录下的 `.synly/` 会被保留给 Synly 自己使用，并且永远不会参与同步
 - 符号链接会被忽略
 - `.git` 目录会被忽略
 
 ### 删除行为
 
+如果当前设备会接收文件，Synly 会额外确认是否同步对端删除，默认是不删除。
+也可以显式指定：
+
+```bash
+synly receive ./incoming --join --sync-delete
+synly both . --host --no-sync-delete
+```
+
 单向同步时：
 
-- 如果远端删除了某个共享文件，本地会在对应共享范围内删除它
+- 只有在当前接收端明确开启“删除同步”后，如果远端删除了某个共享文件，本地才会处理对应删除
+- 这里的“删除”不会直接抹掉文件，而是移动到接收目录下的 `.synly/deleted/`
+- `.synly/deleted/` 会按删除批次分桶保存，避免同名文件互相覆盖
 
 双向同步时：
 

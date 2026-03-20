@@ -20,6 +20,10 @@ pub struct Cli {
     pub host: bool,
     #[arg(long, conflicts_with = "host")]
     pub join: bool,
+    #[arg(long, conflicts_with = "no_sync_delete")]
+    pub sync_delete: bool,
+    #[arg(long, conflicts_with = "sync_delete")]
+    pub no_sync_delete: bool,
     #[arg(long, default_value_t = 3)]
     pub interval_secs: u64,
 }
@@ -90,10 +94,19 @@ pub struct RuntimeOptions {
     pub mode: SyncMode,
     pub connection: ConnectionPreference,
     pub workspace: WorkspaceSpec,
+    pub sync_delete: bool,
     pub interval_secs: u64,
 }
 
 pub fn collect_runtime_options(cli: Cli, device: &DeviceConfig) -> Result<RuntimeOptions> {
+    let sync_delete_override = if cli.sync_delete {
+        Some(true)
+    } else if cli.no_sync_delete {
+        Some(false)
+    } else {
+        None
+    };
+
     let connection = if cli.host {
         ConnectionPreference::Host
     } else if cli.join {
@@ -126,13 +139,19 @@ pub fn collect_runtime_options(cli: Cli, device: &DeviceConfig) -> Result<Runtim
         }
         None => interactive_workspace(mode)?,
     };
+    let sync_delete = resolve_sync_delete(sync_delete_override, &workspace)?;
 
     Ok(RuntimeOptions {
         mode,
         connection,
         workspace,
+        sync_delete,
         interval_secs: cli.interval_secs.max(1),
     })
+}
+
+pub fn sync_delete_label(enabled: bool) -> &'static str {
+    if enabled { "开启" } else { "关闭" }
 }
 
 pub fn prompt_select(
@@ -232,6 +251,21 @@ pub fn prompt_confirm(label: &str, default: bool) -> Result<bool> {
             _ => term.write_line("请输入 y 或 n。")?,
         }
     }
+}
+
+fn resolve_sync_delete(
+    sync_delete_override: Option<bool>,
+    workspace: &WorkspaceSpec,
+) -> Result<bool> {
+    if workspace.incoming_root.is_none() {
+        return Ok(false);
+    }
+
+    if let Some(sync_delete) = sync_delete_override {
+        return Ok(sync_delete);
+    }
+
+    prompt_confirm("同步删除吗", false)
 }
 
 fn choose_mode(device: &DeviceConfig, connection: ConnectionPreference) -> Result<SyncMode> {

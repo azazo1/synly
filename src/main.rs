@@ -20,5 +20,8 @@ async fn main() -> Result<()> {
     for line in options.workspace.local_human_lines() {
         println!("{line}");
     }
+    if options.workspace.incoming_root.is_some() {
+        println!("删除同步: {}", cli::sync_delete_label(options.sync_delete));
+    }
     app::run(device, options).await
 }

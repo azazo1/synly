@@ -11,6 +11,9 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::{DirEntry, WalkDir};
 
+const SYNLY_INTERNAL_DIR: &str = ".synly";
+const SYNLY_DELETED_DIR: &str = "deleted";
+
 #[derive(Clone, Debug)]
 pub struct WorkspaceSpec {
     pub mode: SyncMode,
@@ -361,16 +364,7 @@ pub fn delete_paths(root: &Path, wire_paths: &[String]) -> Result<()> {
     for wire_path in wire_paths {
         let path = resolve_incoming_path(root, wire_path)?;
         match fs::symlink_metadata(&path) {
-            Ok(metadata) => {
-                if metadata.is_dir() {
-                    fs::remove_dir_all(&path).with_context(|| {
-                        format!("failed to remove directory {}", path.display())
-                    })?;
-                } else {
-                    fs::remove_file(&path)
-                        .with_context(|| format!("failed to remove file {}", path.display()))?;
-                }
-            }
+            Ok(_) => archive_deleted_path(root, wire_path, &path)?,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => {
                 return Err(err)
@@ -420,8 +414,19 @@ where
         })
         .collect::<Vec<_>>();
 
-    paths.sort_by(|left, right| right.1.cmp(&left.1));
-    paths.into_iter().map(|(path, _)| path).collect()
+    paths.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
+
+    let mut collapsed = Vec::<String>::new();
+    for (path, _) in paths {
+        if !collapsed
+            .iter()
+            .any(|ancestor| is_ancestor_path(ancestor, &path))
+        {
+            collapsed.push(path);
+        }
+    }
+
+    collapsed
 }
 
 fn remote_selected_scopes(snapshot: &ManifestSnapshot) -> BTreeSet<String> {
@@ -620,7 +625,73 @@ fn ensure_directory(path: PathBuf) -> Result<PathBuf> {
 
 fn should_keep_entry(entry: &DirEntry) -> bool {
     let name = entry.file_name().to_string_lossy();
-    name != ".git" && !name.ends_with(".synly.part")
+    name != ".git" && name != SYNLY_INTERNAL_DIR && !name.ends_with(".synly.part")
+}
+
+fn archive_deleted_path(root: &Path, wire_path: &str, path: &Path) -> Result<()> {
+    let deleted_root = deleted_archive_root(root);
+    fs::create_dir_all(&deleted_root).with_context(|| {
+        format!(
+            "failed to create deleted archive {}",
+            deleted_root.display()
+        )
+    })?;
+
+    let bucket = unique_deleted_bucket(&deleted_root)?;
+    let archive_path = bucket.join(wire_to_relative_path(wire_path)?);
+    if let Some(parent) = archive_path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed to create deleted archive directory {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    fs::rename(path, &archive_path).with_context(|| {
+        format!(
+            "failed to archive {} into {}",
+            path.display(),
+            archive_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn deleted_archive_root(root: &Path) -> PathBuf {
+    root.join(SYNLY_INTERNAL_DIR).join(SYNLY_DELETED_DIR)
+}
+
+fn unique_deleted_bucket(deleted_root: &Path) -> Result<PathBuf> {
+    let timestamp_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+
+    for attempt in 0..10_000u32 {
+        let candidate = deleted_root.join(format!("{timestamp_ms}-{attempt:04}"));
+        if !candidate.exists() {
+            fs::create_dir_all(&candidate).with_context(|| {
+                format!(
+                    "failed to create deleted archive bucket {}",
+                    candidate.display()
+                )
+            })?;
+            return Ok(candidate);
+        }
+    }
+
+    bail!(
+        "failed to allocate a unique deleted archive bucket under {}",
+        deleted_root.display()
+    );
+}
+
+fn is_ancestor_path(ancestor: &str, path: &str) -> bool {
+    path == ancestor
+        || path
+            .strip_prefix(ancestor)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 fn modified_time_ms(time: &Option<SystemTime>) -> u64 {
@@ -647,6 +718,8 @@ fn is_executable(_metadata: &fs::Metadata) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
+    use uuid::Uuid;
 
     #[test]
     fn wire_path_validation_rejects_parent_segments() {
@@ -733,5 +806,53 @@ mod tests {
 
         let plan = build_apply_plan(&remote, &local, DeletePolicy::Never);
         assert_eq!(plan.file_requests, vec!["bin/tool".to_string()]);
+    }
+
+    #[test]
+    fn root_contents_snapshot_ignores_synly_directory() {
+        let root = test_dir("ignores-synly");
+        fs::create_dir_all(root.join(".synly/deleted")).unwrap();
+        fs::write(root.join(".synly/deleted/archived.txt"), "old").unwrap();
+        fs::write(root.join("keep.txt"), "new").unwrap();
+
+        let snapshot = build_snapshot(&OutgoingSpec::RootContents { root: root.clone() }).unwrap();
+
+        assert!(snapshot.entries.contains_key("keep.txt"));
+        assert!(
+            !snapshot
+                .entries
+                .keys()
+                .any(|path| path.starts_with(".synly"))
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn delete_paths_moves_entries_into_synly_deleted_without_collisions() {
+        let root = test_dir("archives-delete");
+        fs::create_dir_all(&root).unwrap();
+
+        fs::write(root.join("sample.txt"), "first").unwrap();
+        delete_paths(&root, &["sample.txt".to_string()]).unwrap();
+
+        fs::write(root.join("sample.txt"), "second").unwrap();
+        delete_paths(&root, &["sample.txt".to_string()]).unwrap();
+
+        assert!(!root.join("sample.txt").exists());
+
+        let archived = WalkDir::new(root.join(".synly/deleted"))
+            .into_iter()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_type().is_file())
+            .filter(|entry| entry.file_name() == "sample.txt")
+            .count();
+        assert_eq!(archived, 2);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    fn test_dir(prefix: &str) -> PathBuf {
+        env::temp_dir().join(format!("synly-{prefix}-{}", Uuid::new_v4()))
     }
 }

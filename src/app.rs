@@ -1,5 +1,6 @@
 use crate::cli::{
     ConnectionPreference, RuntimeOptions, SyncMode, prompt_confirm, prompt_secret, prompt_select,
+    sync_delete_label,
 };
 use crate::config::DeviceConfig;
 use crate::crypto;
@@ -99,7 +100,13 @@ async fn run_host(device: DeviceConfig, options: RuntimeOptions) -> Result<()> {
             .await
         {
             Ok(Some(session)) => {
-                run_sync_session(session, &options.workspace, options.interval_secs).await?;
+                run_sync_session(
+                    session,
+                    &options.workspace,
+                    options.interval_secs,
+                    options.sync_delete,
+                )
+                .await?;
                 break;
             }
             Ok(None) => continue,
@@ -117,7 +124,13 @@ async fn run_client(device: DeviceConfig, options: RuntimeOptions) -> Result<()>
         let peer = choose_peer()?;
         match connect_to_peer(&peer, &device, &options).await {
             Ok(session) => {
-                run_sync_session(session, &options.workspace, options.interval_secs).await?;
+                run_sync_session(
+                    session,
+                    &options.workspace,
+                    options.interval_secs,
+                    options.sync_delete,
+                )
+                .await?;
                 break;
             }
             Err(err) => {
@@ -177,6 +190,9 @@ async fn handle_incoming_connection(
         }
         for line in options.workspace.local_human_lines() {
             println!("本机 {line}");
+        }
+        if options.workspace.incoming_root.is_some() {
+            println!("本机 删除同步: {}", sync_delete_label(options.sync_delete));
         }
         println!(
             "协商结果: {}",
@@ -406,6 +422,7 @@ async fn run_sync_session(
     session: AuthenticatedSession,
     workspace: &WorkspaceSpec,
     interval_secs: u64,
+    sync_delete: bool,
 ) -> Result<()> {
     println!();
     println!("{}", style("同步已开始").bold());
@@ -471,14 +488,32 @@ async fn run_sync_session(
                     "session negotiated receiving, but local workspace has no destination",
                 )?;
                 let local_snapshot = build_incoming_snapshot(root)?;
-                let delete_policy = delete_policy(&agreement, snapshot.layout);
+                let skipped_delete_count = if !sync_delete && !agreement.bidirectional() {
+                    let preview_policy = delete_policy(&agreement, snapshot.layout, true);
+                    build_apply_plan(&snapshot, &local_snapshot, preview_policy)
+                        .delete_paths
+                        .len()
+                } else {
+                    0
+                };
+                let delete_policy = delete_policy(&agreement, snapshot.layout, sync_delete);
                 let plan = build_apply_plan(&snapshot, &local_snapshot, delete_policy);
                 ensure_directories(root, &snapshot)?;
+
+                if skipped_delete_count > 0 {
+                    println!(
+                        "检测到对端删除 {} 项；本机未开启删除同步，已保留本地文件。",
+                        skipped_delete_count
+                    );
+                }
 
                 if plan.file_requests.is_empty() {
                     delete_paths(root, &plan.delete_paths)?;
                     if !plan.delete_paths.is_empty() {
-                        println!("已应用对端删除操作，共 {} 项。", plan.delete_paths.len());
+                        println!(
+                            "已归档对端删除项，共 {} 项，位置: .synly/deleted",
+                            plan.delete_paths.len()
+                        );
                     } else {
                         println!("本地已是最新状态。");
                     }
@@ -788,7 +823,7 @@ fn maybe_finalize_revision(
             .requested_files
             .saturating_sub(pending.remaining_files.len());
         println!(
-            "已完成一次同步，更新 {} 个文件，删除 {} 项。",
+            "已完成一次同步，更新 {} 个文件，归档删除 {} 项。",
             updated_files,
             pending.delete_paths.len()
         );
@@ -875,8 +910,9 @@ fn negotiate(host_mode: SyncMode, client_mode: SyncMode) -> SessionAgreement {
 fn delete_policy(
     agreement: &SessionAgreement,
     layout: crate::sync::SnapshotLayout,
+    sync_delete: bool,
 ) -> DeletePolicy {
-    if agreement.bidirectional() {
+    if agreement.bidirectional() || !sync_delete {
         return DeletePolicy::Never;
     }
 
@@ -932,6 +968,9 @@ fn print_host_ready(device: &DeviceConfig, options: &RuntimeOptions, port: u16) 
     println!("{}", style("Synly 已就绪").bold());
     println!("设备: {} ({})", device.device_name, device.short_id());
     println!("模式: {}", options.mode.label());
+    if options.workspace.incoming_root.is_some() {
+        println!("删除同步: {}", sync_delete_label(options.sync_delete));
+    }
     println!("监听端口: {}", port);
     println!("等待同步请求。收到请求后会为该请求单独显示 6 位 PIN。");
 }
