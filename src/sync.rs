@@ -124,6 +124,15 @@ impl WorkspaceSpec {
         })
     }
 
+    pub fn for_auto(root: PathBuf) -> Result<Self> {
+        let root = ensure_directory(root)?;
+        Ok(Self {
+            mode: SyncMode::Auto,
+            outgoing: Some(OutgoingSpec::RootContents { root: root.clone() }),
+            incoming_root: Some(root),
+        })
+    }
+
     pub fn summary(&self) -> WorkspaceSummary {
         let (send_description, send_layout, send_items) = match &self.outgoing {
             Some(OutgoingSpec::RootContents { root }) => (

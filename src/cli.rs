@@ -4,6 +4,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use console::{Term, style};
 use serde::{Deserialize, Serialize};
+use std::env;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -28,6 +29,7 @@ pub enum Command {
     Send { paths: Vec<PathBuf> },
     Receive { path: Option<PathBuf> },
     Both { path: Option<PathBuf> },
+    Auto { path: Option<PathBuf> },
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, ValueEnum)]
@@ -36,15 +38,16 @@ pub enum SyncMode {
     Send,
     Receive,
     Both,
+    Auto,
 }
 
 impl SyncMode {
     pub fn can_send(self) -> bool {
-        matches!(self, SyncMode::Send | SyncMode::Both)
+        matches!(self, SyncMode::Send | SyncMode::Both | SyncMode::Auto)
     }
 
     pub fn can_receive(self) -> bool {
-        matches!(self, SyncMode::Receive | SyncMode::Both)
+        matches!(self, SyncMode::Receive | SyncMode::Both | SyncMode::Auto)
     }
 
     pub fn label(self) -> &'static str {
@@ -52,6 +55,7 @@ impl SyncMode {
             SyncMode::Send => "发送方",
             SyncMode::Receive => "接收方",
             SyncMode::Both => "双向同步",
+            SyncMode::Auto => "自动协商",
         }
     }
 
@@ -60,6 +64,7 @@ impl SyncMode {
             SyncMode::Send => "send",
             SyncMode::Receive => "receive",
             SyncMode::Both => "both",
+            SyncMode::Auto => "auto",
         }
     }
 
@@ -68,6 +73,7 @@ impl SyncMode {
             "send" => Some(Self::Send),
             "receive" => Some(Self::Receive),
             "both" => Some(Self::Both),
+            "auto" => Some(Self::Auto),
             _ => None,
         }
     }
@@ -88,11 +94,20 @@ pub struct RuntimeOptions {
 }
 
 pub fn collect_runtime_options(cli: Cli, device: &DeviceConfig) -> Result<RuntimeOptions> {
+    let connection = if cli.host {
+        ConnectionPreference::Host
+    } else if cli.join {
+        ConnectionPreference::Join
+    } else {
+        choose_connection()?
+    };
+
     let mode = match &cli.command {
         Some(Command::Send { .. }) => SyncMode::Send,
         Some(Command::Receive { .. }) => SyncMode::Receive,
         Some(Command::Both { .. }) => SyncMode::Both,
-        None => choose_mode(device)?,
+        Some(Command::Auto { .. }) => SyncMode::Auto,
+        None => choose_mode(device, connection)?,
     };
 
     let workspace = match cli.command {
@@ -105,15 +120,11 @@ pub fn collect_runtime_options(cli: Cli, device: &DeviceConfig) -> Result<Runtim
             let root = resolve_both_path(path)?;
             WorkspaceSpec::for_both(root)?
         }
+        Some(Command::Auto { path }) => {
+            let root = resolve_auto_path(path)?;
+            WorkspaceSpec::for_auto(root)?
+        }
         None => interactive_workspace(mode)?,
-    };
-
-    let connection = if cli.host {
-        ConnectionPreference::Host
-    } else if cli.join {
-        ConnectionPreference::Join
-    } else {
-        choose_connection()?
     };
 
     Ok(RuntimeOptions {
@@ -186,12 +197,21 @@ pub fn prompt_confirm(label: &str, default: bool) -> Result<bool> {
     }
 }
 
-fn choose_mode(device: &DeviceConfig) -> Result<SyncMode> {
-    let options = vec![
-        "发送方: 把本地文件同步给对方".to_string(),
-        "接收方: 接收对方同步过来的文件".to_string(),
-        "双向同步: 两边都能发送和接收".to_string(),
-    ];
+fn choose_mode(device: &DeviceConfig, connection: ConnectionPreference) -> Result<SyncMode> {
+    let options = match connection {
+        ConnectionPreference::Host => vec![
+            "自动协商: 监听时根据客户端请求决定方向，使用同一个目录收发 (Recommended)".to_string(),
+            "发送方: 把本地文件同步给对方".to_string(),
+            "接收方: 接收对方同步过来的文件".to_string(),
+            "双向同步: 两边都能发送和接收".to_string(),
+        ],
+        ConnectionPreference::Join => vec![
+            "发送方: 把本地文件同步给对方".to_string(),
+            "接收方: 接收对方同步过来的文件".to_string(),
+            "双向同步: 两边都能发送和接收".to_string(),
+            "自动协商: 使用同一个目录收发，并尽量根据对端能力协商".to_string(),
+        ],
+    };
     println!(
         "{} {} ({})",
         style("设备").bold(),
@@ -199,10 +219,19 @@ fn choose_mode(device: &DeviceConfig) -> Result<SyncMode> {
         device.short_id()
     );
     let index = prompt_select("请选择当前设备的同步模式", &options)?;
-    Ok(match index {
-        0 => SyncMode::Send,
-        1 => SyncMode::Receive,
-        _ => SyncMode::Both,
+    Ok(match connection {
+        ConnectionPreference::Host => match index {
+            0 => SyncMode::Auto,
+            1 => SyncMode::Send,
+            2 => SyncMode::Receive,
+            _ => SyncMode::Both,
+        },
+        ConnectionPreference::Join => match index {
+            0 => SyncMode::Send,
+            1 => SyncMode::Receive,
+            2 => SyncMode::Both,
+            _ => SyncMode::Auto,
+        },
     })
 }
 
@@ -232,6 +261,10 @@ fn interactive_workspace(mode: SyncMode) -> Result<WorkspaceSpec> {
             let path = resolve_both_path(None)?;
             WorkspaceSpec::for_both(path)
         }
+        SyncMode::Auto => {
+            let path = resolve_auto_path(None)?;
+            WorkspaceSpec::for_auto(path)
+        }
     }
 }
 
@@ -239,51 +272,82 @@ fn resolve_send_paths(initial: Option<Vec<PathBuf>>) -> Result<Vec<PathBuf>> {
     if let Some(paths) = initial
         && !paths.is_empty()
     {
-        return Ok(paths);
+        return expand_path_list(paths);
     }
 
     let cwd = std::env::current_dir().context("failed to determine current directory")?;
-    if prompt_confirm(
-        &format!("未指定同步源，是否直接同步当前文件夹 `{}`", cwd.display()),
-        true,
-    )? {
+    let raw = prompt_input(
+        &format!(
+            "未指定同步源。直接回车同步当前文件夹 `{}`，或输入要同步的路径，多个路径用英文逗号分隔",
+            cwd.display()
+        ),
+        None,
+    )?;
+    if raw.trim().is_empty() {
         return Ok(vec![cwd]);
     }
 
-    let raw = prompt_input("请输入要同步的文件或文件夹，多个路径用英文逗号分隔", None)?;
     parse_csv_paths(&raw)
 }
 
 fn resolve_receive_path(initial: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(path) = initial {
-        return Ok(path);
+        return expand_pathbuf(path);
     }
 
     let cwd = std::env::current_dir().context("failed to determine current directory")?;
-    if prompt_confirm(
-        &format!("未指定接收目录，是否使用当前文件夹 `{}`", cwd.display()),
-        true,
-    )? {
+    let raw = prompt_input(
+        &format!(
+            "未指定接收目录。直接回车使用当前文件夹 `{}`，或直接输入目标目录",
+            cwd.display()
+        ),
+        None,
+    )?;
+    if raw.trim().is_empty() {
         return Ok(cwd);
     }
 
-    Ok(PathBuf::from(prompt_input("请输入接收目录", None)?))
+    expand_path_string(&raw)
 }
 
 fn resolve_both_path(initial: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(path) = initial {
-        return Ok(path);
+        return expand_pathbuf(path);
     }
 
     let cwd = std::env::current_dir().context("failed to determine current directory")?;
-    if prompt_confirm(
-        &format!("未指定双向同步目录，是否使用当前文件夹 `{}`", cwd.display()),
-        true,
-    )? {
+    let raw = prompt_input(
+        &format!(
+            "未指定双向同步目录。直接回车使用当前文件夹 `{}`，或直接输入目标目录",
+            cwd.display()
+        ),
+        None,
+    )?;
+    if raw.trim().is_empty() {
         return Ok(cwd);
     }
 
-    Ok(PathBuf::from(prompt_input("请输入要双向同步的目录", None)?))
+    expand_path_string(&raw)
+}
+
+fn resolve_auto_path(initial: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(path) = initial {
+        return expand_pathbuf(path);
+    }
+
+    let cwd = std::env::current_dir().context("failed to determine current directory")?;
+    let raw = prompt_input(
+        &format!(
+            "自动协商模式需要一个共享目录。直接回车使用当前文件夹 `{}`，或直接输入目标目录",
+            cwd.display()
+        ),
+        None,
+    )?;
+    if raw.trim().is_empty() {
+        return Ok(cwd);
+    }
+
+    expand_path_string(&raw)
 }
 
 fn parse_csv_paths(raw: &str) -> Result<Vec<PathBuf>> {
@@ -291,11 +355,191 @@ fn parse_csv_paths(raw: &str) -> Result<Vec<PathBuf>> {
     for piece in raw.split(',') {
         let trimmed = piece.trim();
         if !trimmed.is_empty() {
-            paths.push(PathBuf::from(trimmed));
+            paths.push(expand_path_string(trimmed)?);
         }
     }
     if paths.is_empty() {
         bail!("至少需要提供一个路径");
     }
     Ok(paths)
+}
+
+fn expand_path_list(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
+    paths.into_iter().map(expand_pathbuf).collect()
+}
+
+fn expand_pathbuf(path: PathBuf) -> Result<PathBuf> {
+    expand_path_string(&path.to_string_lossy())
+}
+
+fn expand_path_string(raw: &str) -> Result<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        bail!("路径不能为空");
+    }
+
+    let with_env = expand_env_vars(trimmed)?;
+    let expanded = expand_tilde(&with_env)?;
+    Ok(PathBuf::from(expanded))
+}
+
+fn expand_tilde(raw: &str) -> Result<String> {
+    if !raw.starts_with('~') {
+        return Ok(raw.to_string());
+    }
+
+    let rest = &raw[1..];
+    if !rest.is_empty() && !rest.starts_with('/') && !rest.starts_with('\\') {
+        return Ok(raw.to_string());
+    }
+
+    let home = home_dir().context("无法展开 `~`，因为当前环境没有可用的 home 目录")?;
+    Ok(format!("{}{}", home, rest))
+}
+
+fn home_dir() -> Option<String> {
+    #[cfg(windows)]
+    {
+        if let Ok(profile) = env::var("USERPROFILE")
+            && !profile.trim().is_empty()
+        {
+            return Some(profile);
+        }
+
+        let drive = env::var("HOMEDRIVE").ok()?;
+        let path = env::var("HOMEPATH").ok()?;
+        if !drive.trim().is_empty() && !path.trim().is_empty() {
+            return Some(format!("{drive}{path}"));
+        }
+    }
+
+    env::var("HOME")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn expand_env_vars(raw: &str) -> Result<String> {
+    let chars = raw.chars().collect::<Vec<_>>();
+    let mut index = 0usize;
+    let mut output = String::with_capacity(raw.len());
+
+    while index < chars.len() {
+        match chars[index] {
+            '$' => {
+                if index + 1 < chars.len() && chars[index + 1] == '{' {
+                    let mut end = index + 2;
+                    while end < chars.len() && chars[end] != '}' {
+                        end += 1;
+                    }
+                    if end >= chars.len() {
+                        bail!("环境变量表达式缺少 `}}`: {}", raw);
+                    }
+                    let name = chars[index + 2..end].iter().collect::<String>();
+                    output.push_str(&resolve_env_var(&name)?);
+                    index = end + 1;
+                    continue;
+                }
+
+                let mut end = index + 1;
+                while end < chars.len() && is_env_name_char(chars[end], end == index + 1) {
+                    end += 1;
+                }
+
+                if end == index + 1 {
+                    output.push('$');
+                    index += 1;
+                    continue;
+                }
+
+                let name = chars[index + 1..end].iter().collect::<String>();
+                output.push_str(&resolve_env_var(&name)?);
+                index = end;
+            }
+            '%' => {
+                let mut end = index + 1;
+                while end < chars.len() && chars[end] != '%' {
+                    end += 1;
+                }
+
+                if end >= chars.len() {
+                    output.push('%');
+                    index += 1;
+                    continue;
+                }
+
+                let name = chars[index + 1..end].iter().collect::<String>();
+                if name.is_empty() {
+                    output.push('%');
+                    index += 1;
+                    continue;
+                }
+
+                output.push_str(&resolve_env_var(&name)?);
+                index = end + 1;
+            }
+            ch => {
+                output.push(ch);
+                index += 1;
+            }
+        }
+    }
+
+    Ok(output)
+}
+
+fn resolve_env_var(name: &str) -> Result<String> {
+    env::var(name).with_context(|| format!("环境变量 `{name}` 未定义"))
+}
+
+fn is_env_name_char(ch: char, first: bool) -> bool {
+    if first {
+        ch == '_' || ch.is_ascii_alphabetic()
+    } else {
+        ch == '_' || ch.is_ascii_alphanumeric()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{expand_env_vars, expand_path_string, expand_tilde};
+    use std::env;
+
+    #[test]
+    fn expands_shell_style_env_var() {
+        let path = expand_env_vars("$PATH").unwrap();
+        assert_eq!(path, env::var("PATH").unwrap());
+    }
+
+    #[test]
+    fn expands_braced_env_var() {
+        let path = expand_env_vars("${PATH}/bin").unwrap();
+        assert_eq!(path, format!("{}/bin", env::var("PATH").unwrap()));
+    }
+
+    #[test]
+    fn expands_percent_env_var_when_closed() {
+        let path = expand_env_vars("%PATH%/bin").unwrap();
+        assert_eq!(path, format!("{}/bin", env::var("PATH").unwrap()));
+    }
+
+    #[test]
+    fn expands_tilde_prefix() {
+        let home = env::var("HOME")
+            .or_else(|_| env::var("USERPROFILE"))
+            .expect("home-like env var should exist during tests");
+        let path = expand_tilde("~/demo").unwrap();
+        assert_eq!(path, format!("{home}/demo"));
+    }
+
+    #[test]
+    fn expands_combined_path() {
+        let home = env::var("HOME")
+            .or_else(|_| env::var("USERPROFILE"))
+            .expect("home-like env var should exist during tests");
+        let path = expand_path_string("~/$PATH").unwrap();
+        assert_eq!(
+            path,
+            std::path::PathBuf::from(format!("{home}/{}", env::var("PATH").unwrap()))
+        );
+    }
 }
