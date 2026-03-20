@@ -1,0 +1,301 @@
+use crate::config::DeviceConfig;
+use crate::sync::WorkspaceSpec;
+use anyhow::{Context, Result, bail};
+use clap::{Parser, Subcommand, ValueEnum};
+use console::{Term, style};
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "synly",
+    version,
+    about = "在局域网中发现设备、通过 PIN 配对、建立安全连接并持续同步文件"
+)]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Option<Command>,
+    #[arg(long, conflicts_with = "join")]
+    pub host: bool,
+    #[arg(long, conflicts_with = "host")]
+    pub join: bool,
+    #[arg(long, default_value_t = 3)]
+    pub interval_secs: u64,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum Command {
+    Send { paths: Vec<PathBuf> },
+    Receive { path: Option<PathBuf> },
+    Both { path: Option<PathBuf> },
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncMode {
+    Send,
+    Receive,
+    Both,
+}
+
+impl SyncMode {
+    pub fn can_send(self) -> bool {
+        matches!(self, SyncMode::Send | SyncMode::Both)
+    }
+
+    pub fn can_receive(self) -> bool {
+        matches!(self, SyncMode::Receive | SyncMode::Both)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SyncMode::Send => "发送方",
+            SyncMode::Receive => "接收方",
+            SyncMode::Both => "双向同步",
+        }
+    }
+
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            SyncMode::Send => "send",
+            SyncMode::Receive => "receive",
+            SyncMode::Both => "both",
+        }
+    }
+
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "send" => Some(Self::Send),
+            "receive" => Some(Self::Receive),
+            "both" => Some(Self::Both),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum ConnectionPreference {
+    Host,
+    Join,
+}
+
+#[derive(Clone, Debug)]
+pub struct RuntimeOptions {
+    pub mode: SyncMode,
+    pub connection: ConnectionPreference,
+    pub workspace: WorkspaceSpec,
+    pub interval_secs: u64,
+}
+
+pub fn collect_runtime_options(cli: Cli, device: &DeviceConfig) -> Result<RuntimeOptions> {
+    let mode = match &cli.command {
+        Some(Command::Send { .. }) => SyncMode::Send,
+        Some(Command::Receive { .. }) => SyncMode::Receive,
+        Some(Command::Both { .. }) => SyncMode::Both,
+        None => choose_mode(device)?,
+    };
+
+    let workspace = match cli.command {
+        Some(Command::Send { paths }) => WorkspaceSpec::for_send(paths)?,
+        Some(Command::Receive { path }) => {
+            let destination = resolve_receive_path(path)?;
+            WorkspaceSpec::for_receive(destination)?
+        }
+        Some(Command::Both { path }) => {
+            let root = resolve_both_path(path)?;
+            WorkspaceSpec::for_both(root)?
+        }
+        None => interactive_workspace(mode)?,
+    };
+
+    let connection = if cli.host {
+        ConnectionPreference::Host
+    } else if cli.join {
+        ConnectionPreference::Join
+    } else {
+        choose_connection()?
+    };
+
+    Ok(RuntimeOptions {
+        mode,
+        connection,
+        workspace,
+        interval_secs: cli.interval_secs.max(1),
+    })
+}
+
+pub fn prompt_select(title: &str, options: &[String]) -> Result<usize> {
+    if options.is_empty() {
+        bail!("no options available for selection");
+    }
+
+    let term = Term::stdout();
+    term.write_line("")?;
+    term.write_line(&style(title).bold().to_string())?;
+    for (idx, option) in options.iter().enumerate() {
+        term.write_line(&format!("  {}. {}", idx + 1, option))?;
+    }
+
+    loop {
+        let raw = prompt_input("请输入编号", None)?;
+        let number = raw
+            .trim()
+            .parse::<usize>()
+            .with_context(|| format!("`{}` 不是有效编号", raw.trim()))?;
+        if (1..=options.len()).contains(&number) {
+            return Ok(number - 1);
+        }
+        term.write_line("编号超出范围，请重新输入。")?;
+    }
+}
+
+pub fn prompt_input(label: &str, default: Option<&str>) -> Result<String> {
+    let term = Term::stdout();
+    let prompt = match default {
+        Some(value) => format!("{} [{}]: ", label, value),
+        None => format!("{}: ", label),
+    };
+    term.write_str(&prompt)?;
+    let line = term.read_line()?;
+    let trimmed = line.trim();
+    if trimmed.is_empty()
+        && let Some(value) = default
+    {
+        return Ok(value.to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
+pub fn prompt_secret(label: &str) -> Result<String> {
+    let term = Term::stdout();
+    term.write_str(&format!("{}: ", label))?;
+    Ok(term.read_secure_line()?.trim().to_string())
+}
+
+pub fn prompt_confirm(label: &str, default: bool) -> Result<bool> {
+    let suffix = if default { "[Y/n]" } else { "[y/N]" };
+    let raw = prompt_input(&format!("{} {}", label, suffix), None)?;
+    let trimmed = raw.trim().to_ascii_lowercase();
+    if trimmed.is_empty() {
+        return Ok(default);
+    }
+    match trimmed.as_str() {
+        "y" | "yes" => Ok(true),
+        "n" | "no" => Ok(false),
+        _ => bail!("请输入 y 或 n"),
+    }
+}
+
+fn choose_mode(device: &DeviceConfig) -> Result<SyncMode> {
+    let options = vec![
+        "发送方: 把本地文件同步给对方".to_string(),
+        "接收方: 接收对方同步过来的文件".to_string(),
+        "双向同步: 两边都能发送和接收".to_string(),
+    ];
+    println!(
+        "{} {} ({})",
+        style("设备").bold(),
+        device.device_name,
+        device.short_id()
+    );
+    let index = prompt_select("请选择当前设备的同步模式", &options)?;
+    Ok(match index {
+        0 => SyncMode::Send,
+        1 => SyncMode::Receive,
+        _ => SyncMode::Both,
+    })
+}
+
+fn choose_connection() -> Result<ConnectionPreference> {
+    let options = vec![
+        "等待别人连接，我这边显示 PIN".to_string(),
+        "连接局域网中的设备，输入对方显示的 PIN".to_string(),
+    ];
+    let index = prompt_select("请选择本次连接方式", &options)?;
+    Ok(match index {
+        0 => ConnectionPreference::Host,
+        _ => ConnectionPreference::Join,
+    })
+}
+
+fn interactive_workspace(mode: SyncMode) -> Result<WorkspaceSpec> {
+    match mode {
+        SyncMode::Send => {
+            let paths = resolve_send_paths(None)?;
+            WorkspaceSpec::for_send(paths)
+        }
+        SyncMode::Receive => {
+            let path = resolve_receive_path(None)?;
+            WorkspaceSpec::for_receive(path)
+        }
+        SyncMode::Both => {
+            let path = resolve_both_path(None)?;
+            WorkspaceSpec::for_both(path)
+        }
+    }
+}
+
+fn resolve_send_paths(initial: Option<Vec<PathBuf>>) -> Result<Vec<PathBuf>> {
+    if let Some(paths) = initial
+        && !paths.is_empty()
+    {
+        return Ok(paths);
+    }
+
+    let cwd = std::env::current_dir().context("failed to determine current directory")?;
+    if prompt_confirm(
+        &format!("未指定同步源，是否直接同步当前文件夹 `{}`", cwd.display()),
+        true,
+    )? {
+        return Ok(vec![cwd]);
+    }
+
+    let raw = prompt_input("请输入要同步的文件或文件夹，多个路径用英文逗号分隔", None)?;
+    parse_csv_paths(&raw)
+}
+
+fn resolve_receive_path(initial: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(path) = initial {
+        return Ok(path);
+    }
+
+    let cwd = std::env::current_dir().context("failed to determine current directory")?;
+    if prompt_confirm(
+        &format!("未指定接收目录，是否使用当前文件夹 `{}`", cwd.display()),
+        true,
+    )? {
+        return Ok(cwd);
+    }
+
+    Ok(PathBuf::from(prompt_input("请输入接收目录", None)?))
+}
+
+fn resolve_both_path(initial: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(path) = initial {
+        return Ok(path);
+    }
+
+    let cwd = std::env::current_dir().context("failed to determine current directory")?;
+    if prompt_confirm(
+        &format!("未指定双向同步目录，是否使用当前文件夹 `{}`", cwd.display()),
+        true,
+    )? {
+        return Ok(cwd);
+    }
+
+    Ok(PathBuf::from(prompt_input("请输入要双向同步的目录", None)?))
+}
+
+fn parse_csv_paths(raw: &str) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::new();
+    for piece in raw.split(',') {
+        let trimmed = piece.trim();
+        if !trimmed.is_empty() {
+            paths.push(PathBuf::from(trimmed));
+        }
+    }
+    if paths.is_empty() {
+        bail!("至少需要提供一个路径");
+    }
+    Ok(paths)
+}
