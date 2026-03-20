@@ -160,13 +160,12 @@ pub fn prompt_select(
         };
         term.write_line(&format!("  {}. {}{}", idx + 1, option, default_suffix))?;
     }
+    if let Some(index) = default_index {
+        term.write_line(&format!("回车选择默认项 {}", index + 1))?;
+    }
 
     loop {
-        let prompt = match default_index {
-            Some(index) => format!("请输入编号，直接回车选择默认项 {}", index + 1),
-            None => "请输入编号".to_string(),
-        };
-        let raw = prompt_input(&prompt, None)?;
+        let raw = prompt_input("编号", None)?;
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             if let Some(index) = default_index {
@@ -208,7 +207,8 @@ pub fn prompt_input(label: &str, default: Option<&str>) -> Result<String> {
 pub fn prompt_secret(label: &str) -> Result<String> {
     let term = Term::stdout();
     loop {
-        term.write_str(&format!("{}: ", label))?;
+        term.write_line(label)?;
+        term.write_str("PIN: ")?;
         let value = term.read_secure_line()?.trim().to_string();
         if !value.is_empty() {
             return Ok(value);
@@ -221,7 +221,8 @@ pub fn prompt_confirm(label: &str, default: bool) -> Result<bool> {
     let suffix = if default { "[Y/n]" } else { "[y/N]" };
     let term = Term::stdout();
     loop {
-        let raw = prompt_input(&format!("{} {}", label, suffix), None)?;
+        term.write_line(label)?;
+        let raw = prompt_input(&format!("确认 {}", suffix), None)?;
         let trimmed = raw.trim().to_ascii_lowercase();
         if trimmed.is_empty() {
             return Ok(default);
@@ -259,7 +260,7 @@ fn choose_mode(device: &DeviceConfig, connection: ConnectionPreference) -> Resul
         ConnectionPreference::Host => Some(0),
         ConnectionPreference::Join => Some(3),
     };
-    let index = prompt_select("请选择当前设备的同步模式", &options, default_index)?;
+    let index = prompt_select("同步模式", &options, default_index)?;
     Ok(match connection {
         ConnectionPreference::Host => match index {
             0 => SyncMode::Auto,
@@ -281,7 +282,7 @@ fn choose_connection() -> Result<ConnectionPreference> {
         "等待别人连接，收到请求后显示本次 PIN".to_string(),
         "连接局域网中的设备，收到提示后输入对方当前显示的 PIN".to_string(),
     ];
-    let index = prompt_select("请选择本次连接方式", &options, Some(0))?;
+    let index = prompt_select("连接方式", &options, Some(0))?;
     Ok(match index {
         0 => ConnectionPreference::Host,
         _ => ConnectionPreference::Join,
@@ -317,58 +318,35 @@ fn resolve_send_paths(initial: Option<Vec<PathBuf>>) -> Result<Vec<PathBuf>> {
     }
 
     let cwd = std::env::current_dir().context("failed to determine current directory")?;
+    let term = Term::stdout();
     loop {
-        let raw = prompt_input(
-            &format!(
-                "未指定同步源。直接回车同步当前文件夹 `{}`，或输入要同步的路径，多个路径用英文逗号分隔",
-                cwd.display()
-            ),
-            None,
-        )?;
+        term.write_line("未指定同步源。")?;
+        term.write_line(&format!("回车使用当前目录: {}", cwd.display()))?;
+        term.write_line("多个路径用英文逗号分隔。")?;
+        let raw = prompt_input("路径", None)?;
         if raw.trim().is_empty() {
             return Ok(vec![cwd.clone()]);
         }
         match parse_csv_paths(&raw) {
             Ok(paths) => return Ok(paths),
-            Err(err) => Term::stdout().write_line(&format!("输入无效，请重新输入: {err:#}"))?,
+            Err(err) => term.write_line(&format!("输入无效，请重新输入: {err:#}"))?,
         }
     }
 }
 
 fn resolve_receive_path(initial: Option<PathBuf>) -> Result<PathBuf> {
     let cwd = std::env::current_dir().context("failed to determine current directory")?;
-    resolve_directory_path(
-        initial,
-        &format!(
-            "未指定接收目录。直接回车使用当前文件夹 `{}`，或直接输入目标目录",
-            cwd.display()
-        ),
-        &cwd,
-    )
+    resolve_directory_path(initial, "未指定接收目录。", &cwd)
 }
 
 fn resolve_both_path(initial: Option<PathBuf>) -> Result<PathBuf> {
     let cwd = std::env::current_dir().context("failed to determine current directory")?;
-    resolve_directory_path(
-        initial,
-        &format!(
-            "未指定双向同步目录。直接回车使用当前文件夹 `{}`，或直接输入目标目录",
-            cwd.display()
-        ),
-        &cwd,
-    )
+    resolve_directory_path(initial, "未指定双向同步目录。", &cwd)
 }
 
 fn resolve_auto_path(initial: Option<PathBuf>) -> Result<PathBuf> {
     let cwd = std::env::current_dir().context("failed to determine current directory")?;
-    resolve_directory_path(
-        initial,
-        &format!(
-            "自动协商模式需要一个共享目录。直接回车使用当前文件夹 `{}`，或直接输入目标目录",
-            cwd.display()
-        ),
-        &cwd,
-    )
+    resolve_directory_path(initial, "未指定共享目录。", &cwd)
 }
 
 fn resolve_directory_path(
@@ -389,7 +367,9 @@ fn resolve_directory_path(
                 }
             }
         } else {
-            let raw = prompt_input(prompt, None)?;
+            term.write_line(prompt)?;
+            term.write_line(&format!("回车使用当前目录: {}", default_path.display()))?;
+            let raw = prompt_input("目录", None)?;
             if raw.trim().is_empty() {
                 default_path.to_path_buf()
             } else {
@@ -416,10 +396,8 @@ fn resolve_directory_path(
             continue;
         }
 
-        if prompt_confirm(
-            &format!("目录 `{}` 不存在，要自动创建吗", path.display()),
-            true,
-        )? {
+        term.write_line(&format!("目录不存在: {}", path.display()))?;
+        if prompt_confirm("创建该目录吗", true)? {
             return Ok(path);
         }
 

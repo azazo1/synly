@@ -122,7 +122,7 @@ async fn run_client(device: DeviceConfig, options: RuntimeOptions) -> Result<()>
             }
             Err(err) => {
                 eprintln!("连接失败: {err:#}");
-                if !prompt_confirm("要重新搜索局域网设备吗", true)? {
+                if !prompt_confirm("重新搜索设备吗", true)? {
                     break;
                 }
             }
@@ -241,7 +241,7 @@ async fn handle_incoming_connection(
 
         println!("PIN 校验通过，等待本机确认。");
 
-        if !prompt_confirm("是否接受该同步请求", true)? {
+        if !prompt_confirm("接受这次同步吗", true)? {
             let message = "服务端拒绝了本次同步请求。".to_string();
             let control = signed_pair_decision(PairDecisionParams {
                 exporter: &exporter,
@@ -340,7 +340,7 @@ async fn connect_to_peer(
             short_uuid(&server.device_id)
         );
         println!("{prompt_message}");
-        let pin = prompt_secret("请输入服务端当前显示的 6 位 PIN")?;
+        let pin = prompt_secret("输入服务端当前显示的 6 位 PIN")?;
         let exporter = crypto::export_keying_material_from_client(&client_stream, &request_id)?;
         let proof = crypto::sign_pair_auth(&exporter, &request_id, &pin, &payload)?;
         FrameWriter::new(&mut client_stream)
@@ -853,14 +853,14 @@ fn choose_peer() -> Result<DiscoveredPeer> {
     loop {
         let peers = discovery::browse(Duration::from_secs(3))?;
         if peers.is_empty() {
-            if !prompt_confirm("暂时没有发现可用设备，要继续搜索吗", true)? {
+            if !prompt_confirm("继续搜索设备吗", true)? {
                 bail!("no peer selected");
             }
             continue;
         }
 
         let options = peers.iter().map(DiscoveredPeer::label).collect::<Vec<_>>();
-        let index = prompt_select("请选择要连接的设备", &options, None)?;
+        let index = prompt_select("选择设备", &options, None)?;
         return Ok(peers[index].clone());
     }
 }
