@@ -635,7 +635,15 @@ fn ensure_directory(path: PathBuf) -> Result<PathBuf> {
 
 fn should_keep_entry(entry: &DirEntry) -> bool {
     let name = entry.file_name().to_string_lossy();
-    name != ".git" && name != SYNLY_INTERNAL_DIR && !name.ends_with(".synly.part")
+    !is_ignored_name(&name)
+}
+
+fn is_ignored_name(name: &str) -> bool {
+    name == ".git"
+        || name == SYNLY_INTERNAL_DIR
+        || name == ".DS_Store"
+        || name.eq_ignore_ascii_case("desktop.ini")
+        || name.ends_with(".synly.part")
 }
 
 fn ensure_no_symlink_ancestors(root: &Path, relative: &Path) -> Result<()> {
@@ -766,6 +774,15 @@ mod tests {
         assert!(wire_to_relative_path("../etc/passwd").is_err());
         assert!(wire_to_relative_path("a/../../b").is_err());
         assert!(wire_to_relative_path("safe/path").is_ok());
+    }
+
+    #[test]
+    fn ignores_platform_metadata_files() {
+        assert!(is_ignored_name(".DS_Store"));
+        assert!(is_ignored_name("desktop.ini"));
+        assert!(is_ignored_name("Desktop.ini"));
+        assert!(!is_ignored_name("desktop.ini.backup"));
+        assert!(!is_ignored_name("notes.txt"));
     }
 
     #[test]
