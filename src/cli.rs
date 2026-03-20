@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 #[command(
     name = "synly",
     version,
-    about = "在局域网中发现设备、通过 PIN 配对、建立安全连接并持续同步文件"
+    about = "在局域网中发现设备、通过 PIN 配对、建立安全连接并持续同步文件与可选剪贴板"
 )]
 pub struct Cli {
     #[command(subcommand)]
@@ -24,6 +24,14 @@ pub struct Cli {
     pub sync_delete: bool,
     #[arg(long, conflicts_with = "sync_delete")]
     pub no_sync_delete: bool,
+    #[arg(
+        long,
+        conflicts_with = "no_sync_clipboard",
+        help = "开启纯文本剪贴板同步；只有双方都开启才会生效，方向跟随当前同步模式"
+    )]
+    pub sync_clipboard: bool,
+    #[arg(long, conflicts_with = "sync_clipboard")]
+    pub no_sync_clipboard: bool,
     #[arg(
         long,
         default_value_t = 3,
@@ -99,6 +107,7 @@ pub struct RuntimeOptions {
     pub connection: ConnectionPreference,
     pub workspace: WorkspaceSpec,
     pub sync_delete: bool,
+    pub sync_clipboard: bool,
     pub interval_secs: u64,
 }
 
@@ -106,6 +115,13 @@ pub fn collect_runtime_options(cli: Cli, device: &DeviceConfig) -> Result<Runtim
     let sync_delete_override = if cli.sync_delete {
         Some(true)
     } else if cli.no_sync_delete {
+        Some(false)
+    } else {
+        None
+    };
+    let sync_clipboard_override = if cli.sync_clipboard {
+        Some(true)
+    } else if cli.no_sync_clipboard {
         Some(false)
     } else {
         None
@@ -144,17 +160,23 @@ pub fn collect_runtime_options(cli: Cli, device: &DeviceConfig) -> Result<Runtim
         None => interactive_workspace(mode)?,
     };
     let sync_delete = resolve_sync_delete(sync_delete_override, &workspace)?;
+    let sync_clipboard = resolve_sync_clipboard(sync_clipboard_override)?;
 
     Ok(RuntimeOptions {
         mode,
         connection,
         workspace,
         sync_delete,
+        sync_clipboard,
         interval_secs: cli.interval_secs.max(1),
     })
 }
 
 pub fn sync_delete_label(enabled: bool) -> &'static str {
+    if enabled { "开启" } else { "关闭" }
+}
+
+pub fn sync_clipboard_label(enabled: bool) -> &'static str {
     if enabled { "开启" } else { "关闭" }
 }
 
@@ -270,6 +292,14 @@ fn resolve_sync_delete(
     }
 
     prompt_confirm("同步删除吗", false)
+}
+
+fn resolve_sync_clipboard(sync_clipboard_override: Option<bool>) -> Result<bool> {
+    if let Some(sync_clipboard) = sync_clipboard_override {
+        return Ok(sync_clipboard);
+    }
+
+    prompt_confirm("同步纯文本剪贴板吗（双方都开启才会生效）", false)
 }
 
 fn choose_mode(device: &DeviceConfig, connection: ConnectionPreference) -> Result<SyncMode> {

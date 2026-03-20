@@ -1,7 +1,8 @@
 use crate::cli::{
     ConnectionPreference, RuntimeOptions, SyncMode, prompt_confirm, prompt_secret, prompt_select,
-    sync_delete_label,
+    sync_clipboard_label, sync_delete_label,
 };
+use crate::clipboard::ClipboardSync;
 use crate::config::DeviceConfig;
 use crate::crypto;
 use crate::discovery::{self, Advertisement, DiscoveredPeer};
@@ -74,6 +75,7 @@ struct PairDecisionParams<'a> {
     message: String,
     device: &'a DeviceConfig,
     workspace: &'a WorkspaceSpec,
+    sync_clipboard: bool,
     agreement: &'a SessionAgreement,
 }
 
@@ -109,6 +111,7 @@ async fn run_host(device: DeviceConfig, options: RuntimeOptions) -> Result<()> {
                     &options.workspace,
                     options.interval_secs,
                     options.sync_delete,
+                    options.sync_clipboard,
                 )
                 .await?;
                 break;
@@ -133,6 +136,7 @@ async fn run_client(device: DeviceConfig, options: RuntimeOptions) -> Result<()>
                     &options.workspace,
                     options.interval_secs,
                     options.sync_delete,
+                    options.sync_clipboard,
                 )
                 .await?;
                 break;
@@ -192,7 +196,7 @@ async fn handle_incoming_connection(
         for line in payload.workspace.human_lines() {
             println!("{line}");
         }
-        for line in options.workspace.local_human_lines() {
+        for line in options.workspace.local_human_lines(options.sync_clipboard) {
             println!("本机 {line}");
         }
         if options.workspace.incoming_root.is_some() {
@@ -271,6 +275,7 @@ async fn handle_incoming_connection(
                 message: message.clone(),
                 device,
                 workspace: &options.workspace,
+                sync_clipboard: options.sync_clipboard,
                 agreement: &agreement,
             })?;
             FrameWriter::new(&mut server_stream)
@@ -288,6 +293,7 @@ async fn handle_incoming_connection(
             message,
             device,
             workspace: &options.workspace,
+            sync_clipboard: options.sync_clipboard,
             agreement: &agreement,
         })?;
         FrameWriter::new(&mut server_stream)
@@ -329,7 +335,7 @@ async fn connect_to_peer(
             protocol_version: 1,
             client: device_identity(device),
             requested_mode: options.mode,
-            workspace: options.workspace.summary(),
+            workspace: options.workspace.summary(options.sync_clipboard),
         };
         FrameWriter::new(&mut client_stream)
             .write_frame(Frame::Control(ControlMessage::PairRequest {
@@ -427,6 +433,7 @@ async fn run_sync_session(
     workspace: &WorkspaceSpec,
     interval_secs: u64,
     sync_delete: bool,
+    sync_clipboard: bool,
 ) -> Result<()> {
     println!();
     println!("{}", style("同步已开始").bold());
@@ -441,6 +448,19 @@ async fn run_sync_session(
 
     let local_can_send = allows_local_send(session.role, &session.agreement);
     let local_can_receive = allows_local_receive(session.role, &session.agreement);
+    let clipboard_enabled_on_both = sync_clipboard && session.remote_workspace.sync_clipboard;
+    let clipboard_can_send = clipboard_enabled_on_both && local_can_send;
+    let clipboard_can_receive = clipboard_enabled_on_both && local_can_receive;
+
+    match (sync_clipboard, session.remote_workspace.sync_clipboard) {
+        (true, true) => println!(
+            "本次剪贴板同步: {}",
+            clipboard_agreement_label(session.role, &session.agreement)
+        ),
+        (true, false) => println!("本次剪贴板同步: 本机已开启，但对端未开启，本次不会同步。"),
+        (false, true) => println!("本次剪贴板同步: 对端已开启，但本机未开启，本次不会同步。"),
+        (false, false) => println!("本次剪贴板同步: 关闭"),
+    }
 
     let (read_half, write_half) = tokio::io::split(session.stream);
     let (tx, rx) = mpsc::channel::<Frame>(64);
@@ -459,6 +479,30 @@ async fn run_sync_session(
         )))
     } else {
         None
+    };
+    let clipboard_sync = clipboard_enabled_on_both.then(ClipboardSync::new);
+    let (clipboard_watch_handle, clipboard_task) = if clipboard_can_send {
+        let clipboard_sync = clipboard_sync
+            .as_ref()
+            .context("clipboard sync unexpectedly unavailable")?;
+        let (clipboard_tx, clipboard_rx) = mpsc::unbounded_channel();
+        let watcher = match clipboard_sync.start_local_watcher(clipboard_tx.clone()) {
+            Ok(watcher) => Some(watcher),
+            Err(err) => {
+                eprintln!("无法启动剪贴板监听，本次将只接收远端剪贴板更新: {err:#}");
+                None
+            }
+        };
+        if watcher.is_some()
+            && let Err(err) = clipboard_sync.publish_initial_text(&clipboard_tx).await
+        {
+            eprintln!("无法读取当前剪贴板内容，已跳过初始剪贴板同步: {err:#}");
+        }
+        let sender = tx.clone();
+        let task = Some(tokio::spawn(clipboard_sender_loop(clipboard_rx, sender)));
+        (watcher, task)
+    } else {
+        (None, None)
     };
 
     let incoming_root = workspace.incoming_root.clone();
@@ -561,6 +605,16 @@ async fn run_sync_session(
                 }
                 maybe_finalize_revision(&incoming_root, &mut pending_revisions, revision);
             }
+            Frame::Control(ControlMessage::ClipboardUpdate { text }) => {
+                if !clipboard_can_receive {
+                    continue;
+                }
+                if let Some(clipboard_sync) = &clipboard_sync
+                    && let Err(err) = clipboard_sync.apply_remote_text(text).await
+                {
+                    eprintln!("无法应用远端剪贴板内容: {err:#}");
+                }
+            }
             Frame::Control(ControlMessage::TransferAborted { revision, message }) => {
                 eprintln!("对端中止了修订版 {revision} 的传输: {message}");
                 abort_revision(&mut pending_revisions, &mut incoming_files, revision).await?;
@@ -598,6 +652,12 @@ async fn run_sync_session(
     if let Some(task) = snapshot_task {
         task.abort();
     }
+    if let Some(watcher) = clipboard_watch_handle {
+        watcher.stop();
+    }
+    if let Some(task) = clipboard_task {
+        task.abort();
+    }
     writer_task.await??;
     Ok(())
 }
@@ -609,6 +669,17 @@ where
     let mut writer = FrameWriter::new(writer);
     while let Some(frame) = rx.recv().await {
         writer.write_frame(frame).await?;
+    }
+    Ok(())
+}
+
+async fn clipboard_sender_loop(
+    mut rx: mpsc::UnboundedReceiver<String>,
+    tx: mpsc::Sender<Frame>,
+) -> Result<()> {
+    while let Some(text) = rx.recv().await {
+        tx.send(Frame::Control(ControlMessage::ClipboardUpdate { text }))
+            .await?;
     }
     Ok(())
 }
@@ -1226,7 +1297,7 @@ fn allows_local_receive(role: SessionRole, agreement: &SessionAgreement) -> bool
 }
 
 fn signed_pair_decision(params: PairDecisionParams<'_>) -> Result<ControlMessage> {
-    let summary = params.workspace.summary();
+    let summary = params.workspace.summary(params.sync_clipboard);
     let proof = crypto::sign_pair_decision(
         params.exporter,
         params.request_id,
@@ -1257,6 +1328,10 @@ fn print_host_ready(device: &DeviceConfig, options: &RuntimeOptions, port: u16) 
     println!("{}", style("Synly 已就绪").bold());
     println!("设备: {} ({})", device.device_name, device.short_id());
     println!("模式: {}", options.mode.label());
+    println!(
+        "剪贴板同步: {}",
+        sync_clipboard_label(options.sync_clipboard)
+    );
     if options.workspace.incoming_root.is_some() {
         println!("删除同步: {}", sync_delete_label(options.sync_delete));
     }
@@ -1274,6 +1349,10 @@ fn agreement_label(role: SessionRole, agreement: &SessionAgreement) -> &'static 
         (false, true) => "对端 -> 本机",
         (false, false) => "无可用同步方向",
     }
+}
+
+fn clipboard_agreement_label(role: SessionRole, agreement: &SessionAgreement) -> &'static str {
+    agreement_label(role, agreement)
 }
 
 fn temp_file_path(destination: &Path) -> PathBuf {

@@ -1,5 +1,6 @@
 mod app;
 mod cli;
+mod clipboard;
 mod config;
 mod crypto;
 mod discovery;
@@ -17,7 +18,7 @@ async fn main() -> Result<()> {
     let options = cli::collect_runtime_options(cli, &device)?;
     println!();
     println!("{}", style("本次同步确认").bold());
-    for line in options.workspace.local_human_lines() {
+    for line in options.workspace.local_human_lines(options.sync_clipboard) {
         println!("{line}");
     }
     if options.workspace.incoming_root.is_some() {

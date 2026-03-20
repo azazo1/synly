@@ -7,6 +7,7 @@ edition = "2024"
 anyhow = "1.0.102"
 base64 = "0.22.1"
 clap = { version = "4.5.58", features = ["derive"] }
+clipboard-rs = { version = "0.3.3", default-features = false }
 console = "0.16.3"
 filetime = "0.2.26"
 hmac = "0.12.1"

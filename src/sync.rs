@@ -43,6 +43,8 @@ pub struct WorkspaceSummary {
     pub send_layout: Option<SnapshotLayout>,
     pub send_items: Vec<String>,
     pub receive_root: Option<String>,
+    #[serde(default)]
+    pub sync_clipboard: bool,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -169,7 +171,7 @@ impl WorkspaceSpec {
         })
     }
 
-    pub fn summary(&self) -> WorkspaceSummary {
+    pub fn summary(&self, sync_clipboard: bool) -> WorkspaceSummary {
         let (send_description, send_layout, send_items) = match &self.outgoing {
             Some(OutgoingSpec::RootContents { root }) => (
                 Some(format!("同步目录内容: {}", root.display())),
@@ -193,10 +195,11 @@ impl WorkspaceSpec {
                 .incoming_root
                 .as_ref()
                 .map(|path| path.display().to_string()),
+            sync_clipboard,
         }
     }
 
-    pub fn local_human_lines(&self) -> Vec<String> {
+    pub fn local_human_lines(&self, sync_clipboard: bool) -> Vec<String> {
         let mut lines = vec![format!("模式: {}", self.mode.label())];
 
         match &self.outgoing {
@@ -214,6 +217,10 @@ impl WorkspaceSpec {
         if let Some(root) = &self.incoming_root {
             lines.push(format!("接收目录: {}", root.display()));
         }
+        lines.push(format!(
+            "剪贴板同步: {}",
+            if sync_clipboard { "开启" } else { "关闭" }
+        ));
 
         lines
     }
@@ -232,6 +239,14 @@ impl WorkspaceSummary {
         if let Some(root) = &self.receive_root {
             lines.push(format!("接收目录: {}", root));
         }
+        lines.push(format!(
+            "剪贴板同步: {}",
+            if self.sync_clipboard {
+                "开启"
+            } else {
+                "关闭"
+            }
+        ));
 
         lines
     }

@@ -290,6 +290,7 @@ mod tests {
                 send_layout: None,
                 send_items: vec![],
                 receive_root: Some("/tmp".into()),
+                sync_clipboard: false,
             },
         };
         let exporter = [7u8; 32];

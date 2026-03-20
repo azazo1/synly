@@ -70,6 +70,9 @@ pub enum ControlMessage {
     TransferDone {
         revision: u64,
     },
+    ClipboardUpdate {
+        text: String,
+    },
     TransferAborted {
         revision: u64,
         message: String,
