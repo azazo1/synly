@@ -12,6 +12,7 @@ use crate::protocol::{
 use crate::sync::{
     DeletePolicy, WorkspaceSpec, apply_file_metadata, build_apply_plan, build_incoming_snapshot,
     build_snapshot, delete_paths, ensure_directories, resolve_incoming_path, resolve_outgoing_path,
+    snapshot_contains_file,
 };
 use anyhow::{Context, Result, bail};
 use console::style;
@@ -645,7 +646,11 @@ async fn send_requested_files(
     revision: u64,
     paths: Vec<String>,
 ) -> Result<()> {
+    let snapshot = build_snapshot(&outgoing)?;
     for path in paths {
+        if !snapshot_contains_file(&snapshot, &path)? {
+            bail!("requested path `{path}` is not part of the advertised snapshot");
+        }
         send_one_file(&tx, &outgoing, revision, &path).await?;
     }
 
@@ -873,11 +878,11 @@ async fn abort_revision(
 }
 
 async fn replace_destination(destination: &Path, temp_path: &Path) -> Result<()> {
-    if let Ok(metadata) = tokio::fs::metadata(destination).await {
-        if metadata.is_dir() {
-            tokio::fs::remove_dir_all(destination).await?;
-        } else {
+    if let Ok(metadata) = tokio::fs::symlink_metadata(destination).await {
+        if metadata.file_type().is_symlink() || metadata.is_file() {
             tokio::fs::remove_file(destination).await?;
+        } else if metadata.is_dir() {
+            tokio::fs::remove_dir_all(destination).await?;
         }
     }
     tokio::fs::rename(temp_path, destination).await?;

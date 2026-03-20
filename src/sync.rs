@@ -332,8 +332,18 @@ pub fn resolve_outgoing_path(spec: &OutgoingSpec, wire_path: &str) -> Result<Pat
     }
 }
 
+pub fn snapshot_contains_file(snapshot: &ManifestSnapshot, wire_path: &str) -> Result<bool> {
+    let normalized = path_to_wire(&wire_to_relative_path(wire_path)?)?;
+    Ok(snapshot
+        .entries
+        .get(&normalized)
+        .is_some_and(|entry| entry.kind == EntryKind::File))
+}
+
 pub fn resolve_incoming_path(root: &Path, wire_path: &str) -> Result<PathBuf> {
-    Ok(root.join(wire_to_relative_path(wire_path)?))
+    let relative = wire_to_relative_path(wire_path)?;
+    ensure_no_symlink_ancestors(root, &relative)?;
+    Ok(root.join(relative))
 }
 
 pub fn ensure_directories(root: &Path, snapshot: &ManifestSnapshot) -> Result<()> {
@@ -346,8 +356,8 @@ pub fn ensure_directories(root: &Path, snapshot: &ManifestSnapshot) -> Result<()
 
     for wire_path in directories {
         let directory = resolve_incoming_path(root, &wire_path)?;
-        if let Ok(metadata) = fs::metadata(&directory)
-            && metadata.is_file()
+        if let Ok(metadata) = fs::symlink_metadata(&directory)
+            && (metadata.file_type().is_symlink() || metadata.is_file())
         {
             fs::remove_file(&directory).with_context(|| {
                 format!("failed to remove conflicting file {}", directory.display())
@@ -628,6 +638,36 @@ fn should_keep_entry(entry: &DirEntry) -> bool {
     name != ".git" && name != SYNLY_INTERNAL_DIR && !name.ends_with(".synly.part")
 }
 
+fn ensure_no_symlink_ancestors(root: &Path, relative: &Path) -> Result<()> {
+    let mut current = root.to_path_buf();
+    let mut components = relative.components().peekable();
+
+    while let Some(component) = components.next() {
+        if components.peek().is_none() {
+            break;
+        }
+
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                bail!(
+                    "incoming path {} escapes through symlink ancestor {}",
+                    relative.display(),
+                    current.display()
+                );
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("failed to inspect {}", current.display()));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn archive_deleted_path(root: &Path, wire_path: &str, path: &Path) -> Result<()> {
     let deleted_root = deleted_archive_root(root);
     fs::create_dir_all(&deleted_root).with_context(|| {
@@ -809,6 +849,27 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_file_lookup_rejects_unadvertised_paths() {
+        let snapshot = ManifestSnapshot {
+            layout: SnapshotLayout::RootContents,
+            entries: BTreeMap::from([(
+                "docs/readme.txt".to_string(),
+                ManifestEntry {
+                    kind: EntryKind::File,
+                    size: 1,
+                    modified_ms: 1,
+                    hash: Some("x".into()),
+                    executable: false,
+                },
+            )]),
+        };
+
+        assert!(snapshot_contains_file(&snapshot, "docs/readme.txt").unwrap());
+        assert!(!snapshot_contains_file(&snapshot, "docs/../../etc/passwd").unwrap_or(false));
+        assert!(!snapshot_contains_file(&snapshot, "docs/private.txt").unwrap());
+    }
+
+    #[test]
     fn root_contents_snapshot_ignores_synly_directory() {
         let root = test_dir("ignores-synly");
         fs::create_dir_all(root.join(".synly/deleted")).unwrap();
@@ -850,6 +911,24 @@ mod tests {
         assert_eq!(archived, 2);
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn incoming_path_rejects_symlink_ancestor() {
+        use std::os::unix::fs::symlink;
+
+        let root = test_dir("symlink-ancestor");
+        fs::create_dir_all(&root).unwrap();
+        let outside = test_dir("symlink-outside");
+        fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, root.join("escape")).unwrap();
+
+        assert!(resolve_incoming_path(&root, "escape/file.txt").is_err());
+
+        let _ = fs::remove_file(root.join("escape"));
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(outside);
     }
 
     fn test_dir(prefix: &str) -> PathBuf {
