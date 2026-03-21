@@ -7,7 +7,7 @@ edition = "2024"
 anyhow = "1.0.102"
 base64 = "0.22.1"
 clap = { version = "4.5.58", features = ["derive"] }
-clipboard-rs = { version = "0.3.3", default-features = false }
+clipboard-rs = { version = "0.3.3", default-features = false, features = ["image"] }
 console = "0.16.3"
 filetime = "0.2.26"
 hmac = "0.12.1"
@@ -24,5 +24,7 @@ serde_json = "1.0.149"
 sha2 = "0.10.9"
 tokio = { version = "1.49.0", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring"] }
+toml = "0.8.23"
+url = "2.5.7"
 uuid = { version = "1.22.0", features = ["serde", "v4"] }
 walkdir = "2.5.0"

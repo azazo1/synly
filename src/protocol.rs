@@ -7,8 +7,11 @@ use uuid::Uuid;
 
 const FRAME_CONTROL: u8 = 1;
 const FRAME_FILE_CHUNK: u8 = 2;
+const FRAME_CLIPBOARD: u8 = 3;
 const MAX_META_LEN: usize = 4 * 1024 * 1024;
-const MAX_DATA_LEN: usize = 1024 * 1024;
+const MAX_DATA_LEN: usize = 64 * 1024 * 1024;
+
+pub const PROTOCOL_VERSION: u16 = 2;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DeviceIdentity {
@@ -70,9 +73,6 @@ pub enum ControlMessage {
     TransferDone {
         revision: u64,
     },
-    ClipboardUpdate {
-        text: String,
-    },
     TransferAborted {
         revision: u64,
         message: String,
@@ -94,10 +94,31 @@ pub struct FileChunkHeader {
     pub final_chunk: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClipboardPayload {
+    pub text: Option<String>,
+    pub rich_text: Option<String>,
+    pub html: Option<String>,
+    pub image: Option<ClipboardImage>,
+    pub files: Vec<ClipboardFile>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClipboardImage {
+    pub png_bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClipboardFile {
+    pub name: String,
+    pub bytes: Vec<u8>,
+}
+
 #[derive(Clone, Debug)]
 pub enum Frame {
     Control(ControlMessage),
     FileChunk(FileChunkHeader, Vec<u8>),
+    Clipboard(ClipboardPayload),
 }
 
 pub struct FrameReader<R> {
@@ -106,6 +127,106 @@ pub struct FrameReader<R> {
 
 pub struct FrameWriter<W> {
     inner: W,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ClipboardPayloadMeta {
+    pub text: Option<String>,
+    pub rich_text: Option<String>,
+    pub html: Option<String>,
+    pub image: Option<ClipboardBinaryMeta>,
+    pub files: Vec<ClipboardFileMeta>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct ClipboardBinaryMeta {
+    pub offset: u64,
+    pub len: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct ClipboardFileMeta {
+    pub name: String,
+    pub data: ClipboardBinaryMeta,
+}
+
+impl ClipboardPayload {
+    pub fn is_empty(&self) -> bool {
+        self.text.is_none()
+            && self.rich_text.is_none()
+            && self.html.is_none()
+            && self.image.is_none()
+            && self.files.is_empty()
+    }
+
+    pub fn total_binary_size(&self) -> usize {
+        let image_len = self
+            .image
+            .as_ref()
+            .map(|image| image.png_bytes.len())
+            .unwrap_or_default();
+        image_len
+            + self
+                .files
+                .iter()
+                .map(|file| file.bytes.len())
+                .sum::<usize>()
+    }
+
+    fn into_wire(self) -> Result<(ClipboardPayloadMeta, Vec<u8>)> {
+        let mut data = Vec::with_capacity(self.total_binary_size());
+        let image = self
+            .image
+            .map(|image| append_binary(&mut data, image.png_bytes))
+            .transpose()?;
+        let files = self
+            .files
+            .into_iter()
+            .map(|file| {
+                Ok(ClipboardFileMeta {
+                    name: file.name,
+                    data: append_binary(&mut data, file.bytes)?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let meta = ClipboardPayloadMeta {
+            text: self.text,
+            rich_text: self.rich_text,
+            html: self.html,
+            image,
+            files,
+        };
+        Ok((meta, data))
+    }
+
+    fn from_wire(meta: ClipboardPayloadMeta, data: Vec<u8>) -> Result<Self> {
+        let image = meta
+            .image
+            .map(|binary| {
+                read_binary(&data, binary).map(|bytes| ClipboardImage {
+                    png_bytes: bytes.to_vec(),
+                })
+            })
+            .transpose()?;
+        let files = meta
+            .files
+            .into_iter()
+            .map(|file| {
+                Ok(ClipboardFile {
+                    name: file.name,
+                    bytes: read_binary(&data, file.data)?.to_vec(),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Self {
+            text: meta.text,
+            rich_text: meta.rich_text,
+            html: meta.html,
+            image,
+            files,
+        })
+    }
 }
 
 impl<R> FrameReader<R> {
@@ -155,6 +276,16 @@ where
                 self.inner.read_exact(&mut data).await?;
                 Ok(Frame::FileChunk(header, data))
             }
+            FRAME_CLIPBOARD => {
+                let payload_meta: ClipboardPayloadMeta = serde_json::from_slice(&meta)
+                    .context("failed to decode clipboard frame metadata")?;
+                let mut data = vec![0u8; data_len];
+                self.inner.read_exact(&mut data).await?;
+                Ok(Frame::Clipboard(ClipboardPayload::from_wire(
+                    payload_meta,
+                    data,
+                )?))
+            }
             other => bail!("unknown frame type {}", other),
         }
     }
@@ -184,8 +315,88 @@ where
                 self.inner.write_all(&meta).await?;
                 self.inner.write_all(&data).await?;
             }
+            Frame::Clipboard(payload) => {
+                let (meta, data) = payload.into_wire()?;
+                if data.len() > MAX_DATA_LEN {
+                    bail!(
+                        "refusing to send over-sized clipboard payload: {}",
+                        data.len()
+                    );
+                }
+                let meta = serde_json::to_vec(&meta)?;
+                self.inner.write_u8(FRAME_CLIPBOARD).await?;
+                self.inner.write_u32(meta.len() as u32).await?;
+                self.inner.write_u64(data.len() as u64).await?;
+                self.inner.write_all(&meta).await?;
+                self.inner.write_all(&data).await?;
+            }
         }
         self.inner.flush().await?;
         Ok(())
+    }
+}
+
+fn append_binary(data: &mut Vec<u8>, bytes: Vec<u8>) -> Result<ClipboardBinaryMeta> {
+    let offset = data.len();
+    data.extend_from_slice(&bytes);
+    let len = bytes.len();
+    let offset = u64::try_from(offset).context("clipboard payload offset overflowed u64")?;
+    let len = u64::try_from(len).context("clipboard payload length overflowed u64")?;
+    Ok(ClipboardBinaryMeta { offset, len })
+}
+
+fn read_binary(data: &[u8], meta: ClipboardBinaryMeta) -> Result<&[u8]> {
+    let start =
+        usize::try_from(meta.offset).context("clipboard payload offset overflowed usize")?;
+    let len = usize::try_from(meta.len).context("clipboard payload length overflowed usize")?;
+    let end = start
+        .checked_add(len)
+        .context("clipboard payload range overflowed")?;
+    data.get(start..end)
+        .with_context(|| format!("clipboard payload range {start}..{end} out of bounds"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ClipboardFile, ClipboardImage, ClipboardPayload};
+
+    #[test]
+    fn clipboard_payload_roundtrip_preserves_binary_content() {
+        let payload = ClipboardPayload {
+            text: Some("hello".to_string()),
+            rich_text: Some("{\\rtf1 hello}".to_string()),
+            html: Some("<b>hello</b>".to_string()),
+            image: Some(ClipboardImage {
+                png_bytes: vec![1, 2, 3, 4],
+            }),
+            files: vec![
+                ClipboardFile {
+                    name: "a.txt".to_string(),
+                    bytes: b"alpha".to_vec(),
+                },
+                ClipboardFile {
+                    name: "b.bin".to_string(),
+                    bytes: vec![9, 8, 7],
+                },
+            ],
+        };
+
+        let (meta, data) = payload.clone().into_wire().unwrap();
+        let decoded = ClipboardPayload::from_wire(meta, data).unwrap();
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn clipboard_payload_rejects_invalid_binary_range() {
+        let meta = super::ClipboardPayloadMeta {
+            text: None,
+            rich_text: None,
+            html: None,
+            image: Some(super::ClipboardBinaryMeta { offset: 2, len: 5 }),
+            files: vec![],
+        };
+
+        let err = ClipboardPayload::from_wire(meta, vec![1, 2, 3]).unwrap_err();
+        assert!(err.to_string().contains("out of bounds"));
     }
 }

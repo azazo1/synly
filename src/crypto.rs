@@ -271,14 +271,14 @@ fn derive_pin_key(request_id: &str, pin: &str) -> [u8; 32] {
 mod tests {
     use super::*;
     use crate::cli::SyncMode;
-    use crate::protocol::{DeviceIdentity, PairRequestPayload};
+    use crate::protocol::{DeviceIdentity, PROTOCOL_VERSION, PairRequestPayload};
     use crate::sync::WorkspaceSummary;
     use uuid::Uuid;
 
     #[test]
     fn pair_auth_sign_and_verify_roundtrip() {
         let payload = PairRequestPayload {
-            protocol_version: 1,
+            protocol_version: PROTOCOL_VERSION,
             client: DeviceIdentity {
                 device_id: Uuid::new_v4(),
                 device_name: "tester".into(),

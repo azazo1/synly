@@ -1,4 +1,4 @@
-use crate::config::DeviceConfig;
+use crate::config::{DeviceConfig, SynlyConfig};
 use crate::sync::WorkspaceSpec;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -27,11 +27,17 @@ pub struct Cli {
     #[arg(
         long,
         conflicts_with = "no_sync_clipboard",
-        help = "开启纯文本剪贴板同步；只有双方都开启才会生效，方向跟随当前同步模式"
+        help = "开启剪贴板同步；支持文本、富文本、图片和限制大小内的文件，只有双方都开启才会生效，方向跟随当前同步模式"
     )]
     pub sync_clipboard: bool,
     #[arg(long, conflicts_with = "sync_clipboard")]
     pub no_sync_clipboard: bool,
+    #[arg(
+        long,
+        conflicts_with = "no_sync_clipboard",
+        help = "仅同步剪贴板，不进行文件同步；会自动开启剪贴板同步"
+    )]
+    pub clipboard_only: bool,
     #[arg(
         long,
         default_value_t = 3,
@@ -108,10 +114,18 @@ pub struct RuntimeOptions {
     pub workspace: WorkspaceSpec,
     pub sync_delete: bool,
     pub sync_clipboard: bool,
+    pub clipboard: ClipboardRuntimeOptions,
     pub interval_secs: u64,
 }
 
-pub fn collect_runtime_options(cli: Cli, device: &DeviceConfig) -> Result<RuntimeOptions> {
+#[derive(Clone, Debug)]
+pub struct ClipboardRuntimeOptions {
+    pub max_file_bytes: u64,
+    pub cache_dir: PathBuf,
+}
+
+pub fn collect_runtime_options(cli: Cli, config: &SynlyConfig) -> Result<RuntimeOptions> {
+    let device = &config.device;
     let sync_delete_override = if cli.sync_delete {
         Some(true)
     } else if cli.no_sync_delete {
@@ -135,32 +149,44 @@ pub fn collect_runtime_options(cli: Cli, device: &DeviceConfig) -> Result<Runtim
         choose_connection()?
     };
 
+    let clipboard_only = if cli.clipboard_only {
+        true
+    } else if cli.command.is_none() {
+        choose_clipboard_only()?
+    } else {
+        false
+    };
+
     let mode = match &cli.command {
         Some(Command::Send { .. }) => SyncMode::Send,
         Some(Command::Receive { .. }) => SyncMode::Receive,
         Some(Command::Both { .. }) => SyncMode::Both,
         Some(Command::Auto { .. }) => SyncMode::Auto,
-        None => choose_mode(device, connection)?,
+        None => choose_mode(device, connection, clipboard_only)?,
     };
 
-    let workspace = match cli.command {
-        Some(Command::Send { paths }) => WorkspaceSpec::for_send(paths)?,
-        Some(Command::Receive { path }) => {
-            let destination = resolve_receive_path(path)?;
-            WorkspaceSpec::for_receive(destination)?
+    let workspace = if clipboard_only {
+        WorkspaceSpec::for_clipboard_only(mode)
+    } else {
+        match cli.command {
+            Some(Command::Send { paths }) => WorkspaceSpec::for_send(paths)?,
+            Some(Command::Receive { path }) => {
+                let destination = resolve_receive_path(path)?;
+                WorkspaceSpec::for_receive(destination)?
+            }
+            Some(Command::Both { path }) => {
+                let root = resolve_both_path(path)?;
+                WorkspaceSpec::for_both(root)?
+            }
+            Some(Command::Auto { path }) => {
+                let root = resolve_auto_path(path)?;
+                WorkspaceSpec::for_auto(root)?
+            }
+            None => interactive_workspace(mode)?,
         }
-        Some(Command::Both { path }) => {
-            let root = resolve_both_path(path)?;
-            WorkspaceSpec::for_both(root)?
-        }
-        Some(Command::Auto { path }) => {
-            let root = resolve_auto_path(path)?;
-            WorkspaceSpec::for_auto(root)?
-        }
-        None => interactive_workspace(mode)?,
     };
     let sync_delete = resolve_sync_delete(sync_delete_override, &workspace)?;
-    let sync_clipboard = resolve_sync_clipboard(sync_clipboard_override)?;
+    let sync_clipboard = resolve_sync_clipboard(sync_clipboard_override, clipboard_only)?;
 
     Ok(RuntimeOptions {
         mode,
@@ -168,6 +194,10 @@ pub fn collect_runtime_options(cli: Cli, device: &DeviceConfig) -> Result<Runtim
         workspace,
         sync_delete,
         sync_clipboard,
+        clipboard: ClipboardRuntimeOptions {
+            max_file_bytes: config.clipboard.max_file_bytes,
+            cache_dir: config.clipboard_cache_dir()?,
+        },
         interval_secs: cli.interval_secs.max(1),
     })
 }
@@ -294,27 +324,53 @@ fn resolve_sync_delete(
     prompt_confirm("同步删除吗", false)
 }
 
-fn resolve_sync_clipboard(sync_clipboard_override: Option<bool>) -> Result<bool> {
+fn resolve_sync_clipboard(
+    sync_clipboard_override: Option<bool>,
+    clipboard_only: bool,
+) -> Result<bool> {
+    if clipboard_only {
+        return Ok(true);
+    }
+
     if let Some(sync_clipboard) = sync_clipboard_override {
         return Ok(sync_clipboard);
     }
 
-    prompt_confirm("同步纯文本剪贴板吗（双方都开启才会生效）", false)
+    prompt_confirm(
+        "同步剪贴板吗（支持文本/富文本/图片/文件，双方都开启才会生效）",
+        false,
+    )
 }
 
-fn choose_mode(device: &DeviceConfig, connection: ConnectionPreference) -> Result<SyncMode> {
-    let options = match connection {
-        ConnectionPreference::Host => vec![
+fn choose_mode(
+    device: &DeviceConfig,
+    connection: ConnectionPreference,
+    clipboard_only: bool,
+) -> Result<SyncMode> {
+    let options = match (connection, clipboard_only) {
+        (ConnectionPreference::Host, false) => vec![
             "自动协商: 监听时根据客户端请求决定方向，使用同一个目录收发 (Recommended)".to_string(),
             "发送方: 把本地文件同步给对方".to_string(),
             "接收方: 接收对方同步过来的文件".to_string(),
             "双向同步: 两边都能发送和接收".to_string(),
         ],
-        ConnectionPreference::Join => vec![
+        (ConnectionPreference::Join, false) => vec![
             "发送方: 把本地文件同步给对方".to_string(),
             "接收方: 接收对方同步过来的文件".to_string(),
             "双向同步: 两边都能发送和接收".to_string(),
             "自动协商: 使用同一个目录收发，并尽量根据对端能力协商".to_string(),
+        ],
+        (ConnectionPreference::Host, true) => vec![
+            "自动协商: 监听时根据客户端请求决定剪贴板方向，不同步文件 (Recommended)".to_string(),
+            "发送方: 把本机剪贴板同步给对方".to_string(),
+            "接收方: 只接收对方剪贴板".to_string(),
+            "双向同步: 两边都能发送和接收剪贴板".to_string(),
+        ],
+        (ConnectionPreference::Join, true) => vec![
+            "发送方: 把本机剪贴板同步给对方".to_string(),
+            "接收方: 只接收对方剪贴板".to_string(),
+            "双向同步: 两边都能发送和接收剪贴板".to_string(),
+            "自动协商: 不同步文件，只协商剪贴板方向".to_string(),
         ],
     };
     println!(
@@ -342,6 +398,10 @@ fn choose_mode(device: &DeviceConfig, connection: ConnectionPreference) -> Resul
             _ => SyncMode::Auto,
         },
     })
+}
+
+fn choose_clipboard_only() -> Result<bool> {
+    prompt_confirm("仅同步剪贴板，不同步文件吗", false)
 }
 
 fn choose_connection() -> Result<ConnectionPreference> {

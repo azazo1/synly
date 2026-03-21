@@ -7,8 +7,8 @@ use crate::config::DeviceConfig;
 use crate::crypto;
 use crate::discovery::{self, Advertisement, DiscoveredPeer};
 use crate::protocol::{
-    ControlMessage, DeviceIdentity, FileChunkHeader, Frame, FrameReader, FrameWriter,
-    PairRequestPayload, SessionAgreement,
+    ClipboardPayload, ControlMessage, DeviceIdentity, FileChunkHeader, Frame, FrameReader,
+    FrameWriter, PROTOCOL_VERSION, PairRequestPayload, SessionAgreement,
 };
 use crate::sync::{
     DeletePolicy, WorkspaceSpec, apply_file_metadata, build_apply_plan, build_incoming_snapshot,
@@ -112,6 +112,7 @@ async fn run_host(device: DeviceConfig, options: RuntimeOptions) -> Result<()> {
                     options.interval_secs,
                     options.sync_delete,
                     options.sync_clipboard,
+                    &options.clipboard,
                 )
                 .await?;
                 break;
@@ -137,6 +138,7 @@ async fn run_client(device: DeviceConfig, options: RuntimeOptions) -> Result<()>
                     options.interval_secs,
                     options.sync_delete,
                     options.sync_clipboard,
+                    &options.clipboard,
                 )
                 .await?;
                 break;
@@ -175,7 +177,7 @@ async fn handle_incoming_connection(
             }
         };
 
-        if payload.protocol_version != 1 {
+        if payload.protocol_version != PROTOCOL_VERSION {
             FrameWriter::new(&mut server_stream)
                 .write_frame(Frame::Control(ControlMessage::Error {
                     message: format!("不支持的协议版本: {}", payload.protocol_version),
@@ -332,7 +334,7 @@ async fn connect_to_peer(
 
     let remote_info = {
         let payload = PairRequestPayload {
-            protocol_version: 1,
+            protocol_version: PROTOCOL_VERSION,
             client: device_identity(device),
             requested_mode: options.mode,
             workspace: options.workspace.summary(options.sync_clipboard),
@@ -434,6 +436,7 @@ async fn run_sync_session(
     interval_secs: u64,
     sync_delete: bool,
     sync_clipboard: bool,
+    clipboard_options: &crate::cli::ClipboardRuntimeOptions,
 ) -> Result<()> {
     println!();
     println!("{}", style("同步已开始").bold());
@@ -448,6 +451,12 @@ async fn run_sync_session(
 
     let local_can_send = allows_local_send(session.role, &session.agreement);
     let local_can_receive = allows_local_receive(session.role, &session.agreement);
+    let file_can_send = local_can_send
+        && workspace.can_send_files()
+        && session.remote_workspace.can_receive_files();
+    let file_can_receive = local_can_receive
+        && workspace.can_receive_files()
+        && session.remote_workspace.can_send_files();
     let clipboard_enabled_on_both = sync_clipboard && session.remote_workspace.sync_clipboard;
     let clipboard_can_send = clipboard_enabled_on_both && local_can_send;
     let clipboard_can_receive = clipboard_enabled_on_both && local_can_receive;
@@ -466,7 +475,7 @@ async fn run_sync_session(
     let (tx, rx) = mpsc::channel::<Frame>(64);
     let writer_task = tokio::spawn(writer_loop(write_half, rx));
 
-    let snapshot_task = if local_can_send {
+    let snapshot_task = if file_can_send {
         let outgoing = workspace
             .outgoing
             .clone()
@@ -480,7 +489,12 @@ async fn run_sync_session(
     } else {
         None
     };
-    let clipboard_sync = clipboard_enabled_on_both.then(ClipboardSync::new);
+    let clipboard_sync = clipboard_enabled_on_both.then(|| {
+        ClipboardSync::new(
+            clipboard_options.max_file_bytes,
+            clipboard_options.cache_dir.clone(),
+        )
+    });
     let (clipboard_watch_handle, clipboard_task) = if clipboard_can_send {
         let clipboard_sync = clipboard_sync
             .as_ref()
@@ -494,7 +508,7 @@ async fn run_sync_session(
             }
         };
         if watcher.is_some()
-            && let Err(err) = clipboard_sync.publish_initial_text(&clipboard_tx).await
+            && let Err(err) = clipboard_sync.publish_initial_payload(&clipboard_tx).await
         {
             eprintln!("无法读取当前剪贴板内容，已跳过初始剪贴板同步: {err:#}");
         }
@@ -525,7 +539,7 @@ async fn run_sync_session(
 
         match frame {
             Frame::Control(ControlMessage::SnapshotAdvert { revision, snapshot }) => {
-                if !local_can_receive {
+                if !file_can_receive {
                     continue;
                 }
                 discard_superseded_revisions(&mut pending_revisions, &mut incoming_files, revision)
@@ -577,7 +591,7 @@ async fn run_sync_session(
                 }
             }
             Frame::Control(ControlMessage::FileRequest { revision, paths }) => {
-                if !local_can_send {
+                if !file_can_send {
                     continue;
                 }
                 let sender = tx.clone();
@@ -605,16 +619,6 @@ async fn run_sync_session(
                 }
                 maybe_finalize_revision(&incoming_root, &mut pending_revisions, revision);
             }
-            Frame::Control(ControlMessage::ClipboardUpdate { text }) => {
-                if !clipboard_can_receive {
-                    continue;
-                }
-                if let Some(clipboard_sync) = &clipboard_sync
-                    && let Err(err) = clipboard_sync.apply_remote_text(text).await
-                {
-                    eprintln!("无法应用远端剪贴板内容: {err:#}");
-                }
-            }
             Frame::Control(ControlMessage::TransferAborted { revision, message }) => {
                 eprintln!("对端中止了修订版 {revision} 的传输: {message}");
                 abort_revision(&mut pending_revisions, &mut incoming_files, revision).await?;
@@ -629,7 +633,20 @@ async fn run_sync_session(
             | Frame::Control(ControlMessage::PairDecision { .. }) => {
                 bail!("received an unexpected pairing message after session start")
             }
+            Frame::Clipboard(payload) => {
+                if !clipboard_can_receive {
+                    continue;
+                }
+                if let Some(clipboard_sync) = &clipboard_sync
+                    && let Err(err) = clipboard_sync.apply_remote_payload(payload).await
+                {
+                    eprintln!("无法应用远端剪贴板内容: {err:#}");
+                }
+            }
             Frame::FileChunk(header, data) => {
+                if !file_can_receive {
+                    continue;
+                }
                 if !pending_revisions.contains_key(&header.revision) {
                     continue;
                 }
@@ -674,12 +691,11 @@ where
 }
 
 async fn clipboard_sender_loop(
-    mut rx: mpsc::UnboundedReceiver<String>,
+    mut rx: mpsc::UnboundedReceiver<ClipboardPayload>,
     tx: mpsc::Sender<Frame>,
 ) -> Result<()> {
-    while let Some(text) = rx.recv().await {
-        tx.send(Frame::Control(ControlMessage::ClipboardUpdate { text }))
-            .await?;
+    while let Some(payload) = rx.recv().await {
+        tx.send(Frame::Clipboard(payload)).await?;
     }
     Ok(())
 }
@@ -1328,6 +1344,9 @@ fn print_host_ready(device: &DeviceConfig, options: &RuntimeOptions, port: u16) 
     println!("{}", style("Synly 已就绪").bold());
     println!("设备: {} ({})", device.device_name, device.short_id());
     println!("模式: {}", options.mode.label());
+    if !options.workspace.file_sync_enabled() {
+        println!("文件同步: 关闭（仅剪贴板）");
+    }
     println!(
         "剪贴板同步: {}",
         sync_clipboard_label(options.sync_clipboard)

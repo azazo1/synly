@@ -121,6 +121,14 @@ struct ScopedIgnoreMatcher {
 }
 
 impl WorkspaceSpec {
+    pub fn for_clipboard_only(mode: SyncMode) -> Self {
+        Self {
+            mode,
+            outgoing: None,
+            incoming_root: None,
+        }
+    }
+
     pub fn for_send(paths: Vec<PathBuf>) -> Result<Self> {
         if paths.is_empty() {
             bail!("at least one path is required for send mode");
@@ -199,8 +207,24 @@ impl WorkspaceSpec {
         }
     }
 
+    pub fn can_send_files(&self) -> bool {
+        self.outgoing.is_some()
+    }
+
+    pub fn can_receive_files(&self) -> bool {
+        self.incoming_root.is_some()
+    }
+
+    pub fn file_sync_enabled(&self) -> bool {
+        self.can_send_files() || self.can_receive_files()
+    }
+
     pub fn local_human_lines(&self, sync_clipboard: bool) -> Vec<String> {
         let mut lines = vec![format!("模式: {}", self.mode.label())];
+
+        if !self.file_sync_enabled() {
+            lines.push("文件同步: 关闭（仅剪贴板）".to_string());
+        }
 
         match &self.outgoing {
             Some(OutgoingSpec::RootContents { root }) => {
@@ -227,8 +251,24 @@ impl WorkspaceSpec {
 }
 
 impl WorkspaceSummary {
+    pub fn can_send_files(&self) -> bool {
+        self.send_layout.is_some()
+    }
+
+    pub fn can_receive_files(&self) -> bool {
+        self.receive_root.is_some()
+    }
+
+    pub fn file_sync_enabled(&self) -> bool {
+        self.can_send_files() || self.can_receive_files()
+    }
+
     pub fn human_lines(&self) -> Vec<String> {
         let mut lines = vec![format!("模式: {}", self.mode.label())];
+
+        if !self.file_sync_enabled() {
+            lines.push("文件同步: 关闭（仅剪贴板）".to_string());
+        }
 
         if let Some(description) = &self.send_description {
             lines.push(format!("发送: {}", description));
@@ -1180,6 +1220,31 @@ mod tests {
 
         let plan = build_apply_plan(&remote, &local, DeletePolicy::MirrorSelectedItems);
         assert_eq!(plan.delete_paths, vec!["docs/old.txt".to_string()]);
+    }
+
+    #[test]
+    fn clipboard_only_workspace_reports_file_sync_disabled() {
+        let workspace = WorkspaceSpec::for_clipboard_only(SyncMode::Both);
+
+        assert!(!workspace.file_sync_enabled());
+        assert!(!workspace.can_send_files());
+        assert!(!workspace.can_receive_files());
+
+        let lines = workspace.local_human_lines(true);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("文件同步: 关闭（仅剪贴板）"))
+        );
+
+        let summary = workspace.summary(true);
+        assert!(!summary.file_sync_enabled());
+        let remote_lines = summary.human_lines();
+        assert!(
+            remote_lines
+                .iter()
+                .any(|line| line.contains("文件同步: 关闭（仅剪贴板）"))
+        );
     }
 
     #[test]
