@@ -139,7 +139,7 @@ synly auto . --host --pin 123456 --accept --trust-device
 synly auto . --join --peer workstation --pin 123456 --trust-device
 ```
 
-如果这次 PIN 认证成功，双方都会保存对端的身份公钥和 TLS 根证书。
+如果这次 PIN 认证成功，并且服务端在确认时选择 `T`、客户端也同意信任服务端，那么双方都会保存对端的身份公钥和 TLS 根证书。
 
 ### 方式四：后续免 PIN 自动运行
 
@@ -155,7 +155,7 @@ synly auto . --host --accept --trusted-only
 synly auto . --join --peer workstation --trusted-only
 ```
 
-这时如果双方之前已经通过 `--trust-device` 建立过可信设备绑定，就不会再询问 PIN，而是直接走长期 mTLS。
+这时如果双方之前已经互相建立过可信设备绑定，就不会再询问 PIN，而是直接走长期 mTLS。
 
 ## 使用流程
 
@@ -173,7 +173,7 @@ synly auto . --host
 2. 打印当前设备模式、端口，并开始等待请求
 3. 如果连接方尚未被信任，先只接收一个最小 bootstrap 请求，并显示客户端 bootstrap 指纹 ASCII 图、本次会话核对图和该请求专属的 6 位 PIN
 4. 客户端输入 PIN 后，双方先完成 SPAKE2 PAKE，再切换到临时 mTLS；只有这之后，服务端才会看到对端设备身份、请求模式和同步摘要
-5. 认证通过后，如果没有传 `--accept`，再询问你是否接受本次同步
+5. 认证通过后，如果没有传 `--accept`，再询问你是否接受本次同步；输入 `T` 表示接受并信任该客户端，`Y` 表示只接受本次，`n` 表示拒绝
 
 ### 客户端（连接方）
 
@@ -190,7 +190,8 @@ synly both . --join
 3. 如果双方已有可信设备绑定，就直接通过长期 mTLS + 身份签名免 PIN 建立认证
 4. 否则客户端先生成一次性 bootstrap 指纹 ASCII 图并发起最小请求，服务端随后显示相同的客户端 bootstrap 图、本次会话核对图以及该会话专属的 6 位 PIN
 5. 客户端核对图形后输入 PIN，双方完成 SPAKE2 PAKE，验证彼此的 key confirmation，再派生临时 mTLS，并只在这条信道里发送设备身份和同步摘要
-6. 等待服务端确认后建立同步
+6. 如果服务端选择了信任客户端，而本机还没保存该服务端，客户端会再询问是否也信任服务端；传了 `--trust-device` 时会自动同意
+7. 完成确认后建立同步
 
 ## 命令概览
 
@@ -405,7 +406,7 @@ Synly 当前的安全连接模型是：
 7. 双方再用 `X25519 shared secret + PAKE key + request_id + 双方 bootstrap 公钥` 派生一次性临时 mTLS 根证书和双端叶子证书
 8. 只有在临时 mTLS 建好以后，客户端才会发送本机身份、请求模式和同步摘要
 9. host 会对未信任设备的失败尝试做超时、退避、失败次数限制和冷却，降低在线猜 PIN 风险
-10. 如果这次 PIN 认证成功并且双方都开启了 `--trust-device`，双方会保存彼此的长期身份公钥和设备根证书；后续会话必须同时通过长期 mTLS 和对应私钥签名，才会被当作可信设备
+10. 如果这次 PIN 认证成功，并且服务端在确认时选择信任客户端，客户端随后也同意信任服务端，双方就会保存彼此的长期身份公钥和设备根证书；后续会话必须同时通过长期 mTLS 和对应私钥签名，才会被当作可信设备
 11. 服务端确认请求后，才开始同步
 
 这意味着：
@@ -484,7 +485,7 @@ successful_sessions = 3
 - `clipboard.cache_dir` 可选；可以写绝对路径，也可以写相对配置目录的路径
 - 未设置 `clipboard.cache_dir` 时，剪贴板文件缓存默认保存在同一配置目录下的 `clipboard-cache/current/`
 - `device.identity_private_key` / `device.identity_public_key` 是当前设备的长期身份密钥
-- `trusted_devices` 可选；只有双方都曾在一次 PIN 认证成功后启用 `--trust-device`，这里才会出现记录；以后会用这里保存的公钥和根证书建立 mTLS，并校验对端签名
+- `trusted_devices` 可选；只有在一次 PIN 认证成功后，本机明确同意信任对端时，这里才会出现记录；以后会用这里保存的公钥和根证书建立 mTLS，并校验对端签名
 
 设备名称来源优先级大致为：
 

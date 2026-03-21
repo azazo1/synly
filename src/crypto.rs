@@ -405,6 +405,7 @@ pub fn sign_pair_decision(
     agreement: &SessionAgreement,
     workspace: &WorkspaceSummary,
     auth_method: PairAuthMethod,
+    server_trusts_client: bool,
     trust_established: bool,
 ) -> Result<String> {
     let payload = serde_json::to_vec(&DecisionProofPayload {
@@ -414,6 +415,7 @@ pub fn sign_pair_decision(
         agreement,
         workspace,
         auth_method,
+        server_trusts_client,
         trust_established,
     })?;
     Ok(sign_payload(
@@ -439,6 +441,7 @@ pub fn verify_pair_decision(
             workspace,
             agreement,
             auth_method,
+            server_trusts_client,
             proof,
             trust_established,
             ..
@@ -450,6 +453,7 @@ pub fn verify_pair_decision(
                 agreement,
                 workspace,
                 auth_method: *auth_method,
+                server_trusts_client: *server_trusts_client,
                 trust_established: *trust_established,
             })?;
             verify_payload(
@@ -509,6 +513,7 @@ pub fn sign_trusted_pair_decision(
     server: &DeviceIdentity,
     agreement: &SessionAgreement,
     workspace: &WorkspaceSummary,
+    server_trusts_client: bool,
     trust_established: bool,
 ) -> Result<String> {
     let payload = serde_json::to_vec(&DecisionProofPayload {
@@ -518,6 +523,7 @@ pub fn sign_trusted_pair_decision(
         agreement,
         workspace,
         auth_method: PairAuthMethod::TrustedDevice,
+        server_trusts_client,
         trust_established,
     })?;
     sign_identity_payload(
@@ -543,6 +549,7 @@ pub fn verify_trusted_pair_decision(
             workspace,
             agreement,
             auth_method,
+            server_trusts_client,
             proof,
             trust_established,
             ..
@@ -554,6 +561,7 @@ pub fn verify_trusted_pair_decision(
                 agreement,
                 workspace,
                 auth_method: *auth_method,
+                server_trusts_client: *server_trusts_client,
                 trust_established: *trust_established,
             })?;
             verify_identity_payload(
@@ -577,6 +585,7 @@ struct DecisionProofPayload<'a> {
     agreement: &'a SessionAgreement,
     workspace: &'a WorkspaceSummary,
     auth_method: PairAuthMethod,
+    server_trusts_client: bool,
     trust_established: bool,
 }
 
@@ -1147,7 +1156,10 @@ mod tests {
     use super::*;
     use crate::cli::SyncMode;
     use crate::config::DeviceConfig;
-    use crate::protocol::{DeviceIdentity, PROTOCOL_VERSION, PairRequestPayload};
+    use crate::protocol::{
+        ControlMessage, DeviceIdentity, PROTOCOL_VERSION, PairAuthMethod, PairRequestPayload,
+        SessionAgreement,
+    };
     use crate::sync::WorkspaceSummary;
     use ring::rand::SystemRandom;
     use ring::signature::KeyPair;
@@ -1233,6 +1245,140 @@ mod tests {
         let (_, other_public_key) = sample_identity();
         assert!(
             verify_trusted_pair_auth(&exporter, &other_public_key, "request", &payload, &proof)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn pair_decision_signature_covers_server_trust_choice() {
+        let device = sample_device();
+        let exporter = [5u8; 32];
+        let request_id = "request";
+        let pin = "123456";
+        let message = "accepted";
+        let server = DeviceIdentity {
+            device_id: device.device_id,
+            device_name: device.device_name.clone(),
+            identity_public_key: device.identity_public_key().unwrap().to_string(),
+            tls_root_certificate: device_tls_root_certificate(&device).unwrap(),
+        };
+        let agreement = SessionAgreement {
+            host_to_client: true,
+            client_to_host: false,
+        };
+        let workspace = WorkspaceSummary {
+            mode: SyncMode::Both,
+            send_description: Some("demo".into()),
+            send_layout: None,
+            send_items: vec![],
+            receive_root: Some("/tmp".into()),
+            sync_clipboard: false,
+        };
+        let proof = sign_pair_decision(
+            &exporter,
+            request_id,
+            pin,
+            true,
+            message,
+            &server,
+            &agreement,
+            &workspace,
+            PairAuthMethod::Pin,
+            true,
+            false,
+        )
+        .unwrap();
+        let decision = ControlMessage::PairDecision {
+            accepted: true,
+            message: message.into(),
+            server: server.clone(),
+            workspace: workspace.clone(),
+            agreement: agreement.clone(),
+            auth_method: PairAuthMethod::Pin,
+            server_trusts_client: true,
+            proof: proof.clone(),
+            trust_established: false,
+        };
+        verify_pair_decision(&decision, &exporter, request_id, pin).unwrap();
+
+        let tampered_decision = ControlMessage::PairDecision {
+            accepted: true,
+            message: message.into(),
+            server,
+            workspace,
+            agreement,
+            auth_method: PairAuthMethod::Pin,
+            server_trusts_client: false,
+            proof,
+            trust_established: false,
+        };
+        assert!(verify_pair_decision(&tampered_decision, &exporter, request_id, pin).is_err());
+    }
+
+    #[test]
+    fn trusted_pair_decision_signature_covers_server_trust_choice() {
+        let (private_key, public_key) = sample_identity();
+        let device = sample_device_from_identity(private_key.clone(), public_key.clone());
+        let exporter = [6u8; 32];
+        let request_id = "request";
+        let message = "accepted";
+        let server = DeviceIdentity {
+            device_id: device.device_id,
+            device_name: device.device_name.clone(),
+            identity_public_key: public_key.clone(),
+            tls_root_certificate: device_tls_root_certificate(&device).unwrap(),
+        };
+        let agreement = SessionAgreement {
+            host_to_client: true,
+            client_to_host: true,
+        };
+        let workspace = WorkspaceSummary {
+            mode: SyncMode::Both,
+            send_description: Some("demo".into()),
+            send_layout: None,
+            send_items: vec![],
+            receive_root: Some("/tmp".into()),
+            sync_clipboard: true,
+        };
+        let proof = sign_trusted_pair_decision(
+            &private_key,
+            &exporter,
+            request_id,
+            true,
+            message,
+            &server,
+            &agreement,
+            &workspace,
+            true,
+            false,
+        )
+        .unwrap();
+        let decision = ControlMessage::PairDecision {
+            accepted: true,
+            message: message.into(),
+            server: server.clone(),
+            workspace: workspace.clone(),
+            agreement: agreement.clone(),
+            auth_method: PairAuthMethod::TrustedDevice,
+            server_trusts_client: true,
+            proof: proof.clone(),
+            trust_established: false,
+        };
+        verify_trusted_pair_decision(&decision, &exporter, request_id, &public_key).unwrap();
+
+        let tampered_decision = ControlMessage::PairDecision {
+            accepted: true,
+            message: message.into(),
+            server,
+            workspace,
+            agreement,
+            auth_method: PairAuthMethod::TrustedDevice,
+            server_trusts_client: false,
+            proof,
+            trust_established: false,
+        };
+        assert!(
+            verify_trusted_pair_decision(&tampered_decision, &exporter, request_id, &public_key)
                 .is_err()
         );
     }

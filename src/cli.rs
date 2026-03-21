@@ -64,7 +64,7 @@ pub struct Cli {
     #[arg(
         long,
         global = true,
-        help = "在 PIN 认证成功后互相记住设备身份公钥，后续双方可免 PIN 并校验签名"
+        help = "在 PIN 认证成功后尽量建立可信设备绑定；host 端会直接记住对端，join 端会自动同意“是否信任服务端”的提示"
     )]
     pub trust_device: bool,
     #[arg(

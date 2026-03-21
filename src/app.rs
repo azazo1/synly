@@ -86,6 +86,7 @@ struct PairDecisionParams<'a> {
     agreement: &'a SessionAgreement,
     auth_method: PairAuthMethod,
     pin: Option<&'a str>,
+    server_trusts_client: bool,
     trust_established: bool,
 }
 
@@ -352,6 +353,7 @@ async fn handle_trusted_incoming_connection(
         agreement: &agreement,
         auth_method: PairAuthMethod::TrustedDevice,
         pin: None,
+        server_trusts_client: true,
         trust_established: false,
     })?;
     FrameWriter::new(&mut server_stream)
@@ -632,6 +634,7 @@ async fn handle_bootstrap_incoming_connection(
             TrustPromptDecision::Reject => (false, false),
         }
     };
+    let server_trusts_client = accepted && remember_trusted_device;
     let trust_established = accepted && remember_trusted_device && payload.request_trust;
     let message = if accepted {
         "服务端已接受同步请求。".to_string()
@@ -649,6 +652,7 @@ async fn handle_bootstrap_incoming_connection(
         agreement: &agreement,
         auth_method: PairAuthMethod::Pin,
         pin: Some(&pin),
+        server_trusts_client,
         trust_established,
     })?;
     FrameWriter::new(&mut server_stream)
@@ -736,6 +740,7 @@ async fn connect_to_trusted_peer(
             workspace,
             agreement,
             auth_method,
+            server_trusts_client,
             proof,
             trust_established,
         } => {
@@ -749,6 +754,7 @@ async fn connect_to_trusted_peer(
                 workspace: workspace.clone(),
                 agreement: agreement.clone(),
                 auth_method,
+                server_trusts_client,
                 proof,
                 trust_established,
             };
@@ -930,20 +936,43 @@ async fn connect_to_untrusted_peer(
         other => bail!("unexpected bootstrap pairing response: {other:?}"),
     };
 
-    if let ControlMessage::PairDecision {
-        trust_established, ..
-    } = &reply
-        && *trust_established
-        && options.pairing.trust_device
-    {
-        config.remember_trusted_device(
-            remote.device_id,
-            remote.device_name.clone(),
-            remote.identity_public_key.clone(),
-            remote.tls_root_certificate.clone(),
-        );
-        config.save()?;
-        println!("已保存对端身份公钥和 TLS 根证书，后续连接会使用长期 mTLS 并可免 PIN。");
+    let (server_trusts_client, trust_established) = match &reply {
+        ControlMessage::PairDecision {
+            server_trusts_client,
+            trust_established,
+            ..
+        } => (*server_trusts_client, *trust_established),
+        _ => (false, false),
+    };
+    if server_trusts_client && !has_trusted_transport_for_device(config, &remote.device_id) {
+        let remember_server = if options.pairing.trust_device {
+            true
+        } else {
+            prompt_confirm(
+                "服务端已选择信任本机。也信任这个服务端，以便后续直接建立安全连接吗",
+                true,
+            )?
+        };
+        if remember_server {
+            config.remember_trusted_device(
+                remote.device_id,
+                remote.device_name.clone(),
+                remote.identity_public_key.clone(),
+                remote.tls_root_certificate.clone(),
+            );
+            config.save()?;
+            if options.pairing.trust_device {
+                println!(
+                    "服务端已信任本机，已按 --trust-device 保存对端身份公钥和 TLS 根证书，后续连接会优先使用长期 mTLS。"
+                );
+            } else if trust_established {
+                println!("双方都已保存彼此身份，后续连接会优先使用长期 mTLS 并可免 PIN。");
+            } else {
+                println!("已保存服务端身份公钥和 TLS 根证书，后续连接会优先使用长期 mTLS。");
+            }
+        } else {
+            println!("本机未保存服务端身份；下次连接仍会走 bootstrap/PIN/PAKE 流程。");
+        }
     }
 
     let tls_stream: TlsStream<TcpStream> = client_stream.into();
@@ -1932,6 +1961,14 @@ fn has_trusted_transport(config: &SynlyConfig) -> bool {
     })
 }
 
+fn has_trusted_transport_for_device(config: &SynlyConfig, device_id: &Uuid) -> bool {
+    config.trusted_devices.iter().any(|device| {
+        device.device_id == *device_id
+            && !device.public_key.trim().is_empty()
+            && !device.tls_root_certificate.trim().is_empty()
+    })
+}
+
 fn print_pair_request_overview(
     payload: &PairRequestPayload,
     options: &RuntimeOptions,
@@ -2031,6 +2068,7 @@ fn signed_pair_decision(params: PairDecisionParams<'_>) -> Result<ControlMessage
             params.agreement,
             &summary,
             params.auth_method,
+            params.server_trusts_client,
             params.trust_established,
         )?,
         PairAuthMethod::TrustedDevice => crypto::sign_trusted_pair_decision(
@@ -2042,6 +2080,7 @@ fn signed_pair_decision(params: PairDecisionParams<'_>) -> Result<ControlMessage
             &server,
             params.agreement,
             &summary,
+            params.server_trusts_client,
             params.trust_established,
         )?,
     };
@@ -2052,6 +2091,7 @@ fn signed_pair_decision(params: PairDecisionParams<'_>) -> Result<ControlMessage
         workspace: summary,
         agreement: params.agreement.clone(),
         auth_method: params.auth_method,
+        server_trusts_client: params.server_trusts_client,
         proof,
         trust_established: params.trust_established,
     })

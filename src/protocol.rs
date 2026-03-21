@@ -11,7 +11,7 @@ const FRAME_CLIPBOARD: u8 = 3;
 const MAX_META_LEN: usize = 4 * 1024 * 1024;
 const MAX_DATA_LEN: usize = 64 * 1024 * 1024;
 
-pub const PROTOCOL_VERSION: u16 = 7;
+pub const PROTOCOL_VERSION: u16 = 8;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -94,6 +94,8 @@ pub enum ControlMessage {
         agreement: SessionAgreement,
         #[serde(default)]
         auth_method: PairAuthMethod,
+        #[serde(default)]
+        server_trusts_client: bool,
         proof: String,
         #[serde(default)]
         trust_established: bool,
