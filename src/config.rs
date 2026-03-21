@@ -14,7 +14,7 @@ use uuid::Uuid;
 const CONFIG_FILE_NAME: &str = "config.toml";
 const LEGACY_DEVICE_CONFIG_FILE_NAME: &str = "device.json";
 const CLIPBOARD_CACHE_DIR_NAME: &str = "clipboard-cache";
-const DEFAULT_CLIPBOARD_MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
+const DEFAULT_CLIPBOARD_MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SynlyConfig {

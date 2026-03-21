@@ -50,6 +50,12 @@ pub struct Cli {
     #[arg(
         long,
         global = true,
+        help = "发送目录时允许递归进入的最大文件夹深度；0 表示只发送共享根目录下的直接内容，默认不限制"
+    )]
+    pub max_folder_depth: Option<usize>,
+    #[arg(
+        long,
+        global = true,
         help = "join 模式下要连接的设备；可填写设备名、设备 ID 前缀或广播出的 IPv4 地址"
     )]
     pub peer: Option<String>,
@@ -235,7 +241,8 @@ pub fn collect_runtime_options(cli: Cli, config: &SynlyConfig) -> Result<Runtime
             }
             None => interactive_workspace(mode)?,
         }
-    };
+    }
+    .with_max_folder_depth(cli.max_folder_depth);
     let sync_delete = resolve_sync_delete(sync_delete_override, &workspace)?;
     let sync_clipboard = resolve_sync_clipboard(sync_clipboard_override, clipboard_only)?;
     let pin = cli.pin.as_deref().map(normalize_pin).transpose()?;
@@ -689,6 +696,8 @@ mod tests {
             "--sync-clipboard",
             "--interval-secs",
             "9",
+            "--max-folder-depth",
+            "2",
             "receive",
             ".",
         ])
@@ -702,6 +711,8 @@ mod tests {
             "--sync-clipboard",
             "--interval-secs",
             "9",
+            "--max-folder-depth",
+            "2",
         ])
         .unwrap();
 
@@ -726,6 +737,8 @@ mod tests {
             "--no-sync-clipboard",
             "--interval-secs",
             "9",
+            "--max-folder-depth",
+            "4",
         ])
         .unwrap();
 
@@ -736,7 +749,27 @@ mod tests {
         assert!(!options.sync_delete);
         assert!(!options.sync_clipboard);
         assert_eq!(options.interval_secs, 9);
+        assert_eq!(options.workspace.summary(false).max_folder_depth, None);
         assert!(options.workspace.incoming_root.is_some());
+    }
+
+    #[test]
+    fn collect_runtime_options_applies_max_folder_depth_to_outgoing_workspace() {
+        let cli = Cli::try_parse_from([
+            "synly",
+            "both",
+            ".",
+            "--join",
+            "--no-sync-delete",
+            "--no-sync-clipboard",
+            "--max-folder-depth",
+            "4",
+        ])
+        .unwrap();
+
+        let options = collect_runtime_options(cli, &test_config()).unwrap();
+
+        assert_eq!(options.workspace.summary(false).max_folder_depth, Some(4));
     }
 
     #[test]
@@ -786,6 +819,7 @@ mod tests {
         assert!(cli.sync_clipboard);
         assert!(!cli.no_sync_clipboard);
         assert_eq!(cli.interval_secs, 9);
+        assert_eq!(cli.max_folder_depth, Some(2));
         match cli.command {
             Some(Command::Receive { path }) => {
                 assert_eq!(path, Some(std::path::PathBuf::from(".")));

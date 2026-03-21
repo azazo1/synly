@@ -10,10 +10,11 @@ use crate::discovery::{self, Advertisement, DiscoveredPeer};
 use crate::protocol::{
     ClipboardPayload, ControlMessage, DeviceIdentity, FileChunkHeader, Frame, FrameReader,
     FrameWriter, PROTOCOL_VERSION, PairAuthMethod, PairRequestPayload, SessionAgreement,
+    frame_size_limit_message,
 };
 use crate::sync::{
     DeletePolicy, WorkspaceSpec, apply_file_metadata, build_apply_plan, build_incoming_snapshot,
-    build_snapshot, delete_paths_best_effort, ensure_directories,
+    build_snapshot, delete_paths_best_effort, ensure_directories, filter_snapshot_by_folder_depth,
     filter_snapshot_for_incoming_root, resolve_incoming_path, resolve_outgoing_path,
     snapshot_contains_file, watch_targets,
 };
@@ -33,13 +34,15 @@ use tokio::time::{self, Instant};
 use tokio_rustls::TlsStream;
 use uuid::Uuid;
 
-const FILE_CHUNK_SIZE: usize = 256 * 1024;
+const FILE_STREAM_CHUNK_SIZE: usize = 256 * 1024;
 const PAIRING_TIMEOUT: Duration = Duration::from_secs(90);
 const TLS_UPGRADE_TIMEOUT: Duration = Duration::from_secs(15);
 const PAIRING_FAILURE_WINDOW: Duration = Duration::from_secs(5 * 60);
 const PAIRING_COOLDOWN: Duration = Duration::from_secs(3 * 60);
 const PAIRING_MAX_FAILURES: u32 = 5;
 const PAIRING_BACKOFF_BASE_MS: u64 = 1_000;
+const RECONNECT_BASE_DELAY: Duration = Duration::from_secs(2);
+const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Copy, Debug)]
 enum SessionRole {
@@ -144,7 +147,12 @@ async fn run_host(config: &mut SynlyConfig, options: RuntimeOptions) -> Result<(
             .await
         {
             Ok(Some(session)) => {
-                run_sync_session(
+                let remote_label = format!(
+                    "{} ({})",
+                    session.remote.device_name,
+                    short_uuid(&session.remote.device_id)
+                );
+                match run_sync_session(
                     session,
                     &options.workspace,
                     options.interval_secs,
@@ -152,8 +160,15 @@ async fn run_host(config: &mut SynlyConfig, options: RuntimeOptions) -> Result<(
                     options.sync_clipboard,
                     &options.clipboard,
                 )
-                .await?;
-                break;
+                .await
+                {
+                    Ok(()) => {
+                        println!("与 {remote_label} 的连接已断开，继续等待重连。");
+                    }
+                    Err(err) => {
+                        eprintln!("与 {remote_label} 的同步会话中断: {err:#}");
+                    }
+                }
             }
             Ok(None) => continue,
             Err(err) => {
@@ -161,19 +176,37 @@ async fn run_host(config: &mut SynlyConfig, options: RuntimeOptions) -> Result<(
             }
         }
     }
-
-    Ok(())
 }
 
 async fn run_client(config: &mut SynlyConfig, options: RuntimeOptions) -> Result<()> {
+    let discovery_timeout = Duration::from_secs(options.pairing.discovery_secs);
+    let mut reconnect_query = options.pairing.peer_query.clone();
+    let mut reconnect_delay = RECONNECT_BASE_DELAY;
+
     loop {
-        let peer = choose_peer(
-            options.pairing.peer_query.as_deref(),
-            Duration::from_secs(options.pairing.discovery_secs),
-        )?;
+        let peer = match choose_peer(reconnect_query.as_deref(), discovery_timeout) {
+            Ok(peer) => peer,
+            Err(err) => {
+                if reconnect_query.is_some() {
+                    eprintln!("等待目标设备重新出现: {err:#}");
+                    sleep_before_reconnect(reconnect_delay).await;
+                    reconnect_delay = next_reconnect_delay(reconnect_delay);
+                    continue;
+                }
+                return Err(err);
+            }
+        };
+        reconnect_query = Some(peer.device_id.clone());
+
         match connect_to_peer(&peer, config, &options).await {
             Ok(session) => {
-                run_sync_session(
+                let remote_label = format!(
+                    "{} ({})",
+                    session.remote.device_name,
+                    short_uuid(&session.remote.device_id)
+                );
+                reconnect_delay = RECONNECT_BASE_DELAY;
+                if let Err(err) = run_sync_session(
                     session,
                     &options.workspace,
                     options.interval_secs,
@@ -181,22 +214,22 @@ async fn run_client(config: &mut SynlyConfig, options: RuntimeOptions) -> Result
                     options.sync_clipboard,
                     &options.clipboard,
                 )
-                .await?;
-                break;
+                .await
+                {
+                    eprintln!("与 {remote_label} 的同步会话中断: {err:#}");
+                } else {
+                    eprintln!("与 {remote_label} 的连接已断开。");
+                }
+                sleep_before_reconnect(reconnect_delay).await;
+                reconnect_delay = next_reconnect_delay(reconnect_delay);
             }
             Err(err) => {
                 eprintln!("连接失败: {err:#}");
-                if options.pairing.peer_query.is_some() {
-                    break;
-                }
-                if !prompt_confirm("重新搜索设备吗", true)? {
-                    break;
-                }
+                sleep_before_reconnect(reconnect_delay).await;
+                reconnect_delay = next_reconnect_delay(reconnect_delay);
             }
         }
     }
-
-    Ok(())
 }
 
 async fn handle_incoming_connection(
@@ -1093,14 +1126,12 @@ async fn run_sync_session(
     let mut reader = FrameReader::new(read_half);
     let mut pending_revisions = BTreeMap::<u64, PendingRevision>::new();
     let mut incoming_files = HashMap::<(u64, String), IncomingFileState>::new();
-    loop {
+    let disconnected = loop {
         let frame = match reader.read_frame().await {
             Ok(frame) => frame,
             Err(err) => {
-                if let Some(io_err) = err.downcast_ref::<std::io::Error>()
-                    && io_err.kind() == std::io::ErrorKind::UnexpectedEof
-                {
-                    break;
+                if is_connection_shutdown_error(&err) {
+                    break true;
                 }
                 return Err(err);
             }
@@ -1117,7 +1148,11 @@ async fn run_sync_session(
                     "session negotiated receiving, but local workspace has no destination",
                 )?;
                 let snapshot = filter_snapshot_for_incoming_root(root, &snapshot)?;
-                let local_snapshot = build_incoming_snapshot(root)?;
+                let local_snapshot = filter_snapshot_by_folder_depth(
+                    &build_incoming_snapshot(root)?,
+                    snapshot.layout,
+                    snapshot.max_folder_depth,
+                );
                 let skipped_delete_count = if !sync_delete {
                     let preview_policy = delete_policy(snapshot.layout, true);
                     build_apply_plan(&snapshot, &local_snapshot, preview_policy)
@@ -1195,7 +1230,9 @@ async fn run_sync_session(
             Frame::Control(ControlMessage::Error { message }) => {
                 eprintln!("对端报告错误: {}", message);
             }
-            Frame::Control(ControlMessage::Goodbye) => break,
+            Frame::Control(ControlMessage::Goodbye) => {
+                break true;
+            }
             Frame::Control(ControlMessage::BootstrapHello { .. })
             | Frame::Control(ControlMessage::BootstrapChallenge { .. })
             | Frame::Control(ControlMessage::BootstrapPake { .. })
@@ -1236,7 +1273,7 @@ async fn run_sync_session(
                 .await?;
             }
         }
-    }
+    };
 
     drop(tx);
     if let Some(task) = snapshot_task {
@@ -1248,7 +1285,12 @@ async fn run_sync_session(
     if let Some(task) = clipboard_task {
         task.abort();
     }
-    writer_task.await??;
+    match writer_task.await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) if disconnected && is_connection_shutdown_error(&err) => {}
+        Ok(Err(err)) => return Err(err),
+        Err(err) => return Err(err.into()),
+    }
     Ok(())
 }
 
@@ -1258,7 +1300,16 @@ where
 {
     let mut writer = FrameWriter::new(writer);
     while let Some(frame) = rx.recv().await {
-        writer.write_frame(frame).await?;
+        match writer.write_frame(frame).await {
+            Ok(()) => {}
+            Err(err) => {
+                if let Some(message) = frame_size_limit_message(&err) {
+                    eprintln!("已跳过超出大小限制的内容: {message}");
+                    continue;
+                }
+                return Err(err);
+            }
+        }
     }
     Ok(())
 }
@@ -1420,7 +1471,7 @@ async fn send_one_file(
         .with_context(|| format!("failed to open {}", path.display()))?;
     let mut offset = 0u64;
     let total_size = metadata.len();
-    let mut buffer = vec![0u8; FILE_CHUNK_SIZE];
+    let mut buffer = vec![0u8; FILE_STREAM_CHUNK_SIZE];
 
     if total_size == 0 {
         tx.send(Frame::FileChunk(
@@ -1918,6 +1969,34 @@ where
         .map_err(|_| anyhow!("等待对端响应超时"))?
 }
 
+fn is_connection_shutdown_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<std::io::Error>().is_some_and(|io_err| {
+        matches!(
+            io_err.kind(),
+            std::io::ErrorKind::UnexpectedEof
+                | std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::NotConnected
+                | std::io::ErrorKind::TimedOut
+        )
+    })
+}
+
+async fn sleep_before_reconnect(delay: Duration) {
+    if delay.is_zero() {
+        return;
+    }
+
+    eprintln!("将在 {} 秒后重试连接。", delay.as_secs());
+    time::sleep(delay).await;
+}
+
+fn next_reconnect_delay(current: Duration) -> Duration {
+    let next = current.as_secs().saturating_mul(2).max(1);
+    Duration::from_secs(next.min(RECONNECT_MAX_DELAY.as_secs()))
+}
+
 async fn register_pairing_failure(pairing_throttle: &mut PairingThrottle, peer_key: &str) {
     let backoff = pairing_throttle.note_failure(peer_key);
     if !backoff.is_zero() {
@@ -2214,14 +2293,21 @@ fn is_executable(_metadata: &std::fs::Metadata) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        accept_policy_label, delete_policy, peer_matches_query, select_peer_from_query,
+        FILE_STREAM_CHUNK_SIZE, accept_policy_label, delete_policy, is_connection_shutdown_error,
+        next_reconnect_delay, peer_matches_query, select_peer_from_query, send_one_file,
         should_auto_accept_request,
     };
     use crate::cli::{PairingRuntimeOptions, SyncMode};
     use crate::discovery::DiscoveredPeer;
-    use crate::protocol::PairAuthMethod;
-    use crate::sync::{DeletePolicy, SnapshotLayout};
+    use crate::protocol::{Frame, PairAuthMethod};
+    use crate::sync::{DeletePolicy, OutgoingSpec, SnapshotLayout};
+    use std::env;
+    use std::fs;
     use std::net::Ipv4Addr;
+    use std::path::PathBuf;
+    use std::time::Duration;
+    use tokio::sync::mpsc;
+    use uuid::Uuid;
 
     #[test]
     fn delete_policy_stays_disabled_when_sync_delete_is_off() {
@@ -2249,6 +2335,71 @@ mod tests {
             delete_policy(SnapshotLayout::SelectedItems, true),
             DeletePolicy::MirrorSelectedItems
         ));
+    }
+
+    #[test]
+    fn reconnect_backoff_doubles_until_cap() {
+        assert_eq!(
+            next_reconnect_delay(Duration::from_secs(2)),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            next_reconnect_delay(Duration::from_secs(10)),
+            Duration::from_secs(20)
+        );
+        assert_eq!(
+            next_reconnect_delay(Duration::from_secs(20)),
+            Duration::from_secs(20)
+        );
+    }
+
+    #[test]
+    fn connection_shutdown_errors_are_recognized() {
+        let err = anyhow::Error::from(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "reset",
+        ));
+        assert!(is_connection_shutdown_error(&err));
+
+        let err = anyhow::Error::from(std::io::Error::other("other"));
+        assert!(!is_connection_shutdown_error(&err));
+    }
+
+    #[tokio::test]
+    async fn send_one_file_streams_large_files_in_multiple_chunks() {
+        let dir = test_dir("file-streaming");
+        fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("large.bin");
+        let expected = vec![0x5au8; FILE_STREAM_CHUNK_SIZE * 2 + 37];
+        fs::write(&file_path, &expected).unwrap();
+
+        let outgoing = OutgoingSpec::RootContents {
+            root: dir.clone(),
+            max_folder_depth: None,
+        };
+        let (tx, mut rx) = mpsc::channel(16);
+
+        send_one_file(&tx, &outgoing, 1, "large.bin").await.unwrap();
+        drop(tx);
+
+        let mut chunk_count = 0usize;
+        let mut assembled = Vec::new();
+        while let Some(frame) = rx.recv().await {
+            match frame {
+                Frame::FileChunk(header, data) => {
+                    assert_eq!(header.path, "large.bin");
+                    assert_eq!(header.offset, assembled.len() as u64);
+                    assembled.extend_from_slice(&data);
+                    chunk_count += 1;
+                }
+                other => panic!("expected file chunk frame, got {other:?}"),
+            }
+        }
+
+        assert_eq!(assembled, expected);
+        assert!(chunk_count >= 3);
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -2321,5 +2472,9 @@ mod tests {
             trusted_only: false,
             discovery_secs: 3,
         }
+    }
+
+    fn test_dir(prefix: &str) -> PathBuf {
+        env::temp_dir().join(format!("synly-app-{prefix}-{}", Uuid::new_v4()))
     }
 }

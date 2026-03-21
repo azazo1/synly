@@ -24,8 +24,14 @@ pub struct WorkspaceSpec {
 
 #[derive(Clone, Debug)]
 pub enum OutgoingSpec {
-    RootContents { root: PathBuf },
-    SelectedItems { items: Vec<NamedItem> },
+    RootContents {
+        root: PathBuf,
+        max_folder_depth: Option<usize>,
+    },
+    SelectedItems {
+        items: Vec<NamedItem>,
+        max_folder_depth: Option<usize>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -43,6 +49,8 @@ pub struct WorkspaceSummary {
     pub send_items: Vec<String>,
     pub receive_root: Option<String>,
     #[serde(default)]
+    pub max_folder_depth: Option<usize>,
+    #[serde(default)]
     pub sync_clipboard: bool,
 }
 
@@ -56,6 +64,8 @@ pub enum SnapshotLayout {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ManifestSnapshot {
     pub layout: SnapshotLayout,
+    #[serde(default)]
+    pub max_folder_depth: Option<usize>,
     pub entries: BTreeMap<String, ManifestEntry>,
 }
 
@@ -137,10 +147,12 @@ impl WorkspaceSpec {
         let outgoing = if canonical_paths.len() == 1 && canonical_paths[0].is_dir() {
             OutgoingSpec::RootContents {
                 root: canonical_paths[0].clone(),
+                max_folder_depth: None,
             }
         } else {
             OutgoingSpec::SelectedItems {
                 items: build_named_items(canonical_paths)?,
+                max_folder_depth: None,
             }
         };
 
@@ -164,7 +176,10 @@ impl WorkspaceSpec {
         let root = ensure_directory(root)?;
         Ok(Self {
             mode: SyncMode::Both,
-            outgoing: Some(OutgoingSpec::RootContents { root: root.clone() }),
+            outgoing: Some(OutgoingSpec::RootContents {
+                root: root.clone(),
+                max_folder_depth: None,
+            }),
             incoming_root: Some(root),
         })
     }
@@ -173,24 +188,42 @@ impl WorkspaceSpec {
         let root = ensure_directory(root)?;
         Ok(Self {
             mode: SyncMode::Auto,
-            outgoing: Some(OutgoingSpec::RootContents { root: root.clone() }),
+            outgoing: Some(OutgoingSpec::RootContents {
+                root: root.clone(),
+                max_folder_depth: None,
+            }),
             incoming_root: Some(root),
         })
     }
 
+    pub fn with_max_folder_depth(mut self, max_folder_depth: Option<usize>) -> Self {
+        if let Some(outgoing) = &mut self.outgoing {
+            outgoing.set_max_folder_depth(max_folder_depth);
+        }
+        self
+    }
+
     pub fn summary(&self, sync_clipboard: bool) -> WorkspaceSummary {
-        let (send_description, send_layout, send_items) = match &self.outgoing {
-            Some(OutgoingSpec::RootContents { root }) => (
+        let (send_description, send_layout, send_items, max_folder_depth) = match &self.outgoing {
+            Some(OutgoingSpec::RootContents {
+                root,
+                max_folder_depth,
+            }) => (
                 Some(format!("同步目录内容: {}", root.display())),
                 Some(SnapshotLayout::RootContents),
                 Vec::new(),
+                *max_folder_depth,
             ),
-            Some(OutgoingSpec::SelectedItems { items }) => (
+            Some(OutgoingSpec::SelectedItems {
+                items,
+                max_folder_depth,
+            }) => (
                 Some(format!("同步 {} 个指定文件/文件夹", items.len())),
                 Some(SnapshotLayout::SelectedItems),
                 items.iter().map(|item| item.name.clone()).collect(),
+                *max_folder_depth,
             ),
-            None => (None, None, Vec::new()),
+            None => (None, None, Vec::new(), None),
         };
 
         WorkspaceSummary {
@@ -202,6 +235,7 @@ impl WorkspaceSpec {
                 .incoming_root
                 .as_ref()
                 .map(|path| path.display().to_string()),
+            max_folder_depth,
             sync_clipboard,
         }
     }
@@ -226,12 +260,24 @@ impl WorkspaceSpec {
         }
 
         match &self.outgoing {
-            Some(OutgoingSpec::RootContents { root }) => {
+            Some(OutgoingSpec::RootContents {
+                root,
+                max_folder_depth,
+            }) => {
                 lines.push(format!("发送目录: {}", root.display()));
+                if let Some(max_folder_depth) = max_folder_depth {
+                    lines.push(format!("发送最大目录深度: {}", max_folder_depth));
+                }
             }
-            Some(OutgoingSpec::SelectedItems { items }) => {
+            Some(OutgoingSpec::SelectedItems {
+                items,
+                max_folder_depth,
+            }) => {
                 for item in items {
                     lines.push(format!("发送条目: {}", item.path.display()));
+                }
+                if let Some(max_folder_depth) = max_folder_depth {
+                    lines.push(format!("发送最大目录深度: {}", max_folder_depth));
                 }
             }
             None => {}
@@ -275,6 +321,9 @@ impl WorkspaceSummary {
         if !self.send_items.is_empty() {
             lines.push(format!("发送条目: {}", self.send_items.join(", ")));
         }
+        if let Some(max_folder_depth) = self.max_folder_depth {
+            lines.push(format!("发送最大目录深度: {}", max_folder_depth));
+        }
         if let Some(root) = &self.receive_root {
             lines.push(format!("接收目录: {}", root));
         }
@@ -291,20 +340,48 @@ impl WorkspaceSummary {
     }
 }
 
+impl OutgoingSpec {
+    pub fn set_max_folder_depth(&mut self, max_folder_depth: Option<usize>) {
+        match self {
+            OutgoingSpec::RootContents {
+                max_folder_depth: depth,
+                ..
+            }
+            | OutgoingSpec::SelectedItems {
+                max_folder_depth: depth,
+                ..
+            } => *depth = max_folder_depth,
+        }
+    }
+}
+
 pub fn build_snapshot(spec: &OutgoingSpec) -> Result<ManifestSnapshot> {
     let mut entries = BTreeMap::new();
     match spec {
-        OutgoingSpec::RootContents { root } => {
-            add_walk_entries(root, None, 1, &mut entries)?;
+        OutgoingSpec::RootContents {
+            root,
+            max_folder_depth,
+        } => {
+            add_walk_entries(root, None, 1, *max_folder_depth, &mut entries)?;
             Ok(ManifestSnapshot {
                 layout: SnapshotLayout::RootContents,
+                max_folder_depth: *max_folder_depth,
                 entries,
             })
         }
-        OutgoingSpec::SelectedItems { items } => {
+        OutgoingSpec::SelectedItems {
+            items,
+            max_folder_depth,
+        } => {
             for item in items {
                 if item.is_dir {
-                    add_walk_entries(&item.path, Some(&item.name), 0, &mut entries)?;
+                    add_walk_entries(
+                        &item.path,
+                        Some(&item.name),
+                        0,
+                        *max_folder_depth,
+                        &mut entries,
+                    )?;
                 } else if should_keep_path(&item.path) {
                     add_entry(&item.path, &item.path, Some(&item.name), &mut entries)?;
                 }
@@ -312,6 +389,7 @@ pub fn build_snapshot(spec: &OutgoingSpec) -> Result<ManifestSnapshot> {
 
             Ok(ManifestSnapshot {
                 layout: SnapshotLayout::SelectedItems,
+                max_folder_depth: *max_folder_depth,
                 entries,
             })
         }
@@ -321,6 +399,7 @@ pub fn build_snapshot(spec: &OutgoingSpec) -> Result<ManifestSnapshot> {
 pub fn build_incoming_snapshot(root: &Path) -> Result<ManifestSnapshot> {
     build_snapshot(&OutgoingSpec::RootContents {
         root: root.to_path_buf(),
+        max_folder_depth: None,
     })
 }
 
@@ -331,14 +410,37 @@ pub fn filter_snapshot_for_incoming_root(
     SynlyIgnoreMatcher::discover(root)?.filter_snapshot(snapshot)
 }
 
+pub fn filter_snapshot_by_folder_depth(
+    snapshot: &ManifestSnapshot,
+    layout: SnapshotLayout,
+    max_folder_depth: Option<usize>,
+) -> ManifestSnapshot {
+    let Some(max_folder_depth) = max_folder_depth else {
+        return snapshot.clone();
+    };
+
+    let entries = snapshot
+        .entries
+        .iter()
+        .filter(|(path, _)| snapshot_folder_depth(layout, path) <= max_folder_depth)
+        .map(|(path, entry)| (path.clone(), entry.clone()))
+        .collect();
+
+    ManifestSnapshot {
+        layout: snapshot.layout,
+        max_folder_depth: snapshot.max_folder_depth,
+        entries,
+    }
+}
+
 pub fn watch_targets(spec: &OutgoingSpec) -> Result<Vec<WatchTarget>> {
     let mut targets = BTreeMap::<PathBuf, bool>::new();
 
     match spec {
-        OutgoingSpec::RootContents { root } => {
+        OutgoingSpec::RootContents { root, .. } => {
             targets.insert(root.clone(), true);
         }
-        OutgoingSpec::SelectedItems { items } => {
+        OutgoingSpec::SelectedItems { items, .. } => {
             for item in items {
                 let (path, recursive) = if item.is_dir {
                     (item.path.clone(), true)
@@ -416,8 +518,8 @@ pub fn build_apply_plan(
 pub fn resolve_outgoing_path(spec: &OutgoingSpec, wire_path: &str) -> Result<PathBuf> {
     let relative = wire_to_relative_path(wire_path)?;
     match spec {
-        OutgoingSpec::RootContents { root } => Ok(root.join(relative)),
-        OutgoingSpec::SelectedItems { items } => {
+        OutgoingSpec::RootContents { root, .. } => Ok(root.join(relative)),
+        OutgoingSpec::SelectedItems { items, .. } => {
             let mut components = relative.components();
             let first = match components.next() {
                 Some(Component::Normal(component)) => component.to_string_lossy().to_string(),
@@ -596,6 +698,7 @@ fn add_walk_entries(
     base: &Path,
     prefix: Option<&str>,
     min_depth: usize,
+    max_folder_depth: Option<usize>,
     entries: &mut BTreeMap<String, ManifestEntry>,
 ) -> Result<()> {
     if !should_keep_path(base) {
@@ -607,7 +710,15 @@ fn add_walk_entries(
     }
 
     let mut active_matchers = Vec::new();
-    visit_snapshot_directory(base, base, prefix, &mut active_matchers, entries)?;
+    visit_snapshot_directory(
+        base,
+        base,
+        prefix,
+        0,
+        max_folder_depth,
+        &mut active_matchers,
+        entries,
+    )?;
     Ok(())
 }
 
@@ -819,6 +930,7 @@ impl SynlyIgnoreMatcher {
 
         Ok(ManifestSnapshot {
             layout: snapshot.layout,
+            max_folder_depth: snapshot.max_folder_depth,
             entries,
         })
     }
@@ -850,6 +962,8 @@ fn visit_snapshot_directory(
     directory: &Path,
     base: &Path,
     prefix: Option<&str>,
+    current_depth: usize,
+    max_folder_depth: Option<usize>,
     active_matchers: &mut Vec<ScopedIgnoreMatcher>,
     entries: &mut BTreeMap<String, ManifestEntry>,
 ) -> Result<()> {
@@ -871,8 +985,16 @@ fn visit_snapshot_directory(
         }
 
         add_entry(base, &child, prefix, entries)?;
-        if is_dir {
-            visit_snapshot_directory(&child, base, prefix, active_matchers, entries)?;
+        if is_dir && should_descend(current_depth, max_folder_depth) {
+            visit_snapshot_directory(
+                &child,
+                base,
+                prefix,
+                current_depth + 1,
+                max_folder_depth,
+                active_matchers,
+                entries,
+            )?;
         }
     }
 
@@ -1106,6 +1228,17 @@ fn path_depth(path: &str) -> usize {
     path.split('/').count()
 }
 
+fn snapshot_folder_depth(layout: SnapshotLayout, path: &str) -> usize {
+    match layout {
+        SnapshotLayout::RootContents => path_depth(path).saturating_sub(1),
+        SnapshotLayout::SelectedItems => path_depth(path).saturating_sub(2),
+    }
+}
+
+fn should_descend(current_depth: usize, max_folder_depth: Option<usize>) -> bool {
+    max_folder_depth.is_none_or(|max_folder_depth| current_depth < max_folder_depth)
+}
+
 #[cfg(unix)]
 fn is_executable(metadata: &fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -1164,6 +1297,7 @@ mod tests {
     fn selected_items_delete_scope_stays_inside_shared_items() {
         let remote = ManifestSnapshot {
             layout: SnapshotLayout::SelectedItems,
+            max_folder_depth: None,
             entries: BTreeMap::from([(
                 "docs/readme.txt".to_string(),
                 ManifestEntry {
@@ -1178,6 +1312,7 @@ mod tests {
 
         let local = ManifestSnapshot {
             layout: SnapshotLayout::RootContents,
+            max_folder_depth: None,
             entries: BTreeMap::from([
                 (
                     "docs/old.txt".to_string(),
@@ -1235,6 +1370,7 @@ mod tests {
     fn metadata_change_requires_resync() {
         let remote = ManifestSnapshot {
             layout: SnapshotLayout::RootContents,
+            max_folder_depth: None,
             entries: BTreeMap::from([(
                 "bin/tool".to_string(),
                 ManifestEntry {
@@ -1249,6 +1385,7 @@ mod tests {
 
         let local = ManifestSnapshot {
             layout: SnapshotLayout::RootContents,
+            max_folder_depth: None,
             entries: BTreeMap::from([(
                 "bin/tool".to_string(),
                 ManifestEntry {
@@ -1268,7 +1405,11 @@ mod tests {
     #[test]
     fn root_contents_watch_target_is_recursive() {
         let root = PathBuf::from("/tmp/workspace");
-        let targets = watch_targets(&OutgoingSpec::RootContents { root: root.clone() }).unwrap();
+        let targets = watch_targets(&OutgoingSpec::RootContents {
+            root: root.clone(),
+            max_folder_depth: None,
+        })
+        .unwrap();
 
         assert_eq!(
             targets,
@@ -1299,6 +1440,7 @@ mod tests {
                     is_dir: false,
                 },
             ],
+            max_folder_depth: None,
         })
         .unwrap();
 
@@ -1315,6 +1457,7 @@ mod tests {
     fn snapshot_file_lookup_rejects_unadvertised_paths() {
         let snapshot = ManifestSnapshot {
             layout: SnapshotLayout::RootContents,
+            max_folder_depth: None,
             entries: BTreeMap::from([(
                 "docs/readme.txt".to_string(),
                 ManifestEntry {
@@ -1339,7 +1482,11 @@ mod tests {
         fs::write(root.join(".synly/deleted/archived.txt"), "old").unwrap();
         fs::write(root.join("keep.txt"), "new").unwrap();
 
-        let snapshot = build_snapshot(&OutgoingSpec::RootContents { root: root.clone() }).unwrap();
+        let snapshot = build_snapshot(&OutgoingSpec::RootContents {
+            root: root.clone(),
+            max_folder_depth: None,
+        })
+        .unwrap();
 
         assert!(snapshot.entries.contains_key("keep.txt"));
         assert!(
@@ -1363,7 +1510,11 @@ mod tests {
         fs::write(root.join("drop.tmp"), "drop").unwrap();
         fs::write(root.join("keep.tmp"), "keep").unwrap();
 
-        let snapshot = build_snapshot(&OutgoingSpec::RootContents { root: root.clone() }).unwrap();
+        let snapshot = build_snapshot(&OutgoingSpec::RootContents {
+            root: root.clone(),
+            max_folder_depth: None,
+        })
+        .unwrap();
 
         assert!(snapshot.entries.contains_key(".synlyignore"));
         assert!(snapshot.entries.contains_key("docs/readme.txt"));
@@ -1383,7 +1534,11 @@ mod tests {
         fs::write(root.join("docs/keep.txt"), "keep").unwrap();
         fs::write(root.join("docs/sub/hidden.txt"), "hidden").unwrap();
 
-        let snapshot = build_snapshot(&OutgoingSpec::RootContents { root: root.clone() }).unwrap();
+        let snapshot = build_snapshot(&OutgoingSpec::RootContents {
+            root: root.clone(),
+            max_folder_depth: None,
+        })
+        .unwrap();
 
         assert!(snapshot.entries.contains_key("docs/.synlyignore"));
         assert!(snapshot.entries.contains_key("docs/keep.txt"));
@@ -1399,6 +1554,51 @@ mod tests {
     }
 
     #[test]
+    fn root_contents_snapshot_honors_max_folder_depth() {
+        let root = test_dir("depth-limited-root");
+        fs::create_dir_all(root.join("nested/deeper")).unwrap();
+        fs::write(root.join("top.txt"), "top").unwrap();
+        fs::write(root.join("nested/child.txt"), "child").unwrap();
+        fs::write(root.join("nested/deeper/grandchild.txt"), "grandchild").unwrap();
+
+        let snapshot = build_snapshot(&OutgoingSpec::RootContents {
+            root: root.clone(),
+            max_folder_depth: Some(0),
+        })
+        .unwrap();
+
+        assert_eq!(snapshot.max_folder_depth, Some(0));
+        assert!(snapshot.entries.contains_key("top.txt"));
+        assert!(snapshot.entries.contains_key("nested"));
+        assert!(!snapshot.entries.contains_key("nested/child.txt"));
+        assert!(!snapshot.entries.contains_key("nested/deeper"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn selected_item_depth_filter_preserves_only_visible_levels() {
+        let snapshot = ManifestSnapshot {
+            layout: SnapshotLayout::RootContents,
+            max_folder_depth: None,
+            entries: BTreeMap::from([
+                ("docs".to_string(), dir_entry()),
+                ("docs/readme.txt".to_string(), file_entry("a")),
+                ("docs/sub".to_string(), dir_entry()),
+                ("docs/sub/deep.txt".to_string(), file_entry("b")),
+            ]),
+        };
+
+        let filtered =
+            filter_snapshot_by_folder_depth(&snapshot, SnapshotLayout::SelectedItems, Some(0));
+
+        assert!(filtered.entries.contains_key("docs"));
+        assert!(filtered.entries.contains_key("docs/readme.txt"));
+        assert!(filtered.entries.contains_key("docs/sub"));
+        assert!(!filtered.entries.contains_key("docs/sub/deep.txt"));
+    }
+
+    #[test]
     fn incoming_filter_respects_synlyignore_for_requests_and_deletes() {
         let root = test_dir("incoming-synlyignore");
         fs::create_dir_all(&root).unwrap();
@@ -1407,6 +1607,7 @@ mod tests {
 
         let remote = ManifestSnapshot {
             layout: SnapshotLayout::RootContents,
+            max_folder_depth: None,
             entries: BTreeMap::from([
                 (".synlyignore".to_string(), file_entry("ignore")),
                 ("cache".to_string(), dir_entry()),

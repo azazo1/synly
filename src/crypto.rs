@@ -1,6 +1,7 @@
 use crate::config::{DeviceConfig, TrustedDeviceConfig};
 use crate::protocol::{
     ControlMessage, DeviceIdentity, PairAuthMethod, PairRequestPayload, SessionAgreement,
+    encode_payload,
 };
 use crate::sync::WorkspaceSummary;
 use anyhow::{Result, anyhow, bail};
@@ -365,7 +366,7 @@ pub fn sign_pair_auth(
     pin: &str,
     payload: &PairRequestPayload,
 ) -> Result<String> {
-    let payload_bytes = serde_json::to_vec(payload)?;
+    let payload_bytes = encode_payload(payload)?;
     Ok(sign_payload(
         exporter,
         request_id,
@@ -383,7 +384,7 @@ pub fn verify_pair_auth(
     payload: &PairRequestPayload,
     proof: &str,
 ) -> Result<()> {
-    let payload_bytes = serde_json::to_vec(payload)?;
+    let payload_bytes = encode_payload(payload)?;
     verify_payload(
         exporter,
         request_id,
@@ -408,7 +409,7 @@ pub fn sign_pair_decision(
     server_trusts_client: bool,
     trust_established: bool,
 ) -> Result<String> {
-    let payload = serde_json::to_vec(&DecisionProofPayload {
+    let payload = encode_payload(&DecisionProofPayload {
         accepted,
         message,
         server,
@@ -446,7 +447,7 @@ pub fn verify_pair_decision(
             trust_established,
             ..
         } => {
-            let payload = serde_json::to_vec(&DecisionProofPayload {
+            let payload = encode_payload(&DecisionProofPayload {
                 accepted: *accepted,
                 message,
                 server,
@@ -475,7 +476,7 @@ pub fn sign_trusted_pair_auth(
     request_id: &str,
     payload: &PairRequestPayload,
 ) -> Result<String> {
-    let payload_bytes = serde_json::to_vec(payload)?;
+    let payload_bytes = encode_payload(payload)?;
     sign_identity_payload(
         private_key,
         exporter,
@@ -492,7 +493,7 @@ pub fn verify_trusted_pair_auth(
     payload: &PairRequestPayload,
     proof: &str,
 ) -> Result<()> {
-    let payload_bytes = serde_json::to_vec(payload)?;
+    let payload_bytes = encode_payload(payload)?;
     verify_identity_payload(
         public_key,
         exporter,
@@ -516,7 +517,7 @@ pub fn sign_trusted_pair_decision(
     server_trusts_client: bool,
     trust_established: bool,
 ) -> Result<String> {
-    let payload = serde_json::to_vec(&DecisionProofPayload {
+    let payload = encode_payload(&DecisionProofPayload {
         accepted,
         message,
         server,
@@ -554,7 +555,7 @@ pub fn verify_trusted_pair_decision(
             trust_established,
             ..
         } => {
-            let payload = serde_json::to_vec(&DecisionProofPayload {
+            let payload = encode_payload(&DecisionProofPayload {
                 accepted: *accepted,
                 message,
                 server,
@@ -1206,6 +1207,7 @@ mod tests {
                 send_layout: None,
                 send_items: vec![],
                 receive_root: Some("/tmp".into()),
+                max_folder_depth: None,
                 sync_clipboard: false,
             },
             request_trust: false,
@@ -1235,6 +1237,7 @@ mod tests {
                 send_layout: None,
                 send_items: vec![],
                 receive_root: Some("/tmp".into()),
+                max_folder_depth: None,
                 sync_clipboard: false,
             },
             request_trust: true,
@@ -1272,6 +1275,7 @@ mod tests {
             send_layout: None,
             send_items: vec![],
             receive_root: Some("/tmp".into()),
+            max_folder_depth: None,
             sync_clipboard: false,
         };
         let proof = sign_pair_decision(
@@ -1338,6 +1342,7 @@ mod tests {
             send_layout: None,
             send_items: vec![],
             receive_root: Some("/tmp".into()),
+            max_folder_depth: None,
             sync_clipboard: true,
         };
         let proof = sign_trusted_pair_decision(

@@ -1,15 +1,20 @@
 use crate::cli::SyncMode;
 use crate::sync::{ManifestSnapshot, WorkspaceSummary};
 use anyhow::{Context, Result, bail};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use uuid::Uuid;
 
 const FRAME_CONTROL: u8 = 1;
 const FRAME_FILE_CHUNK: u8 = 2;
-const FRAME_CLIPBOARD: u8 = 3;
-const MAX_META_LEN: usize = 4 * 1024 * 1024;
-const MAX_DATA_LEN: usize = 64 * 1024 * 1024;
+const FRAME_CLIPBOARD_META: u8 = 3;
+const FRAME_CLIPBOARD_CHUNK: u8 = 4;
+const MAX_META_LEN: usize = 20 * 1024 * 1024;
+const MAX_FRAME_DATA_LEN: usize = 128 * 1024 * 1024;
+const MAX_CLIPBOARD_BINARY_LEN: usize = 100 * 1024 * 1024;
+const CLIPBOARD_STREAM_CHUNK_SIZE: usize = 1024 * 1024;
 
 pub const PROTOCOL_VERSION: u16 = 8;
 
@@ -188,6 +193,49 @@ struct ClipboardFileMeta {
     pub data: ClipboardBinaryMeta,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ClipboardTransferHeader {
+    pub transfer_id: Uuid,
+    pub payload: ClipboardPayloadMeta,
+    pub binary_len: u64,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct ClipboardChunkHeader {
+    pub transfer_id: Uuid,
+    pub offset: u64,
+    pub final_chunk: bool,
+}
+
+#[derive(Debug)]
+pub struct FrameSizeLimitError {
+    context: &'static str,
+    actual: usize,
+    limit: usize,
+}
+
+impl FrameSizeLimitError {
+    fn new(context: &'static str, actual: usize, limit: usize) -> Self {
+        Self {
+            context,
+            actual,
+            limit,
+        }
+    }
+}
+
+impl fmt::Display for FrameSizeLimitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} exceeds limit: {} > {}",
+            self.context, self.actual, self.limit
+        )
+    }
+}
+
+impl std::error::Error for FrameSizeLimitError {}
+
 impl ClipboardPayload {
     pub fn is_empty(&self) -> bool {
         self.text.is_none()
@@ -267,6 +315,26 @@ impl ClipboardPayload {
     }
 }
 
+pub fn encode_payload<T: Serialize>(value: &T) -> Result<Vec<u8>> {
+    bincode::serialize(value).context("failed to serialize payload")
+}
+
+pub fn decode_payload<T: DeserializeOwned>(bytes: &[u8], context: &'static str) -> Result<T> {
+    bincode::deserialize(bytes).with_context(|| context.to_string())
+}
+
+pub fn frame_size_limit_message(err: &anyhow::Error) -> Option<String> {
+    err.downcast_ref::<FrameSizeLimitError>()
+        .map(ToString::to_string)
+}
+
+#[derive(Debug)]
+struct RawFrame {
+    frame_type: u8,
+    meta: Vec<u8>,
+    data: Vec<u8>,
+}
+
 impl<R> FrameReader<R> {
     pub fn new(inner: R) -> Self {
         Self { inner }
@@ -284,47 +352,116 @@ where
     R: AsyncRead + Unpin,
 {
     pub async fn read_frame(&mut self) -> Result<Frame> {
-        let frame_type = self.inner.read_u8().await?;
-        let meta_len = self.inner.read_u32().await? as usize;
-        let data_len = self.inner.read_u64().await? as usize;
+        let raw = self.read_raw_frame().await?;
 
-        if meta_len > MAX_META_LEN {
-            bail!("frame metadata too large: {}", meta_len);
-        }
-        if data_len > MAX_DATA_LEN {
-            bail!("frame data too large: {}", data_len);
-        }
-
-        let mut meta = vec![0u8; meta_len];
-        self.inner.read_exact(&mut meta).await?;
-
-        match frame_type {
+        match raw.frame_type {
             FRAME_CONTROL => {
-                if data_len != 0 {
+                if !raw.data.is_empty() {
                     bail!("control frame unexpectedly carried binary data");
                 }
                 let message: ControlMessage =
-                    serde_json::from_slice(&meta).context("failed to decode control frame")?;
+                    decode_payload(&raw.meta, "failed to decode control frame")?;
                 Ok(Frame::Control(message))
             }
             FRAME_FILE_CHUNK => {
                 let header: FileChunkHeader =
-                    serde_json::from_slice(&meta).context("failed to decode file header")?;
-                let mut data = vec![0u8; data_len];
-                self.inner.read_exact(&mut data).await?;
-                Ok(Frame::FileChunk(header, data))
+                    decode_payload(&raw.meta, "failed to decode file header")?;
+                Ok(Frame::FileChunk(header, raw.data))
             }
-            FRAME_CLIPBOARD => {
-                let payload_meta: ClipboardPayloadMeta = serde_json::from_slice(&meta)
-                    .context("failed to decode clipboard frame metadata")?;
-                let mut data = vec![0u8; data_len];
-                self.inner.read_exact(&mut data).await?;
-                Ok(Frame::Clipboard(ClipboardPayload::from_wire(
-                    payload_meta,
-                    data,
-                )?))
-            }
+            FRAME_CLIPBOARD_META => self.read_clipboard_frame(raw).await,
+            FRAME_CLIPBOARD_CHUNK => bail!("unexpected clipboard chunk without clipboard header"),
             other => bail!("unknown frame type {}", other),
+        }
+    }
+
+    async fn read_raw_frame(&mut self) -> Result<RawFrame> {
+        let frame_type = self.inner.read_u8().await?;
+        let meta_len = self.inner.read_u32().await? as usize;
+        let data_len = self.inner.read_u64().await? as usize;
+
+        ensure_len("incoming frame metadata", meta_len, MAX_META_LEN)?;
+        ensure_len("incoming frame data", data_len, MAX_FRAME_DATA_LEN)?;
+
+        let mut meta = vec![0u8; meta_len];
+        self.inner.read_exact(&mut meta).await?;
+        let mut data = vec![0u8; data_len];
+        self.inner.read_exact(&mut data).await?;
+
+        Ok(RawFrame {
+            frame_type,
+            meta,
+            data,
+        })
+    }
+
+    async fn read_clipboard_frame(&mut self, raw: RawFrame) -> Result<Frame> {
+        if !raw.data.is_empty() {
+            bail!("clipboard metadata frame unexpectedly carried binary data");
+        }
+
+        let header: ClipboardTransferHeader =
+            decode_payload(&raw.meta, "failed to decode clipboard transfer header")?;
+        let binary_len = usize::try_from(header.binary_len)
+            .context("clipboard binary length overflowed usize")?;
+        ensure_len(
+            "incoming clipboard binary payload",
+            binary_len,
+            MAX_CLIPBOARD_BINARY_LEN,
+        )?;
+
+        if binary_len == 0 {
+            return Ok(Frame::Clipboard(ClipboardPayload::from_wire(
+                header.payload,
+                Vec::new(),
+            )?));
+        }
+
+        let mut binary = Vec::with_capacity(binary_len);
+        let mut expected_offset = 0u64;
+
+        loop {
+            let chunk = self.read_raw_frame().await?;
+            if chunk.frame_type != FRAME_CLIPBOARD_CHUNK {
+                bail!("clipboard transfer was interrupted by a non-chunk frame");
+            }
+
+            let chunk_header: ClipboardChunkHeader =
+                decode_payload(&chunk.meta, "failed to decode clipboard chunk header")?;
+            if chunk_header.transfer_id != header.transfer_id {
+                bail!("clipboard transfer id mismatch");
+            }
+            if chunk_header.offset != expected_offset {
+                bail!(
+                    "clipboard chunk offset mismatch: expected {}, got {}",
+                    expected_offset,
+                    chunk_header.offset
+                );
+            }
+            if chunk.data.is_empty() {
+                bail!("clipboard chunk unexpectedly carried no data");
+            }
+
+            expected_offset = expected_offset
+                .checked_add(chunk.data.len() as u64)
+                .context("clipboard chunk offset overflowed")?;
+            if expected_offset > header.binary_len {
+                bail!("clipboard transfer exceeded announced length");
+            }
+            binary.extend_from_slice(&chunk.data);
+
+            if chunk_header.final_chunk {
+                if expected_offset != header.binary_len {
+                    bail!(
+                        "clipboard transfer ended early: expected {}, got {}",
+                        header.binary_len,
+                        expected_offset
+                    );
+                }
+                return Ok(Frame::Clipboard(ClipboardPayload::from_wire(
+                    header.payload,
+                    binary,
+                )?));
+            }
         }
     }
 }
@@ -336,42 +473,70 @@ where
     pub async fn write_frame(&mut self, frame: Frame) -> Result<()> {
         match frame {
             Frame::Control(message) => {
-                let meta = serde_json::to_vec(&message)?;
-                self.inner.write_u8(FRAME_CONTROL).await?;
-                self.inner.write_u32(meta.len() as u32).await?;
-                self.inner.write_u64(0).await?;
-                self.inner.write_all(&meta).await?;
+                let meta = encode_payload(&message)?;
+                self.write_raw_frame(FRAME_CONTROL, &meta, &[]).await?;
             }
             Frame::FileChunk(header, data) => {
-                if data.len() > MAX_DATA_LEN {
-                    bail!("refusing to send over-sized file chunk: {}", data.len());
-                }
-                let meta = serde_json::to_vec(&header)?;
-                self.inner.write_u8(FRAME_FILE_CHUNK).await?;
-                self.inner.write_u32(meta.len() as u32).await?;
-                self.inner.write_u64(data.len() as u64).await?;
-                self.inner.write_all(&meta).await?;
-                self.inner.write_all(&data).await?;
+                ensure_len("file chunk data", data.len(), MAX_FRAME_DATA_LEN)?;
+                let meta = encode_payload(&header)?;
+                self.write_raw_frame(FRAME_FILE_CHUNK, &meta, &data).await?;
             }
             Frame::Clipboard(payload) => {
                 let (meta, data) = payload.into_wire()?;
-                if data.len() > MAX_DATA_LEN {
-                    bail!(
-                        "refusing to send over-sized clipboard payload: {}",
-                        data.len()
-                    );
+                ensure_len(
+                    "clipboard binary payload",
+                    data.len(),
+                    MAX_CLIPBOARD_BINARY_LEN,
+                )?;
+                let transfer_id = Uuid::new_v4();
+                let meta = encode_payload(&ClipboardTransferHeader {
+                    transfer_id,
+                    payload: meta,
+                    binary_len: u64::try_from(data.len())
+                        .context("clipboard payload length overflowed u64")?,
+                })?;
+                self.write_raw_frame(FRAME_CLIPBOARD_META, &meta, &[])
+                    .await?;
+
+                for (index, chunk) in data.chunks(CLIPBOARD_STREAM_CHUNK_SIZE).enumerate() {
+                    let offset = index
+                        .checked_mul(CLIPBOARD_STREAM_CHUNK_SIZE)
+                        .context("clipboard chunk offset overflowed")?;
+                    let meta = encode_payload(&ClipboardChunkHeader {
+                        transfer_id,
+                        offset: u64::try_from(offset)
+                            .context("clipboard chunk offset overflowed u64")?,
+                        final_chunk: offset + chunk.len() >= data.len(),
+                    })?;
+                    self.write_raw_frame(FRAME_CLIPBOARD_CHUNK, &meta, chunk)
+                        .await?;
                 }
-                let meta = serde_json::to_vec(&meta)?;
-                self.inner.write_u8(FRAME_CLIPBOARD).await?;
-                self.inner.write_u32(meta.len() as u32).await?;
-                self.inner.write_u64(data.len() as u64).await?;
-                self.inner.write_all(&meta).await?;
-                self.inner.write_all(&data).await?;
             }
         }
         self.inner.flush().await?;
         Ok(())
     }
+
+    async fn write_raw_frame(&mut self, frame_type: u8, meta: &[u8], data: &[u8]) -> Result<()> {
+        ensure_len("frame metadata", meta.len(), MAX_META_LEN)?;
+        ensure_len("frame data", data.len(), MAX_FRAME_DATA_LEN)?;
+        let meta_len = u32::try_from(meta.len()).context("frame metadata length overflowed u32")?;
+        let data_len = u64::try_from(data.len()).context("frame data length overflowed u64")?;
+
+        self.inner.write_u8(frame_type).await?;
+        self.inner.write_u32(meta_len).await?;
+        self.inner.write_u64(data_len).await?;
+        self.inner.write_all(meta).await?;
+        self.inner.write_all(data).await?;
+        Ok(())
+    }
+}
+
+fn ensure_len(context: &'static str, actual: usize, limit: usize) -> Result<()> {
+    if actual > limit {
+        return Err(FrameSizeLimitError::new(context, actual, limit).into());
+    }
+    Ok(())
 }
 
 fn append_binary(data: &mut Vec<u8>, bytes: Vec<u8>) -> Result<ClipboardBinaryMeta> {
@@ -396,7 +561,9 @@ fn read_binary(data: &[u8], meta: ClipboardBinaryMeta) -> Result<&[u8]> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClipboardFile, ClipboardImage, ClipboardPayload};
+    use super::{CLIPBOARD_STREAM_CHUNK_SIZE, ClipboardFile, ClipboardImage, ClipboardPayload};
+    use super::{Frame, FrameReader, FrameWriter};
+    use tokio::io::duplex;
 
     #[test]
     fn clipboard_payload_roundtrip_preserves_binary_content() {
@@ -436,5 +603,38 @@ mod tests {
 
         let err = ClipboardPayload::from_wire(meta, vec![1, 2, 3]).unwrap_err();
         assert!(err.to_string().contains("out of bounds"));
+    }
+
+    #[tokio::test]
+    async fn clipboard_frame_roundtrip_streams_large_binary_payload() {
+        let payload = ClipboardPayload {
+            text: Some("stream".to_string()),
+            rich_text: None,
+            html: None,
+            image: Some(ClipboardImage {
+                png_bytes: vec![7u8; CLIPBOARD_STREAM_CHUNK_SIZE + 321],
+            }),
+            files: vec![ClipboardFile {
+                name: "big.bin".to_string(),
+                bytes: vec![9u8; CLIPBOARD_STREAM_CHUNK_SIZE + 17],
+            }],
+        };
+
+        let (client, server) = duplex(64 * 1024);
+        let expected = payload.clone();
+
+        let writer = tokio::spawn(async move {
+            let mut writer = FrameWriter::new(client);
+            writer.write_frame(Frame::Clipboard(payload)).await.unwrap();
+        });
+
+        let mut reader = FrameReader::new(server);
+        let frame = reader.read_frame().await.unwrap();
+        writer.await.unwrap();
+
+        match frame {
+            Frame::Clipboard(decoded) => assert_eq!(decoded, expected),
+            other => panic!("expected clipboard frame, got {other:?}"),
+        }
     }
 }
