@@ -377,6 +377,35 @@ pub fn resolve_pairing_pin(pin: Option<&str>, prompt: &str) -> Result<String> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrustPromptDecision {
+    Accept,
+    AcceptAndTrust,
+    Reject,
+}
+
+pub fn prompt_confirm_with_trust(label: &str, default_trust: bool) -> Result<TrustPromptDecision> {
+    let term = Term::stdout();
+    loop {
+        term.write_line(label)?;
+        let raw = prompt_input("确认 [T/Y/n]", None)?;
+        let trimmed = raw.trim().to_ascii_lowercase();
+        if trimmed.is_empty() {
+            return Ok(if default_trust {
+                TrustPromptDecision::AcceptAndTrust
+            } else {
+                TrustPromptDecision::Accept
+            });
+        }
+        match trimmed.as_str() {
+            "t" | "trust" => return Ok(TrustPromptDecision::AcceptAndTrust),
+            "y" | "yes" => return Ok(TrustPromptDecision::Accept),
+            "n" | "no" => return Ok(TrustPromptDecision::Reject),
+            _ => term.write_line("请输入 t、y 或 n。")?,
+        }
+    }
+}
+
 pub fn prompt_confirm(label: &str, default: bool) -> Result<bool> {
     let suffix = if default { "[Y/n]" } else { "[y/N]" };
     let term = Term::stdout();

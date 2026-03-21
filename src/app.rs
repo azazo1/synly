@@ -1,6 +1,7 @@
 use crate::cli::{
-    ConnectionPreference, RuntimeOptions, SyncMode, prompt_confirm, prompt_select,
-    require_peer_query, resolve_pairing_pin, sync_clipboard_label, sync_delete_label,
+    ConnectionPreference, RuntimeOptions, SyncMode, TrustPromptDecision, prompt_confirm,
+    prompt_confirm_with_trust, prompt_select, require_peer_query, resolve_pairing_pin,
+    sync_clipboard_label, sync_delete_label,
 };
 use crate::clipboard::ClipboardSync;
 use crate::config::{DeviceConfig, SynlyConfig, TrustedDeviceConfig};
@@ -622,12 +623,16 @@ async fn handle_bootstrap_incoming_connection(
     }
 
     println!("已建立基于 PIN 的临时 mTLS，设备元数据现在处于加密保护中。");
-    let accepted = if options.pairing.accept {
-        true
+    let (accepted, remember_trusted_device) = if options.pairing.accept {
+        (true, options.pairing.trust_device)
     } else {
-        prompt_confirm("接受这次同步吗", true)?
+        match prompt_confirm_with_trust("接受这次同步吗", options.pairing.trust_device)? {
+            TrustPromptDecision::Accept => (true, false),
+            TrustPromptDecision::AcceptAndTrust => (true, true),
+            TrustPromptDecision::Reject => (false, false),
+        }
     };
-    let trust_established = accepted && options.pairing.trust_device && payload.request_trust;
+    let trust_established = accepted && remember_trusted_device && payload.request_trust;
     let message = if accepted {
         "服务端已接受同步请求。".to_string()
     } else {
@@ -650,7 +655,7 @@ async fn handle_bootstrap_incoming_connection(
         .write_frame(Frame::Control(control))
         .await?;
 
-    if trust_established {
+    if accepted && remember_trusted_device {
         config.remember_trusted_device(
             payload.client.device_id,
             payload.client.device_name.clone(),
@@ -658,7 +663,13 @@ async fn handle_bootstrap_incoming_connection(
             payload.client.tls_root_certificate.clone(),
         );
         config.save()?;
-        println!("已记住该设备的身份公钥和 TLS 根证书，后续连接会使用长期 mTLS 并可免 PIN。");
+        if trust_established {
+            println!("已记住该设备的身份公钥和 TLS 根证书，后续连接会使用长期 mTLS 并可免 PIN。");
+        } else {
+            println!(
+                "已在本机记住该设备，但对端这次没有请求建立双向信任；后续是否能免 PIN 仍取决于对端是否也保存本机。"
+            );
+        }
     }
 
     if !accepted {
