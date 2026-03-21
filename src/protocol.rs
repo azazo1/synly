@@ -74,7 +74,7 @@ impl SessionAgreement {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum ControlMessage {
     BootstrapHello {
         protocol_version: u16,
@@ -600,8 +600,13 @@ fn read_binary(data: &[u8], meta: ClipboardBinaryMeta) -> Result<&[u8]> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CLIPBOARD_STREAM_CHUNK_SIZE, ClipboardFile, ClipboardImage, ClipboardPayload};
-    use super::{Frame, FrameReader, FrameWriter};
+    use super::{
+        CLIPBOARD_STREAM_CHUNK_SIZE, ClipboardFile, ClipboardImage, ClipboardPayload,
+        ControlMessage, Frame, FrameReader, FrameWriter, SessionAgreement, decode_payload,
+        encode_payload,
+    };
+    use crate::cli::SyncMode;
+    use crate::sync::WorkspaceSummary;
     use tokio::io::duplex;
 
     #[test]
@@ -642,6 +647,57 @@ mod tests {
 
         let err = ClipboardPayload::from_wire(meta, vec![1, 2, 3]).unwrap_err();
         assert!(err.to_string().contains("out of bounds"));
+    }
+
+    #[test]
+    fn control_message_roundtrip_with_bincode() {
+        let message = ControlMessage::PairDecision {
+            accepted: true,
+            message: "ok".to_string(),
+            server: super::DeviceIdentity {
+                device_id: uuid::Uuid::nil(),
+                device_name: "server".to_string(),
+                identity_public_key: "pub".to_string(),
+                tls_root_certificate: "cert".to_string(),
+            },
+            workspace: WorkspaceSummary {
+                mode: SyncMode::Both,
+                send_description: Some("demo".to_string()),
+                send_layout: None,
+                send_items: vec!["docs".to_string()],
+                receive_root: Some("/tmp".to_string()),
+                max_folder_depth: Some(2),
+                sync_clipboard: true,
+            },
+            agreement: SessionAgreement {
+                host_to_client: true,
+                client_to_host: true,
+            },
+            auth_method: super::PairAuthMethod::TrustedDevice,
+            server_trusts_client: true,
+            proof: "proof".to_string(),
+            trust_established: true,
+        };
+
+        let encoded = encode_payload(&message).unwrap();
+        let decoded: ControlMessage =
+            decode_payload(&encoded, "failed to decode control frame").unwrap();
+
+        match decoded {
+            ControlMessage::PairDecision {
+                accepted,
+                message,
+                server_trusts_client,
+                trust_established,
+                ..
+            } => {
+                assert!(accepted);
+                assert_eq!(message, "ok");
+                assert!(server_trusts_client);
+                assert!(trust_established);
+            }
+            other => panic!("expected pair decision, got {other:?}"),
+        }
     }
 
     #[tokio::test]
