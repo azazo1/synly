@@ -170,6 +170,7 @@ pub struct RuntimeOptions {
 #[derive(Clone, Debug)]
 pub struct ClipboardRuntimeOptions {
     pub max_file_bytes: u64,
+    pub max_cache_bytes: Option<u64>,
     pub cache_dir: PathBuf,
 }
 
@@ -257,6 +258,7 @@ pub fn collect_runtime_options(cli: Cli, config: &SynlyConfig) -> Result<Runtime
         sync_clipboard,
         clipboard: ClipboardRuntimeOptions {
             max_file_bytes: config.clipboard.max_file_bytes,
+            max_cache_bytes: config.clipboard.max_cache_bytes,
             cache_dir: config.clipboard_cache_dir()?,
         },
         transfer_limits: config.transfer.to_limits()?,

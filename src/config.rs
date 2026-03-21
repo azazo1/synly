@@ -43,6 +43,8 @@ pub struct ClipboardConfig {
     #[serde(default = "default_clipboard_max_file_bytes")]
     pub max_file_bytes: u64,
     #[serde(default)]
+    pub max_cache_bytes: Option<u64>,
+    #[serde(default)]
     pub cache_dir: Option<PathBuf>,
 }
 
@@ -76,6 +78,7 @@ impl Default for ClipboardConfig {
     fn default() -> Self {
         Self {
             max_file_bytes: default_clipboard_max_file_bytes(),
+            max_cache_bytes: None,
             cache_dir: None,
         }
     }
@@ -537,7 +540,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = config_path_in(&dir);
         let toml = format!(
-            "[device]\ndevice_id = \"{}\"\ndevice_name = \"demo\"\n\n[clipboard]\nmax_file_bytes = 42\ncache_dir = \"custom-cache\"\n",
+            "[device]\ndevice_id = \"{}\"\ndevice_name = \"demo\"\n\n[clipboard]\nmax_file_bytes = 42\nmax_cache_bytes = 99\ncache_dir = \"custom-cache\"\n",
             Uuid::new_v4()
         );
         fs::write(&path, toml).unwrap();
@@ -546,6 +549,7 @@ mod tests {
         assert!(config.device.identity_private_key.is_some());
         assert!(config.device.identity_public_key.is_some());
         assert_eq!(config.clipboard.max_file_bytes, 42);
+        assert_eq!(config.clipboard.max_cache_bytes, Some(99));
         assert_eq!(config.transfer, TransferConfig::default());
         assert_eq!(
             config.clipboard.cache_dir,

@@ -355,6 +355,7 @@ struct RawFrame {
 }
 
 impl<R> FrameReader<R> {
+    #[allow(dead_code)]
     pub fn new(inner: R) -> Self {
         Self::with_limits(inner, TransferLimits::default())
     }
@@ -365,6 +366,7 @@ impl<R> FrameReader<R> {
 }
 
 impl<W> FrameWriter<W> {
+    #[allow(dead_code)]
     pub fn new(inner: W) -> Self {
         Self::with_limits(inner, TransferLimits::default())
     }

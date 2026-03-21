@@ -316,8 +316,9 @@ synly both --host --clipboard-only
 - 剪贴板的发送 / 接收方向跟随当前同步模式和最终协商结果
 - 连接建立后会先尝试同步一次当前剪贴板，之后继续监听新的剪贴板变化
 - 剪贴板文件只同步普通文件，不同步目录、符号链接或其他非常规条目；被跳过的条目会打印原因
-- 剪贴板文件会先落地到本机配置里的缓存目录下，再挂到系统剪贴板，便于跨机器粘贴；默认目录是配置目录下的 `clipboard-cache/current/`
+- 剪贴板文件会先落地到本机配置里的缓存目录下，再挂到系统剪贴板，便于跨机器粘贴；默认目录是配置目录下的 `clipboard-cache/`
 - 单个剪贴板文件会受配置项 `clipboard.max_file_bytes` 限制；超过上限的文件不会同步，并会输出原因
+- 如果设置了 `clipboard.max_cache_bytes`，剪贴板缓存总占用超过上限后，会按最早出现的顺序清理较旧批次，并尽量保留最新一次缓存
 - 双向模式下如果两边几乎同时复制了不同内容，最终结果取决于最后到达的一次更新
 
 ### `.synlyignore`
@@ -477,6 +478,7 @@ identity_public_key = "0i0s2v8kP4q2Tf8s0QylhKf5q7H7YBfQGfJY8y1zPM0"
 
 [clipboard]
 max_file_bytes = 104857600
+max_cache_bytes = 536870912
 cache_dir = "clipboard-cache-custom"
 
 [transfer]
@@ -497,8 +499,9 @@ successful_sessions = 3
 其中：
 
 - `clipboard.max_file_bytes` 是单个剪贴板文件的大小上限，单位为字节
+- `clipboard.max_cache_bytes` 可选；是剪贴板缓存目录总占用上限，单位为字节；超过后会按最早出现顺序清理旧缓存
 - `clipboard.cache_dir` 可选；可以写绝对路径，也可以写相对配置目录的路径
-- 未设置 `clipboard.cache_dir` 时，剪贴板文件缓存默认保存在同一配置目录下的 `clipboard-cache/current/`
+- 未设置 `clipboard.cache_dir` 时，剪贴板文件缓存默认保存在同一配置目录下的 `clipboard-cache/`
 - `transfer.max_meta_bytes` 是单帧元数据上限，单位为字节
 - `transfer.max_frame_data_bytes` 是单个二进制帧的数据上限，单位为字节
 - `transfer.max_clipboard_bytes` 是单次剪贴板二进制总载荷上限，单位为字节

@@ -1180,6 +1180,7 @@ async fn run_sync_session(
     let clipboard_sync = clipboard_enabled_on_both.then(|| {
         ClipboardSync::new(
             clipboard_options.max_file_bytes,
+            clipboard_options.max_cache_bytes,
             clipboard_options.cache_dir.clone(),
         )
     });

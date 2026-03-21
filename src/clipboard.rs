@@ -10,13 +10,17 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use url::Url;
+
+const CLIPBOARD_CACHE_BATCH_PREFIX: &str = "batch-";
 
 #[derive(Clone)]
 pub struct ClipboardSync {
     state: Arc<Mutex<ClipboardSyncState>>,
     max_file_bytes: u64,
+    max_cache_bytes: Option<u64>,
     cache_dir: PathBuf,
 }
 
@@ -44,10 +48,11 @@ struct CapturedClipboard {
 }
 
 impl ClipboardSync {
-    pub fn new(max_file_bytes: u64, cache_dir: PathBuf) -> Self {
+    pub fn new(max_file_bytes: u64, max_cache_bytes: Option<u64>, cache_dir: PathBuf) -> Self {
         Self {
             state: Arc::new(Mutex::new(ClipboardSyncState::default())),
             max_file_bytes,
+            max_cache_bytes,
             cache_dir,
         }
     }
@@ -87,6 +92,7 @@ impl ClipboardSync {
 
     pub async fn apply_remote_payload(&self, payload: ClipboardPayload) -> Result<()> {
         let max_file_bytes = self.max_file_bytes;
+        let max_cache_bytes = self.max_cache_bytes;
         let cache_dir = self.cache_dir.clone();
         let state = self.state.clone();
 
@@ -104,7 +110,7 @@ impl ClipboardSync {
                 capture_clipboard(&ctx, max_file_bytes).payload.as_ref() == Some(&payload);
 
             if !already_matches {
-                apply_payload_to_clipboard(&ctx, &payload, &cache_dir)?;
+                apply_payload_to_clipboard(&ctx, &payload, &cache_dir, max_cache_bytes)?;
             }
 
             let signature = payload_signature(&payload);
@@ -399,6 +405,7 @@ fn apply_payload_to_clipboard(
     ctx: &ClipboardContext,
     payload: &ClipboardPayload,
     cache_dir: &Path,
+    max_cache_bytes: Option<u64>,
 ) -> Result<()> {
     let mut contents = Vec::new();
 
@@ -418,7 +425,12 @@ fn apply_payload_to_clipboard(
     }
 
     let mut file_warnings = Vec::new();
-    let file_paths = write_clipboard_files_to_cache(cache_dir, &payload.files, &mut file_warnings)?;
+    let file_paths = write_clipboard_files_to_cache(
+        cache_dir,
+        &payload.files,
+        max_cache_bytes,
+        &mut file_warnings,
+    )?;
     emit_warnings(&file_warnings);
     if !file_paths.is_empty() {
         contents.push(ClipboardContent::Files(
@@ -439,33 +451,33 @@ fn apply_payload_to_clipboard(
 fn write_clipboard_files_to_cache(
     cache_dir: &Path,
     files: &[ClipboardFile],
+    max_cache_bytes: Option<u64>,
     warnings: &mut Vec<String>,
 ) -> Result<Vec<PathBuf>> {
+    fs::create_dir_all(cache_dir).with_context(|| {
+        format!(
+            "failed to create clipboard cache root {}",
+            cache_dir.display()
+        )
+    })?;
+
     if files.is_empty() {
+        prune_clipboard_cache(cache_dir, max_cache_bytes, None, warnings)?;
         return Ok(Vec::new());
     }
 
-    let current_dir = cache_dir.join("current");
-    if current_dir.exists() {
-        fs::remove_dir_all(&current_dir).with_context(|| {
-            format!(
-                "failed to clear clipboard cache directory {}",
-                current_dir.display()
-            )
-        })?;
-    }
-
-    fs::create_dir_all(&current_dir).with_context(|| {
+    let batch_dir = allocate_cache_batch_dir(cache_dir)?;
+    fs::create_dir_all(&batch_dir).with_context(|| {
         format!(
             "failed to create clipboard cache directory {}",
-            current_dir.display()
+            batch_dir.display()
         )
     })?;
 
     let mut written = Vec::new();
     for file in files {
         let file_name = sanitize_clipboard_file_name(&file.name);
-        let path = unique_cache_path(&current_dir, &file_name);
+        let path = unique_cache_path(&batch_dir, &file_name);
         match fs::write(&path, &file.bytes) {
             Ok(()) => written.push(path),
             Err(err) => warnings.push(format!(
@@ -476,6 +488,13 @@ fn write_clipboard_files_to_cache(
         }
     }
 
+    if written.is_empty() {
+        let _ = fs::remove_dir_all(&batch_dir);
+        prune_clipboard_cache(cache_dir, max_cache_bytes, None, warnings)?;
+        return Ok(Vec::new());
+    }
+
+    prune_clipboard_cache(cache_dir, max_cache_bytes, Some(&batch_dir), warnings)?;
     Ok(written)
 }
 
@@ -565,6 +584,158 @@ fn unique_cache_path(dir: &Path, file_name: &str) -> PathBuf {
     unreachable!("finite loop over candidate file names unexpectedly exhausted")
 }
 
+fn allocate_cache_batch_dir(cache_dir: &Path) -> Result<PathBuf> {
+    let now_ms = unix_time_ms();
+    for index in 0..10_000u32 {
+        let candidate = cache_dir.join(format!(
+            "{CLIPBOARD_CACHE_BATCH_PREFIX}{now_ms:020}-{index:04}"
+        ));
+        if !candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+
+    Err(anyhow!(
+        "failed to allocate a unique clipboard cache directory under {}",
+        cache_dir.display()
+    ))
+}
+
+fn prune_clipboard_cache(
+    cache_dir: &Path,
+    max_cache_bytes: Option<u64>,
+    active_dir: Option<&Path>,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    let Some(max_cache_bytes) = max_cache_bytes else {
+        return Ok(());
+    };
+    if !cache_dir.exists() {
+        return Ok(());
+    }
+
+    let mut batches = collect_cache_batches(cache_dir)?;
+    let mut total_bytes = batches.iter().map(|batch| batch.size_bytes).sum::<u64>();
+    batches.sort_by(|left, right| {
+        left.created_ms
+            .cmp(&right.created_ms)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+
+    while total_bytes > max_cache_bytes {
+        let Some(index) = batches
+            .iter()
+            .position(|batch| active_dir != Some(batch.path.as_path()))
+        else {
+            warnings.push(format!(
+                "剪贴板缓存当前占用 {}，仍超过配置上限 {}；已保留最新缓存。",
+                format_bytes(total_bytes),
+                format_bytes(max_cache_bytes)
+            ));
+            break;
+        };
+
+        let batch = batches.remove(index);
+        fs::remove_dir_all(&batch.path).with_context(|| {
+            format!(
+                "failed to remove clipboard cache directory {}",
+                batch.path.display()
+            )
+        })?;
+        total_bytes = total_bytes.saturating_sub(batch.size_bytes);
+        warnings.push(format!(
+            "已清理较早的剪贴板缓存 `{}`，释放 {}。",
+            batch.path.display(),
+            format_bytes(batch.size_bytes)
+        ));
+    }
+
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct CacheBatch {
+    path: PathBuf,
+    created_ms: u64,
+    size_bytes: u64,
+}
+
+fn collect_cache_batches(cache_dir: &Path) -> Result<Vec<CacheBatch>> {
+    let mut batches = Vec::new();
+    for entry in fs::read_dir(cache_dir).with_context(|| {
+        format!(
+            "failed to read clipboard cache root {}",
+            cache_dir.display()
+        )
+    })? {
+        let entry = entry.with_context(|| {
+            format!(
+                "failed to read an entry under clipboard cache root {}",
+                cache_dir.display()
+            )
+        })?;
+        let path = entry.path();
+        let metadata = entry
+            .metadata()
+            .with_context(|| format!("failed to inspect {}", path.display()))?;
+        if !metadata.is_dir() {
+            continue;
+        }
+
+        let file_name = entry.file_name().to_string_lossy().to_string();
+        if !file_name.starts_with(CLIPBOARD_CACHE_BATCH_PREFIX) {
+            continue;
+        }
+
+        batches.push(CacheBatch {
+            created_ms: metadata_modified_ms(&metadata),
+            size_bytes: directory_size(&path)?,
+            path,
+        });
+    }
+    Ok(batches)
+}
+
+fn directory_size(path: &Path) -> Result<u64> {
+    let mut total = 0u64;
+    for entry in fs::read_dir(path).with_context(|| {
+        format!(
+            "failed to read clipboard cache directory {}",
+            path.display()
+        )
+    })? {
+        let entry =
+            entry.with_context(|| format!("failed to read an entry under {}", path.display()))?;
+        let path = entry.path();
+        let metadata = entry
+            .metadata()
+            .with_context(|| format!("failed to inspect {}", path.display()))?;
+        if metadata.is_dir() {
+            total = total.saturating_add(directory_size(&path)?);
+        } else if metadata.is_file() {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    Ok(total)
+}
+
+fn metadata_modified_ms(metadata: &fs::Metadata) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
+}
+
 fn emit_warnings(warnings: &[String]) {
     for warning in warnings {
         eprintln!("{warning}");
@@ -636,9 +807,10 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClipboardSyncState, capture_files_from_paths, payload_signature, sanitize_remote_payload,
+        ClipboardFile, ClipboardSyncState, capture_files_from_paths, payload_signature,
+        sanitize_remote_payload, write_clipboard_files_to_cache,
     };
-    use crate::protocol::{ClipboardFile, ClipboardPayload};
+    use crate::protocol::ClipboardPayload;
     use std::fs;
     use std::path::Path;
     use uuid::Uuid;
@@ -719,6 +891,81 @@ mod tests {
         assert_eq!(filtered.files[0].name, "keep.txt");
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("drop.txt"));
+    }
+
+    #[test]
+    fn clipboard_cache_prunes_oldest_batches_when_over_limit() {
+        let dir = unique_test_dir("cache-prune");
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut warnings = Vec::new();
+        let first = write_clipboard_files_to_cache(
+            &dir,
+            &[ClipboardFile {
+                name: "one.bin".to_string(),
+                bytes: vec![1, 2, 3],
+            }],
+            Some(6),
+            &mut warnings,
+        )
+        .unwrap();
+        assert_eq!(first.len(), 1);
+
+        let second = write_clipboard_files_to_cache(
+            &dir,
+            &[ClipboardFile {
+                name: "two.bin".to_string(),
+                bytes: vec![4, 5, 6, 7],
+            }],
+            Some(6),
+            &mut warnings,
+        )
+        .unwrap();
+        assert_eq!(second.len(), 1);
+
+        let batch_dirs = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.metadata().map(|meta| meta.is_dir()).unwrap_or(false))
+            .collect::<Vec<_>>();
+        assert_eq!(batch_dirs.len(), 1);
+        assert!(second[0].exists());
+        assert!(!first[0].exists());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("已清理较早的剪贴板缓存"))
+        );
+
+        cleanup_dir(&dir);
+    }
+
+    #[test]
+    fn oversized_latest_clipboard_cache_is_retained_with_warning() {
+        let dir = unique_test_dir("cache-keep-latest");
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut warnings = Vec::new();
+        let paths = write_clipboard_files_to_cache(
+            &dir,
+            &[ClipboardFile {
+                name: "large.bin".to_string(),
+                bytes: vec![9; 8],
+            }],
+            Some(4),
+            &mut warnings,
+        )
+        .unwrap();
+
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].exists());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("已保留最新缓存"))
+        );
+
+        cleanup_dir(&dir);
     }
 
     fn text_payload(text: &str) -> ClipboardPayload {
