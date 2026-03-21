@@ -16,30 +16,33 @@ use std::path::{Path, PathBuf};
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
-    #[arg(long, conflicts_with = "join")]
+    #[arg(long, global = true, conflicts_with = "join")]
     pub host: bool,
-    #[arg(long, conflicts_with = "host")]
+    #[arg(long, global = true, conflicts_with = "host")]
     pub join: bool,
-    #[arg(long, conflicts_with = "no_sync_delete")]
+    #[arg(long, global = true, conflicts_with = "no_sync_delete")]
     pub sync_delete: bool,
-    #[arg(long, conflicts_with = "sync_delete")]
+    #[arg(long, global = true, conflicts_with = "sync_delete")]
     pub no_sync_delete: bool,
     #[arg(
         long,
+        global = true,
         conflicts_with = "no_sync_clipboard",
         help = "开启剪贴板同步；支持文本、富文本、图片和限制大小内的文件，只有双方都开启才会生效，方向跟随当前同步模式"
     )]
     pub sync_clipboard: bool,
-    #[arg(long, conflicts_with = "sync_clipboard")]
+    #[arg(long, global = true, conflicts_with = "sync_clipboard")]
     pub no_sync_clipboard: bool,
     #[arg(
         long,
+        global = true,
         conflicts_with = "no_sync_clipboard",
         help = "仅同步剪贴板，不进行文件同步；会自动开启剪贴板同步"
     )]
     pub clipboard_only: bool,
     #[arg(
         long,
+        global = true,
         default_value_t = 3,
         help = "兜底全量重扫间隔（秒），目录变化仍会实时监听"
     )]
@@ -552,4 +555,97 @@ fn expand_path_list(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
 
 fn expand_pathbuf(path: PathBuf) -> Result<PathBuf> {
     expand_path_string(&path.to_string_lossy())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ClipboardConfig;
+    use clap::Parser;
+    use uuid::Uuid;
+
+    #[test]
+    fn global_flags_parse_before_and_after_subcommand() {
+        let before = Cli::try_parse_from([
+            "synly",
+            "--join",
+            "--no-sync-delete",
+            "--sync-clipboard",
+            "--interval-secs",
+            "9",
+            "receive",
+            ".",
+        ])
+        .unwrap();
+        let after = Cli::try_parse_from([
+            "synly",
+            "receive",
+            ".",
+            "--join",
+            "--no-sync-delete",
+            "--sync-clipboard",
+            "--interval-secs",
+            "9",
+        ])
+        .unwrap();
+
+        assert_global_receive_cli(before);
+        assert_global_receive_cli(after);
+    }
+
+    #[test]
+    fn conflicting_global_flags_still_conflict_after_subcommand() {
+        let result = Cli::try_parse_from(["synly", "receive", ".", "--host", "--join"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn collect_runtime_options_uses_subcommand_scoped_global_flags() {
+        let cli = Cli::try_parse_from([
+            "synly",
+            "receive",
+            ".",
+            "--join",
+            "--no-sync-delete",
+            "--no-sync-clipboard",
+            "--interval-secs",
+            "9",
+        ])
+        .unwrap();
+
+        let options = collect_runtime_options(cli, &test_config()).unwrap();
+
+        assert!(matches!(options.connection, ConnectionPreference::Join));
+        assert_eq!(options.mode, SyncMode::Receive);
+        assert!(!options.sync_delete);
+        assert!(!options.sync_clipboard);
+        assert_eq!(options.interval_secs, 9);
+        assert!(options.workspace.incoming_root.is_some());
+    }
+
+    fn assert_global_receive_cli(cli: Cli) {
+        assert!(cli.join);
+        assert!(!cli.host);
+        assert!(cli.no_sync_delete);
+        assert!(!cli.sync_delete);
+        assert!(cli.sync_clipboard);
+        assert!(!cli.no_sync_clipboard);
+        assert_eq!(cli.interval_secs, 9);
+        match cli.command {
+            Some(Command::Receive { path }) => {
+                assert_eq!(path, Some(std::path::PathBuf::from(".")));
+            }
+            other => panic!("expected receive command, got {other:?}"),
+        }
+    }
+
+    fn test_config() -> SynlyConfig {
+        SynlyConfig {
+            device: DeviceConfig {
+                device_id: Uuid::nil(),
+                device_name: "test-device".to_string(),
+            },
+            clipboard: ClipboardConfig::default(),
+        }
+    }
 }
