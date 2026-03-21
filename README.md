@@ -146,7 +146,7 @@ synly auto . --join --peer workstation --pin 123456 --trust-device
 接收端：
 
 ```bash
-synly auto . --host --accept --trusted-only
+synly auto . --host --trusted-only
 ```
 
 连接端：
@@ -155,7 +155,7 @@ synly auto . --host --accept --trusted-only
 synly auto . --join --peer workstation --trusted-only
 ```
 
-这时如果双方之前已经互相建立过可信设备绑定，就不会再询问 PIN，而是直接走长期 mTLS。
+这时如果双方之前已经互相建立过可信设备绑定，就不会再询问 PIN，而是直接走长期 mTLS；服务端也会默认自动接受这次同步。
 
 ## 使用流程
 
@@ -171,9 +171,10 @@ synly auto . --host
 
 1. 在局域网中通过 mDNS 广播当前设备
 2. 打印当前设备模式、端口，并开始等待请求
-3. 如果连接方尚未被信任，先只接收一个最小 bootstrap 请求，并显示客户端 bootstrap 指纹 ASCII 图、本次会话核对图和该请求专属的 6 位 PIN
-4. 客户端输入 PIN 后，双方先完成 SPAKE2 PAKE，再切换到临时 mTLS；只有这之后，服务端才会看到对端设备身份、请求模式和同步摘要
-5. 认证通过后，如果没有传 `--accept`，再询问你是否接受本次同步；输入 `T` 表示接受并信任该客户端，`Y` 表示只接受本次，`n` 表示拒绝
+3. 如果连接方已经被信任，就直接通过长期 mTLS + 身份签名完成认证，并默认自动接受本次同步
+4. 如果连接方尚未被信任，先只接收一个最小 bootstrap 请求，并显示客户端 bootstrap 指纹 ASCII 图、本次会话核对图和该请求专属的 6 位 PIN
+5. 客户端输入 PIN 后，双方先完成 SPAKE2 PAKE，再切换到临时 mTLS；只有这之后，服务端才会看到对端设备身份、请求模式和同步摘要
+6. 对未受信任设备，如果没有传 `--accept`，再询问你是否接受本次同步；输入 `T` 表示接受并信任该客户端，`Y` 表示只接受本次，`n` 表示拒绝
 
 ### 客户端（连接方）
 
@@ -187,7 +188,7 @@ synly both . --join
 
 1. 在局域网中搜索可连接的 Synly 设备
 2. 如果没有传 `--peer`，列出发现到的设备供你选择；传了 `--peer` 时会按设备名、设备 ID 前缀或 IPv4 地址自动匹配
-3. 如果双方已有可信设备绑定，就直接通过长期 mTLS + 身份签名免 PIN 建立认证
+3. 如果双方已有可信设备绑定，就直接通过长期 mTLS + 身份签名免 PIN 建立认证，服务端会默认自动接受这次同步
 4. 否则客户端先生成一次性 bootstrap 指纹 ASCII 图并发起最小请求，服务端随后显示相同的客户端 bootstrap 图、本次会话核对图以及该会话专属的 6 位 PIN
 5. 客户端核对图形后输入 PIN，双方完成 SPAKE2 PAKE，验证彼此的 key confirmation，再派生临时 mTLS，并只在这条信道里发送设备身份和同步摘要
 6. 如果服务端选择了信任客户端，而本机还没保存该服务端，客户端会再询问是否也信任服务端；传了 `--trust-device` 时会自动同意

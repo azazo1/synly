@@ -1,7 +1,7 @@
 use crate::cli::{
-    ConnectionPreference, RuntimeOptions, SyncMode, TrustPromptDecision, prompt_confirm,
-    prompt_confirm_with_trust, prompt_select, require_peer_query, resolve_pairing_pin,
-    sync_clipboard_label, sync_delete_label,
+    ConnectionPreference, PairingRuntimeOptions, RuntimeOptions, SyncMode, TrustPromptDecision,
+    prompt_confirm, prompt_confirm_with_trust, prompt_select, require_peer_query,
+    resolve_pairing_pin, sync_clipboard_label, sync_delete_label,
 };
 use crate::clipboard::ClipboardSync;
 use crate::config::{DeviceConfig, SynlyConfig, TrustedDeviceConfig};
@@ -105,6 +105,21 @@ pub async fn run(config: &mut SynlyConfig, options: RuntimeOptions) -> Result<()
     match options.connection {
         ConnectionPreference::Host => run_host(config, options).await,
         ConnectionPreference::Join => run_client(config, options).await,
+    }
+}
+
+fn should_auto_accept_request(
+    pairing: &PairingRuntimeOptions,
+    auth_method: PairAuthMethod,
+) -> bool {
+    pairing.accept || auth_method == PairAuthMethod::TrustedDevice
+}
+
+fn accept_policy_label(pairing: &PairingRuntimeOptions) -> &'static str {
+    if pairing.accept {
+        "认证通过后自动接受"
+    } else {
+        "可信设备自动接受；未受信任设备认证通过后仍需本机确认"
     }
 }
 
@@ -332,11 +347,7 @@ async fn handle_trusted_incoming_connection(
     }
 
     println!("可信设备 mTLS 与身份签名校验通过。");
-    let accepted = if options.pairing.accept {
-        true
-    } else {
-        prompt_confirm("接受这次同步吗", true)?
-    };
+    let accepted = should_auto_accept_request(&options.pairing, PairAuthMethod::TrustedDevice);
     let message = if accepted {
         "服务端已接受同步请求。".to_string()
     } else {
@@ -625,15 +636,17 @@ async fn handle_bootstrap_incoming_connection(
     }
 
     println!("已建立基于 PIN 的临时 mTLS，设备元数据现在处于加密保护中。");
-    let (accepted, remember_trusted_device) = if options.pairing.accept {
-        (true, options.pairing.trust_device)
-    } else {
-        match prompt_confirm_with_trust("接受这次同步吗", options.pairing.trust_device)? {
-            TrustPromptDecision::Accept => (true, false),
-            TrustPromptDecision::AcceptAndTrust => (true, true),
-            TrustPromptDecision::Reject => (false, false),
-        }
-    };
+    let (accepted, remember_trusted_device) =
+        if should_auto_accept_request(&options.pairing, PairAuthMethod::Pin) {
+            (true, options.pairing.trust_device)
+        } else {
+            match prompt_confirm_with_trust("接受这次同步吗", options.pairing.trust_device)?
+            {
+                TrustPromptDecision::Accept => (true, false),
+                TrustPromptDecision::AcceptAndTrust => (true, true),
+                TrustPromptDecision::Reject => (false, false),
+            }
+        };
     let server_trusts_client = accepted && remember_trusted_device;
     let trust_established = accepted && remember_trusted_device && payload.request_trust;
     let message = if accepted {
@@ -2141,14 +2154,7 @@ fn print_host_ready(device: &DeviceConfig, options: &RuntimeOptions, port: u16) 
             "可信设备走长期 mTLS；未信任设备走 bootstrap + PIN + 临时 mTLS"
         }
     );
-    println!(
-        "接受策略: {}",
-        if options.pairing.accept {
-            "认证通过后自动接受"
-        } else {
-            "认证通过后仍需本机确认"
-        }
-    );
+    println!("接受策略: {}", accept_policy_label(&options.pairing));
     if let Some(pin) = &options.pairing.pin {
         println!("固定 PIN: {}", style(pin).bold());
     }
@@ -2207,9 +2213,13 @@ fn is_executable(_metadata: &std::fs::Metadata) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{delete_policy, peer_matches_query, select_peer_from_query};
-    use crate::cli::SyncMode;
+    use super::{
+        accept_policy_label, delete_policy, peer_matches_query, select_peer_from_query,
+        should_auto_accept_request,
+    };
+    use crate::cli::{PairingRuntimeOptions, SyncMode};
     use crate::discovery::DiscoveredPeer;
+    use crate::protocol::PairAuthMethod;
     use crate::sync::{DeletePolicy, SnapshotLayout};
     use std::net::Ipv4Addr;
 
@@ -2267,6 +2277,30 @@ mod tests {
         assert!(select_peer_from_query(&[peer, duplicate], "demo-device").is_err());
     }
 
+    #[test]
+    fn trusted_device_requests_auto_accept_without_accept_flag() {
+        let pairing = sample_pairing_options();
+
+        assert!(should_auto_accept_request(
+            &pairing,
+            PairAuthMethod::TrustedDevice
+        ));
+        assert!(!should_auto_accept_request(&pairing, PairAuthMethod::Pin));
+    }
+
+    #[test]
+    fn accept_policy_label_reflects_trusted_device_default() {
+        let pairing = sample_pairing_options();
+        assert_eq!(
+            accept_policy_label(&pairing),
+            "可信设备自动接受；未受信任设备认证通过后仍需本机确认"
+        );
+
+        let mut pairing = pairing;
+        pairing.accept = true;
+        assert_eq!(accept_policy_label(&pairing), "认证通过后自动接受");
+    }
+
     fn sample_peer() -> DiscoveredPeer {
         DiscoveredPeer {
             fullname: "demo._synly._tcp.local.".to_string(),
@@ -2275,6 +2309,17 @@ mod tests {
             mode: SyncMode::Both,
             port: 8080,
             addresses: vec![Ipv4Addr::new(192, 168, 1, 20)],
+        }
+    }
+
+    fn sample_pairing_options() -> PairingRuntimeOptions {
+        PairingRuntimeOptions {
+            peer_query: None,
+            pin: None,
+            accept: false,
+            trust_device: false,
+            trusted_only: false,
+            discovery_secs: 3,
         }
     }
 }

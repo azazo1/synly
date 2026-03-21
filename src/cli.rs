@@ -59,7 +59,11 @@ pub struct Cli {
         help = "当前连接使用的 6 位 PIN；host 模式下会把它作为固定 PIN，join 模式下会直接使用它而不再询问"
     )]
     pub pin: Option<String>,
-    #[arg(long, global = true, help = "认证通过后自动接受本次同步，不再二次确认")]
+    #[arg(
+        long,
+        global = true,
+        help = "对未受信任设备在认证通过后自动接受本次同步，不再二次确认；可信设备默认自动接受"
+    )]
     pub accept: bool,
     #[arg(
         long,
