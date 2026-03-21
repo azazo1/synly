@@ -10,7 +10,6 @@ use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use walkdir::WalkDir;
 
 const SYNLY_INTERNAL_DIR: &str = ".synly";
 const SYNLY_DELETED_DIR: &str = "deleted";
@@ -478,22 +477,6 @@ pub fn ensure_directories(root: &Path, snapshot: &ManifestSnapshot) -> Result<()
         }
         fs::create_dir_all(&directory)
             .with_context(|| format!("failed to create directory {}", directory.display()))?;
-    }
-
-    Ok(())
-}
-
-pub fn delete_paths(root: &Path, wire_paths: &[String]) -> Result<()> {
-    for wire_path in wire_paths {
-        let path = resolve_incoming_path(root, wire_path)?;
-        match fs::symlink_metadata(&path) {
-            Ok(_) => archive_deleted_path(root, wire_path, &path)?,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(err)
-                    .with_context(|| format!("failed to inspect path {}", path.display()));
-            }
-        }
     }
 
     Ok(())
@@ -1139,6 +1122,7 @@ mod tests {
     use super::*;
     use std::env;
     use uuid::Uuid;
+    use walkdir::WalkDir;
 
     fn file_entry(hash: &str) -> ManifestEntry {
         ManifestEntry {
@@ -1460,10 +1444,16 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
 
         fs::write(root.join("sample.txt"), "first").unwrap();
-        delete_paths(&root, &["sample.txt".to_string()]).unwrap();
+        assert!(matches!(
+            try_delete_path(&root, "sample.txt"),
+            Ok(DeleteDisposition::Archived)
+        ));
 
         fs::write(root.join("sample.txt"), "second").unwrap();
-        delete_paths(&root, &["sample.txt".to_string()]).unwrap();
+        assert!(matches!(
+            try_delete_path(&root, "sample.txt"),
+            Ok(DeleteDisposition::Archived)
+        ));
 
         assert!(!root.join("sample.txt").exists());
 

@@ -1172,6 +1172,7 @@ async fn finalize_incoming_file(state: IncomingFileState) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn report_incoming_file_failure(
     root: &Path,
     incoming_files: &mut HashMap<(u64, String), IncomingFileState>,
