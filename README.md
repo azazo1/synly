@@ -456,7 +456,7 @@ _synly._tcp.local.
 
 ## 配置文件
 
-首次运行时，Synly 会为当前设备生成一个本地配置文件，保存设备信息和剪贴板策略。
+首次运行时，Synly 会为当前设备生成一个本地配置文件，保存设备信息、剪贴板策略和传输大小限制。
 
 典型位置：
 
@@ -476,8 +476,13 @@ identity_private_key = "MC4CAQAwBQYDK2VwBCIEIOt5..."
 identity_public_key = "0i0s2v8kP4q2Tf8s0QylhKf5q7H7YBfQGfJY8y1zPM0"
 
 [clipboard]
-max_file_bytes = 10485760
+max_file_bytes = 104857600
 cache_dir = "clipboard-cache-custom"
+
+[transfer]
+max_meta_bytes = 20971520
+max_frame_data_bytes = 134217728
+max_clipboard_bytes = 104857600
 
 [[trusted_devices]]
 device_id = "6fce44a6-2a07-4f72-9192-a4ec4a1e6df0"
@@ -494,6 +499,9 @@ successful_sessions = 3
 - `clipboard.max_file_bytes` 是单个剪贴板文件的大小上限，单位为字节
 - `clipboard.cache_dir` 可选；可以写绝对路径，也可以写相对配置目录的路径
 - 未设置 `clipboard.cache_dir` 时，剪贴板文件缓存默认保存在同一配置目录下的 `clipboard-cache/current/`
+- `transfer.max_meta_bytes` 是单帧元数据上限，单位为字节
+- `transfer.max_frame_data_bytes` 是单个二进制帧的数据上限，单位为字节
+- `transfer.max_clipboard_bytes` 是单次剪贴板二进制总载荷上限，单位为字节
 - `device.identity_private_key` / `device.identity_public_key` 是当前设备的长期身份密钥
 - `trusted_devices` 可选；只有在一次 PIN 认证成功后，本机明确同意信任对端时，这里才会出现记录；以后会用这里保存的公钥和根证书建立 mTLS，并校验对端签名
 

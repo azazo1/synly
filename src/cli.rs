@@ -1,5 +1,6 @@
 use crate::config::{DeviceConfig, SynlyConfig};
 use crate::path_expand::expand_path_string;
+use crate::protocol::TransferLimits;
 use crate::sync::WorkspaceSpec;
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -161,6 +162,7 @@ pub struct RuntimeOptions {
     pub sync_delete: bool,
     pub sync_clipboard: bool,
     pub clipboard: ClipboardRuntimeOptions,
+    pub transfer_limits: TransferLimits,
     pub interval_secs: u64,
     pub pairing: PairingRuntimeOptions,
 }
@@ -257,6 +259,7 @@ pub fn collect_runtime_options(cli: Cli, config: &SynlyConfig) -> Result<Runtime
             max_file_bytes: config.clipboard.max_file_bytes,
             cache_dir: config.clipboard_cache_dir()?,
         },
+        transfer_limits: config.transfer.to_limits()?,
         interval_secs: cli.interval_secs.max(1),
         pairing: PairingRuntimeOptions {
             peer_query: cli.peer.map(|value| value.trim().to_string()),
@@ -683,7 +686,7 @@ fn expand_pathbuf(path: PathBuf) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ClipboardConfig;
+    use crate::config::{ClipboardConfig, TransferConfig};
     use clap::Parser;
     use uuid::Uuid;
 
@@ -837,6 +840,7 @@ mod tests {
                 identity_public_key: None,
             },
             clipboard: ClipboardConfig::default(),
+            transfer: TransferConfig::default(),
             trusted_devices: Vec::new(),
         }
     }

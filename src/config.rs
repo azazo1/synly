@@ -1,4 +1,5 @@
 use crate::path_expand::expand_config_path_string;
+use crate::protocol::TransferLimits;
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
@@ -22,6 +23,8 @@ pub struct SynlyConfig {
     #[serde(default)]
     pub clipboard: ClipboardConfig,
     #[serde(default)]
+    pub transfer: TransferConfig,
+    #[serde(default)]
     pub trusted_devices: Vec<TrustedDeviceConfig>,
 }
 
@@ -41,6 +44,16 @@ pub struct ClipboardConfig {
     pub max_file_bytes: u64,
     #[serde(default)]
     pub cache_dir: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransferConfig {
+    #[serde(default = "default_transfer_max_meta_bytes")]
+    pub max_meta_bytes: u64,
+    #[serde(default = "default_transfer_max_frame_data_bytes")]
+    pub max_frame_data_bytes: u64,
+    #[serde(default = "default_transfer_max_clipboard_bytes")]
+    pub max_clipboard_bytes: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -64,6 +77,16 @@ impl Default for ClipboardConfig {
         Self {
             max_file_bytes: default_clipboard_max_file_bytes(),
             cache_dir: None,
+        }
+    }
+}
+
+impl Default for TransferConfig {
+    fn default() -> Self {
+        Self {
+            max_meta_bytes: default_transfer_max_meta_bytes(),
+            max_frame_data_bytes: default_transfer_max_frame_data_bytes(),
+            max_clipboard_bytes: default_transfer_max_clipboard_bytes(),
         }
     }
 }
@@ -149,6 +172,7 @@ impl SynlyConfig {
             Self {
                 device,
                 clipboard: ClipboardConfig::default(),
+                transfer: TransferConfig::default(),
                 trusted_devices: Vec::new(),
             }
         } else {
@@ -173,6 +197,7 @@ impl SynlyConfig {
                 identity_public_key: Some(identity_public_key),
             },
             clipboard: ClipboardConfig::default(),
+            transfer: TransferConfig::default(),
             trusted_devices: Vec::new(),
         }
     }
@@ -222,6 +247,33 @@ impl DeviceConfig {
             }
         }
         Ok(())
+    }
+}
+
+impl TransferConfig {
+    pub fn to_limits(&self) -> Result<TransferLimits> {
+        let max_meta_len = usize::try_from(self.max_meta_bytes)
+            .context("transfer.max_meta_bytes exceeds this platform's supported size")?;
+        let max_frame_data_len = usize::try_from(self.max_frame_data_bytes)
+            .context("transfer.max_frame_data_bytes exceeds this platform's supported size")?;
+        let max_clipboard_binary_len = usize::try_from(self.max_clipboard_bytes)
+            .context("transfer.max_clipboard_bytes exceeds this platform's supported size")?;
+
+        if max_meta_len == 0 {
+            bail!("transfer.max_meta_bytes must be greater than 0");
+        }
+        if max_frame_data_len == 0 {
+            bail!("transfer.max_frame_data_bytes must be greater than 0");
+        }
+        if max_clipboard_binary_len == 0 {
+            bail!("transfer.max_clipboard_bytes must be greater than 0");
+        }
+
+        Ok(TransferLimits {
+            max_meta_len,
+            max_frame_data_len,
+            max_clipboard_binary_len,
+        })
     }
 }
 
@@ -284,6 +336,18 @@ fn load_legacy_device_from_dir(dir: &Path) -> Result<Option<DeviceConfig>> {
 
 fn default_clipboard_max_file_bytes() -> u64 {
     DEFAULT_CLIPBOARD_MAX_FILE_BYTES
+}
+
+fn default_transfer_max_meta_bytes() -> u64 {
+    TransferLimits::default().max_meta_len as u64
+}
+
+fn default_transfer_max_frame_data_bytes() -> u64 {
+    TransferLimits::default().max_frame_data_len as u64
+}
+
+fn default_transfer_max_clipboard_bytes() -> u64 {
+    TransferLimits::default().max_clipboard_binary_len as u64
 }
 
 fn unix_time_ms() -> u64 {
@@ -387,8 +451,8 @@ fn detect_device_name(device_id: Uuid) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClipboardConfig, DeviceConfig, SynlyConfig, TrustedDeviceConfig, config_path_in,
-        legacy_device_config_path_in, resolve_configured_path,
+        ClipboardConfig, DeviceConfig, SynlyConfig, TransferConfig, TrustedDeviceConfig,
+        config_path_in, legacy_device_config_path_in, resolve_configured_path,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -405,7 +469,9 @@ mod tests {
         let saved = fs::read_to_string(path).unwrap();
         assert!(saved.contains("[device]"));
         assert!(saved.contains("[clipboard]"));
+        assert!(saved.contains("[transfer]"));
         assert_eq!(config.clipboard, ClipboardConfig::default());
+        assert_eq!(config.transfer, TransferConfig::default());
         assert!(config.trusted_devices.is_empty());
 
         cleanup_dir(&dir);
@@ -436,6 +502,7 @@ mod tests {
         assert!(config.device.identity_private_key.is_some());
         assert!(config.device.identity_public_key.is_some());
         assert_eq!(config.clipboard, ClipboardConfig::default());
+        assert_eq!(config.transfer, TransferConfig::default());
         assert!(config.trusted_devices.is_empty());
         assert!(config_path_in(&dir).exists());
 
@@ -458,6 +525,7 @@ mod tests {
         assert!(config.device.identity_private_key.is_some());
         assert!(config.device.identity_public_key.is_some());
         assert_eq!(config.clipboard, ClipboardConfig::default());
+        assert_eq!(config.transfer, TransferConfig::default());
         assert!(config.trusted_devices.is_empty());
 
         cleanup_dir(&dir);
@@ -478,6 +546,7 @@ mod tests {
         assert!(config.device.identity_private_key.is_some());
         assert!(config.device.identity_public_key.is_some());
         assert_eq!(config.clipboard.max_file_bytes, 42);
+        assert_eq!(config.transfer, TransferConfig::default());
         assert_eq!(
             config.clipboard.cache_dir,
             Some(PathBuf::from("custom-cache"))
@@ -526,6 +595,42 @@ mod tests {
         let base = PathBuf::from("/tmp/synly-config-base");
         let resolved = resolve_configured_path(Path::new("cache-dir"), &base).unwrap();
         assert_eq!(resolved, base.join("cache-dir"));
+    }
+
+    #[test]
+    fn custom_transfer_limits_are_loaded() {
+        let dir = unique_test_dir("transfer");
+        fs::create_dir_all(&dir).unwrap();
+        let path = config_path_in(&dir);
+        let toml = format!(
+            "[device]\ndevice_id = \"{}\"\ndevice_name = \"demo\"\n\n[transfer]\nmax_meta_bytes = 123\nmax_frame_data_bytes = 456\nmax_clipboard_bytes = 789\n",
+            Uuid::new_v4()
+        );
+        fs::write(&path, toml).unwrap();
+
+        let config = SynlyConfig::load_or_create_in_dir(&dir).unwrap();
+        assert_eq!(
+            config.transfer,
+            TransferConfig {
+                max_meta_bytes: 123,
+                max_frame_data_bytes: 456,
+                max_clipboard_bytes: 789,
+            }
+        );
+
+        cleanup_dir(&dir);
+    }
+
+    #[test]
+    fn invalid_transfer_limits_are_rejected() {
+        let err = TransferConfig {
+            max_meta_bytes: 0,
+            max_frame_data_bytes: 1,
+            max_clipboard_bytes: 1,
+        }
+        .to_limits()
+        .unwrap_err();
+        assert!(err.to_string().contains("max_meta_bytes"));
     }
 
     #[test]

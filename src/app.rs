@@ -10,7 +10,7 @@ use crate::discovery::{self, Advertisement, DiscoveredPeer};
 use crate::protocol::{
     ClipboardPayload, ControlMessage, DeviceIdentity, FileChunkHeader, Frame, FrameReader,
     FrameWriter, PROTOCOL_VERSION, PairAuthMethod, PairRequestPayload, SessionAgreement,
-    frame_size_limit_message,
+    TransferLimits, frame_size_limit_message,
 };
 use crate::sync::{
     DeletePolicy, WorkspaceSpec, apply_file_metadata, build_apply_plan, build_incoming_snapshot,
@@ -27,7 +27,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::fs::File;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::time::{self, Instant};
@@ -159,6 +159,7 @@ async fn run_host(config: &mut SynlyConfig, options: RuntimeOptions) -> Result<(
                     options.sync_delete,
                     options.sync_clipboard,
                     &options.clipboard,
+                    options.transfer_limits,
                 )
                 .await
                 {
@@ -213,6 +214,7 @@ async fn run_client(config: &mut SynlyConfig, options: RuntimeOptions) -> Result
                     options.sync_delete,
                     options.sync_clipboard,
                     &options.clipboard,
+                    options.transfer_limits,
                 )
                 .await
                 {
@@ -286,6 +288,7 @@ async fn handle_trusted_incoming_connection(
     config: &mut SynlyConfig,
     options: &RuntimeOptions,
 ) -> Result<Option<AuthenticatedSession>> {
+    let transfer_limits = options.transfer_limits;
     let device = config.device.clone();
     if !has_trusted_transport(config) {
         bail!("收到 TLS 连接，但本机尚未保存任何可信设备根证书；未信任设备必须先走 bootstrap/PIN");
@@ -293,7 +296,7 @@ async fn handle_trusted_incoming_connection(
 
     let acceptor = crypto::build_server_acceptor(&device, &config.trusted_devices)?;
     let mut server_stream = acceptor.accept(socket).await?;
-    let frame = FrameReader::new(&mut server_stream).read_frame().await?;
+    let frame = read_frame(&mut server_stream, transfer_limits).await?;
     let (request_id, payload, trusted_proof) = match frame {
         Frame::Control(ControlMessage::PairRequest {
             request_id,
@@ -301,50 +304,65 @@ async fn handle_trusted_incoming_connection(
             trusted_proof,
         }) => (request_id, payload, trusted_proof),
         _ => {
-            FrameWriter::new(&mut server_stream)
-                .write_frame(Frame::Control(ControlMessage::Error {
+            write_frame(
+                &mut server_stream,
+                transfer_limits,
+                Frame::Control(ControlMessage::Error {
                     message: "连接建立了，但请求格式不正确".to_string(),
-                }))
-                .await?;
+                }),
+            )
+            .await?;
             return Ok(None);
         }
     };
 
     if payload.protocol_version != PROTOCOL_VERSION {
-        FrameWriter::new(&mut server_stream)
-            .write_frame(Frame::Control(ControlMessage::Error {
+        write_frame(
+            &mut server_stream,
+            transfer_limits,
+            Frame::Control(ControlMessage::Error {
                 message: format!("不支持的协议版本: {}", payload.protocol_version),
-            }))
-            .await?;
+            }),
+        )
+        .await?;
         return Ok(None);
     }
 
     if let Err(err) = crypto::verify_device_identity_material(&payload.client) {
-        FrameWriter::new(&mut server_stream)
-            .write_frame(Frame::Control(ControlMessage::Error {
+        write_frame(
+            &mut server_stream,
+            transfer_limits,
+            Frame::Control(ControlMessage::Error {
                 message: format!("对端提供的设备身份材料无效: {err:#}"),
-            }))
-            .await?;
+            }),
+        )
+        .await?;
         return Ok(None);
     }
 
     let trusted_device = match config.trusted_device(&payload.client.device_id).cloned() {
         Some(trusted_device) => trusted_device,
         None => {
-            FrameWriter::new(&mut server_stream)
-                .write_frame(Frame::Control(ControlMessage::Error {
+            write_frame(
+                &mut server_stream,
+                transfer_limits,
+                Frame::Control(ControlMessage::Error {
                     message: "该设备未处于可信状态，不能走免 PIN 的 mTLS 直连。".to_string(),
-                }))
-                .await?;
+                }),
+            )
+            .await?;
             return Ok(None);
         }
     };
     let Some(trusted_proof) = trusted_proof.as_deref() else {
-        FrameWriter::new(&mut server_stream)
-            .write_frame(Frame::Control(ControlMessage::Error {
+        write_frame(
+            &mut server_stream,
+            transfer_limits,
+            Frame::Control(ControlMessage::Error {
                 message: "可信设备已建立 mTLS，但缺少应用层身份签名。".to_string(),
-            }))
-            .await?;
+            }),
+        )
+        .await?;
         return Ok(None);
     };
 
@@ -360,22 +378,28 @@ async fn handle_trusted_incoming_connection(
             )
         })
     {
-        FrameWriter::new(&mut server_stream)
-            .write_frame(Frame::Control(ControlMessage::Error {
+        write_frame(
+            &mut server_stream,
+            transfer_limits,
+            Frame::Control(ControlMessage::Error {
                 message: format!("可信设备身份绑定失败，已拒绝本次连接: {err:#}"),
-            }))
-            .await?;
+            }),
+        )
+        .await?;
         return Ok(None);
     }
 
     let agreement = negotiate(options.mode, payload.requested_mode);
     print_pair_request_overview(&payload, options, &agreement, &remote_addr)?;
     if !agreement.any_direction() {
-        FrameWriter::new(&mut server_stream)
-            .write_frame(Frame::Control(ControlMessage::Error {
+        write_frame(
+            &mut server_stream,
+            transfer_limits,
+            Frame::Control(ControlMessage::Error {
                 message: "双方模式不兼容，本次请求无法建立同步。".to_string(),
-            }))
-            .await?;
+            }),
+        )
+        .await?;
         return Ok(None);
     }
 
@@ -400,9 +424,7 @@ async fn handle_trusted_incoming_connection(
         server_trusts_client: true,
         trust_established: false,
     })?;
-    FrameWriter::new(&mut server_stream)
-        .write_frame(Frame::Control(control))
-        .await?;
+    write_frame(&mut server_stream, transfer_limits, Frame::Control(control)).await?;
 
     if !accepted {
         return Ok(None);
@@ -428,57 +450,71 @@ async fn handle_bootstrap_incoming_connection(
     config: &mut SynlyConfig,
     options: &RuntimeOptions,
 ) -> Result<Option<AuthenticatedSession>> {
+    let transfer_limits = options.transfer_limits;
     let remote_label = remote_addr.to_string();
     let remote_peer_key = remote_addr.ip().to_string();
     if options.pairing.trusted_only {
-        FrameWriter::new(&mut socket)
-            .write_frame(Frame::Control(ControlMessage::Error {
+        write_frame(
+            &mut socket,
+            transfer_limits,
+            Frame::Control(ControlMessage::Error {
                 message: "当前 host 只允许已建立长期信任的设备通过 mTLS 直连。".to_string(),
-            }))
-            .await?;
+            }),
+        )
+        .await?;
         return Ok(None);
     }
 
     if let Some(remaining) = pairing_throttle.blocked_remaining(&remote_peer_key) {
-        FrameWriter::new(&mut socket)
-            .write_frame(Frame::Control(ControlMessage::Error {
+        write_frame(
+            &mut socket,
+            transfer_limits,
+            Frame::Control(ControlMessage::Error {
                 message: format!(
                     "该地址近期配对失败过多，请等待 {} 秒后再试。",
                     remaining.as_secs().max(1)
                 ),
-            }))
-            .await?;
+            }),
+        )
+        .await?;
         return Ok(None);
     }
 
-    let bootstrap_hello = match read_frame_with_timeout(&mut socket, PAIRING_TIMEOUT).await {
-        Ok(frame) => frame,
-        Err(err) => {
-            register_pairing_failure(pairing_throttle, &remote_peer_key).await;
-            return Err(err);
-        }
-    };
+    let bootstrap_hello =
+        match read_frame_with_timeout(&mut socket, PAIRING_TIMEOUT, transfer_limits).await {
+            Ok(frame) => frame,
+            Err(err) => {
+                register_pairing_failure(pairing_throttle, &remote_peer_key).await;
+                return Err(err);
+            }
+        };
     let bootstrap_hello = match bootstrap_hello {
         Frame::Control(ControlMessage::BootstrapHello {
             protocol_version,
             client_bootstrap_public_key,
         }) => (protocol_version, client_bootstrap_public_key),
         _ => {
-            FrameWriter::new(&mut socket)
-                .write_frame(Frame::Control(ControlMessage::Error {
+            write_frame(
+                &mut socket,
+                transfer_limits,
+                Frame::Control(ControlMessage::Error {
                     message: "未信任设备必须先发送最小 bootstrap 请求。".to_string(),
-                }))
-                .await?;
+                }),
+            )
+            .await?;
             return Ok(None);
         }
     };
     let (protocol_version, client_bootstrap_public_key) = bootstrap_hello;
     if protocol_version != PROTOCOL_VERSION {
-        FrameWriter::new(&mut socket)
-            .write_frame(Frame::Control(ControlMessage::Error {
+        write_frame(
+            &mut socket,
+            transfer_limits,
+            Frame::Control(ControlMessage::Error {
                 message: format!("不支持的协议版本: {protocol_version}"),
-            }))
-            .await?;
+            }),
+        )
+        .await?;
         return Ok(None);
     }
 
@@ -519,21 +555,25 @@ async fn handle_bootstrap_incoming_connection(
         &server_bootstrap_public_key,
     )?;
 
-    FrameWriter::new(&mut socket)
-        .write_frame(Frame::Control(ControlMessage::BootstrapChallenge {
+    write_frame(
+        &mut socket,
+        transfer_limits,
+        Frame::Control(ControlMessage::BootstrapChallenge {
             request_id: request_id.clone(),
             server_bootstrap_public_key: server_bootstrap_public_key.clone(),
             server_pake_message,
-        }))
-        .await?;
+        }),
+    )
+    .await?;
 
-    let pake_frame = match read_frame_with_timeout(&mut socket, PAIRING_TIMEOUT).await {
-        Ok(frame) => frame,
-        Err(err) => {
-            register_pairing_failure(pairing_throttle, &remote_peer_key).await;
-            return Err(err);
-        }
-    };
+    let pake_frame =
+        match read_frame_with_timeout(&mut socket, PAIRING_TIMEOUT, transfer_limits).await {
+            Ok(frame) => frame,
+            Err(err) => {
+                register_pairing_failure(pairing_throttle, &remote_peer_key).await;
+                return Err(err);
+            }
+        };
     let (client_pake_message, client_confirm) = match pake_frame {
         Frame::Control(ControlMessage::BootstrapPake {
             request_id: incoming_request_id,
@@ -542,20 +582,26 @@ async fn handle_bootstrap_incoming_connection(
         }) if incoming_request_id == request_id => (client_pake_message, client_confirm),
         Frame::Control(ControlMessage::BootstrapPake { .. }) => {
             register_pairing_failure(pairing_throttle, &remote_peer_key).await;
-            FrameWriter::new(&mut socket)
-                .write_frame(Frame::Control(ControlMessage::Error {
+            write_frame(
+                &mut socket,
+                transfer_limits,
+                Frame::Control(ControlMessage::Error {
                     message: "收到的 PAKE 请求标识与当前连接不匹配。".to_string(),
-                }))
-                .await?;
+                }),
+            )
+            .await?;
             return Ok(None);
         }
         _ => {
             register_pairing_failure(pairing_throttle, &remote_peer_key).await;
-            FrameWriter::new(&mut socket)
-                .write_frame(Frame::Control(ControlMessage::Error {
+            write_frame(
+                &mut socket,
+                transfer_limits,
+                Frame::Control(ControlMessage::Error {
                     message: "客户端没有按预期完成 PAKE 认证。".to_string(),
-                }))
-                .await?;
+                }),
+            )
+            .await?;
             return Ok(None);
         }
     };
@@ -574,11 +620,14 @@ async fn handle_bootstrap_incoming_connection(
             Ok(pake_key) => pake_key,
             Err(err) => {
                 register_pairing_failure(pairing_throttle, &remote_peer_key).await;
-                FrameWriter::new(&mut socket)
-                    .write_frame(Frame::Control(ControlMessage::Error {
+                write_frame(
+                    &mut socket,
+                    transfer_limits,
+                    Frame::Control(ControlMessage::Error {
                         message: format!("PIN 或 PAKE 认证失败：{err:#}"),
-                    }))
-                    .await?;
+                    }),
+                )
+                .await?;
                 return Ok(None);
             }
         };
@@ -590,12 +639,15 @@ async fn handle_bootstrap_incoming_connection(
         &client_bootstrap_public_key,
         &server_bootstrap_public_key,
     );
-    FrameWriter::new(&mut socket)
-        .write_frame(Frame::Control(ControlMessage::BootstrapAck {
+    write_frame(
+        &mut socket,
+        transfer_limits,
+        Frame::Control(ControlMessage::BootstrapAck {
             request_id: request_id.clone(),
             server_confirm,
-        }))
-        .await?;
+        }),
+    )
+    .await?;
 
     let acceptor = crypto::build_bootstrap_server_acceptor(
         &request_id,
@@ -607,7 +659,8 @@ async fn handle_bootstrap_incoming_connection(
     let mut server_stream = time::timeout(TLS_UPGRADE_TIMEOUT, acceptor.accept(socket))
         .await
         .map_err(|_| anyhow!("等待客户端切换到临时 mTLS 超时"))??;
-    let frame = read_frame_with_timeout(&mut server_stream, PAIRING_TIMEOUT).await?;
+    let frame =
+        read_frame_with_timeout(&mut server_stream, PAIRING_TIMEOUT, transfer_limits).await?;
     let (incoming_request_id, payload, trusted_proof) = match frame {
         Frame::Control(ControlMessage::PairRequest {
             request_id,
@@ -615,44 +668,59 @@ async fn handle_bootstrap_incoming_connection(
             trusted_proof,
         }) => (request_id, payload, trusted_proof),
         _ => {
-            FrameWriter::new(&mut server_stream)
-                .write_frame(Frame::Control(ControlMessage::Error {
+            write_frame(
+                &mut server_stream,
+                transfer_limits,
+                Frame::Control(ControlMessage::Error {
                     message: "临时 mTLS 已建立，但请求格式不正确。".to_string(),
-                }))
-                .await?;
+                }),
+            )
+            .await?;
             return Ok(None);
         }
     };
     if incoming_request_id != request_id {
-        FrameWriter::new(&mut server_stream)
-            .write_frame(Frame::Control(ControlMessage::Error {
+        write_frame(
+            &mut server_stream,
+            transfer_limits,
+            Frame::Control(ControlMessage::Error {
                 message: "收到的请求标识与当前 bootstrap 会话不匹配。".to_string(),
-            }))
-            .await?;
+            }),
+        )
+        .await?;
         return Ok(None);
     }
     if trusted_proof.is_some() {
-        FrameWriter::new(&mut server_stream)
-            .write_frame(Frame::Control(ControlMessage::Error {
+        write_frame(
+            &mut server_stream,
+            transfer_limits,
+            Frame::Control(ControlMessage::Error {
                 message: "bootstrap 配对阶段不接受 trusted-device 签名。".to_string(),
-            }))
-            .await?;
+            }),
+        )
+        .await?;
         return Ok(None);
     }
     if payload.protocol_version != PROTOCOL_VERSION {
-        FrameWriter::new(&mut server_stream)
-            .write_frame(Frame::Control(ControlMessage::Error {
+        write_frame(
+            &mut server_stream,
+            transfer_limits,
+            Frame::Control(ControlMessage::Error {
                 message: format!("不支持的协议版本: {}", payload.protocol_version),
-            }))
-            .await?;
+            }),
+        )
+        .await?;
         return Ok(None);
     }
     if let Err(err) = crypto::verify_device_identity_material(&payload.client) {
-        FrameWriter::new(&mut server_stream)
-            .write_frame(Frame::Control(ControlMessage::Error {
+        write_frame(
+            &mut server_stream,
+            transfer_limits,
+            Frame::Control(ControlMessage::Error {
                 message: format!("对端提供的设备身份材料无效: {err:#}"),
-            }))
-            .await?;
+            }),
+        )
+        .await?;
         return Ok(None);
     }
 
@@ -660,11 +728,14 @@ async fn handle_bootstrap_incoming_connection(
     let agreement = negotiate(options.mode, payload.requested_mode);
     print_pair_request_overview(&payload, options, &agreement, &remote_label)?;
     if !agreement.any_direction() {
-        FrameWriter::new(&mut server_stream)
-            .write_frame(Frame::Control(ControlMessage::Error {
+        write_frame(
+            &mut server_stream,
+            transfer_limits,
+            Frame::Control(ControlMessage::Error {
                 message: "双方模式不兼容，本次请求无法建立同步。".to_string(),
-            }))
-            .await?;
+            }),
+        )
+        .await?;
         return Ok(None);
     }
 
@@ -701,9 +772,7 @@ async fn handle_bootstrap_incoming_connection(
         server_trusts_client,
         trust_established,
     })?;
-    FrameWriter::new(&mut server_stream)
-        .write_frame(Frame::Control(control))
-        .await?;
+    write_frame(&mut server_stream, transfer_limits, Frame::Control(control)).await?;
 
     if accepted && remember_trusted_device {
         config.remember_trusted_device(
@@ -744,6 +813,7 @@ async fn connect_to_trusted_peer(
     config: &mut SynlyConfig,
     options: &RuntimeOptions,
 ) -> Result<AuthenticatedSession> {
+    let transfer_limits = options.transfer_limits;
     let socket = TcpStream::connect((address, port))
         .await
         .with_context(|| format!("failed to connect to {}:{}", address, port))?;
@@ -766,15 +836,18 @@ async fn connect_to_trusted_peer(
         &request_id,
         &payload,
     )?;
-    FrameWriter::new(&mut client_stream)
-        .write_frame(Frame::Control(ControlMessage::PairRequest {
+    write_frame(
+        &mut client_stream,
+        transfer_limits,
+        Frame::Control(ControlMessage::PairRequest {
             request_id: request_id.clone(),
             payload: payload.clone(),
             trusted_proof: Some(trusted_proof),
-        }))
-        .await?;
+        }),
+    )
+    .await?;
 
-    let reply = match FrameReader::new(&mut client_stream).read_frame().await? {
+    let reply = match read_frame(&mut client_stream, transfer_limits).await? {
         Frame::Control(message) => message,
         _ => bail!("peer sent a non-control response during trusted pairing"),
     };
@@ -842,6 +915,7 @@ async fn connect_to_untrusted_peer(
     config: &mut SynlyConfig,
     options: &RuntimeOptions,
 ) -> Result<AuthenticatedSession> {
+    let transfer_limits = options.transfer_limits;
     let mut socket = TcpStream::connect((address, port))
         .await
         .with_context(|| format!("failed to connect to {}:{}", address, port))?;
@@ -855,15 +929,18 @@ async fn connect_to_untrusted_peer(
     println!("{}", client_display.randomart);
     println!("请确认 host 屏幕上显示的是同一张 bootstrap 图，再继续输入 PIN。");
 
-    FrameWriter::new(&mut socket)
-        .write_frame(Frame::Control(ControlMessage::BootstrapHello {
+    write_frame(
+        &mut socket,
+        transfer_limits,
+        Frame::Control(ControlMessage::BootstrapHello {
             protocol_version: PROTOCOL_VERSION,
             client_bootstrap_public_key: client_bootstrap_public_key.clone(),
-        }))
-        .await?;
+        }),
+    )
+    .await?;
 
     let (request_id, server_bootstrap_public_key, server_pake_message) =
-        match read_frame_with_timeout(&mut socket, PAIRING_TIMEOUT).await? {
+        match read_frame_with_timeout(&mut socket, PAIRING_TIMEOUT, transfer_limits).await? {
             Frame::Control(ControlMessage::BootstrapChallenge {
                 request_id,
                 server_bootstrap_public_key,
@@ -898,15 +975,18 @@ async fn connect_to_untrusted_peer(
         &server_bootstrap_public_key,
     );
 
-    FrameWriter::new(&mut socket)
-        .write_frame(Frame::Control(ControlMessage::BootstrapPake {
+    write_frame(
+        &mut socket,
+        transfer_limits,
+        Frame::Control(ControlMessage::BootstrapPake {
             request_id: request_id.clone(),
             client_pake_message,
             client_confirm,
-        }))
-        .await?;
+        }),
+    )
+    .await?;
 
-    match read_frame_with_timeout(&mut socket, PAIRING_TIMEOUT).await? {
+    match read_frame_with_timeout(&mut socket, PAIRING_TIMEOUT, transfer_limits).await? {
         Frame::Control(ControlMessage::BootstrapAck {
             request_id: incoming_request_id,
             server_confirm,
@@ -946,15 +1026,20 @@ async fn connect_to_untrusted_peer(
         workspace: options.workspace.summary(options.sync_clipboard),
         request_trust: options.pairing.trust_device,
     };
-    FrameWriter::new(&mut client_stream)
-        .write_frame(Frame::Control(ControlMessage::PairRequest {
+    write_frame(
+        &mut client_stream,
+        transfer_limits,
+        Frame::Control(ControlMessage::PairRequest {
             request_id: request_id.clone(),
             payload: payload.clone(),
             trusted_proof: None,
-        }))
-        .await?;
+        }),
+    )
+    .await?;
 
-    let reply = match read_frame_with_timeout(&mut client_stream, PAIRING_TIMEOUT).await? {
+    let reply = match read_frame_with_timeout(&mut client_stream, PAIRING_TIMEOUT, transfer_limits)
+        .await?
+    {
         Frame::Control(message) => message,
         _ => bail!("peer sent a non-control response during bootstrap pairing"),
     };
@@ -1039,6 +1124,7 @@ async fn run_sync_session(
     sync_delete: bool,
     sync_clipboard: bool,
     clipboard_options: &crate::cli::ClipboardRuntimeOptions,
+    transfer_limits: TransferLimits,
 ) -> Result<()> {
     println!();
     println!("{}", style("同步已开始").bold());
@@ -1075,7 +1161,7 @@ async fn run_sync_session(
 
     let (read_half, write_half) = tokio::io::split(session.stream);
     let (tx, rx) = mpsc::channel::<Frame>(64);
-    let writer_task = tokio::spawn(writer_loop(write_half, rx));
+    let writer_task = tokio::spawn(writer_loop(write_half, rx, transfer_limits));
 
     let snapshot_task = if file_can_send {
         let outgoing = workspace
@@ -1123,7 +1209,7 @@ async fn run_sync_session(
 
     let incoming_root = workspace.incoming_root.clone();
     let outgoing_spec = workspace.outgoing.clone();
-    let mut reader = FrameReader::new(read_half);
+    let mut reader = FrameReader::with_limits(read_half, transfer_limits);
     let mut pending_revisions = BTreeMap::<u64, PendingRevision>::new();
     let mut incoming_files = HashMap::<(u64, String), IncomingFileState>::new();
     let disconnected = loop {
@@ -1294,11 +1380,15 @@ async fn run_sync_session(
     Ok(())
 }
 
-async fn writer_loop<W>(writer: W, mut rx: mpsc::Receiver<Frame>) -> Result<()>
+async fn writer_loop<W>(
+    writer: W,
+    mut rx: mpsc::Receiver<Frame>,
+    transfer_limits: TransferLimits,
+) -> Result<()>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    let mut writer = FrameWriter::new(writer);
+    let mut writer = FrameWriter::with_limits(writer, transfer_limits);
     while let Some(frame) = rx.recv().await {
         match writer.write_frame(frame).await {
             Ok(()) => {}
@@ -1960,11 +2050,33 @@ fn trusted_device_for_peer(
     Ok(config.trusted_device(&device_id).cloned())
 }
 
-async fn read_frame_with_timeout<R>(reader: &mut R, timeout: Duration) -> Result<Frame>
+async fn read_frame<R>(reader: &mut R, transfer_limits: TransferLimits) -> Result<Frame>
 where
     R: AsyncRead + Unpin,
 {
-    time::timeout(timeout, FrameReader::new(reader).read_frame())
+    FrameReader::with_limits(reader, transfer_limits)
+        .read_frame()
+        .await
+}
+
+async fn write_frame<W>(writer: &mut W, transfer_limits: TransferLimits, frame: Frame) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    FrameWriter::with_limits(writer, transfer_limits)
+        .write_frame(frame)
+        .await
+}
+
+async fn read_frame_with_timeout<R>(
+    reader: &mut R,
+    timeout: Duration,
+    transfer_limits: TransferLimits,
+) -> Result<Frame>
+where
+    R: AsyncRead + Unpin,
+{
+    time::timeout(timeout, read_frame(reader, transfer_limits))
         .await
         .map_err(|_| anyhow!("等待对端响应超时"))?
 }

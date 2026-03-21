@@ -11,12 +11,29 @@ const FRAME_CONTROL: u8 = 1;
 const FRAME_FILE_CHUNK: u8 = 2;
 const FRAME_CLIPBOARD_META: u8 = 3;
 const FRAME_CLIPBOARD_CHUNK: u8 = 4;
-const MAX_META_LEN: usize = 20 * 1024 * 1024;
-const MAX_FRAME_DATA_LEN: usize = 128 * 1024 * 1024;
-const MAX_CLIPBOARD_BINARY_LEN: usize = 100 * 1024 * 1024;
+const DEFAULT_MAX_META_LEN: usize = 20 * 1024 * 1024;
+const DEFAULT_MAX_FRAME_DATA_LEN: usize = 128 * 1024 * 1024;
+const DEFAULT_MAX_CLIPBOARD_BINARY_LEN: usize = 100 * 1024 * 1024;
 const CLIPBOARD_STREAM_CHUNK_SIZE: usize = 1024 * 1024;
 
 pub const PROTOCOL_VERSION: u16 = 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TransferLimits {
+    pub max_meta_len: usize,
+    pub max_frame_data_len: usize,
+    pub max_clipboard_binary_len: usize,
+}
+
+impl Default for TransferLimits {
+    fn default() -> Self {
+        Self {
+            max_meta_len: DEFAULT_MAX_META_LEN,
+            max_frame_data_len: DEFAULT_MAX_FRAME_DATA_LEN,
+            max_clipboard_binary_len: DEFAULT_MAX_CLIPBOARD_BINARY_LEN,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -166,10 +183,12 @@ pub enum Frame {
 
 pub struct FrameReader<R> {
     inner: R,
+    limits: TransferLimits,
 }
 
 pub struct FrameWriter<W> {
     inner: W,
+    limits: TransferLimits,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -337,13 +356,21 @@ struct RawFrame {
 
 impl<R> FrameReader<R> {
     pub fn new(inner: R) -> Self {
-        Self { inner }
+        Self::with_limits(inner, TransferLimits::default())
+    }
+
+    pub fn with_limits(inner: R, limits: TransferLimits) -> Self {
+        Self { inner, limits }
     }
 }
 
 impl<W> FrameWriter<W> {
     pub fn new(inner: W) -> Self {
-        Self { inner }
+        Self::with_limits(inner, TransferLimits::default())
+    }
+
+    pub fn with_limits(inner: W, limits: TransferLimits) -> Self {
+        Self { inner, limits }
     }
 }
 
@@ -379,8 +406,16 @@ where
         let meta_len = self.inner.read_u32().await? as usize;
         let data_len = self.inner.read_u64().await? as usize;
 
-        ensure_len("incoming frame metadata", meta_len, MAX_META_LEN)?;
-        ensure_len("incoming frame data", data_len, MAX_FRAME_DATA_LEN)?;
+        ensure_len(
+            "incoming frame metadata",
+            meta_len,
+            self.limits.max_meta_len,
+        )?;
+        ensure_len(
+            "incoming frame data",
+            data_len,
+            self.limits.max_frame_data_len,
+        )?;
 
         let mut meta = vec![0u8; meta_len];
         self.inner.read_exact(&mut meta).await?;
@@ -406,7 +441,7 @@ where
         ensure_len(
             "incoming clipboard binary payload",
             binary_len,
-            MAX_CLIPBOARD_BINARY_LEN,
+            self.limits.max_clipboard_binary_len,
         )?;
 
         if binary_len == 0 {
@@ -477,7 +512,11 @@ where
                 self.write_raw_frame(FRAME_CONTROL, &meta, &[]).await?;
             }
             Frame::FileChunk(header, data) => {
-                ensure_len("file chunk data", data.len(), MAX_FRAME_DATA_LEN)?;
+                ensure_len(
+                    "file chunk data",
+                    data.len(),
+                    self.limits.max_frame_data_len,
+                )?;
                 let meta = encode_payload(&header)?;
                 self.write_raw_frame(FRAME_FILE_CHUNK, &meta, &data).await?;
             }
@@ -486,7 +525,7 @@ where
                 ensure_len(
                     "clipboard binary payload",
                     data.len(),
-                    MAX_CLIPBOARD_BINARY_LEN,
+                    self.limits.max_clipboard_binary_len,
                 )?;
                 let transfer_id = Uuid::new_v4();
                 let meta = encode_payload(&ClipboardTransferHeader {
@@ -518,8 +557,8 @@ where
     }
 
     async fn write_raw_frame(&mut self, frame_type: u8, meta: &[u8], data: &[u8]) -> Result<()> {
-        ensure_len("frame metadata", meta.len(), MAX_META_LEN)?;
-        ensure_len("frame data", data.len(), MAX_FRAME_DATA_LEN)?;
+        ensure_len("frame metadata", meta.len(), self.limits.max_meta_len)?;
+        ensure_len("frame data", data.len(), self.limits.max_frame_data_len)?;
         let meta_len = u32::try_from(meta.len()).context("frame metadata length overflowed u32")?;
         let data_len = u64::try_from(data.len()).context("frame data length overflowed u64")?;
 
