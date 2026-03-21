@@ -21,6 +21,9 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, Serve
 use rustls::server::WebPkiClientVerifier;
 use rustls::{ClientConfig, ServerConfig};
 use sha2::{Digest, Sha256};
+use spake2::{
+    Ed25519Group as SpakeGroup, Identity as SpakeIdentity, Password as SpakePassword, Spake2,
+};
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
@@ -43,6 +46,10 @@ const ED25519_PKCS8_PUBLIC_KEY_PREFIX: [u8; 3] = [0x81, 0x21, 0x00];
 pub struct BootstrapKeyMaterial {
     private_key: agreement::EphemeralPrivateKey,
     public_key: Vec<u8>,
+}
+
+pub struct BootstrapPakeState {
+    state: Spake2<SpakeGroup>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -118,6 +125,116 @@ pub fn bootstrap_session_display(
     Ok(fingerprint_display("session", &context))
 }
 
+pub fn start_bootstrap_pake_client(
+    pin: &str,
+    request_id: &str,
+    client_bootstrap_public_key: &str,
+    server_bootstrap_public_key: &str,
+) -> Result<(BootstrapPakeState, String)> {
+    let password = SpakePassword::new(pin.trim().as_bytes());
+    let (id_a, id_b) = bootstrap_pake_identities(
+        request_id,
+        client_bootstrap_public_key,
+        server_bootstrap_public_key,
+    );
+    let (state, outbound_message) = Spake2::<SpakeGroup>::start_a(&password, &id_a, &id_b);
+    Ok((
+        BootstrapPakeState { state },
+        encode_bootstrap_message(&outbound_message),
+    ))
+}
+
+pub fn start_bootstrap_pake_server(
+    pin: &str,
+    request_id: &str,
+    client_bootstrap_public_key: &str,
+    server_bootstrap_public_key: &str,
+) -> Result<(BootstrapPakeState, String)> {
+    let password = SpakePassword::new(pin.trim().as_bytes());
+    let (id_a, id_b) = bootstrap_pake_identities(
+        request_id,
+        client_bootstrap_public_key,
+        server_bootstrap_public_key,
+    );
+    let (state, outbound_message) = Spake2::<SpakeGroup>::start_b(&password, &id_a, &id_b);
+    Ok((
+        BootstrapPakeState { state },
+        encode_bootstrap_message(&outbound_message),
+    ))
+}
+
+pub fn finish_bootstrap_pake(state: BootstrapPakeState, inbound_message: &str) -> Result<Vec<u8>> {
+    let inbound_message = decode_bootstrap_message(inbound_message)?;
+    state
+        .state
+        .finish(&inbound_message)
+        .map_err(|err| anyhow!("PAKE handshake failed: {err}"))
+}
+
+pub fn client_pake_confirm(
+    pake_key: &[u8],
+    request_id: &str,
+    client_bootstrap_public_key: &str,
+    server_bootstrap_public_key: &str,
+) -> String {
+    bootstrap_confirmation(
+        pake_key,
+        b"synly-pake-client-confirm",
+        request_id,
+        client_bootstrap_public_key,
+        server_bootstrap_public_key,
+    )
+}
+
+pub fn verify_client_pake_confirm(
+    pake_key: &[u8],
+    request_id: &str,
+    client_bootstrap_public_key: &str,
+    server_bootstrap_public_key: &str,
+    proof: &str,
+) -> Result<()> {
+    verify_bootstrap_confirmation(
+        pake_key,
+        b"synly-pake-client-confirm",
+        request_id,
+        client_bootstrap_public_key,
+        server_bootstrap_public_key,
+        proof,
+    )
+}
+
+pub fn server_pake_confirm(
+    pake_key: &[u8],
+    request_id: &str,
+    client_bootstrap_public_key: &str,
+    server_bootstrap_public_key: &str,
+) -> String {
+    bootstrap_confirmation(
+        pake_key,
+        b"synly-pake-server-confirm",
+        request_id,
+        client_bootstrap_public_key,
+        server_bootstrap_public_key,
+    )
+}
+
+pub fn verify_server_pake_confirm(
+    pake_key: &[u8],
+    request_id: &str,
+    client_bootstrap_public_key: &str,
+    server_bootstrap_public_key: &str,
+    proof: &str,
+) -> Result<()> {
+    verify_bootstrap_confirmation(
+        pake_key,
+        b"synly-pake-server-confirm",
+        request_id,
+        client_bootstrap_public_key,
+        server_bootstrap_public_key,
+        proof,
+    )
+}
+
 pub fn build_server_acceptor(
     device: &DeviceConfig,
     trusted_devices: &[TrustedDeviceConfig],
@@ -151,7 +268,7 @@ pub fn build_client_connector(
 
 pub fn build_bootstrap_client_connector(
     request_id: &str,
-    pin: &str,
+    pake_key: &[u8],
     client_bootstrap_key: BootstrapKeyMaterial,
     server_bootstrap_public_key: &str,
 ) -> Result<TlsConnector> {
@@ -160,8 +277,8 @@ pub fn build_bootstrap_client_connector(
     let shared_secret = client_bootstrap_key.derive_shared_secret(&server_public_key)?;
     let tls_materials = derive_bootstrap_tls_materials(
         &shared_secret,
+        pake_key,
         request_id,
-        pin,
         &client_public_key,
         &server_public_key,
     )?;
@@ -180,7 +297,7 @@ pub fn build_bootstrap_client_connector(
 
 pub fn build_bootstrap_server_acceptor(
     request_id: &str,
-    pin: &str,
+    pake_key: &[u8],
     server_bootstrap_key: BootstrapKeyMaterial,
     client_bootstrap_public_key: &str,
 ) -> Result<TlsAcceptor> {
@@ -189,8 +306,8 @@ pub fn build_bootstrap_server_acceptor(
     let shared_secret = server_bootstrap_key.derive_shared_secret(&client_public_key)?;
     let tls_materials = derive_bootstrap_tls_materials(
         &shared_secret,
+        pake_key,
         request_id,
-        pin,
         &client_public_key,
         &server_public_key,
     )?;
@@ -611,15 +728,15 @@ pub fn short_identity_fingerprint(public_key: &str) -> Result<String> {
 
 fn derive_bootstrap_tls_materials(
     shared_secret: &[u8],
+    pake_key: &[u8],
     request_id: &str,
-    pin: &str,
     client_public_key: &[u8],
     server_public_key: &[u8],
 ) -> Result<BootstrapTlsMaterials> {
     let bootstrap_secret = derive_bootstrap_secret(
         shared_secret,
+        pake_key,
         request_id,
-        pin,
         client_public_key,
         server_public_key,
     );
@@ -660,13 +777,12 @@ fn derive_bootstrap_tls_materials(
 
 fn derive_bootstrap_secret(
     shared_secret: &[u8],
+    pake_key: &[u8],
     request_id: &str,
-    pin: &str,
     client_public_key: &[u8],
     server_public_key: &[u8],
 ) -> [u8; 32] {
-    let pin_key = derive_pin_key(request_id, pin);
-    let mut mac = HmacSha256::new_from_slice(&pin_key).expect("valid HMAC key");
+    let mut mac = HmacSha256::new_from_slice(pake_key).expect("valid HMAC key");
     mac.update(b"synly-bootstrap-secret");
     mac.update(shared_secret);
     mac.update(request_id.as_bytes());
@@ -835,6 +951,63 @@ fn randomart_from_digest(label: &str, digest: &[u8]) -> String {
     }
     output.push_str("+-----------------+");
     output
+}
+
+fn bootstrap_pake_identities(
+    request_id: &str,
+    client_bootstrap_public_key: &str,
+    server_bootstrap_public_key: &str,
+) -> (SpakeIdentity, SpakeIdentity) {
+    let id_a = SpakeIdentity::new(
+        format!("synly-bootstrap-pake/client/{request_id}/{client_bootstrap_public_key}")
+            .as_bytes(),
+    );
+    let id_b = SpakeIdentity::new(
+        format!("synly-bootstrap-pake/server/{request_id}/{server_bootstrap_public_key}")
+            .as_bytes(),
+    );
+    (id_a, id_b)
+}
+
+fn bootstrap_confirmation(
+    pake_key: &[u8],
+    label: &[u8],
+    request_id: &str,
+    client_bootstrap_public_key: &str,
+    server_bootstrap_public_key: &str,
+) -> String {
+    let mut mac = HmacSha256::new_from_slice(pake_key).expect("valid HMAC key");
+    mac.update(label);
+    mac.update(request_id.as_bytes());
+    mac.update(client_bootstrap_public_key.as_bytes());
+    mac.update(server_bootstrap_public_key.as_bytes());
+    STANDARD_NO_PAD.encode(mac.finalize().into_bytes())
+}
+
+fn verify_bootstrap_confirmation(
+    pake_key: &[u8],
+    label: &[u8],
+    request_id: &str,
+    client_bootstrap_public_key: &str,
+    server_bootstrap_public_key: &str,
+    proof: &str,
+) -> Result<()> {
+    let expected = STANDARD_NO_PAD.decode(proof.as_bytes())?;
+    let mut mac = HmacSha256::new_from_slice(pake_key).expect("valid HMAC key");
+    mac.update(label);
+    mac.update(request_id.as_bytes());
+    mac.update(client_bootstrap_public_key.as_bytes());
+    mac.update(server_bootstrap_public_key.as_bytes());
+    mac.verify_slice(&expected)?;
+    Ok(())
+}
+
+fn encode_bootstrap_message(message: &[u8]) -> String {
+    STANDARD_NO_PAD.encode(message)
+}
+
+fn decode_bootstrap_message(message: &str) -> Result<Vec<u8>> {
+    Ok(STANDARD_NO_PAD.decode(message.trim().as_bytes())?)
 }
 
 fn encode_bootstrap_public_key(public_key: &[u8]) -> String {
@@ -1108,20 +1281,21 @@ mod tests {
     #[test]
     fn bootstrap_tls_materials_are_deterministic() {
         let shared_secret = [9u8; 32];
+        let pake_key = [8u8; 32];
         let client_public_key = [1u8; 32];
         let server_public_key = [2u8; 32];
         let left = derive_bootstrap_tls_materials(
             &shared_secret,
+            &pake_key,
             "request-1",
-            "123456",
             &client_public_key,
             &server_public_key,
         )
         .unwrap();
         let right = derive_bootstrap_tls_materials(
             &shared_secret,
+            &pake_key,
             "request-1",
-            "123456",
             &client_public_key,
             &server_public_key,
         )
@@ -1143,5 +1317,57 @@ mod tests {
             left.client_materials.cert_chain[0].as_ref(),
             left.server_materials.cert_chain[0].as_ref()
         );
+    }
+
+    #[test]
+    fn bootstrap_pake_roundtrip_and_confirmation() {
+        let client_public_key = STANDARD_NO_PAD.encode([3u8; 32]);
+        let server_public_key = STANDARD_NO_PAD.encode([4u8; 32]);
+        let (client_state, client_message) = start_bootstrap_pake_client(
+            "123456",
+            "request-2",
+            &client_public_key,
+            &server_public_key,
+        )
+        .unwrap();
+        let (server_state, server_message) = start_bootstrap_pake_server(
+            "123456",
+            "request-2",
+            &client_public_key,
+            &server_public_key,
+        )
+        .unwrap();
+        let client_key = finish_bootstrap_pake(client_state, &server_message).unwrap();
+        let server_key = finish_bootstrap_pake(server_state, &client_message).unwrap();
+        assert_eq!(client_key, server_key);
+
+        let client_confirm = client_pake_confirm(
+            &client_key,
+            "request-2",
+            &client_public_key,
+            &server_public_key,
+        );
+        verify_client_pake_confirm(
+            &server_key,
+            "request-2",
+            &client_public_key,
+            &server_public_key,
+            &client_confirm,
+        )
+        .unwrap();
+        let server_confirm = server_pake_confirm(
+            &server_key,
+            "request-2",
+            &client_public_key,
+            &server_public_key,
+        );
+        verify_server_pake_confirm(
+            &client_key,
+            "request-2",
+            &client_public_key,
+            &server_public_key,
+            &server_confirm,
+        )
+        .unwrap();
     }
 }

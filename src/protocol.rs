@@ -11,7 +11,7 @@ const FRAME_CLIPBOARD: u8 = 3;
 const MAX_META_LEN: usize = 4 * 1024 * 1024;
 const MAX_DATA_LEN: usize = 64 * 1024 * 1024;
 
-pub const PROTOCOL_VERSION: u16 = 6;
+pub const PROTOCOL_VERSION: u16 = 7;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -61,6 +61,16 @@ pub enum ControlMessage {
     BootstrapChallenge {
         request_id: String,
         server_bootstrap_public_key: String,
+        server_pake_message: String,
+    },
+    BootstrapPake {
+        request_id: String,
+        client_pake_message: String,
+        client_confirm: String,
+    },
+    BootstrapAck {
+        request_id: String,
+        server_confirm: String,
     },
     PairRequest {
         request_id: String,

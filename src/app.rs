@@ -21,10 +21,11 @@ use console::style;
 use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use rand::RngExt;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::time::{self, Instant};
@@ -32,6 +33,12 @@ use tokio_rustls::TlsStream;
 use uuid::Uuid;
 
 const FILE_CHUNK_SIZE: usize = 256 * 1024;
+const PAIRING_TIMEOUT: Duration = Duration::from_secs(90);
+const TLS_UPGRADE_TIMEOUT: Duration = Duration::from_secs(15);
+const PAIRING_FAILURE_WINDOW: Duration = Duration::from_secs(5 * 60);
+const PAIRING_COOLDOWN: Duration = Duration::from_secs(3 * 60);
+const PAIRING_MAX_FAILURES: u32 = 5;
+const PAIRING_BACKOFF_BASE_MS: u64 = 1_000;
 
 #[derive(Clone, Copy, Debug)]
 enum SessionRole {
@@ -81,6 +88,17 @@ struct PairDecisionParams<'a> {
     trust_established: bool,
 }
 
+#[derive(Default)]
+struct PairingThrottle {
+    peers: HashMap<String, PairingPeerState>,
+}
+
+struct PairingPeerState {
+    failures: u32,
+    window_started_at: Instant,
+    blocked_until: Option<Instant>,
+}
+
 pub async fn run(config: &mut SynlyConfig, options: RuntimeOptions) -> Result<()> {
     match options.connection {
         ConnectionPreference::Host => run_host(config, options).await,
@@ -90,6 +108,7 @@ pub async fn run(config: &mut SynlyConfig, options: RuntimeOptions) -> Result<()
 
 async fn run_host(config: &mut SynlyConfig, options: RuntimeOptions) -> Result<()> {
     let device = config.device.clone();
+    let mut pairing_throttle = PairingThrottle::default();
     let listener = TcpListener::bind(("0.0.0.0", 0))
         .await
         .context("failed to bind TCP listener")?;
@@ -104,7 +123,9 @@ async fn run_host(config: &mut SynlyConfig, options: RuntimeOptions) -> Result<(
 
     loop {
         let (socket, address) = listener.accept().await?;
-        match handle_incoming_connection(socket, address.to_string(), config, &options).await {
+        match handle_incoming_connection(socket, address, &mut pairing_throttle, config, &options)
+            .await
+        {
             Ok(Some(session)) => {
                 run_sync_session(
                     session,
@@ -163,7 +184,8 @@ async fn run_client(config: &mut SynlyConfig, options: RuntimeOptions) -> Result
 
 async fn handle_incoming_connection(
     socket: TcpStream,
-    remote_addr: String,
+    remote_addr: SocketAddr,
+    pairing_throttle: &mut PairingThrottle,
     config: &mut SynlyConfig,
     options: &RuntimeOptions,
 ) -> Result<Option<AuthenticatedSession>> {
@@ -174,9 +196,10 @@ async fn handle_incoming_connection(
     }
 
     if first_byte[0] == 0x16 {
-        handle_trusted_incoming_connection(socket, remote_addr, config, options).await
+        handle_trusted_incoming_connection(socket, remote_addr.to_string(), config, options).await
     } else {
-        handle_bootstrap_incoming_connection(socket, remote_addr, config, options).await
+        handle_bootstrap_incoming_connection(socket, remote_addr, pairing_throttle, config, options)
+            .await
     }
 }
 
@@ -353,10 +376,13 @@ async fn handle_trusted_incoming_connection(
 
 async fn handle_bootstrap_incoming_connection(
     mut socket: TcpStream,
-    remote_addr: String,
+    remote_addr: SocketAddr,
+    pairing_throttle: &mut PairingThrottle,
     config: &mut SynlyConfig,
     options: &RuntimeOptions,
 ) -> Result<Option<AuthenticatedSession>> {
+    let remote_label = remote_addr.to_string();
+    let remote_peer_key = remote_addr.ip().to_string();
     if options.pairing.trusted_only {
         FrameWriter::new(&mut socket)
             .write_frame(Frame::Control(ControlMessage::Error {
@@ -366,7 +392,26 @@ async fn handle_bootstrap_incoming_connection(
         return Ok(None);
     }
 
-    let bootstrap_hello = match FrameReader::new(&mut socket).read_frame().await? {
+    if let Some(remaining) = pairing_throttle.blocked_remaining(&remote_peer_key) {
+        FrameWriter::new(&mut socket)
+            .write_frame(Frame::Control(ControlMessage::Error {
+                message: format!(
+                    "该地址近期配对失败过多，请等待 {} 秒后再试。",
+                    remaining.as_secs().max(1)
+                ),
+            }))
+            .await?;
+        return Ok(None);
+    }
+
+    let bootstrap_hello = match read_frame_with_timeout(&mut socket, PAIRING_TIMEOUT).await {
+        Ok(frame) => frame,
+        Err(err) => {
+            register_pairing_failure(pairing_throttle, &remote_peer_key).await;
+            return Err(err);
+        }
+    };
+    let bootstrap_hello = match bootstrap_hello {
         Frame::Control(ControlMessage::BootstrapHello {
             protocol_version,
             client_bootstrap_public_key,
@@ -407,7 +452,7 @@ async fn handle_bootstrap_incoming_connection(
 
     println!();
     println!("{}", style("收到未信任设备的最小配对请求").bold());
-    println!("地址: {}", remote_addr);
+    println!("地址: {}", remote_label);
     println!("客户端 bootstrap 指纹: {}", client_display.short);
     println!("{}", client_display.randomart);
     println!("本次会话核对图: {}", session_display.short);
@@ -420,22 +465,102 @@ async fn handle_bootstrap_incoming_connection(
         println!("这个 PIN 只绑定到上面这组 bootstrap / 会话指纹。");
     }
 
+    let (pake_state, server_pake_message) = crypto::start_bootstrap_pake_server(
+        &pin,
+        &request_id,
+        &client_bootstrap_public_key,
+        &server_bootstrap_public_key,
+    )?;
+
     FrameWriter::new(&mut socket)
         .write_frame(Frame::Control(ControlMessage::BootstrapChallenge {
             request_id: request_id.clone(),
             server_bootstrap_public_key: server_bootstrap_public_key.clone(),
+            server_pake_message,
+        }))
+        .await?;
+
+    let pake_frame = match read_frame_with_timeout(&mut socket, PAIRING_TIMEOUT).await {
+        Ok(frame) => frame,
+        Err(err) => {
+            register_pairing_failure(pairing_throttle, &remote_peer_key).await;
+            return Err(err);
+        }
+    };
+    let (client_pake_message, client_confirm) = match pake_frame {
+        Frame::Control(ControlMessage::BootstrapPake {
+            request_id: incoming_request_id,
+            client_pake_message,
+            client_confirm,
+        }) if incoming_request_id == request_id => (client_pake_message, client_confirm),
+        Frame::Control(ControlMessage::BootstrapPake { .. }) => {
+            register_pairing_failure(pairing_throttle, &remote_peer_key).await;
+            FrameWriter::new(&mut socket)
+                .write_frame(Frame::Control(ControlMessage::Error {
+                    message: "收到的 PAKE 请求标识与当前连接不匹配。".to_string(),
+                }))
+                .await?;
+            return Ok(None);
+        }
+        _ => {
+            register_pairing_failure(pairing_throttle, &remote_peer_key).await;
+            FrameWriter::new(&mut socket)
+                .write_frame(Frame::Control(ControlMessage::Error {
+                    message: "客户端没有按预期完成 PAKE 认证。".to_string(),
+                }))
+                .await?;
+            return Ok(None);
+        }
+    };
+
+    let pake_key =
+        match crypto::finish_bootstrap_pake(pake_state, &client_pake_message).and_then(|pake_key| {
+            crypto::verify_client_pake_confirm(
+                &pake_key,
+                &request_id,
+                &client_bootstrap_public_key,
+                &server_bootstrap_public_key,
+                &client_confirm,
+            )?;
+            Ok(pake_key)
+        }) {
+            Ok(pake_key) => pake_key,
+            Err(err) => {
+                register_pairing_failure(pairing_throttle, &remote_peer_key).await;
+                FrameWriter::new(&mut socket)
+                    .write_frame(Frame::Control(ControlMessage::Error {
+                        message: format!("PIN 或 PAKE 认证失败：{err:#}"),
+                    }))
+                    .await?;
+                return Ok(None);
+            }
+        };
+
+    pairing_throttle.note_success(&remote_peer_key);
+    let server_confirm = crypto::server_pake_confirm(
+        &pake_key,
+        &request_id,
+        &client_bootstrap_public_key,
+        &server_bootstrap_public_key,
+    );
+    FrameWriter::new(&mut socket)
+        .write_frame(Frame::Control(ControlMessage::BootstrapAck {
+            request_id: request_id.clone(),
+            server_confirm,
         }))
         .await?;
 
     let acceptor = crypto::build_bootstrap_server_acceptor(
         &request_id,
-        &pin,
+        &pake_key,
         server_bootstrap_key,
         &client_bootstrap_public_key,
     )?;
     let device = config.device.clone();
-    let mut server_stream = acceptor.accept(socket).await?;
-    let frame = FrameReader::new(&mut server_stream).read_frame().await?;
+    let mut server_stream = time::timeout(TLS_UPGRADE_TIMEOUT, acceptor.accept(socket))
+        .await
+        .map_err(|_| anyhow!("等待客户端切换到临时 mTLS 超时"))??;
+    let frame = read_frame_with_timeout(&mut server_stream, PAIRING_TIMEOUT).await?;
     let (incoming_request_id, payload, trusted_proof) = match frame {
         Frame::Control(ControlMessage::PairRequest {
             request_id,
@@ -486,7 +611,7 @@ async fn handle_bootstrap_incoming_connection(
 
     let exporter = crypto::export_keying_material_from_server(&server_stream, &request_id)?;
     let agreement = negotiate(options.mode, payload.requested_mode);
-    print_pair_request_overview(&payload, options, &agreement, &remote_addr)?;
+    print_pair_request_overview(&payload, options, &agreement, &remote_label)?;
     if !agreement.any_direction() {
         FrameWriter::new(&mut server_stream)
             .write_frame(Frame::Control(ControlMessage::Error {
@@ -674,12 +799,13 @@ async fn connect_to_untrusted_peer(
         }))
         .await?;
 
-    let (request_id, server_bootstrap_public_key) =
-        match FrameReader::new(&mut socket).read_frame().await? {
+    let (request_id, server_bootstrap_public_key, server_pake_message) =
+        match read_frame_with_timeout(&mut socket, PAIRING_TIMEOUT).await? {
             Frame::Control(ControlMessage::BootstrapChallenge {
                 request_id,
                 server_bootstrap_public_key,
-            }) => (request_id, server_bootstrap_public_key),
+                server_pake_message,
+            }) => (request_id, server_bootstrap_public_key, server_pake_message),
             Frame::Control(ControlMessage::Error { message }) => bail!("{}", message),
             other => bail!("unexpected bootstrap response: {other:?}"),
         };
@@ -695,14 +821,60 @@ async fn connect_to_untrusted_peer(
         options.pairing.pin.as_deref(),
         "先核对 host 屏幕上的 bootstrap 图和会话图都与本机一致，再输入对应的 6 位 PIN",
     )?;
+    let (pake_state, client_pake_message) = crypto::start_bootstrap_pake_client(
+        &pin,
+        &request_id,
+        &client_bootstrap_public_key,
+        &server_bootstrap_public_key,
+    )?;
+    let pake_key = crypto::finish_bootstrap_pake(pake_state, &server_pake_message)?;
+    let client_confirm = crypto::client_pake_confirm(
+        &pake_key,
+        &request_id,
+        &client_bootstrap_public_key,
+        &server_bootstrap_public_key,
+    );
+
+    FrameWriter::new(&mut socket)
+        .write_frame(Frame::Control(ControlMessage::BootstrapPake {
+            request_id: request_id.clone(),
+            client_pake_message,
+            client_confirm,
+        }))
+        .await?;
+
+    match read_frame_with_timeout(&mut socket, PAIRING_TIMEOUT).await? {
+        Frame::Control(ControlMessage::BootstrapAck {
+            request_id: incoming_request_id,
+            server_confirm,
+        }) if incoming_request_id == request_id => {
+            crypto::verify_server_pake_confirm(
+                &pake_key,
+                &request_id,
+                &client_bootstrap_public_key,
+                &server_bootstrap_public_key,
+                &server_confirm,
+            )?;
+        }
+        Frame::Control(ControlMessage::BootstrapAck { .. }) => {
+            bail!("peer returned a mismatched bootstrap acknowledgment");
+        }
+        Frame::Control(ControlMessage::Error { message }) => bail!("{}", message),
+        other => bail!("unexpected PAKE response: {other:?}"),
+    }
 
     let connector = crypto::build_bootstrap_client_connector(
         &request_id,
-        &pin,
+        &pake_key,
         client_bootstrap_key,
         &server_bootstrap_public_key,
     )?;
-    let mut client_stream = connector.connect(crypto::server_name()?, socket).await?;
+    let mut client_stream = time::timeout(
+        TLS_UPGRADE_TIMEOUT,
+        connector.connect(crypto::server_name()?, socket),
+    )
+    .await
+    .map_err(|_| anyhow!("等待服务端切换到临时 mTLS 超时"))??;
     let exporter = crypto::export_keying_material_from_client(&client_stream, &request_id)?;
     let payload = PairRequestPayload {
         protocol_version: PROTOCOL_VERSION,
@@ -719,7 +891,7 @@ async fn connect_to_untrusted_peer(
         }))
         .await?;
 
-    let reply = match FrameReader::new(&mut client_stream).read_frame().await? {
+    let reply = match read_frame_with_timeout(&mut client_stream, PAIRING_TIMEOUT).await? {
         Frame::Control(message) => message,
         _ => bail!("peer sent a non-control response during bootstrap pairing"),
     };
@@ -973,6 +1145,8 @@ async fn run_sync_session(
             Frame::Control(ControlMessage::Goodbye) => break,
             Frame::Control(ControlMessage::BootstrapHello { .. })
             | Frame::Control(ControlMessage::BootstrapChallenge { .. })
+            | Frame::Control(ControlMessage::BootstrapPake { .. })
+            | Frame::Control(ControlMessage::BootstrapAck { .. })
             | Frame::Control(ControlMessage::PairRequest { .. })
             | Frame::Control(ControlMessage::PinChallenge { .. })
             | Frame::Control(ControlMessage::PairAuth { .. })
@@ -1680,6 +1854,65 @@ fn trusted_device_for_peer(
     let device_id = Uuid::parse_str(&peer.device_id)
         .with_context(|| format!("peer advertised an invalid device id: {}", peer.device_id))?;
     Ok(config.trusted_device(&device_id).cloned())
+}
+
+async fn read_frame_with_timeout<R>(reader: &mut R, timeout: Duration) -> Result<Frame>
+where
+    R: AsyncRead + Unpin,
+{
+    time::timeout(timeout, FrameReader::new(reader).read_frame())
+        .await
+        .map_err(|_| anyhow!("等待对端响应超时"))?
+}
+
+async fn register_pairing_failure(pairing_throttle: &mut PairingThrottle, peer_key: &str) {
+    let backoff = pairing_throttle.note_failure(peer_key);
+    if !backoff.is_zero() {
+        time::sleep(backoff).await;
+    }
+}
+
+impl PairingThrottle {
+    fn blocked_remaining(&mut self, peer_key: &str) -> Option<Duration> {
+        let now = Instant::now();
+        let state = self.peers.get(peer_key)?;
+        if now.duration_since(state.window_started_at) > PAIRING_FAILURE_WINDOW {
+            self.peers.remove(peer_key);
+            return None;
+        }
+        match state.blocked_until {
+            Some(blocked_until) if blocked_until > now => Some(blocked_until.duration_since(now)),
+            _ => None,
+        }
+    }
+
+    fn note_failure(&mut self, peer_key: &str) -> Duration {
+        let now = Instant::now();
+        let state = self
+            .peers
+            .entry(peer_key.to_string())
+            .or_insert(PairingPeerState {
+                failures: 0,
+                window_started_at: now,
+                blocked_until: None,
+            });
+        if now.duration_since(state.window_started_at) > PAIRING_FAILURE_WINDOW {
+            state.failures = 0;
+            state.window_started_at = now;
+            state.blocked_until = None;
+        }
+        state.failures = state.failures.saturating_add(1);
+        if state.failures >= PAIRING_MAX_FAILURES {
+            state.blocked_until = Some(now + PAIRING_COOLDOWN);
+        }
+        Duration::from_millis(
+            PAIRING_BACKOFF_BASE_MS.saturating_mul(u64::from(state.failures.min(4))),
+        )
+    }
+
+    fn note_success(&mut self, peer_key: &str) {
+        self.peers.remove(peer_key);
+    }
 }
 
 fn has_trusted_transport(config: &SynlyConfig) -> bool {
