@@ -1751,6 +1751,7 @@ dependencies = [
  "url",
  "uuid",
  "walkdir",
+ "x509-parser",
 ]
 
 [[package]]

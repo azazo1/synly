@@ -1,14 +1,14 @@
 use crate::cli::{
-    ConnectionPreference, RuntimeOptions, SyncMode, prompt_confirm, prompt_secret, prompt_select,
-    sync_clipboard_label, sync_delete_label,
+    ConnectionPreference, RuntimeOptions, SyncMode, prompt_confirm, prompt_select,
+    require_peer_query, resolve_pairing_pin, sync_clipboard_label, sync_delete_label,
 };
 use crate::clipboard::ClipboardSync;
-use crate::config::DeviceConfig;
+use crate::config::{DeviceConfig, SynlyConfig, TrustedDeviceConfig};
 use crate::crypto;
 use crate::discovery::{self, Advertisement, DiscoveredPeer};
 use crate::protocol::{
     ClipboardPayload, ControlMessage, DeviceIdentity, FileChunkHeader, Frame, FrameReader,
-    FrameWriter, PROTOCOL_VERSION, PairRequestPayload, SessionAgreement,
+    FrameWriter, PROTOCOL_VERSION, PairAuthMethod, PairRequestPayload, SessionAgreement,
 };
 use crate::sync::{
     DeletePolicy, WorkspaceSpec, apply_file_metadata, build_apply_plan, build_incoming_snapshot,
@@ -70,28 +70,30 @@ struct IncomingFileState {
 struct PairDecisionParams<'a> {
     exporter: &'a [u8],
     request_id: &'a str,
-    pin: &'a str,
     accepted: bool,
     message: String,
     device: &'a DeviceConfig,
     workspace: &'a WorkspaceSpec,
     sync_clipboard: bool,
     agreement: &'a SessionAgreement,
+    auth_method: PairAuthMethod,
+    pin: Option<&'a str>,
+    trust_established: bool,
 }
 
-pub async fn run(device: DeviceConfig, options: RuntimeOptions) -> Result<()> {
+pub async fn run(config: &mut SynlyConfig, options: RuntimeOptions) -> Result<()> {
     match options.connection {
-        ConnectionPreference::Host => run_host(device, options).await,
-        ConnectionPreference::Join => run_client(device, options).await,
+        ConnectionPreference::Host => run_host(config, options).await,
+        ConnectionPreference::Join => run_client(config, options).await,
     }
 }
 
-async fn run_host(device: DeviceConfig, options: RuntimeOptions) -> Result<()> {
+async fn run_host(config: &mut SynlyConfig, options: RuntimeOptions) -> Result<()> {
+    let device = config.device.clone();
     let listener = TcpListener::bind(("0.0.0.0", 0))
         .await
         .context("failed to bind TCP listener")?;
     let port = listener.local_addr()?.port();
-    let acceptor = crypto::build_server_acceptor()?;
     let _advertisement = discovery::advertise(&Advertisement {
         port,
         device: device.clone(),
@@ -102,9 +104,7 @@ async fn run_host(device: DeviceConfig, options: RuntimeOptions) -> Result<()> {
 
     loop {
         let (socket, address) = listener.accept().await?;
-        match handle_incoming_connection(socket, address.to_string(), &acceptor, &device, &options)
-            .await
-        {
+        match handle_incoming_connection(socket, address.to_string(), config, &options).await {
             Ok(Some(session)) => {
                 run_sync_session(
                     session,
@@ -127,10 +127,13 @@ async fn run_host(device: DeviceConfig, options: RuntimeOptions) -> Result<()> {
     Ok(())
 }
 
-async fn run_client(device: DeviceConfig, options: RuntimeOptions) -> Result<()> {
+async fn run_client(config: &mut SynlyConfig, options: RuntimeOptions) -> Result<()> {
     loop {
-        let peer = choose_peer()?;
-        match connect_to_peer(&peer, &device, &options).await {
+        let peer = choose_peer(
+            options.pairing.peer_query.as_deref(),
+            Duration::from_secs(options.pairing.discovery_secs),
+        )?;
+        match connect_to_peer(&peer, config, &options).await {
             Ok(session) => {
                 run_sync_session(
                     session,
@@ -145,6 +148,9 @@ async fn run_client(device: DeviceConfig, options: RuntimeOptions) -> Result<()>
             }
             Err(err) => {
                 eprintln!("连接失败: {err:#}");
+                if options.pairing.peer_query.is_some() {
+                    break;
+                }
                 if !prompt_confirm("重新搜索设备吗", true)? {
                     break;
                 }
@@ -158,269 +164,607 @@ async fn run_client(device: DeviceConfig, options: RuntimeOptions) -> Result<()>
 async fn handle_incoming_connection(
     socket: TcpStream,
     remote_addr: String,
-    acceptor: &tokio_rustls::TlsAcceptor,
-    device: &DeviceConfig,
+    config: &mut SynlyConfig,
     options: &RuntimeOptions,
 ) -> Result<Option<AuthenticatedSession>> {
-    let mut server_stream = acceptor.accept(socket).await?;
-    let pair_result = {
-        let frame = FrameReader::new(&mut server_stream).read_frame().await?;
-        let payload = match frame {
-            Frame::Control(ControlMessage::PairRequest { payload }) => payload,
-            _ => {
-                FrameWriter::new(&mut server_stream)
-                    .write_frame(Frame::Control(ControlMessage::Error {
-                        message: "连接建立了，但请求格式不正确".to_string(),
-                    }))
-                    .await?;
-                return Ok(None);
-            }
-        };
+    let mut first_byte = [0u8; 1];
+    let peeked = socket.peek(&mut first_byte).await?;
+    if peeked == 0 {
+        return Ok(None);
+    }
 
-        if payload.protocol_version != PROTOCOL_VERSION {
-            FrameWriter::new(&mut server_stream)
-                .write_frame(Frame::Control(ControlMessage::Error {
-                    message: format!("不支持的协议版本: {}", payload.protocol_version),
-                }))
-                .await?;
-            return Ok(None);
-        }
-
-        let agreement = negotiate(options.mode, payload.requested_mode);
-        println!();
-        println!("{}", style("收到同步请求").bold());
-        println!(
-            "来自: {} ({})",
-            payload.client.device_name,
-            short_uuid(&payload.client.device_id)
-        );
-        println!("地址: {}", remote_addr);
-        for line in payload.workspace.human_lines() {
-            println!("{line}");
-        }
-        for line in options.workspace.local_human_lines(options.sync_clipboard) {
-            println!("本机 {line}");
-        }
-        if options.workspace.incoming_root.is_some() {
-            println!("本机 删除同步: {}", sync_delete_label(options.sync_delete));
-        }
-        println!(
-            "协商结果: {}",
-            agreement_label(SessionRole::Host, &agreement)
-        );
-
-        if !agreement.any_direction() {
-            FrameWriter::new(&mut server_stream)
-                .write_frame(Frame::Control(ControlMessage::Error {
-                    message: "双方模式不兼容，本次请求无法建立同步。".to_string(),
-                }))
-                .await?;
-            return Ok(None);
-        }
-
-        let request_id = Uuid::new_v4().to_string();
-        let pin = crypto::random_pin();
-        println!("本次 PIN: {}", style(&pin).bold());
-        println!("请让对方输入这个 PIN。该 PIN 只适用于这一次请求。");
-
-        FrameWriter::new(&mut server_stream)
-            .write_frame(Frame::Control(ControlMessage::PinChallenge {
-                request_id: request_id.clone(),
-                server: device_identity(device),
-                message: "请求信息已送达对端，请查看服务端屏幕上的本次 PIN。".to_string(),
-            }))
-            .await?;
-
-        let exporter = crypto::export_keying_material_from_server(&server_stream, &request_id)?;
-        let frame = FrameReader::new(&mut server_stream).read_frame().await?;
-        let proof = match frame {
-            Frame::Control(ControlMessage::PairAuth {
-                request_id: incoming_request_id,
-                proof,
-            }) if incoming_request_id == request_id => proof,
-            Frame::Control(ControlMessage::PairAuth { .. }) => {
-                FrameWriter::new(&mut server_stream)
-                    .write_frame(Frame::Control(ControlMessage::Error {
-                        message: "收到的 PIN 请求标识与当前连接不匹配。".to_string(),
-                    }))
-                    .await?;
-                return Ok(None);
-            }
-            _ => {
-                FrameWriter::new(&mut server_stream)
-                    .write_frame(Frame::Control(ControlMessage::Error {
-                        message: "客户端没有按预期提交 PIN 校验信息。".to_string(),
-                    }))
-                    .await?;
-                return Ok(None);
-            }
-        };
-
-        if crypto::verify_pair_auth(&exporter, &request_id, &pin, &payload, &proof).is_err() {
-            FrameWriter::new(&mut server_stream)
-                .write_frame(Frame::Control(ControlMessage::Error {
-                    message: "PIN 校验失败，本次连接未被接受。".to_string(),
-                }))
-                .await?;
-            return Ok(None);
-        }
-
-        println!("PIN 校验通过，等待本机确认。");
-
-        if !prompt_confirm("接受这次同步吗", true)? {
-            let message = "服务端拒绝了本次同步请求。".to_string();
-            let control = signed_pair_decision(PairDecisionParams {
-                exporter: &exporter,
-                request_id: &request_id,
-                pin: &pin,
-                accepted: false,
-                message: message.clone(),
-                device,
-                workspace: &options.workspace,
-                sync_clipboard: options.sync_clipboard,
-                agreement: &agreement,
-            })?;
-            FrameWriter::new(&mut server_stream)
-                .write_frame(Frame::Control(control))
-                .await?;
-            return Ok(None);
-        }
-
-        let message = "服务端已接受同步请求。".to_string();
-        let control = signed_pair_decision(PairDecisionParams {
-            exporter: &exporter,
-            request_id: &request_id,
-            pin: &pin,
-            accepted: true,
-            message,
-            device,
-            workspace: &options.workspace,
-            sync_clipboard: options.sync_clipboard,
-            agreement: &agreement,
-        })?;
-        FrameWriter::new(&mut server_stream)
-            .write_frame(Frame::Control(control))
-            .await?;
-
-        Ok::<_, anyhow::Error>((payload.client, agreement, payload.workspace))
-    }?;
-
-    let (remote, agreement, remote_workspace) = pair_result;
-    let tls_stream: TlsStream<TcpStream> = server_stream.into();
-    Ok(Some(AuthenticatedSession {
-        role: SessionRole::Host,
-        stream: tls_stream,
-        remote,
-        agreement,
-        remote_workspace,
-    }))
+    if first_byte[0] == 0x16 {
+        handle_trusted_incoming_connection(socket, remote_addr, config, options).await
+    } else {
+        handle_bootstrap_incoming_connection(socket, remote_addr, config, options).await
+    }
 }
 
 async fn connect_to_peer(
     peer: &DiscoveredPeer,
-    device: &DeviceConfig,
+    config: &mut SynlyConfig,
     options: &RuntimeOptions,
 ) -> Result<AuthenticatedSession> {
+    let device = config.device.clone();
     let address = peer
         .addresses
         .first()
         .copied()
         .context("peer advertised no IPv4 address")?;
-    let socket = TcpStream::connect((address, peer.port))
+    let trusted_device = trusted_device_for_peer(config, peer)?;
+    let trusted_transport = trusted_device
+        .as_ref()
+        .filter(|device| !device.tls_root_certificate.trim().is_empty());
+    if options.pairing.trusted_only && trusted_transport.is_none() {
+        bail!("目标设备尚未建立完整的可信 mTLS 信任，请先用一次 PIN 配对并加上 --trust-device");
+    }
+    match trusted_transport {
+        Some(trusted_device) => {
+            connect_to_trusted_peer(address, peer.port, &device, trusted_device, config, options)
+                .await
+        }
+        None => connect_to_untrusted_peer(address, peer.port, &device, config, options).await,
+    }
+}
+
+async fn handle_trusted_incoming_connection(
+    socket: TcpStream,
+    remote_addr: String,
+    config: &mut SynlyConfig,
+    options: &RuntimeOptions,
+) -> Result<Option<AuthenticatedSession>> {
+    let device = config.device.clone();
+    if !has_trusted_transport(config) {
+        bail!("收到 TLS 连接，但本机尚未保存任何可信设备根证书；未信任设备必须先走 bootstrap/PIN");
+    }
+
+    let acceptor = crypto::build_server_acceptor(&device, &config.trusted_devices)?;
+    let mut server_stream = acceptor.accept(socket).await?;
+    let frame = FrameReader::new(&mut server_stream).read_frame().await?;
+    let (request_id, payload, trusted_proof) = match frame {
+        Frame::Control(ControlMessage::PairRequest {
+            request_id,
+            payload,
+            trusted_proof,
+        }) => (request_id, payload, trusted_proof),
+        _ => {
+            FrameWriter::new(&mut server_stream)
+                .write_frame(Frame::Control(ControlMessage::Error {
+                    message: "连接建立了，但请求格式不正确".to_string(),
+                }))
+                .await?;
+            return Ok(None);
+        }
+    };
+
+    if payload.protocol_version != PROTOCOL_VERSION {
+        FrameWriter::new(&mut server_stream)
+            .write_frame(Frame::Control(ControlMessage::Error {
+                message: format!("不支持的协议版本: {}", payload.protocol_version),
+            }))
+            .await?;
+        return Ok(None);
+    }
+
+    if let Err(err) = crypto::verify_device_identity_material(&payload.client) {
+        FrameWriter::new(&mut server_stream)
+            .write_frame(Frame::Control(ControlMessage::Error {
+                message: format!("对端提供的设备身份材料无效: {err:#}"),
+            }))
+            .await?;
+        return Ok(None);
+    }
+
+    let trusted_device = match config.trusted_device(&payload.client.device_id).cloned() {
+        Some(trusted_device) => trusted_device,
+        None => {
+            FrameWriter::new(&mut server_stream)
+                .write_frame(Frame::Control(ControlMessage::Error {
+                    message: "该设备未处于可信状态，不能走免 PIN 的 mTLS 直连。".to_string(),
+                }))
+                .await?;
+            return Ok(None);
+        }
+    };
+    let Some(trusted_proof) = trusted_proof.as_deref() else {
+        FrameWriter::new(&mut server_stream)
+            .write_frame(Frame::Control(ControlMessage::Error {
+                message: "可信设备已建立 mTLS，但缺少应用层身份签名。".to_string(),
+            }))
+            .await?;
+        return Ok(None);
+    };
+
+    let exporter = crypto::export_keying_material_from_server(&server_stream, &request_id)?;
+    if let Err(err) = crypto::verify_device_identity(&payload.client, &trusted_device.public_key)
+        .and_then(|_| {
+            crypto::verify_trusted_pair_auth(
+                &exporter,
+                &trusted_device.public_key,
+                &request_id,
+                &payload,
+                trusted_proof,
+            )
+        })
+    {
+        FrameWriter::new(&mut server_stream)
+            .write_frame(Frame::Control(ControlMessage::Error {
+                message: format!("可信设备身份绑定失败，已拒绝本次连接: {err:#}"),
+            }))
+            .await?;
+        return Ok(None);
+    }
+
+    let agreement = negotiate(options.mode, payload.requested_mode);
+    print_pair_request_overview(&payload, options, &agreement, &remote_addr)?;
+    if !agreement.any_direction() {
+        FrameWriter::new(&mut server_stream)
+            .write_frame(Frame::Control(ControlMessage::Error {
+                message: "双方模式不兼容，本次请求无法建立同步。".to_string(),
+            }))
+            .await?;
+        return Ok(None);
+    }
+
+    println!("可信设备 mTLS 与身份签名校验通过。");
+    let accepted = if options.pairing.accept {
+        true
+    } else {
+        prompt_confirm("接受这次同步吗", true)?
+    };
+    let message = if accepted {
+        "服务端已接受同步请求。".to_string()
+    } else {
+        "服务端拒绝了本次同步请求。".to_string()
+    };
+    let control = signed_pair_decision(PairDecisionParams {
+        exporter: &exporter,
+        request_id: &request_id,
+        accepted,
+        message,
+        device: &device,
+        workspace: &options.workspace,
+        sync_clipboard: options.sync_clipboard,
+        agreement: &agreement,
+        auth_method: PairAuthMethod::TrustedDevice,
+        pin: None,
+        trust_established: false,
+    })?;
+    FrameWriter::new(&mut server_stream)
+        .write_frame(Frame::Control(control))
+        .await?;
+
+    if !accepted {
+        return Ok(None);
+    }
+
+    config.note_trusted_device_session(payload.client.device_id, &payload.client.device_name);
+    config.save()?;
+
+    let tls_stream: TlsStream<TcpStream> = server_stream.into();
+    Ok(Some(AuthenticatedSession {
+        role: SessionRole::Host,
+        stream: tls_stream,
+        remote: payload.client,
+        agreement,
+        remote_workspace: payload.workspace,
+    }))
+}
+
+async fn handle_bootstrap_incoming_connection(
+    mut socket: TcpStream,
+    remote_addr: String,
+    config: &mut SynlyConfig,
+    options: &RuntimeOptions,
+) -> Result<Option<AuthenticatedSession>> {
+    if options.pairing.trusted_only {
+        FrameWriter::new(&mut socket)
+            .write_frame(Frame::Control(ControlMessage::Error {
+                message: "当前 host 只允许已建立长期信任的设备通过 mTLS 直连。".to_string(),
+            }))
+            .await?;
+        return Ok(None);
+    }
+
+    let bootstrap_hello = match FrameReader::new(&mut socket).read_frame().await? {
+        Frame::Control(ControlMessage::BootstrapHello {
+            protocol_version,
+            client_bootstrap_public_key,
+        }) => (protocol_version, client_bootstrap_public_key),
+        _ => {
+            FrameWriter::new(&mut socket)
+                .write_frame(Frame::Control(ControlMessage::Error {
+                    message: "未信任设备必须先发送最小 bootstrap 请求。".to_string(),
+                }))
+                .await?;
+            return Ok(None);
+        }
+    };
+    let (protocol_version, client_bootstrap_public_key) = bootstrap_hello;
+    if protocol_version != PROTOCOL_VERSION {
+        FrameWriter::new(&mut socket)
+            .write_frame(Frame::Control(ControlMessage::Error {
+                message: format!("不支持的协议版本: {protocol_version}"),
+            }))
+            .await?;
+        return Ok(None);
+    }
+
+    let client_display = crypto::bootstrap_public_key_display(&client_bootstrap_public_key)?;
+    let request_id = Uuid::new_v4().to_string();
+    let server_bootstrap_key = crypto::generate_bootstrap_key_material()?;
+    let server_bootstrap_public_key = server_bootstrap_key.public_key_encoded();
+    let session_display = crypto::bootstrap_session_display(
+        &request_id,
+        &client_bootstrap_public_key,
+        &server_bootstrap_public_key,
+    )?;
+    let pin = options
+        .pairing
+        .pin
+        .clone()
+        .unwrap_or_else(crypto::random_pin);
+
+    println!();
+    println!("{}", style("收到未信任设备的最小配对请求").bold());
+    println!("地址: {}", remote_addr);
+    println!("客户端 bootstrap 指纹: {}", client_display.short);
+    println!("{}", client_display.randomart);
+    println!("本次会话核对图: {}", session_display.short);
+    println!("{}", session_display.randomart);
+    if options.pairing.pin.is_some() {
+        println!("固定 PIN: {}", style(&pin).bold());
+        println!("请让对方先核对上面的图形，再输入这个固定 PIN。");
+    } else {
+        println!("本次 PIN: {}", style(&pin).bold());
+        println!("这个 PIN 只绑定到上面这组 bootstrap / 会话指纹。");
+    }
+
+    FrameWriter::new(&mut socket)
+        .write_frame(Frame::Control(ControlMessage::BootstrapChallenge {
+            request_id: request_id.clone(),
+            server_bootstrap_public_key: server_bootstrap_public_key.clone(),
+        }))
+        .await?;
+
+    let acceptor = crypto::build_bootstrap_server_acceptor(
+        &request_id,
+        &pin,
+        server_bootstrap_key,
+        &client_bootstrap_public_key,
+    )?;
+    let device = config.device.clone();
+    let mut server_stream = acceptor.accept(socket).await?;
+    let frame = FrameReader::new(&mut server_stream).read_frame().await?;
+    let (incoming_request_id, payload, trusted_proof) = match frame {
+        Frame::Control(ControlMessage::PairRequest {
+            request_id,
+            payload,
+            trusted_proof,
+        }) => (request_id, payload, trusted_proof),
+        _ => {
+            FrameWriter::new(&mut server_stream)
+                .write_frame(Frame::Control(ControlMessage::Error {
+                    message: "临时 mTLS 已建立，但请求格式不正确。".to_string(),
+                }))
+                .await?;
+            return Ok(None);
+        }
+    };
+    if incoming_request_id != request_id {
+        FrameWriter::new(&mut server_stream)
+            .write_frame(Frame::Control(ControlMessage::Error {
+                message: "收到的请求标识与当前 bootstrap 会话不匹配。".to_string(),
+            }))
+            .await?;
+        return Ok(None);
+    }
+    if trusted_proof.is_some() {
+        FrameWriter::new(&mut server_stream)
+            .write_frame(Frame::Control(ControlMessage::Error {
+                message: "bootstrap 配对阶段不接受 trusted-device 签名。".to_string(),
+            }))
+            .await?;
+        return Ok(None);
+    }
+    if payload.protocol_version != PROTOCOL_VERSION {
+        FrameWriter::new(&mut server_stream)
+            .write_frame(Frame::Control(ControlMessage::Error {
+                message: format!("不支持的协议版本: {}", payload.protocol_version),
+            }))
+            .await?;
+        return Ok(None);
+    }
+    if let Err(err) = crypto::verify_device_identity_material(&payload.client) {
+        FrameWriter::new(&mut server_stream)
+            .write_frame(Frame::Control(ControlMessage::Error {
+                message: format!("对端提供的设备身份材料无效: {err:#}"),
+            }))
+            .await?;
+        return Ok(None);
+    }
+
+    let exporter = crypto::export_keying_material_from_server(&server_stream, &request_id)?;
+    let agreement = negotiate(options.mode, payload.requested_mode);
+    print_pair_request_overview(&payload, options, &agreement, &remote_addr)?;
+    if !agreement.any_direction() {
+        FrameWriter::new(&mut server_stream)
+            .write_frame(Frame::Control(ControlMessage::Error {
+                message: "双方模式不兼容，本次请求无法建立同步。".to_string(),
+            }))
+            .await?;
+        return Ok(None);
+    }
+
+    println!("已建立基于 PIN 的临时 mTLS，设备元数据现在处于加密保护中。");
+    let accepted = if options.pairing.accept {
+        true
+    } else {
+        prompt_confirm("接受这次同步吗", true)?
+    };
+    let trust_established = accepted && options.pairing.trust_device && payload.request_trust;
+    let message = if accepted {
+        "服务端已接受同步请求。".to_string()
+    } else {
+        "服务端拒绝了本次同步请求。".to_string()
+    };
+    let control = signed_pair_decision(PairDecisionParams {
+        exporter: &exporter,
+        request_id: &request_id,
+        accepted,
+        message,
+        device: &device,
+        workspace: &options.workspace,
+        sync_clipboard: options.sync_clipboard,
+        agreement: &agreement,
+        auth_method: PairAuthMethod::Pin,
+        pin: Some(&pin),
+        trust_established,
+    })?;
+    FrameWriter::new(&mut server_stream)
+        .write_frame(Frame::Control(control))
+        .await?;
+
+    if trust_established {
+        config.remember_trusted_device(
+            payload.client.device_id,
+            payload.client.device_name.clone(),
+            payload.client.identity_public_key.clone(),
+            payload.client.tls_root_certificate.clone(),
+        );
+        config.save()?;
+        println!("已记住该设备的身份公钥和 TLS 根证书，后续连接会使用长期 mTLS 并可免 PIN。");
+    }
+
+    if !accepted {
+        return Ok(None);
+    }
+
+    let tls_stream: TlsStream<TcpStream> = server_stream.into();
+    Ok(Some(AuthenticatedSession {
+        role: SessionRole::Host,
+        stream: tls_stream,
+        remote: payload.client,
+        agreement,
+        remote_workspace: payload.workspace,
+    }))
+}
+
+async fn connect_to_trusted_peer(
+    address: std::net::Ipv4Addr,
+    port: u16,
+    device: &DeviceConfig,
+    trusted_device: &TrustedDeviceConfig,
+    config: &mut SynlyConfig,
+    options: &RuntimeOptions,
+) -> Result<AuthenticatedSession> {
+    let socket = TcpStream::connect((address, port))
         .await
-        .with_context(|| format!("failed to connect to {}:{}", address, peer.port))?;
-    let connector = crypto::build_client_connector()?;
+        .with_context(|| format!("failed to connect to {}:{}", address, port))?;
+    let connector =
+        crypto::build_client_connector(device, trusted_device.tls_root_certificate.as_str())?;
     let mut client_stream = connector.connect(crypto::server_name()?, socket).await?;
 
-    let remote_info = {
-        let payload = PairRequestPayload {
-            protocol_version: PROTOCOL_VERSION,
-            client: device_identity(device),
-            requested_mode: options.mode,
-            workspace: options.workspace.summary(options.sync_clipboard),
-        };
-        FrameWriter::new(&mut client_stream)
-            .write_frame(Frame::Control(ControlMessage::PairRequest {
-                payload: payload.clone(),
-            }))
-            .await?;
+    let request_id = Uuid::new_v4().to_string();
+    let exporter = crypto::export_keying_material_from_client(&client_stream, &request_id)?;
+    let payload = PairRequestPayload {
+        protocol_version: PROTOCOL_VERSION,
+        client: device_identity(device),
+        requested_mode: options.mode,
+        workspace: options.workspace.summary(options.sync_clipboard),
+        request_trust: options.pairing.trust_device,
+    };
+    let trusted_proof = crypto::sign_trusted_pair_auth(
+        &exporter,
+        device.identity_private_key()?,
+        &request_id,
+        &payload,
+    )?;
+    FrameWriter::new(&mut client_stream)
+        .write_frame(Frame::Control(ControlMessage::PairRequest {
+            request_id: request_id.clone(),
+            payload: payload.clone(),
+            trusted_proof: Some(trusted_proof),
+        }))
+        .await?;
 
-        let reply = match FrameReader::new(&mut client_stream).read_frame().await? {
-            Frame::Control(message) => message,
-            _ => bail!("peer sent a non-control response during pairing"),
-        };
-
-        let (request_id, server, prompt_message) = match reply {
-            ControlMessage::PinChallenge {
-                request_id,
-                server,
-                message,
-            } => (request_id, server, message),
-            ControlMessage::Error { message } => bail!("{}", message),
-            other => bail!("unexpected pairing response: {other:?}"),
-        };
-
-        println!();
-        println!("{}", style("同步请求已送达").bold());
-        println!(
-            "对端: {} ({})",
-            server.device_name,
-            short_uuid(&server.device_id)
-        );
-        println!("{prompt_message}");
-        let pin = prompt_secret("输入服务端当前显示的 6 位 PIN")?;
-        let exporter = crypto::export_keying_material_from_client(&client_stream, &request_id)?;
-        let proof = crypto::sign_pair_auth(&exporter, &request_id, &pin, &payload)?;
-        FrameWriter::new(&mut client_stream)
-            .write_frame(Frame::Control(ControlMessage::PairAuth {
-                request_id: request_id.clone(),
-                proof,
-            }))
-            .await?;
-
-        let reply = match FrameReader::new(&mut client_stream).read_frame().await? {
-            Frame::Control(message) => message,
-            _ => bail!("peer sent a non-control response during pairing"),
-        };
-
-        match &reply {
-            ControlMessage::PairDecision { accepted, .. } => {
-                crypto::verify_pair_decision(&reply, &exporter, &request_id, &pin)?;
-                if !accepted && let ControlMessage::PairDecision { message, .. } = &reply {
-                    bail!("{}", message);
-                }
-            }
-            ControlMessage::Error { message } => bail!("{}", message),
-            other => bail!("unexpected pairing response: {other:?}"),
-        }
-
-        if let ControlMessage::PairDecision {
+    let reply = match FrameReader::new(&mut client_stream).read_frame().await? {
+        Frame::Control(message) => message,
+        _ => bail!("peer sent a non-control response during trusted pairing"),
+    };
+    let (remote, remote_workspace, agreement) = match reply {
+        ControlMessage::PairDecision {
+            accepted,
+            message,
             server,
             workspace,
             agreement,
-            ..
-        } = reply
-        {
-            Ok::<_, anyhow::Error>((server, workspace, agreement))
-        } else {
-            bail!("peer did not send a pair decision")
+            auth_method,
+            proof,
+            trust_established,
+        } => {
+            if auth_method != PairAuthMethod::TrustedDevice {
+                bail!("peer replied to trusted mTLS with an unexpected auth method");
+            }
+            let decision = ControlMessage::PairDecision {
+                accepted,
+                message: message.clone(),
+                server: server.clone(),
+                workspace: workspace.clone(),
+                agreement: agreement.clone(),
+                auth_method,
+                proof,
+                trust_established,
+            };
+            crypto::verify_device_identity_material(&server)?;
+            crypto::verify_device_identity(&server, &trusted_device.public_key)?;
+            crypto::verify_trusted_pair_decision(
+                &decision,
+                &exporter,
+                &request_id,
+                &trusted_device.public_key,
+            )?;
+            if !accepted {
+                bail!("{}", message);
+            }
+            (server, workspace, agreement)
         }
-    }?;
+        ControlMessage::Error { message } => bail!("{}", message),
+        other => bail!("unexpected trusted pairing response: {other:?}"),
+    };
 
-    let (remote, remote_workspace, agreement) = remote_info;
+    config.note_trusted_device_session(remote.device_id, &remote.device_name);
+    config.save()?;
+
     let tls_stream: TlsStream<TcpStream> = client_stream.into();
-    println!();
-    println!("{}", style("连接已建立").bold());
-    println!(
-        "对端: {} ({})",
-        remote.device_name,
-        short_uuid(&remote.device_id)
-    );
-    println!(
-        "协商结果: {}",
-        agreement_label(SessionRole::Client, &agreement)
-    );
+    print_connected_peer(&remote, &agreement)?;
+    Ok(AuthenticatedSession {
+        role: SessionRole::Client,
+        stream: tls_stream,
+        remote,
+        agreement,
+        remote_workspace,
+    })
+}
 
+async fn connect_to_untrusted_peer(
+    address: std::net::Ipv4Addr,
+    port: u16,
+    device: &DeviceConfig,
+    config: &mut SynlyConfig,
+    options: &RuntimeOptions,
+) -> Result<AuthenticatedSession> {
+    let mut socket = TcpStream::connect((address, port))
+        .await
+        .with_context(|| format!("failed to connect to {}:{}", address, port))?;
+    let client_bootstrap_key = crypto::generate_bootstrap_key_material()?;
+    let client_bootstrap_public_key = client_bootstrap_key.public_key_encoded();
+    let client_display = crypto::bootstrap_public_key_display(&client_bootstrap_public_key)?;
+
+    println!();
+    println!("{}", style("发起最小配对请求").bold());
+    println!("本机 bootstrap 指纹: {}", client_display.short);
+    println!("{}", client_display.randomart);
+    println!("请确认 host 屏幕上显示的是同一张 bootstrap 图，再继续输入 PIN。");
+
+    FrameWriter::new(&mut socket)
+        .write_frame(Frame::Control(ControlMessage::BootstrapHello {
+            protocol_version: PROTOCOL_VERSION,
+            client_bootstrap_public_key: client_bootstrap_public_key.clone(),
+        }))
+        .await?;
+
+    let (request_id, server_bootstrap_public_key) =
+        match FrameReader::new(&mut socket).read_frame().await? {
+            Frame::Control(ControlMessage::BootstrapChallenge {
+                request_id,
+                server_bootstrap_public_key,
+            }) => (request_id, server_bootstrap_public_key),
+            Frame::Control(ControlMessage::Error { message }) => bail!("{}", message),
+            other => bail!("unexpected bootstrap response: {other:?}"),
+        };
+    let session_display = crypto::bootstrap_session_display(
+        &request_id,
+        &client_bootstrap_public_key,
+        &server_bootstrap_public_key,
+    )?;
+
+    println!("本次会话核对图: {}", session_display.short);
+    println!("{}", session_display.randomart);
+    let pin = resolve_pairing_pin(
+        options.pairing.pin.as_deref(),
+        "先核对 host 屏幕上的 bootstrap 图和会话图都与本机一致，再输入对应的 6 位 PIN",
+    )?;
+
+    let connector = crypto::build_bootstrap_client_connector(
+        &request_id,
+        &pin,
+        client_bootstrap_key,
+        &server_bootstrap_public_key,
+    )?;
+    let mut client_stream = connector.connect(crypto::server_name()?, socket).await?;
+    let exporter = crypto::export_keying_material_from_client(&client_stream, &request_id)?;
+    let payload = PairRequestPayload {
+        protocol_version: PROTOCOL_VERSION,
+        client: device_identity(device),
+        requested_mode: options.mode,
+        workspace: options.workspace.summary(options.sync_clipboard),
+        request_trust: options.pairing.trust_device,
+    };
+    FrameWriter::new(&mut client_stream)
+        .write_frame(Frame::Control(ControlMessage::PairRequest {
+            request_id: request_id.clone(),
+            payload: payload.clone(),
+            trusted_proof: None,
+        }))
+        .await?;
+
+    let reply = match FrameReader::new(&mut client_stream).read_frame().await? {
+        Frame::Control(message) => message,
+        _ => bail!("peer sent a non-control response during bootstrap pairing"),
+    };
+    let (remote, remote_workspace, agreement) = match &reply {
+        ControlMessage::PairDecision {
+            accepted,
+            message,
+            server,
+            workspace,
+            agreement,
+            auth_method,
+            ..
+        } => {
+            if *auth_method != PairAuthMethod::Pin {
+                bail!("bootstrap pairing expected a PIN-bound decision");
+            }
+            crypto::verify_device_identity_material(server)?;
+            crypto::verify_pair_decision(&reply, &exporter, &request_id, &pin)?;
+            if !accepted {
+                bail!("{}", message);
+            }
+            (server.clone(), workspace.clone(), agreement.clone())
+        }
+        ControlMessage::Error { message } => bail!("{}", message),
+        other => bail!("unexpected bootstrap pairing response: {other:?}"),
+    };
+
+    if let ControlMessage::PairDecision {
+        trust_established, ..
+    } = &reply
+        && *trust_established
+        && options.pairing.trust_device
+    {
+        config.remember_trusted_device(
+            remote.device_id,
+            remote.device_name.clone(),
+            remote.identity_public_key.clone(),
+            remote.tls_root_certificate.clone(),
+        );
+        config.save()?;
+        println!("已保存对端身份公钥和 TLS 根证书，后续连接会使用长期 mTLS 并可免 PIN。");
+    }
+
+    let tls_stream: TlsStream<TcpStream> = client_stream.into();
+    print_connected_peer(&remote, &agreement)?;
     Ok(AuthenticatedSession {
         role: SessionRole::Client,
         stream: tls_stream,
@@ -627,7 +971,9 @@ async fn run_sync_session(
                 eprintln!("对端报告错误: {}", message);
             }
             Frame::Control(ControlMessage::Goodbye) => break,
-            Frame::Control(ControlMessage::PairRequest { .. })
+            Frame::Control(ControlMessage::BootstrapHello { .. })
+            | Frame::Control(ControlMessage::BootstrapChallenge { .. })
+            | Frame::Control(ControlMessage::PairRequest { .. })
             | Frame::Control(ControlMessage::PinChallenge { .. })
             | Frame::Control(ControlMessage::PairAuth { .. })
             | Frame::Control(ControlMessage::PairDecision { .. }) => {
@@ -1265,9 +1611,14 @@ fn print_revision_result(
     );
 }
 
-fn choose_peer() -> Result<DiscoveredPeer> {
+fn choose_peer(peer_query: Option<&str>, timeout: Duration) -> Result<DiscoveredPeer> {
+    if let Some(query) = peer_query {
+        let peers = discovery::browse(timeout)?;
+        return select_peer_from_query(&peers, require_peer_query(Some(query))?);
+    }
+
     loop {
-        let peers = discovery::browse(Duration::from_secs(3))?;
+        let peers = discovery::browse(timeout)?;
         if peers.is_empty() {
             if !prompt_confirm("继续搜索设备吗", true)? {
                 bail!("no peer selected");
@@ -1279,6 +1630,115 @@ fn choose_peer() -> Result<DiscoveredPeer> {
         let index = prompt_select("选择设备", &options, None)?;
         return Ok(peers[index].clone());
     }
+}
+
+fn select_peer_from_query(peers: &[DiscoveredPeer], query: &str) -> Result<DiscoveredPeer> {
+    let matches = peers
+        .iter()
+        .filter(|peer| peer_matches_query(peer, query))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    match matches.len() {
+        0 => bail!("没有找到匹配 `{query}` 的设备"),
+        1 => Ok(matches[0].clone()),
+        _ => {
+            let labels = matches
+                .iter()
+                .map(DiscoveredPeer::label)
+                .collect::<Vec<_>>()
+                .join(" | ");
+            bail!(
+                "`{query}` 匹配到多个设备，请改用更精确的名称、设备 ID 前缀或 IPv4 地址: {labels}"
+            )
+        }
+    }
+}
+
+fn peer_matches_query(peer: &DiscoveredPeer, query: &str) -> bool {
+    let query = query.trim();
+    if query.is_empty() {
+        return false;
+    }
+
+    peer.device_name.eq_ignore_ascii_case(query)
+        || peer.device_id.eq_ignore_ascii_case(query)
+        || peer
+            .device_id
+            .to_ascii_lowercase()
+            .starts_with(&query.to_ascii_lowercase())
+        || peer
+            .addresses
+            .iter()
+            .any(|address| address.to_string() == query)
+}
+
+fn trusted_device_for_peer(
+    config: &SynlyConfig,
+    peer: &DiscoveredPeer,
+) -> Result<Option<TrustedDeviceConfig>> {
+    let device_id = Uuid::parse_str(&peer.device_id)
+        .with_context(|| format!("peer advertised an invalid device id: {}", peer.device_id))?;
+    Ok(config.trusted_device(&device_id).cloned())
+}
+
+fn has_trusted_transport(config: &SynlyConfig) -> bool {
+    config.trusted_devices.iter().any(|device| {
+        !device.public_key.trim().is_empty() && !device.tls_root_certificate.trim().is_empty()
+    })
+}
+
+fn print_pair_request_overview(
+    payload: &PairRequestPayload,
+    options: &RuntimeOptions,
+    agreement: &SessionAgreement,
+    remote_addr: &str,
+) -> Result<()> {
+    println!();
+    println!("{}", style("收到同步请求").bold());
+    println!(
+        "来自: {} ({})",
+        payload.client.device_name,
+        short_uuid(&payload.client.device_id)
+    );
+    println!(
+        "对端身份指纹: {}",
+        crypto::short_identity_fingerprint(&payload.client.identity_public_key)?
+    );
+    println!("地址: {}", remote_addr);
+    for line in payload.workspace.human_lines() {
+        println!("{line}");
+    }
+    for line in options.workspace.local_human_lines(options.sync_clipboard) {
+        println!("本机 {line}");
+    }
+    if options.workspace.incoming_root.is_some() {
+        println!("本机 删除同步: {}", sync_delete_label(options.sync_delete));
+    }
+    println!(
+        "协商结果: {}",
+        agreement_label(SessionRole::Host, agreement)
+    );
+    Ok(())
+}
+
+fn print_connected_peer(remote: &DeviceIdentity, agreement: &SessionAgreement) -> Result<()> {
+    println!();
+    println!("{}", style("连接已建立").bold());
+    println!(
+        "对端: {} ({})",
+        remote.device_name,
+        short_uuid(&remote.device_id)
+    );
+    println!(
+        "对端身份指纹: {}",
+        crypto::short_identity_fingerprint(&remote.identity_public_key)?
+    );
+    println!(
+        "协商结果: {}",
+        agreement_label(SessionRole::Client, agreement)
+    );
+    Ok(())
 }
 
 fn negotiate(host_mode: SyncMode, client_mode: SyncMode) -> SessionAgreement {
@@ -1315,22 +1775,41 @@ fn allows_local_receive(role: SessionRole, agreement: &SessionAgreement) -> bool
 
 fn signed_pair_decision(params: PairDecisionParams<'_>) -> Result<ControlMessage> {
     let summary = params.workspace.summary(params.sync_clipboard);
-    let proof = crypto::sign_pair_decision(
-        params.exporter,
-        params.request_id,
-        params.pin,
-        params.accepted,
-        &params.message,
-        params.agreement,
-        &summary,
-    )?;
+    let server = device_identity(params.device);
+    let proof = match params.auth_method {
+        PairAuthMethod::Pin => crypto::sign_pair_decision(
+            params.exporter,
+            params.request_id,
+            params.pin.context("missing PIN for pair decision")?,
+            params.accepted,
+            &params.message,
+            &server,
+            params.agreement,
+            &summary,
+            params.auth_method,
+            params.trust_established,
+        )?,
+        PairAuthMethod::TrustedDevice => crypto::sign_trusted_pair_decision(
+            params.device.identity_private_key()?,
+            params.exporter,
+            params.request_id,
+            params.accepted,
+            &params.message,
+            &server,
+            params.agreement,
+            &summary,
+            params.trust_established,
+        )?,
+    };
     Ok(ControlMessage::PairDecision {
         accepted: params.accepted,
         message: params.message,
-        server: device_identity(params.device),
+        server,
         workspace: summary,
         agreement: params.agreement.clone(),
+        auth_method: params.auth_method,
         proof,
+        trust_established: params.trust_established,
     })
 }
 
@@ -1338,12 +1817,27 @@ fn device_identity(device: &DeviceConfig) -> DeviceIdentity {
     DeviceIdentity {
         device_id: device.device_id,
         device_name: device.device_name.clone(),
+        identity_public_key: device
+            .identity_public_key()
+            .expect("device identity public key is missing")
+            .to_string(),
+        tls_root_certificate: crypto::device_tls_root_certificate(device)
+            .expect("device TLS root certificate generation failed"),
     }
 }
 
 fn print_host_ready(device: &DeviceConfig, options: &RuntimeOptions, port: u16) {
     println!("{}", style("Synly 已就绪").bold());
     println!("设备: {} ({})", device.device_name, device.short_id());
+    println!(
+        "本机身份指纹: {}",
+        crypto::short_identity_fingerprint(
+            device
+                .identity_public_key()
+                .expect("device identity public key is missing"),
+        )
+        .expect("device identity fingerprint is invalid")
+    );
     println!("模式: {}", options.mode.label());
     if !options.workspace.file_sync_enabled() {
         println!("文件同步: 关闭（仅剪贴板）");
@@ -1355,8 +1849,36 @@ fn print_host_ready(device: &DeviceConfig, options: &RuntimeOptions, port: u16) 
     if options.workspace.incoming_root.is_some() {
         println!("删除同步: {}", sync_delete_label(options.sync_delete));
     }
+    println!(
+        "配对策略: {}",
+        if options.pairing.trusted_only {
+            "仅可信设备"
+        } else {
+            "可信设备走长期 mTLS；未信任设备走 bootstrap + PIN + 临时 mTLS"
+        }
+    );
+    println!(
+        "接受策略: {}",
+        if options.pairing.accept {
+            "认证通过后自动接受"
+        } else {
+            "认证通过后仍需本机确认"
+        }
+    );
+    if let Some(pin) = &options.pairing.pin {
+        println!("固定 PIN: {}", style(pin).bold());
+    }
     println!("监听端口: {}", port);
-    println!("等待同步请求。收到请求后会为该请求单独显示 6 位 PIN。");
+    println!("等待同步请求。");
+    if options.pairing.trusted_only {
+        println!("仅已建立可信设备公钥的设备可以连接。");
+    } else if options.pairing.pin.is_some() {
+        println!("未被信任的设备会先交换 bootstrap 指纹，再使用上面的固定 PIN 建立临时 mTLS。");
+    } else {
+        println!(
+            "收到未被信任的请求后，会先显示 bootstrap 指纹和会话图，再为该请求单独显示 6 位 PIN。"
+        );
+    }
 }
 
 fn agreement_label(role: SessionRole, agreement: &SessionAgreement) -> &'static str {
@@ -1401,8 +1923,11 @@ fn is_executable(_metadata: &std::fs::Metadata) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::delete_policy;
+    use super::{delete_policy, peer_matches_query, select_peer_from_query};
+    use crate::cli::SyncMode;
+    use crate::discovery::DiscoveredPeer;
     use crate::sync::{DeletePolicy, SnapshotLayout};
+    use std::net::Ipv4Addr;
 
     #[test]
     fn delete_policy_stays_disabled_when_sync_delete_is_off() {
@@ -1430,5 +1955,42 @@ mod tests {
             delete_policy(SnapshotLayout::SelectedItems, true),
             DeletePolicy::MirrorSelectedItems
         ));
+    }
+
+    #[test]
+    fn peer_query_matches_name_id_prefix_and_ip() {
+        let peer = sample_peer();
+        assert!(peer_matches_query(&peer, "demo-device"));
+        assert!(peer_matches_query(&peer, "abcd1234"));
+        assert!(peer_matches_query(&peer, "192.168.1.20"));
+        assert!(!peer_matches_query(&peer, "unknown"));
+    }
+
+    #[test]
+    fn select_peer_from_query_requires_unique_match() {
+        let peer = sample_peer();
+        let selected = select_peer_from_query(std::slice::from_ref(&peer), "demo-device").unwrap();
+        assert_eq!(selected.device_id, peer.device_id);
+
+        let duplicate = DiscoveredPeer {
+            fullname: "dup".to_string(),
+            device_name: "demo-device".to_string(),
+            device_id: "ffffeeee-dddd-cccc-bbbb-aaaaaaaaaaaa".to_string(),
+            mode: SyncMode::Auto,
+            port: 9999,
+            addresses: vec![Ipv4Addr::new(192, 168, 1, 21)],
+        };
+        assert!(select_peer_from_query(&[peer, duplicate], "demo-device").is_err());
+    }
+
+    fn sample_peer() -> DiscoveredPeer {
+        DiscoveredPeer {
+            fullname: "demo._synly._tcp.local.".to_string(),
+            device_name: "demo-device".to_string(),
+            device_id: "abcd1234-1111-2222-3333-444455556666".to_string(),
+            mode: SyncMode::Both,
+            port: 8080,
+            addresses: vec![Ipv4Addr::new(192, 168, 1, 20)],
+        }
     }
 }

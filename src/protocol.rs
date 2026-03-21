@@ -11,12 +11,22 @@ const FRAME_CLIPBOARD: u8 = 3;
 const MAX_META_LEN: usize = 4 * 1024 * 1024;
 const MAX_DATA_LEN: usize = 64 * 1024 * 1024;
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 6;
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PairAuthMethod {
+    #[default]
+    Pin,
+    TrustedDevice,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DeviceIdentity {
     pub device_id: Uuid,
     pub device_name: String,
+    pub identity_public_key: String,
+    pub tls_root_certificate: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -25,6 +35,8 @@ pub struct PairRequestPayload {
     pub client: DeviceIdentity,
     pub requested_mode: SyncMode,
     pub workspace: WorkspaceSummary,
+    #[serde(default)]
+    pub request_trust: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -42,8 +54,18 @@ impl SessionAgreement {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ControlMessage {
+    BootstrapHello {
+        protocol_version: u16,
+        client_bootstrap_public_key: String,
+    },
+    BootstrapChallenge {
+        request_id: String,
+        server_bootstrap_public_key: String,
+    },
     PairRequest {
+        request_id: String,
         payload: PairRequestPayload,
+        trusted_proof: Option<String>,
     },
     PinChallenge {
         request_id: String,
@@ -60,7 +82,11 @@ pub enum ControlMessage {
         server: DeviceIdentity,
         workspace: WorkspaceSummary,
         agreement: SessionAgreement,
+        #[serde(default)]
+        auth_method: PairAuthMethod,
         proof: String,
+        #[serde(default)]
+        trust_established: bool,
     },
     SnapshotAdvert {
         revision: u64,

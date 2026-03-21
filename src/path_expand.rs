@@ -141,13 +141,19 @@ mod tests {
     #[test]
     fn expands_braced_env_var() {
         let path = expand_path_string("${PATH}/bin").unwrap();
-        assert_eq!(path, PathBuf::from(format!("{}/bin", env::var("PATH").unwrap())));
+        assert_eq!(
+            path,
+            PathBuf::from(format!("{}/bin", env::var("PATH").unwrap()))
+        );
     }
 
     #[test]
     fn expands_percent_env_var_when_closed() {
         let path = expand_path_string("%PATH%/bin").unwrap();
-        assert_eq!(path, PathBuf::from(format!("{}/bin", env::var("PATH").unwrap())));
+        assert_eq!(
+            path,
+            PathBuf::from(format!("{}/bin", env::var("PATH").unwrap()))
+        );
     }
 
     #[test]
@@ -174,13 +180,15 @@ mod tests {
     #[test]
     fn cli_expansion_errors_when_env_var_is_missing() {
         let err = expand_path_string("$SYNLY_ENV_SHOULD_NOT_EXIST_4F6CC5D6").unwrap_err();
-        assert!(err.to_string().contains("环境变量 `SYNLY_ENV_SHOULD_NOT_EXIST_4F6CC5D6` 未定义"));
+        assert!(
+            err.to_string()
+                .contains("环境变量 `SYNLY_ENV_SHOULD_NOT_EXIST_4F6CC5D6` 未定义")
+        );
     }
 
     #[test]
     fn config_expansion_uses_empty_string_for_missing_env_var() {
-        let path = expand_config_path_string("cache-$SYNLY_ENV_SHOULD_NOT_EXIST_4F6CC5D6")
-            .unwrap();
+        let path = expand_config_path_string("cache-$SYNLY_ENV_SHOULD_NOT_EXIST_4F6CC5D6").unwrap();
         assert_eq!(path, PathBuf::from("cache-"));
     }
 }

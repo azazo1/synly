@@ -47,6 +47,39 @@ pub struct Cli {
         help = "兜底全量重扫间隔（秒），目录变化仍会实时监听"
     )]
     pub interval_secs: u64,
+    #[arg(
+        long,
+        global = true,
+        help = "join 模式下要连接的设备；可填写设备名、设备 ID 前缀或广播出的 IPv4 地址"
+    )]
+    pub peer: Option<String>,
+    #[arg(
+        long,
+        global = true,
+        help = "当前连接使用的 6 位 PIN；host 模式下会把它作为固定 PIN，join 模式下会直接使用它而不再询问"
+    )]
+    pub pin: Option<String>,
+    #[arg(long, global = true, help = "认证通过后自动接受本次同步，不再二次确认")]
+    pub accept: bool,
+    #[arg(
+        long,
+        global = true,
+        help = "在 PIN 认证成功后互相记住设备身份公钥，后续双方可免 PIN 并校验签名"
+    )]
+    pub trust_device: bool,
+    #[arg(
+        long,
+        global = true,
+        help = "只允许使用已建立的可信设备公钥；若未被信任则直接失败，不回退到 PIN"
+    )]
+    pub trusted_only: bool,
+    #[arg(
+        long,
+        global = true,
+        default_value_t = 3,
+        help = "join 模式搜索设备时等待的秒数"
+    )]
+    pub discovery_secs: u64,
 }
 
 #[derive(Subcommand, Debug)]
@@ -119,12 +152,23 @@ pub struct RuntimeOptions {
     pub sync_clipboard: bool,
     pub clipboard: ClipboardRuntimeOptions,
     pub interval_secs: u64,
+    pub pairing: PairingRuntimeOptions,
 }
 
 #[derive(Clone, Debug)]
 pub struct ClipboardRuntimeOptions {
     pub max_file_bytes: u64,
     pub cache_dir: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub struct PairingRuntimeOptions {
+    pub peer_query: Option<String>,
+    pub pin: Option<String>,
+    pub accept: bool,
+    pub trust_device: bool,
+    pub trusted_only: bool,
+    pub discovery_secs: u64,
 }
 
 pub fn collect_runtime_options(cli: Cli, config: &SynlyConfig) -> Result<RuntimeOptions> {
@@ -190,6 +234,7 @@ pub fn collect_runtime_options(cli: Cli, config: &SynlyConfig) -> Result<Runtime
     };
     let sync_delete = resolve_sync_delete(sync_delete_override, &workspace)?;
     let sync_clipboard = resolve_sync_clipboard(sync_clipboard_override, clipboard_only)?;
+    let pin = cli.pin.as_deref().map(normalize_pin).transpose()?;
 
     Ok(RuntimeOptions {
         mode,
@@ -202,6 +247,14 @@ pub fn collect_runtime_options(cli: Cli, config: &SynlyConfig) -> Result<Runtime
             cache_dir: config.clipboard_cache_dir()?,
         },
         interval_secs: cli.interval_secs.max(1),
+        pairing: PairingRuntimeOptions {
+            peer_query: cli.peer.map(|value| value.trim().to_string()),
+            pin,
+            accept: cli.accept,
+            trust_device: cli.trust_device,
+            trusted_only: cli.trusted_only,
+            discovery_secs: cli.discovery_secs.max(1),
+        },
     })
 }
 
@@ -287,10 +340,40 @@ pub fn prompt_secret(label: &str) -> Result<String> {
     loop {
         term.write_line(label)?;
         let value = prompt_input("PIN", None)?;
-        if !value.is_empty() {
-            return Ok(value);
+        if value.is_empty() {
+            term.write_line("输入不能为空，请重新输入。")?;
+            continue;
         }
-        term.write_line("输入不能为空，请重新输入。")?;
+        match normalize_pin(&value) {
+            Ok(pin) => return Ok(pin),
+            Err(err) => {
+                term.write_line(&format!("PIN 无效，请重新输入: {err:#}"))?;
+            }
+        }
+    }
+}
+
+pub fn normalize_pin(pin: &str) -> Result<String> {
+    let trimmed = pin.trim();
+    if trimmed.len() != 6 || !trimmed.chars().all(|ch| ch.is_ascii_digit()) {
+        bail!("PIN 必须是 6 位数字");
+    }
+    Ok(trimmed.to_string())
+}
+
+pub fn require_peer_query(peer_query: Option<&str>) -> Result<&str> {
+    match peer_query {
+        Some(query) if !query.trim().is_empty() => Ok(query.trim()),
+        _ => {
+            bail!("join 模式下请用 --peer 指定要连接的设备（支持设备名、设备 ID 前缀或 IPv4 地址）")
+        }
+    }
+}
+
+pub fn resolve_pairing_pin(pin: Option<&str>, prompt: &str) -> Result<String> {
+    match pin {
+        Some(pin) => normalize_pin(pin),
+        None => prompt_secret(prompt),
     }
 }
 
@@ -623,6 +706,45 @@ mod tests {
         assert!(options.workspace.incoming_root.is_some());
     }
 
+    #[test]
+    fn collect_runtime_options_captures_pairing_flags() {
+        let cli = Cli::try_parse_from([
+            "synly",
+            "both",
+            ".",
+            "--join",
+            "--peer",
+            "demo-device",
+            "--pin",
+            "123456",
+            "--no-sync-delete",
+            "--no-sync-clipboard",
+            "--accept",
+            "--trust-device",
+            "--trusted-only",
+            "--discovery-secs",
+            "7",
+        ])
+        .unwrap();
+
+        let options = collect_runtime_options(cli, &test_config()).unwrap();
+
+        assert!(matches!(options.connection, ConnectionPreference::Join));
+        assert_eq!(options.pairing.peer_query.as_deref(), Some("demo-device"));
+        assert_eq!(options.pairing.pin.as_deref(), Some("123456"));
+        assert!(options.pairing.accept);
+        assert!(options.pairing.trust_device);
+        assert!(options.pairing.trusted_only);
+        assert_eq!(options.pairing.discovery_secs, 7);
+    }
+
+    #[test]
+    fn normalize_pin_requires_six_digits() {
+        assert_eq!(normalize_pin("001234").unwrap(), "001234");
+        assert!(normalize_pin("12345").is_err());
+        assert!(normalize_pin("12ab56").is_err());
+    }
+
     fn assert_global_receive_cli(cli: Cli) {
         assert!(cli.join);
         assert!(!cli.host);
@@ -644,8 +766,11 @@ mod tests {
             device: DeviceConfig {
                 device_id: Uuid::nil(),
                 device_name: "test-device".to_string(),
+                identity_private_key: None,
+                identity_public_key: None,
             },
             clipboard: ClipboardConfig::default(),
+            trusted_devices: Vec::new(),
         }
     }
 }

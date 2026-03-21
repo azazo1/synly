@@ -1,9 +1,14 @@
 use crate::path_expand::expand_config_path_string;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD_NO_PAD;
+use ring::rand::SystemRandom;
+use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 const CONFIG_FILE_NAME: &str = "config.toml";
@@ -16,12 +21,18 @@ pub struct SynlyConfig {
     pub device: DeviceConfig,
     #[serde(default)]
     pub clipboard: ClipboardConfig,
+    #[serde(default)]
+    pub trusted_devices: Vec<TrustedDeviceConfig>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct DeviceConfig {
     pub device_id: Uuid,
     pub device_name: String,
+    #[serde(default)]
+    pub identity_private_key: Option<String>,
+    #[serde(default)]
+    pub identity_public_key: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -30,6 +41,22 @@ pub struct ClipboardConfig {
     pub max_file_bytes: u64,
     #[serde(default)]
     pub cache_dir: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrustedDeviceConfig {
+    pub device_id: Uuid,
+    pub device_name: String,
+    #[serde(default)]
+    pub public_key: String,
+    #[serde(default)]
+    pub tls_root_certificate: String,
+    #[serde(default)]
+    pub trusted_at_ms: u64,
+    #[serde(default)]
+    pub last_seen_ms: u64,
+    #[serde(default)]
+    pub successful_sessions: u64,
 }
 
 impl Default for ClipboardConfig {
@@ -54,6 +81,64 @@ impl SynlyConfig {
         }
     }
 
+    pub fn save(&self) -> Result<()> {
+        write_config_to_path(&config_path_in(&config_dir()?), self)
+    }
+
+    pub fn trusted_device(&self, device_id: &Uuid) -> Option<&TrustedDeviceConfig> {
+        self.trusted_devices
+            .iter()
+            .find(|device| device.device_id == *device_id && !device.public_key.trim().is_empty())
+    }
+
+    pub fn remember_trusted_device(
+        &mut self,
+        device_id: Uuid,
+        device_name: String,
+        public_key: String,
+        tls_root_certificate: String,
+    ) {
+        let now = unix_time_ms();
+        if let Some(device) = self
+            .trusted_devices
+            .iter_mut()
+            .find(|device| device.device_id == device_id)
+        {
+            device.device_name = device_name;
+            device.public_key = public_key;
+            device.tls_root_certificate = tls_root_certificate;
+            if device.trusted_at_ms == 0 {
+                device.trusted_at_ms = now;
+            }
+            device.last_seen_ms = now;
+            device.successful_sessions = device.successful_sessions.saturating_add(1);
+        } else {
+            self.trusted_devices.push(TrustedDeviceConfig {
+                device_id,
+                device_name,
+                public_key,
+                tls_root_certificate,
+                trusted_at_ms: now,
+                last_seen_ms: now,
+                successful_sessions: 1,
+            });
+            self.trusted_devices.sort_by_key(|device| device.device_id);
+        }
+    }
+
+    pub fn note_trusted_device_session(&mut self, device_id: Uuid, device_name: &str) {
+        let now = unix_time_ms();
+        if let Some(device) = self
+            .trusted_devices
+            .iter_mut()
+            .find(|device| device.device_id == device_id)
+        {
+            device.device_name = device_name.to_string();
+            device.last_seen_ms = now;
+            device.successful_sessions = device.successful_sessions.saturating_add(1);
+        }
+    }
+
     fn load_or_create_in_dir(dir: &Path) -> Result<Self> {
         let path = config_path_in(dir);
         if path.exists() {
@@ -64,30 +149,79 @@ impl SynlyConfig {
             Self {
                 device,
                 clipboard: ClipboardConfig::default(),
+                trusted_devices: Vec::new(),
             }
         } else {
             Self::new_generated()
         };
 
+        let mut config = config;
+        config.ensure_device_identity()?;
         write_config_to_path(&path, &config)?;
         Ok(config)
     }
 
     fn new_generated() -> Self {
         let device_id = Uuid::new_v4();
+        let (identity_private_key, identity_public_key) =
+            generate_identity_keypair().expect("failed to generate device identity");
         Self {
             device: DeviceConfig {
                 device_id,
                 device_name: detect_device_name(device_id),
+                identity_private_key: Some(identity_private_key),
+                identity_public_key: Some(identity_public_key),
             },
             clipboard: ClipboardConfig::default(),
+            trusted_devices: Vec::new(),
         }
+    }
+
+    fn ensure_device_identity(&mut self) -> Result<()> {
+        self.device.ensure_identity_keypair()
     }
 }
 
 impl DeviceConfig {
     pub fn short_id(&self) -> String {
         self.device_id.to_string().chars().take(8).collect()
+    }
+
+    pub fn identity_public_key(&self) -> Result<&str> {
+        self.identity_public_key
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .context("device identity public key is missing")
+    }
+
+    pub fn identity_private_key(&self) -> Result<&str> {
+        self.identity_private_key
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .context("device identity private key is missing")
+    }
+
+    fn ensure_identity_keypair(&mut self) -> Result<()> {
+        match (
+            self.identity_private_key.as_deref(),
+            self.identity_public_key.as_deref(),
+        ) {
+            (Some(private_key), Some(public_key)) if !private_key.trim().is_empty() => {
+                let derived_public_key = public_key_from_private_key(private_key)?;
+                if derived_public_key != public_key {
+                    self.identity_public_key = Some(derived_public_key);
+                }
+            }
+            (Some(private_key), _) if !private_key.trim().is_empty() => {
+                self.identity_public_key = Some(public_key_from_private_key(private_key)?);
+            }
+            _ => {
+                let (private_key, public_key) = generate_identity_keypair()?;
+                self.identity_private_key = Some(private_key);
+                self.identity_public_key = Some(public_key);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -102,7 +236,17 @@ fn legacy_device_config_path_in(dir: &Path) -> PathBuf {
 fn load_config_from_path(path: &Path) -> Result<SynlyConfig> {
     let raw = fs::read_to_string(path)
         .with_context(|| format!("failed to read config at {}", path.display()))?;
-    toml::from_str(&raw).with_context(|| format!("failed to parse config at {}", path.display()))
+    let mut config: SynlyConfig = toml::from_str(&raw)
+        .with_context(|| format!("failed to parse config at {}", path.display()))?;
+    let before_private = config.device.identity_private_key.clone();
+    let before_public = config.device.identity_public_key.clone();
+    config.ensure_device_identity()?;
+    if config.device.identity_private_key != before_private
+        || config.device.identity_public_key != before_public
+    {
+        write_config_to_path(path, &config)?;
+    }
+    Ok(config)
 }
 
 fn write_config_to_path(path: &Path, config: &SynlyConfig) -> Result<()> {
@@ -140,6 +284,32 @@ fn load_legacy_device_from_dir(dir: &Path) -> Result<Option<DeviceConfig>> {
 
 fn default_clipboard_max_file_bytes() -> u64 {
     DEFAULT_CLIPBOARD_MAX_FILE_BYTES
+}
+
+fn unix_time_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+fn generate_identity_keypair() -> Result<(String, String)> {
+    let rng = SystemRandom::new();
+    let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng)
+        .map_err(|_| anyhow!("failed to generate identity key"))?;
+    let private_key = STANDARD_NO_PAD.encode(pkcs8.as_ref());
+    let public_key = public_key_from_private_key(&private_key)?;
+    Ok((private_key, public_key))
+}
+
+fn public_key_from_private_key(private_key: &str) -> Result<String> {
+    let pkcs8 = STANDARD_NO_PAD
+        .decode(private_key.trim().as_bytes())
+        .context("failed to decode device identity private key")?;
+    let key_pair = Ed25519KeyPair::from_pkcs8(&pkcs8)
+        .map_err(|_| anyhow!("failed to parse device identity private key"))?;
+    Ok(STANDARD_NO_PAD.encode(key_pair.public_key().as_ref()))
 }
 
 fn resolve_configured_path(path: &Path, base_dir: &Path) -> Result<PathBuf> {
@@ -217,8 +387,8 @@ fn detect_device_name(device_id: Uuid) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClipboardConfig, DeviceConfig, SynlyConfig, config_path_in, legacy_device_config_path_in,
-        resolve_configured_path,
+        ClipboardConfig, DeviceConfig, SynlyConfig, TrustedDeviceConfig, config_path_in,
+        legacy_device_config_path_in, resolve_configured_path,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -236,6 +406,7 @@ mod tests {
         assert!(saved.contains("[device]"));
         assert!(saved.contains("[clipboard]"));
         assert_eq!(config.clipboard, ClipboardConfig::default());
+        assert!(config.trusted_devices.is_empty());
 
         cleanup_dir(&dir);
     }
@@ -248,6 +419,8 @@ mod tests {
         let legacy_device = DeviceConfig {
             device_id: Uuid::new_v4(),
             device_name: "legacy-device".to_string(),
+            identity_private_key: None,
+            identity_public_key: None,
         };
         let legacy_path = legacy_device_config_path_in(&dir);
         fs::write(
@@ -260,7 +433,10 @@ mod tests {
 
         assert_eq!(config.device.device_id, legacy_device.device_id);
         assert_eq!(config.device.device_name, legacy_device.device_name);
+        assert!(config.device.identity_private_key.is_some());
+        assert!(config.device.identity_public_key.is_some());
         assert_eq!(config.clipboard, ClipboardConfig::default());
+        assert!(config.trusted_devices.is_empty());
         assert!(config_path_in(&dir).exists());
 
         cleanup_dir(&dir);
@@ -279,7 +455,10 @@ mod tests {
 
         let config = SynlyConfig::load_or_create_in_dir(&dir).unwrap();
         assert_eq!(config.device.device_name, "demo");
+        assert!(config.device.identity_private_key.is_some());
+        assert!(config.device.identity_public_key.is_some());
         assert_eq!(config.clipboard, ClipboardConfig::default());
+        assert!(config.trusted_devices.is_empty());
 
         cleanup_dir(&dir);
     }
@@ -296,10 +475,47 @@ mod tests {
         fs::write(&path, toml).unwrap();
 
         let config = SynlyConfig::load_or_create_in_dir(&dir).unwrap();
+        assert!(config.device.identity_private_key.is_some());
+        assert!(config.device.identity_public_key.is_some());
         assert_eq!(config.clipboard.max_file_bytes, 42);
         assert_eq!(
             config.clipboard.cache_dir,
             Some(PathBuf::from("custom-cache"))
+        );
+        assert!(config.trusted_devices.is_empty());
+
+        cleanup_dir(&dir);
+    }
+
+    #[test]
+    fn remember_trusted_device_persists_in_config() {
+        let dir = unique_test_dir("trusted-device");
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut config = SynlyConfig::new_generated();
+        super::write_config_to_path(&config_path_in(&dir), &config).unwrap();
+
+        let remote_id = Uuid::new_v4();
+        config.remember_trusted_device(
+            remote_id,
+            "remote".to_string(),
+            "pubkey".to_string(),
+            "rootcert".to_string(),
+        );
+
+        super::write_config_to_path(&config_path_in(&dir), &config).unwrap();
+        let reloaded = SynlyConfig::load_or_create_in_dir(&dir).unwrap();
+        assert_eq!(
+            reloaded.trusted_devices,
+            vec![TrustedDeviceConfig {
+                device_id: remote_id,
+                device_name: "remote".to_string(),
+                public_key: "pubkey".to_string(),
+                tls_root_certificate: "rootcert".to_string(),
+                trusted_at_ms: reloaded.trusted_devices[0].trusted_at_ms,
+                last_seen_ms: reloaded.trusted_devices[0].last_seen_ms,
+                successful_sessions: 1,
+            }]
         );
 
         cleanup_dir(&dir);
@@ -310,6 +526,13 @@ mod tests {
         let base = PathBuf::from("/tmp/synly-config-base");
         let resolved = resolve_configured_path(Path::new("cache-dir"), &base).unwrap();
         assert_eq!(resolved, base.join("cache-dir"));
+    }
+
+    #[test]
+    fn generated_config_contains_identity_keypair() {
+        let config = SynlyConfig::new_generated();
+        assert!(config.device.identity_private_key.is_some());
+        assert!(config.device.identity_public_key.is_some());
     }
 
     fn unique_test_dir(label: &str) -> PathBuf {

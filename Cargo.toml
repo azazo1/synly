@@ -29,3 +29,4 @@ toml = "0.8.23"
 url = "2.5.7"
 uuid = { version = "1.22.0", features = ["serde", "v4"] }
 walkdir = "2.5.0"
+x509-parser = "0.18.1"

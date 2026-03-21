@@ -15,7 +15,7 @@ use console::style;
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let cli = cli::Cli::parse();
-    let config = config::SynlyConfig::load_or_create()?;
+    let mut config = config::SynlyConfig::load_or_create()?;
     let options = cli::collect_runtime_options(cli, &config)?;
     println!();
     println!("{}", style("本次同步确认").bold());
@@ -25,5 +25,5 @@ async fn main() -> Result<()> {
     if options.workspace.incoming_root.is_some() {
         println!("删除同步: {}", cli::sync_delete_label(options.sync_delete));
     }
-    app::run(config.device, options).await
+    app::run(&mut config, options).await
 }
