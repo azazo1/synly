@@ -1,3 +1,4 @@
+use crate::path_expand::expand_config_path_string;
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -143,14 +144,7 @@ fn default_clipboard_max_file_bytes() -> u64 {
 
 fn resolve_configured_path(path: &Path, base_dir: &Path) -> Result<PathBuf> {
     let raw = path.to_string_lossy();
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        bail!("configured path cannot be empty");
-    }
-
-    let with_env = expand_env_vars(trimmed)?;
-    let expanded = expand_tilde(&with_env)?;
-    let path = PathBuf::from(expanded);
+    let path = expand_config_path_string(&raw).context("configured path cannot be empty")?;
     if path.is_absolute() {
         Ok(path)
     } else {
@@ -191,74 +185,6 @@ fn config_dir() -> Result<PathBuf> {
     }
 
     bail!("unable to determine config directory")
-}
-
-fn expand_tilde(raw: &str) -> Result<String> {
-    if !raw.starts_with('~') {
-        return Ok(raw.to_string());
-    }
-
-    let rest = &raw[1..];
-    if !rest.is_empty() && !rest.starts_with('/') && !rest.starts_with('\\') {
-        return Ok(raw.to_string());
-    }
-
-    let home = home_dir().context("无法展开 `~`，因为当前环境没有可用的 home 目录")?;
-    Ok(format!("{}{}", home.display(), rest))
-}
-
-fn expand_env_vars(raw: &str) -> Result<String> {
-    let mut result = String::with_capacity(raw.len());
-    let chars: Vec<char> = raw.chars().collect();
-    let mut index = 0usize;
-
-    while index < chars.len() {
-        if chars[index] == '$' {
-            if index + 1 < chars.len() && chars[index + 1] == '{' {
-                let mut end = index + 2;
-                while end < chars.len() && chars[end] != '}' {
-                    end += 1;
-                }
-                if end >= chars.len() {
-                    bail!("环境变量引用缺少右花括号: {}", raw);
-                }
-                let key = chars[index + 2..end].iter().collect::<String>();
-                result.push_str(&env::var(&key).unwrap_or_default());
-                index = end + 1;
-                continue;
-            }
-
-            let mut end = index + 1;
-            while end < chars.len() && (chars[end].is_ascii_alphanumeric() || chars[end] == '_') {
-                end += 1;
-            }
-            if end == index + 1 {
-                result.push(chars[index]);
-                index += 1;
-                continue;
-            }
-            let key = chars[index + 1..end].iter().collect::<String>();
-            result.push_str(&env::var(&key).unwrap_or_default());
-            index = end;
-            continue;
-        }
-
-        result.push(chars[index]);
-        index += 1;
-    }
-
-    Ok(result)
-}
-
-fn home_dir() -> Option<PathBuf> {
-    #[cfg(windows)]
-    {
-        if let Ok(profile) = env::var("USERPROFILE") {
-            return Some(PathBuf::from(profile));
-        }
-    }
-
-    env::var("HOME").ok().map(PathBuf::from)
 }
 
 fn detect_device_name(device_id: Uuid) -> String {

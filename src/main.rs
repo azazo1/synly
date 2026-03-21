@@ -4,6 +4,7 @@ mod clipboard;
 mod config;
 mod crypto;
 mod discovery;
+mod path_expand;
 mod protocol;
 mod sync;
 
