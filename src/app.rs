@@ -129,7 +129,7 @@ fn accept_policy_label(pairing: &PairingRuntimeOptions) -> &'static str {
 async fn run_host(config: &mut SynlyConfig, options: RuntimeOptions) -> Result<()> {
     let device = config.device.clone();
     let mut pairing_throttle = PairingThrottle::default();
-    let listener = TcpListener::bind(("0.0.0.0", 0))
+    let listener = TcpListener::bind(("0.0.0.0", options.pairing.port.unwrap_or(0)))
         .await
         .context("failed to bind TCP listener")?;
     let port = listener.local_addr()?.port();
@@ -2351,7 +2351,11 @@ fn print_host_ready(device: &DeviceConfig, options: &RuntimeOptions, port: u16) 
     if let Some(pin) = &options.pairing.pin {
         println!("固定 PIN: {}", style(pin).bold());
     }
-    println!("监听端口: {}", port);
+    if options.pairing.port.is_some() {
+        println!("监听端口: {}（固定）", port);
+    } else {
+        println!("监听端口: {}", port);
+    }
     println!("等待同步请求。");
     if options.pairing.trusted_only {
         println!("仅已建立可信设备公钥的设备可以连接。");
@@ -2580,6 +2584,7 @@ mod tests {
     fn sample_pairing_options() -> PairingRuntimeOptions {
         PairingRuntimeOptions {
             peer_query: None,
+            port: None,
             pin: None,
             accept: false,
             trust_device: false,

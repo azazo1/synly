@@ -69,6 +69,13 @@ pub struct Cli {
     #[arg(
         long,
         global = true,
+        value_parser = clap::value_parser!(u16).range(1..),
+        help = "host 模式下固定监听端口；留空则每次自动分配"
+    )]
+    pub port: Option<u16>,
+    #[arg(
+        long,
+        global = true,
         help = "当前连接使用的 6 位 PIN；host 模式下会把它作为固定 PIN，join 模式下会直接使用它而不再询问"
     )]
     pub pin: Option<String>,
@@ -183,6 +190,7 @@ pub struct ClipboardRuntimeOptions {
 #[derive(Clone, Debug)]
 pub struct PairingRuntimeOptions {
     pub peer_query: Option<String>,
+    pub port: Option<u16>,
     pub pin: Option<String>,
     pub accept: bool,
     pub trust_device: bool,
@@ -285,6 +293,7 @@ fn collect_runtime_options_from_cli(cli: Cli, config: &SynlyConfig) -> Result<Ru
         interval_secs: cli.interval_secs.max(1),
         pairing: PairingRuntimeOptions {
             peer_query: cli.peer.map(|value| value.trim().to_string()),
+            port: cli.port,
             pin,
             accept: cli.accept,
             trust_device: cli.trust_device,
@@ -786,6 +795,8 @@ mod tests {
             "--join",
             "--no-sync-delete",
             "--sync-clipboard",
+            "--port",
+            "7070",
             "--interval-secs",
             "9",
             "--max-folder-depth",
@@ -801,6 +812,8 @@ mod tests {
             "--join",
             "--no-sync-delete",
             "--sync-clipboard",
+            "--port",
+            "7070",
             "--interval-secs",
             "9",
             "--max-folder-depth",
@@ -873,6 +886,8 @@ mod tests {
             "--join",
             "--peer",
             "demo-device",
+            "--port",
+            "7373",
             "--pin",
             "123456",
             "--no-sync-delete",
@@ -889,6 +904,7 @@ mod tests {
 
         assert!(matches!(options.connection, ConnectionPreference::Join));
         assert_eq!(options.pairing.peer_query.as_deref(), Some("demo-device"));
+        assert_eq!(options.pairing.port, Some(7373));
         assert_eq!(options.pairing.pin.as_deref(), Some("123456"));
         assert!(options.pairing.accept);
         assert!(options.pairing.trust_device);
@@ -969,6 +985,15 @@ mod tests {
         assert!(err.contains("`--sync-delete` 或 `--no-sync-delete`"));
     }
 
+    #[test]
+    fn fixed_port_must_be_positive() {
+        let err = Cli::try_parse_from(["synly", "--port", "0", "send", ".", "--host"])
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("1.."));
+    }
+
     fn assert_global_receive_cli(cli: Cli) {
         assert!(cli.join);
         assert!(!cli.host);
@@ -976,6 +1001,7 @@ mod tests {
         assert!(!cli.sync_delete);
         assert!(cli.sync_clipboard);
         assert!(!cli.no_sync_clipboard);
+        assert_eq!(cli.port, Some(7070));
         assert_eq!(cli.interval_secs, 9);
         assert_eq!(cli.max_folder_depth, Some(2));
         match cli.command {

@@ -97,6 +97,7 @@ struct WorkspaceDraft {
 
 struct PairingDraft {
     peer_query: TextArea<'static>,
+    port: TextArea<'static>,
     pin: TextArea<'static>,
     accept: bool,
     trust_device: bool,
@@ -134,7 +135,7 @@ impl StartupTab {
         match self {
             Self::Flow => "切换连接方式、同步方向和基础能力开关。",
             Self::Workspace => "补齐目录、发送路径与文件同步节奏。",
-            Self::Pairing => "设置目标设备、PIN 与可信设备策略。",
+            Self::Pairing => "设置目标设备、PIN、端口与可信设备策略。",
         }
     }
 }
@@ -150,6 +151,7 @@ enum FieldId {
     MaxFolderDepth,
     IntervalSecs,
     PeerQuery,
+    Port,
     Pin,
     Accept,
     TrustDevice,
@@ -280,6 +282,10 @@ impl StartupApp {
                 peer_query: single_line_textarea(
                     cli.peer.unwrap_or_default(),
                     "留空则在启动后搜索并选择设备",
+                ),
+                port: single_line_textarea(
+                    cli.port.map(|value| value.to_string()).unwrap_or_default(),
+                    "Host 模式生效；留空随机分配",
                 ),
                 pin: single_line_textarea(cli.pin.unwrap_or_default(), "留空则运行时再输入或显示"),
                 accept: cli.accept,
@@ -539,6 +545,9 @@ impl StartupApp {
                 let _ = key;
             }
             FieldId::PeerQuery => {
+                let _ = key;
+            }
+            FieldId::Port => {
                 let _ = key;
             }
             FieldId::Pin => {
@@ -1012,6 +1021,17 @@ impl StartupApp {
                 );
                 frame.render_widget(&self.pairing.peer_query, area);
             }
+            FieldId::Port => {
+                apply_textarea_theme(
+                    &mut self.pairing.port,
+                    "固定监听端口",
+                    "Host 模式生效；留空随机分配",
+                    focused,
+                    editing,
+                    colors,
+                );
+                frame.render_widget(&self.pairing.port, area);
+            }
             FieldId::Pin => {
                 apply_textarea_theme(
                     &mut self.pairing.pin,
@@ -1350,6 +1370,25 @@ impl StartupApp {
             Err(err) => errors.push(err.to_string()),
         }
 
+        match self.parsed_port() {
+            Ok(Some(port)) => {
+                if self.flow.connection == ConnectionPreference::Host {
+                    summary_lines.push(format!("监听端口: 固定为 {}", port));
+                } else {
+                    notes.push(format!(
+                        "固定监听端口已设为 {}，但 Join 模式不会监听端口。",
+                        port
+                    ));
+                }
+            }
+            Ok(None) => {
+                if self.flow.connection == ConnectionPreference::Host {
+                    summary_lines.push("监听端口: 自动分配".to_string());
+                }
+            }
+            Err(err) => errors.push(err.to_string()),
+        }
+
         if self.flow.connection == ConnectionPreference::Join {
             summary_lines.push(format!(
                 "目标设备: {}",
@@ -1469,6 +1508,7 @@ impl StartupApp {
         let max_folder_depth = self.parsed_max_folder_depth()?;
         let interval_secs = self.parsed_interval_secs()?;
         let discovery_secs = self.parsed_discovery_secs()?;
+        let port = self.parsed_port()?;
         let pin = self.parsed_pin()?;
         let workspace = if self.flow.clipboard_only {
             WorkspaceSpec::for_clipboard_only(self.flow.mode)
@@ -1518,6 +1558,7 @@ impl StartupApp {
             interval_secs,
             pairing: PairingRuntimeOptions {
                 peer_query: trimmed_non_empty(&self.pairing.peer_query),
+                port,
                 pin,
                 accept: self.pairing.accept,
                 trust_device: self.pairing.trust_device,
@@ -1533,6 +1574,21 @@ impl StartupApp {
             return Ok(None);
         }
         Ok(Some(normalize_pin(raw.as_str())?))
+    }
+
+    fn parsed_port(&self) -> Result<Option<u16>> {
+        let raw = trimmed_text(&self.pairing.port);
+        if raw.is_empty() {
+            return Ok(None);
+        }
+
+        let port = raw.parse::<u16>().with_context(|| {
+            format!("固定监听端口必须是 1 到 65535 之间的整数，当前输入为 `{raw}`")
+        })?;
+        if port == 0 {
+            bail!("固定监听端口必须是 1 到 65535 之间的整数，当前输入为 `{raw}`");
+        }
+        Ok(Some(port))
     }
 
     fn parsed_interval_secs(&self) -> Result<u64> {
@@ -1581,6 +1637,7 @@ impl StartupApp {
             ],
             StartupTab::Pairing => &[
                 FieldId::PeerQuery,
+                FieldId::Port,
                 FieldId::Pin,
                 FieldId::Accept,
                 FieldId::TrustDevice,
@@ -1605,6 +1662,7 @@ impl StartupApp {
                 | FieldId::MaxFolderDepth
                 | FieldId::IntervalSecs
                 | FieldId::PeerQuery
+                | FieldId::Port
                 | FieldId::Pin
                 | FieldId::DiscoverySecs
         )
@@ -1689,6 +1747,7 @@ impl StartupApp {
             FieldId::MaxFolderDepth => Some(&mut self.workspace.max_folder_depth),
             FieldId::IntervalSecs => Some(&mut self.workspace.interval_secs),
             FieldId::PeerQuery => Some(&mut self.pairing.peer_query),
+            FieldId::Port => Some(&mut self.pairing.port),
             FieldId::Pin => Some(&mut self.pairing.pin),
             FieldId::DiscoverySecs => Some(&mut self.pairing.discovery_secs),
             _ => None,
