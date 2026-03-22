@@ -163,6 +163,7 @@ struct Palette {
     panel: Color,
     text: Color,
     muted: Color,
+    tag_text: Color,
     border: Color,
     primary: Color,
     primary_soft: Color,
@@ -177,6 +178,7 @@ fn palette() -> Palette {
         panel: Color::Rgb(19, 28, 39),
         text: Color::Rgb(235, 241, 247),
         muted: Color::Rgb(132, 149, 168),
+        tag_text: Color::Rgb(184, 198, 214),
         border: Color::Rgb(52, 69, 90),
         primary: Color::Rgb(92, 188, 255),
         primary_soft: Color::Rgb(34, 49, 68),
@@ -202,12 +204,14 @@ struct WorkspacePreview {
 struct UiState {
     tab_areas: Vec<(StartupTab, Rect)>,
     field_areas: Vec<(FieldId, Rect)>,
+    selector_areas: Vec<(FieldId, usize, Rect)>,
 }
 
 impl UiState {
     fn clear(&mut self) {
         self.tab_areas.clear();
         self.field_areas.clear();
+        self.selector_areas.clear();
     }
 }
 
@@ -610,18 +614,18 @@ impl StartupApp {
                 return;
             }
             self.editing_input = false;
-            self.handle_field_click(field, column);
+            self.handle_field_click(field, column, row);
             return;
         }
 
         self.editing_input = false;
     }
 
-    fn handle_field_click(&mut self, field: FieldId, column: u16) {
+    fn handle_field_click(&mut self, field: FieldId, column: u16, row: u16) {
         match field {
             FieldId::Connection => {
-                if let Some(rect) = self.field_rect(field) {
-                    self.flow.connection = if selector_index_from_click(rect, column, 2) == 0 {
+                if let Some(index) = self.selector_choice_at(field, column, row) {
+                    self.flow.connection = if index == 0 {
                         ConnectionPreference::Host
                     } else {
                         ConnectionPreference::Join
@@ -633,8 +637,8 @@ impl StartupApp {
                 }
             }
             FieldId::Mode => {
-                if let Some(rect) = self.field_rect(field) {
-                    self.flow.mode = match selector_index_from_click(rect, column, 4) {
+                if let Some(index) = self.selector_choice_at(field, column, row) {
+                    self.flow.mode = match index {
                         0 => SyncMode::Send,
                         1 => SyncMode::Receive,
                         2 => SyncMode::Both,
@@ -701,7 +705,12 @@ impl StartupApp {
         );
 
         if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
-            let block = rounded_block(" Synly Launchpad ", colors.primary, colors.panel);
+            let block = rounded_block(
+                " Synly Launchpad ",
+                colors.primary,
+                colors.panel,
+                colors.text,
+            );
             let inner = block.inner(area);
             frame.render_widget(block, area);
             frame.render_widget(
@@ -761,7 +770,12 @@ impl StartupApp {
     }
 
     fn render_header(&self, frame: &mut Frame, area: Rect, colors: Palette) {
-        let block = rounded_block(" Synly Launchpad ", colors.primary, colors.panel);
+        let block = rounded_block(
+            " Synly Launchpad ",
+            colors.primary,
+            colors.panel,
+            colors.text,
+        );
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -795,8 +809,10 @@ impl StartupApp {
             chip(
                 if self.flow.clipboard_only {
                     "Clipboard Only"
-                } else {
+                } else if self.effective_sync_clipboard() {
                     "File + Clipboard"
+                } else {
+                    "Files Only"
                 },
                 colors.text,
                 colors.primary_soft,
@@ -813,20 +829,16 @@ impl StartupApp {
     fn render_tabs(&mut self, frame: &mut Frame, area: Rect, colors: Palette) {
         let titles = StartupTab::ALL
             .iter()
-            .map(|tab| Line::from(format!(" {} ", tab.title())))
+            .map(|tab| tab_title_line(*tab))
             .collect::<Vec<_>>();
 
-        let block = rounded_block(" 分区 ", colors.border, colors.panel);
-        self.ui_state.tab_areas = split_evenly(block.inner(area), StartupTab::ALL.len())
-            .into_iter()
-            .enumerate()
-            .map(|(index, rect)| (StartupTab::ALL[index], rect))
-            .collect();
+        let block = rounded_block(" 分区 ", colors.border, colors.panel, colors.tag_text);
+        self.ui_state.tab_areas = tab_click_areas(block.inner(area));
 
         let tabs = Tabs::new(titles)
             .select(self.tab.index())
             .block(block)
-            .style(Style::default().fg(colors.muted))
+            .style(Style::default().fg(colors.tag_text))
             .highlight_style(
                 Style::default()
                     .fg(colors.primary)
@@ -851,7 +863,7 @@ impl StartupApp {
     }
 
     fn render_form(&mut self, frame: &mut Frame, area: Rect, colors: Palette) {
-        let block = rounded_block(" 会话参数 ", colors.border, colors.panel);
+        let block = rounded_block(" 会话参数 ", colors.border, colors.panel, colors.tag_text);
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -887,6 +899,7 @@ impl StartupApp {
             FieldId::Connection => self.render_selector_field(
                 frame,
                 area,
+                field,
                 "连接方式",
                 &["等待连接", "主动连接"],
                 match self.flow.connection {
@@ -899,6 +912,7 @@ impl StartupApp {
             FieldId::Mode => self.render_selector_field(
                 frame,
                 area,
+                field,
                 "同步模式",
                 &["发送", "接收", "双向", "自动"],
                 match self.flow.mode {
@@ -1054,9 +1068,10 @@ impl StartupApp {
     }
 
     fn render_selector_field(
-        &self,
+        &mut self,
         frame: &mut Frame,
         area: Rect,
+        field: FieldId,
         title: &str,
         labels: &[&str],
         selected: usize,
@@ -1080,16 +1095,29 @@ impl StartupApp {
                 } else {
                     Style::default().fg(colors.text).bg(colors.primary_soft)
                 };
-                [
-                    Span::styled(format!(" {} ", label), selected_style),
-                    Span::raw(" "),
-                ]
+                [selector_choice_span(label, selected_style), Span::raw(" ")]
             })
             .collect::<Vec<_>>();
+        let block = rounded_block(
+            title,
+            border,
+            colors.panel,
+            if focused {
+                colors.text
+            } else {
+                colors.tag_text
+            },
+        );
+        self.ui_state.selector_areas.extend(
+            selector_choice_areas(block.inner(area), labels)
+                .into_iter()
+                .enumerate()
+                .map(|(index, rect)| (field, index, rect)),
+        );
         frame.render_widget(
             Paragraph::new(Line::from(spans))
                 .style(Style::default().bg(colors.panel))
-                .block(rounded_block(title, border, colors.panel)),
+                .block(block),
             area,
         );
     }
@@ -1125,7 +1153,10 @@ impl StartupApp {
                     .add_modifier(Modifier::BOLD)
             }
         } else {
-            Style::default().fg(colors.muted).bg(colors.primary_soft)
+            Style::default()
+                .fg(colors.tag_text)
+                .bg(colors.primary_soft)
+                .add_modifier(Modifier::BOLD)
         };
         let label = if interactive {
             if enabled { "开启" } else { "关闭" }
@@ -1142,7 +1173,16 @@ impl StartupApp {
                 Span::styled(note.to_string(), Style::default().fg(colors.muted)),
             ]))
             .style(Style::default().bg(colors.panel))
-            .block(rounded_block(title, border, colors.panel)),
+            .block(rounded_block(
+                title,
+                border,
+                colors.panel,
+                if focused {
+                    colors.text
+                } else {
+                    colors.tag_text
+                },
+            )),
             area,
         );
     }
@@ -1167,6 +1207,7 @@ impl StartupApp {
                 colors.warning
             },
             colors.panel,
+            colors.text,
         );
         let inner = block.inner(area);
         frame.render_widget(block, area);
@@ -1191,7 +1232,7 @@ impl StartupApp {
         colors: Palette,
         preview: &PreviewModel,
     ) {
-        let block = rounded_block(" 状态输出 ", colors.border, colors.panel);
+        let block = rounded_block(" 状态输出 ", colors.border, colors.panel, colors.tag_text);
         let inner = block.inner(area);
         frame.render_widget(block, area);
 
@@ -1680,12 +1721,12 @@ impl StartupApp {
             .map(|(field, _)| *field)
     }
 
-    fn field_rect(&self, field: FieldId) -> Option<Rect> {
+    fn selector_choice_at(&self, field: FieldId, column: u16, row: u16) -> Option<usize> {
         self.ui_state
-            .field_areas
+            .selector_areas
             .iter()
-            .find(|(candidate, _)| *candidate == field)
-            .map(|(_, rect)| *rect)
+            .find(|(candidate, _, rect)| *candidate == field && rect_contains(*rect, column, row))
+            .map(|(_, index, _)| *index)
     }
 }
 
@@ -1726,6 +1767,11 @@ fn apply_textarea_theme(
             colors.border
         },
         colors.panel,
+        if selected {
+            colors.text
+        } else {
+            colors.tag_text
+        },
     ));
 }
 
@@ -1778,41 +1824,112 @@ fn chip(label: &str, fg: Color, bg: Color) -> Span<'static> {
     )
 }
 
+fn tab_title_line(tab: StartupTab) -> Line<'static> {
+    Line::from(format!(" {} ", tab.title()))
+}
+
+fn selector_choice_span(label: &str, style: Style) -> Span<'static> {
+    Span::styled(format!(" {} ", label), style)
+}
+
 fn rounded_block(
     title: impl Into<String>,
     border_color: Color,
     background: Color,
+    title_color: Color,
 ) -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .style(Style::default().bg(background))
         .border_style(Style::default().fg(border_color))
+        .title_style(
+            Style::default()
+                .fg(title_color)
+                .bg(background)
+                .add_modifier(Modifier::BOLD),
+        )
         .title(title.into())
 }
 
-fn split_evenly(area: Rect, parts: usize) -> Vec<Rect> {
-    if parts == 0 || area.width == 0 {
+fn tab_click_areas(area: Rect) -> Vec<(StartupTab, Rect)> {
+    if area.width == 0 || area.height == 0 {
         return Vec::new();
     }
 
-    let base = area.width / parts as u16;
-    let remainder = area.width % parts as u16;
     let mut x = area.x;
-    (0..parts)
-        .map(|index| {
-            let extra = if index < remainder as usize { 1 } else { 0 };
-            let width = base + extra;
-            let rect = Rect {
-                x,
-                y: area.y,
+    let right = area.x.saturating_add(area.width);
+    let padding_left_width = Line::from(" ").width() as u16;
+    let padding_right_width = Line::from(" ").width() as u16;
+    let divider_width = Span::raw(ratatui::symbols::line::VERTICAL).width() as u16;
+    let mut rects = Vec::with_capacity(StartupTab::ALL.len());
+
+    for (index, tab) in StartupTab::ALL.iter().enumerate() {
+        if x >= right {
+            break;
+        }
+
+        let start = x;
+        x = x.saturating_add(remaining_inline_width(x, right).min(padding_left_width));
+        let title_width = tab_title_line(*tab).width() as u16;
+        x = x.saturating_add(remaining_inline_width(x, right).min(title_width));
+        x = x.saturating_add(remaining_inline_width(x, right).min(padding_right_width));
+        let width = x.saturating_sub(start);
+        if width > 0 {
+            rects.push((
+                *tab,
+                Rect {
+                    x: start,
+                    y: area.y,
+                    width,
+                    height: 1,
+                },
+            ));
+        }
+
+        if index + 1 < StartupTab::ALL.len() {
+            x = x.saturating_add(remaining_inline_width(x, right).min(divider_width));
+        }
+    }
+
+    rects
+}
+
+fn selector_choice_areas(inner: Rect, labels: &[&str]) -> Vec<Rect> {
+    if inner.width == 0 || inner.height == 0 {
+        return Vec::new();
+    }
+
+    let mut x = inner.x;
+    let right = inner.x.saturating_add(inner.width);
+    let gap_width = Span::raw(" ").width() as u16;
+    let mut rects = Vec::with_capacity(labels.len());
+
+    for label in labels {
+        if x >= right {
+            break;
+        }
+
+        let start = x;
+        let chip_width = selector_choice_span(label, Style::default()).width() as u16;
+        x = x.saturating_add(remaining_inline_width(x, right).min(chip_width));
+        x = x.saturating_add(remaining_inline_width(x, right).min(gap_width));
+        let width = x.saturating_sub(start);
+        if width > 0 {
+            rects.push(Rect {
+                x: start,
+                y: inner.y,
                 width,
-                height: area.height,
-            };
-            x = x.saturating_add(width);
-            rect
-        })
-        .collect()
+                height: 1,
+            });
+        }
+    }
+
+    rects
+}
+
+fn remaining_inline_width(x: u16, right: u16) -> u16 {
+    right.saturating_sub(x)
 }
 
 fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
@@ -1820,23 +1937,6 @@ fn rect_contains(rect: Rect, column: u16, row: u16) -> bool {
         && column < rect.x.saturating_add(rect.width)
         && row >= rect.y
         && row < rect.y.saturating_add(rect.height)
-}
-
-fn selector_index_from_click(rect: Rect, column: u16, choices: usize) -> usize {
-    let inner = Rect {
-        x: rect.x.saturating_add(1),
-        y: rect.y.saturating_add(1),
-        width: rect.width.saturating_sub(2),
-        height: rect.height.saturating_sub(2),
-    };
-    if choices == 0 || inner.width == 0 {
-        return 0;
-    }
-    let relative = column
-        .saturating_sub(inner.x)
-        .min(inner.width.saturating_sub(1)) as usize;
-    let slot_width = inner.width as usize;
-    (relative * choices / slot_width).min(choices.saturating_sub(1))
 }
 
 fn remap_navigation_key(key: KeyEvent) -> KeyEvent {
@@ -1939,4 +2039,89 @@ fn trimmed_text(textarea: &TextArea<'_>) -> String {
 fn trimmed_non_empty(textarea: &TextArea<'_>) -> Option<String> {
     let value = trimmed_text(textarea);
     if value.is_empty() { None } else { Some(value) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tab_click_areas_follow_rendered_tab_widths() {
+        let areas = tab_click_areas(Rect {
+            x: 2,
+            y: 1,
+            width: 40,
+            height: 1,
+        });
+
+        assert_eq!(
+            areas,
+            vec![
+                (
+                    StartupTab::Flow,
+                    Rect {
+                        x: 2,
+                        y: 1,
+                        width: 8,
+                        height: 1,
+                    },
+                ),
+                (
+                    StartupTab::Workspace,
+                    Rect {
+                        x: 11,
+                        y: 1,
+                        width: 13,
+                        height: 1,
+                    },
+                ),
+                (
+                    StartupTab::Pairing,
+                    Rect {
+                        x: 25,
+                        y: 1,
+                        width: 11,
+                        height: 1,
+                    },
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn selector_choice_areas_follow_chip_widths() {
+        let areas = selector_choice_areas(
+            Rect {
+                x: 5,
+                y: 3,
+                width: 20,
+                height: 1,
+            },
+            &["A", "Long", "Z"],
+        );
+
+        assert_eq!(
+            areas,
+            vec![
+                Rect {
+                    x: 5,
+                    y: 3,
+                    width: 4,
+                    height: 1,
+                },
+                Rect {
+                    x: 9,
+                    y: 3,
+                    width: 7,
+                    height: 1,
+                },
+                Rect {
+                    x: 16,
+                    y: 3,
+                    width: 4,
+                    height: 1,
+                },
+            ]
+        );
+    }
 }
