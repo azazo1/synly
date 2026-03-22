@@ -2,6 +2,11 @@
 
 Synly 是一个面向局域网的跨平台 Rust CLI，用来发现附近设备、通过最小明文 bootstrap + PIN + PAKE 建立临时 mTLS，或在已信任设备之间直接使用长期 mTLS，并持续同步指定文件、文件夹和可选的多格式剪贴板。
 
+| Host Mode | Join Mode |
+|-----------|-----------|
+| [![Host Mode Demo](host.gif)](host.webm) | [![Join Mode Demo](join.gif)](join.webm) |
+
+
 当前版本已经实现：
 
 - 局域网内通过 mDNS 自动发现设备

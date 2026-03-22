@@ -77,25 +77,29 @@ Sleep 1s
 
 Type "${TMPDIR}synly" Sleep 1s Enter
 
-Type "1" Sleep 500ms
+Type "[" Sleep 500ms # Tab 1
 Left@1s
-Down@1s 4
 Sleep 500ms
+
+Type "[" Sleep 500ms # Tab 3
+
+Enter Type "172.20.0.20:12345" Sleep 500ms Enter
+
+Down@50ms
+
+Sleep 200ms
+
+Enter Type "123456" Sleep 1.5s Enter
+
+Right@50ms
+
+Down@50ms
+
+Sleep 200ms
+
 Right@50ms
 
 Sleep 1s
-
-Type "3" Sleep 500ms
-
-Enter
-
-Type "172.20.0.20" Sleep 500ms Enter
-
-Sleep 1s
-
-Enter
-Type "123456"
-Sleep 1.5s
 
 Ctrl+S
 
