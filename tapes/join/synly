@@ -1,0 +1,3 @@
+#!/bin/bash
+# this is used for synly join to demo launch in tape
+docker compose exec synly-join synly $@

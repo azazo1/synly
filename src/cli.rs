@@ -63,7 +63,7 @@ pub struct Cli {
     #[arg(
         long,
         global = true,
-        help = "join 模式下要连接的设备；可填写设备名、设备 ID 前缀或广播出的 IPv4 地址"
+        help = "join 模式下要连接的设备；可填写设备名、设备 ID 前缀或广播出的 IPv4 地址 (可带端口)"
     )]
     pub peer: Option<String>,
     #[arg(
@@ -107,7 +107,7 @@ pub enum Command {
     Auto { path: Option<PathBuf> },
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, ValueEnum)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, ValueEnum, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum SyncMode {
     Send,

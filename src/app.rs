@@ -2002,12 +2002,14 @@ fn choose_peer(peer_query: Option<&str>, timeout: Duration) -> Result<Discovered
 }
 
 fn select_peer_from_query(peers: &[DiscoveredPeer], query: &str) -> Result<DiscoveredPeer> {
-    let matches = peers
+    let mut matches = peers
         .iter()
         .filter(|peer| peer_matches_query(peer, query))
         .cloned()
         .collect::<Vec<_>>();
 
+    matches.sort();
+    matches.dedup();
     match matches.len() {
         0 => bail!("没有找到匹配 `{query}` 的设备"),
         1 => Ok(matches[0].clone()),
@@ -2016,9 +2018,9 @@ fn select_peer_from_query(peers: &[DiscoveredPeer], query: &str) -> Result<Disco
                 .iter()
                 .map(DiscoveredPeer::label)
                 .collect::<Vec<_>>()
-                .join(" | ");
+                .join("\n");
             bail!(
-                "`{query}` 匹配到多个设备，请改用更精确的名称、设备 ID 前缀或 IPv4 地址: {labels}"
+                "`{query}` 匹配到多个设备，请改用更精确的名称、设备 ID 前缀或 IPv4 地址:\n{labels}"
             )
         }
     }
@@ -2036,10 +2038,9 @@ fn peer_matches_query(peer: &DiscoveredPeer, query: &str) -> bool {
             .device_id
             .to_ascii_lowercase()
             .starts_with(&query.to_ascii_lowercase())
-        || peer
-            .addresses
-            .iter()
-            .any(|address| address.to_string() == query)
+        || peer.addresses.iter().any(|address| {
+            address.to_string() == query || format!("{address}:{}", peer.port) == query
+        })
 }
 
 fn trusted_device_for_peer(

@@ -27,7 +27,7 @@ impl Drop for DiscoveryRegistration {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 pub struct DiscoveredPeer {
     pub fullname: String,
     pub device_name: String,
@@ -42,7 +42,7 @@ impl DiscoveredPeer {
         let addresses = self
             .addresses
             .iter()
-            .map(ToString::to_string)
+            .map(|addr| format!("{addr}:{}", self.port))
             .collect::<Vec<_>>()
             .join(", ");
         format!(

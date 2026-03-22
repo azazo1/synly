@@ -1,0 +1,34 @@
+services:
+  synly-host:
+    image: alpine:latest
+    volumes:
+      - ./target/synly-cross:/usr/bin/synly:ro
+    environment:
+      - TMPDIR=/root/tmp/
+    entrypoint: ["sh"]
+    stdin_open: true
+    tty: true
+    networks:
+      synly-network:
+        ipv4_address: 172.20.0.20
+
+  synly-join:
+    image: alpine:latest
+    volumes:
+      - ./target/synly-cross:/usr/bin/synly:ro
+    environment:
+      - TMPDIR=/root/tmp/
+    entrypoint: ["sh"]
+    stdin_open: true
+    tty: true
+    networks:
+      synly-network:
+        ipv4_address: 172.20.0.21
+
+networks:
+  synly-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+          gateway: 172.20.0.1
