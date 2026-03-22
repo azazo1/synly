@@ -6,6 +6,7 @@ mod crypto;
 mod discovery;
 mod path_expand;
 mod protocol;
+mod startup_tui;
 mod sync;
 
 use anyhow::Result;

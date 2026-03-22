@@ -17,6 +17,12 @@ use std::path::{Path, PathBuf};
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
+    #[arg(
+        long,
+        global = true,
+        help = "禁止进入启动交互；如果启动参数不完整，则直接报错并列出缺失项"
+    )]
+    pub no_interact: bool,
     #[arg(long, global = true, conflicts_with = "join")]
     pub host: bool,
     #[arg(long, global = true, conflicts_with = "host")]
@@ -148,7 +154,7 @@ impl SyncMode {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConnectionPreference {
     Host,
     Join,
@@ -185,6 +191,20 @@ pub struct PairingRuntimeOptions {
 }
 
 pub fn collect_runtime_options(cli: Cli, config: &SynlyConfig) -> Result<RuntimeOptions> {
+    let startup_requirements = missing_startup_requirements(&cli);
+    if cli.no_interact && !startup_requirements.is_empty() {
+        bail!(
+            "{}",
+            format_missing_startup_requirements(&startup_requirements)
+        );
+    }
+    if !startup_requirements.is_empty() {
+        return crate::startup_tui::collect_runtime_options_tui(cli, config);
+    }
+    collect_runtime_options_from_cli(cli, config)
+}
+
+fn collect_runtime_options_from_cli(cli: Cli, config: &SynlyConfig) -> Result<RuntimeOptions> {
     let device = &config.device;
     let sync_delete_override = if cli.sync_delete {
         Some(true)
@@ -272,6 +292,73 @@ pub fn collect_runtime_options(cli: Cli, config: &SynlyConfig) -> Result<Runtime
             discovery_secs: cli.discovery_secs.max(1),
         },
     })
+}
+
+fn missing_startup_requirements(cli: &Cli) -> Vec<String> {
+    let mut missing = Vec::new();
+
+    if !cli.host && !cli.join {
+        missing.push("缺少连接方式：请传 `--host` 或 `--join`".to_string());
+    }
+
+    if cli.command.is_none() {
+        missing.push("缺少同步模式：请传子命令 `send`、`receive`、`both` 或 `auto`".to_string());
+    }
+
+    if !sync_clipboard_is_explicit(cli) {
+        missing.push(
+            "缺少剪贴板同步策略：请传 `--sync-clipboard`、`--no-sync-clipboard`，或使用 `--clipboard-only`"
+                .to_string(),
+        );
+    }
+
+    if cli.clipboard_only {
+        return missing;
+    }
+
+    match &cli.command {
+        Some(Command::Send { paths }) if paths.is_empty() => {
+            missing.push("缺少发送路径：请在 `send` 后至少提供一个路径".to_string());
+        }
+        Some(Command::Receive { path }) if path.is_none() => {
+            missing.push("缺少接收目录：请在 `receive` 后提供目录路径".to_string());
+        }
+        Some(Command::Both { path }) if path.is_none() => {
+            missing.push("缺少双向同步目录：请在 `both` 后提供目录路径".to_string());
+        }
+        Some(Command::Auto { path }) if path.is_none() => {
+            missing.push("缺少共享目录：请在 `auto` 后提供目录路径".to_string());
+        }
+        _ => {}
+    }
+
+    if matches!(
+        cli.command,
+        Some(Command::Receive { .. } | Command::Both { .. } | Command::Auto { .. })
+    ) && !sync_delete_is_explicit(cli)
+    {
+        missing.push("缺少删除同步策略：请传 `--sync-delete` 或 `--no-sync-delete`".to_string());
+    }
+
+    missing
+}
+
+fn format_missing_startup_requirements(missing: &[String]) -> String {
+    let mut message =
+        String::from("已禁止进入启动交互（`--no-interact`），但当前参数还不足以完成启动：");
+    for item in missing {
+        message.push_str("\n- ");
+        message.push_str(item);
+    }
+    message
+}
+
+fn sync_delete_is_explicit(cli: &Cli) -> bool {
+    cli.sync_delete || cli.no_sync_delete
+}
+
+fn sync_clipboard_is_explicit(cli: &Cli) -> bool {
+    cli.clipboard_only || cli.sync_clipboard || cli.no_sync_clipboard
 }
 
 pub fn sync_delete_label(enabled: bool) -> &'static str {
@@ -814,6 +901,72 @@ mod tests {
         assert_eq!(normalize_pin("001234").unwrap(), "001234");
         assert!(normalize_pin("12345").is_err());
         assert!(normalize_pin("12ab56").is_err());
+    }
+
+    #[test]
+    fn requires_startup_tui_when_connection_or_path_is_missing() {
+        let missing_connection = Cli::try_parse_from([
+            "synly",
+            "both",
+            ".",
+            "--no-sync-delete",
+            "--no-sync-clipboard",
+        ])
+        .unwrap();
+        assert!(!missing_startup_requirements(&missing_connection).is_empty());
+
+        let missing_path = Cli::try_parse_from([
+            "synly",
+            "receive",
+            "--host",
+            "--no-sync-delete",
+            "--no-sync-clipboard",
+        ])
+        .unwrap();
+        assert!(!missing_startup_requirements(&missing_path).is_empty());
+    }
+
+    #[test]
+    fn does_not_require_startup_tui_for_complete_noninteractive_cli() {
+        let cli = Cli::try_parse_from([
+            "synly",
+            "send",
+            ".",
+            "--join",
+            "--no-sync-clipboard",
+            "--peer",
+            "demo-device",
+        ])
+        .unwrap();
+
+        assert!(missing_startup_requirements(&cli).is_empty());
+    }
+
+    #[test]
+    fn clipboard_only_send_without_path_does_not_require_startup_tui() {
+        let cli = Cli::try_parse_from(["synly", "send", "--host", "--clipboard-only"]).unwrap();
+
+        assert!(missing_startup_requirements(&cli).is_empty());
+        let options = collect_runtime_options(cli, &test_config()).unwrap();
+        assert!(matches!(options.connection, ConnectionPreference::Host));
+        assert_eq!(options.mode, SyncMode::Send);
+        assert!(options.sync_clipboard);
+        assert!(!options.workspace.file_sync_enabled());
+    }
+
+    #[test]
+    fn no_interact_reports_missing_startup_requirements() {
+        let cli = Cli::try_parse_from(["synly", "receive", "--no-interact"]).unwrap();
+
+        let err = collect_runtime_options(cli, &test_config())
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("已禁止进入启动交互"));
+        assert!(err.contains("`--host` 或 `--join`"));
+        assert!(err.contains("`--sync-clipboard`、`--no-sync-clipboard`"));
+        assert!(err.contains("`receive` 后提供目录路径"));
+        assert!(err.contains("`--sync-delete` 或 `--no-sync-delete`"));
     }
 
     fn assert_global_receive_cli(cli: Cli) {

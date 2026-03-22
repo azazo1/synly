@@ -133,6 +133,12 @@ synly both . --host --sync-clipboard
 synly both --host --clipboard-only
 ```
 
+如果你明确不想进入启动交互，可以加上 `--no-interact`。这时如果启动参数不完整，程序会直接报错，并列出当前还缺哪些参数，例如：
+
+```bash
+synly receive --no-interact
+```
+
 ### 方式三：第一次全参数建立可信设备
 
 接收端先启动，并固定本次 PIN、自动接受、允许建立可信设备绑定：
@@ -214,6 +220,7 @@ Commands:
   both
 
 Options:
+  --no-interact
   --host
   --join
   --sync-delete
