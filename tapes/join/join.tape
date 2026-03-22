@@ -57,8 +57,9 @@
 #   ScrollUp[@<time>] [number]      Scroll terminal viewport up by rows
 #   ScrollDown[@<time>] [number]    Scroll terminal viewport down by rows
 
-Output join.gif
-Output join.webm
+Output assets/join.gif
+Output assets/join.webm
+Output assets/join.mp4
 
 Require synly
 

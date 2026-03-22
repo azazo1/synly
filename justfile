@@ -17,7 +17,7 @@ cross-build:
     cd target && ln -sf {{ arch() }}-unknown-linux-musl/release/synly synly-cross
 
 vhs-join:
-    sleep 1s
+    sleep 0.5s
     PATH={{ join(justfile_directory(), "tapes", "join") }}:$PATH vhs tapes/join/join.tape
 
 vhs-host:
