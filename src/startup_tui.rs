@@ -393,15 +393,15 @@ impl StartupApp {
         let key = remap_navigation_key(key);
         match key.code {
             KeyCode::Char('q') => bail!("已取消启动"),
-            KeyCode::F(1) | KeyCode::Char('1') => {
+            KeyCode::F(1) => {
                 self.set_tab(StartupTab::Flow);
                 Ok(None)
             }
-            KeyCode::F(2) | KeyCode::Char('2') => {
+            KeyCode::F(2) => {
                 self.set_tab(StartupTab::Workspace);
                 Ok(None)
             }
-            KeyCode::F(3) | KeyCode::Char('3') => {
+            KeyCode::F(3) => {
                 self.set_tab(StartupTab::Pairing);
                 Ok(None)
             }
@@ -1295,7 +1295,7 @@ impl StartupApp {
         let line = Line::from(vec![
             chip("Tab / Shift+Tab", colors.primary, colors.panel),
             Span::raw(" 切换字段  "),
-            chip("[ ] / 1 2 3", colors.primary, colors.panel),
+            chip("[ ] / F1 F2 F3", colors.primary, colors.panel),
             Span::raw(" 切换分区  "),
             chip("hjkl / arrows", colors.primary, colors.panel),
             Span::raw(" 浏览  "),
