@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::single_match)]
 use crate::cli::{
     Cli, ClipboardRuntimeOptions, Command, ConnectionPreference, PairingRuntimeOptions,
     RuntimeOptions, SyncMode, normalize_pin,
@@ -395,11 +397,11 @@ impl StartupApp {
             }
             KeyCode::Char('[') => {
                 self.switch_tab(-1);
-                return Ok(None);
+                Ok(None)
             }
             KeyCode::Char(']') => {
                 self.switch_tab(1);
-                return Ok(None);
+                Ok(None)
             }
             KeyCode::Tab | KeyCode::Down => {
                 self.move_focus(1);
