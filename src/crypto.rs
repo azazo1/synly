@@ -342,6 +342,19 @@ pub fn export_keying_material_from_client<T>(
     Ok(output)
 }
 
+pub fn export_audio_master_secret_from_client<T>(
+    stream: &tokio_rustls::client::TlsStream<T>,
+    binding_id: &str,
+) -> Result<[u8; 32]> {
+    let mut output = [0u8; 32];
+    stream.get_ref().1.export_keying_material(
+        &mut output,
+        b"synly-audio-master",
+        Some(binding_id.as_bytes()),
+    )?;
+    Ok(output)
+}
+
 pub fn export_keying_material_from_server<T>(
     stream: &tokio_rustls::server::TlsStream<T>,
     binding_id: &str,
@@ -350,6 +363,19 @@ pub fn export_keying_material_from_server<T>(
     stream.get_ref().1.export_keying_material(
         &mut output,
         b"synly-pin-binding",
+        Some(binding_id.as_bytes()),
+    )?;
+    Ok(output)
+}
+
+pub fn export_audio_master_secret_from_server<T>(
+    stream: &tokio_rustls::server::TlsStream<T>,
+    binding_id: &str,
+) -> Result<[u8; 32]> {
+    let mut output = [0u8; 32];
+    stream.get_ref().1.export_keying_material(
+        &mut output,
+        b"synly-audio-master",
         Some(binding_id.as_bytes()),
     )?;
     Ok(output)
@@ -405,6 +431,7 @@ pub fn sign_pair_decision(
     server: &DeviceIdentity,
     agreement: &SessionAgreement,
     workspace: &WorkspaceSummary,
+    audio_mode: crate::cli::AudioMode,
     auth_method: PairAuthMethod,
     server_trusts_client: bool,
     trust_established: bool,
@@ -415,6 +442,7 @@ pub fn sign_pair_decision(
         server,
         agreement,
         workspace,
+        audio_mode,
         auth_method,
         server_trusts_client,
         trust_established,
@@ -441,6 +469,7 @@ pub fn verify_pair_decision(
             server,
             workspace,
             agreement,
+            audio_mode,
             auth_method,
             server_trusts_client,
             proof,
@@ -453,6 +482,7 @@ pub fn verify_pair_decision(
                 server,
                 agreement,
                 workspace,
+                audio_mode: *audio_mode,
                 auth_method: *auth_method,
                 server_trusts_client: *server_trusts_client,
                 trust_established: *trust_established,
@@ -514,6 +544,7 @@ pub fn sign_trusted_pair_decision(
     server: &DeviceIdentity,
     agreement: &SessionAgreement,
     workspace: &WorkspaceSummary,
+    audio_mode: crate::cli::AudioMode,
     server_trusts_client: bool,
     trust_established: bool,
 ) -> Result<String> {
@@ -523,6 +554,7 @@ pub fn sign_trusted_pair_decision(
         server,
         agreement,
         workspace,
+        audio_mode,
         auth_method: PairAuthMethod::TrustedDevice,
         server_trusts_client,
         trust_established,
@@ -549,6 +581,7 @@ pub fn verify_trusted_pair_decision(
             server,
             workspace,
             agreement,
+            audio_mode,
             auth_method,
             server_trusts_client,
             proof,
@@ -561,6 +594,7 @@ pub fn verify_trusted_pair_decision(
                 server,
                 agreement,
                 workspace,
+                audio_mode: *audio_mode,
                 auth_method: *auth_method,
                 server_trusts_client: *server_trusts_client,
                 trust_established: *trust_established,
@@ -585,6 +619,7 @@ struct DecisionProofPayload<'a> {
     server: &'a DeviceIdentity,
     agreement: &'a SessionAgreement,
     workspace: &'a WorkspaceSummary,
+    audio_mode: crate::cli::AudioMode,
     auth_method: PairAuthMethod,
     server_trusts_client: bool,
     trust_established: bool,
@@ -1155,7 +1190,7 @@ fn decode_certificate_der(certificate: &str) -> Result<CertificateDer<'static>> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::SyncMode;
+    use crate::cli::{AudioMode, SyncMode};
     use crate::config::DeviceConfig;
     use crate::protocol::{
         ControlMessage, DeviceIdentity, PROTOCOL_VERSION, PairAuthMethod, PairRequestPayload,
@@ -1210,6 +1245,7 @@ mod tests {
                 max_folder_depth: None,
                 sync_clipboard: false,
             },
+            audio_mode: AudioMode::Off,
             request_trust: false,
         };
         let exporter = [7u8; 32];
@@ -1240,6 +1276,7 @@ mod tests {
                 max_folder_depth: None,
                 sync_clipboard: false,
             },
+            audio_mode: AudioMode::Off,
             request_trust: true,
         };
         let exporter = [9u8; 32];
@@ -1287,6 +1324,7 @@ mod tests {
             &server,
             &agreement,
             &workspace,
+            AudioMode::Off,
             PairAuthMethod::Pin,
             true,
             false,
@@ -1298,6 +1336,7 @@ mod tests {
             server: server.clone(),
             workspace: workspace.clone(),
             agreement: agreement.clone(),
+            audio_mode: AudioMode::Off,
             auth_method: PairAuthMethod::Pin,
             server_trusts_client: true,
             proof: proof.clone(),
@@ -1311,6 +1350,7 @@ mod tests {
             server,
             workspace,
             agreement,
+            audio_mode: AudioMode::Send,
             auth_method: PairAuthMethod::Pin,
             server_trusts_client: false,
             proof,
@@ -1354,6 +1394,7 @@ mod tests {
             &server,
             &agreement,
             &workspace,
+            AudioMode::Off,
             true,
             false,
         )
@@ -1364,6 +1405,7 @@ mod tests {
             server: server.clone(),
             workspace: workspace.clone(),
             agreement: agreement.clone(),
+            audio_mode: AudioMode::Off,
             auth_method: PairAuthMethod::TrustedDevice,
             server_trusts_client: true,
             proof: proof.clone(),
@@ -1377,6 +1419,7 @@ mod tests {
             server,
             workspace,
             agreement,
+            audio_mode: AudioMode::Send,
             auth_method: PairAuthMethod::TrustedDevice,
             server_trusts_client: false,
             proof,

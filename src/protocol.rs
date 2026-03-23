@@ -1,4 +1,4 @@
-use crate::cli::SyncMode;
+use crate::cli::{AudioMode, SyncMode};
 use crate::sync::{ManifestSnapshot, WorkspaceSummary};
 use anyhow::{Context, Result, bail};
 use serde::de::DeserializeOwned;
@@ -16,7 +16,7 @@ const DEFAULT_MAX_FRAME_DATA_LEN: usize = 128 * 1024 * 1024;
 const DEFAULT_MAX_CLIPBOARD_BINARY_LEN: usize = 100 * 1024 * 1024;
 const CLIPBOARD_STREAM_CHUNK_SIZE: usize = 1024 * 1024;
 
-pub const PROTOCOL_VERSION: u16 = 8;
+pub const PROTOCOL_VERSION: u16 = 9;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TransferLimits {
@@ -57,6 +57,8 @@ pub struct PairRequestPayload {
     pub client: DeviceIdentity,
     pub requested_mode: SyncMode,
     pub workspace: WorkspaceSummary,
+    #[serde(default)]
+    pub audio_mode: AudioMode,
     #[serde(default)]
     pub request_trust: bool,
 }
@@ -115,12 +117,17 @@ pub enum ControlMessage {
         workspace: WorkspaceSummary,
         agreement: SessionAgreement,
         #[serde(default)]
+        audio_mode: AudioMode,
+        #[serde(default)]
         auth_method: PairAuthMethod,
         #[serde(default)]
         server_trusts_client: bool,
         proof: String,
         #[serde(default)]
         trust_established: bool,
+    },
+    AudioUdpReady {
+        port: u16,
     },
     SnapshotAdvert {
         revision: u64,
@@ -607,7 +614,7 @@ mod tests {
         ControlMessage, Frame, FrameReader, FrameWriter, SessionAgreement, decode_payload,
         encode_payload,
     };
-    use crate::cli::SyncMode;
+    use crate::cli::{AudioMode, SyncMode};
     use crate::sync::WorkspaceSummary;
     use tokio::io::duplex;
 
@@ -675,6 +682,7 @@ mod tests {
                 host_to_client: true,
                 client_to_host: true,
             },
+            audio_mode: AudioMode::Receive,
             auth_method: super::PairAuthMethod::TrustedDevice,
             server_trusts_client: true,
             proof: "proof".to_string(),

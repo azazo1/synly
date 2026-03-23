@@ -50,6 +50,13 @@ pub struct Cli {
     #[arg(
         long,
         global = true,
+        value_enum,
+        help = "音频同步模式；默认关闭，可选 off / send / receive"
+    )]
+    pub audio: Option<AudioMode>,
+    #[arg(
+        long,
+        global = true,
         default_value_t = 3,
         help = "兜底全量重扫间隔（秒），目录变化仍会实时监听"
     )]
@@ -123,6 +130,25 @@ pub enum SyncMode {
     Auto,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, ValueEnum, PartialOrd, Ord, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioMode {
+    #[default]
+    Off,
+    Send,
+    Receive,
+}
+
+impl AudioMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            AudioMode::Off => "不启用音频",
+            AudioMode::Send => "音频发送方",
+            AudioMode::Receive => "音频接收方",
+        }
+    }
+}
+
 impl SyncMode {
     pub fn can_send(self) -> bool {
         matches!(self, SyncMode::Send | SyncMode::Both | SyncMode::Auto)
@@ -174,6 +200,7 @@ pub struct RuntimeOptions {
     pub workspace: WorkspaceSpec,
     pub sync_delete: bool,
     pub sync_clipboard: bool,
+    pub audio_mode: AudioMode,
     pub clipboard: ClipboardRuntimeOptions,
     pub transfer_limits: TransferLimits,
     pub interval_secs: u64,
@@ -277,6 +304,7 @@ fn collect_runtime_options_from_cli(cli: Cli, config: &SynlyConfig) -> Result<Ru
     let sync_delete = resolve_sync_delete(sync_delete_override, &workspace)?;
     let sync_clipboard = resolve_sync_clipboard(sync_clipboard_override, clipboard_only)?;
     let pin = cli.pin.as_deref().map(normalize_pin).transpose()?;
+    let audio_mode = cli.audio.unwrap_or(AudioMode::Off);
 
     Ok(RuntimeOptions {
         mode,
@@ -284,6 +312,7 @@ fn collect_runtime_options_from_cli(cli: Cli, config: &SynlyConfig) -> Result<Ru
         workspace,
         sync_delete,
         sync_clipboard,
+        audio_mode,
         clipboard: ClipboardRuntimeOptions {
             max_file_bytes: config.clipboard.max_file_bytes,
             max_cache_bytes: config.clipboard.max_cache_bytes,
@@ -910,6 +939,35 @@ mod tests {
         assert!(options.pairing.trust_device);
         assert!(options.pairing.trusted_only);
         assert_eq!(options.pairing.discovery_secs, 7);
+    }
+
+    #[test]
+    fn collect_runtime_options_defaults_audio_mode_off_and_accepts_explicit_audio_role() {
+        let default_cli = Cli::try_parse_from([
+            "synly",
+            "receive",
+            ".",
+            "--join",
+            "--no-sync-delete",
+            "--no-sync-clipboard",
+        ])
+        .unwrap();
+        let default_options = collect_runtime_options(default_cli, &test_config()).unwrap();
+        assert_eq!(default_options.audio_mode, AudioMode::Off);
+
+        let explicit_cli = Cli::try_parse_from([
+            "synly",
+            "receive",
+            ".",
+            "--join",
+            "--no-sync-delete",
+            "--no-sync-clipboard",
+            "--audio",
+            "receive",
+        ])
+        .unwrap();
+        let explicit_options = collect_runtime_options(explicit_cli, &test_config()).unwrap();
+        assert_eq!(explicit_options.audio_mode, AudioMode::Receive);
     }
 
     #[test]

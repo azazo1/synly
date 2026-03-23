@@ -1,4 +1,5 @@
 mod app;
+mod audio;
 mod cli;
 mod clipboard;
 mod config;
@@ -23,6 +24,7 @@ async fn main() -> Result<()> {
     for line in options.workspace.local_human_lines(options.sync_clipboard) {
         println!("{line}");
     }
+    println!("音频同步: {}", options.audio_mode.label());
     if options.workspace.incoming_root.is_some() {
         println!("删除同步: {}", cli::sync_delete_label(options.sync_delete));
     }

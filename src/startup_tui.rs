@@ -1,8 +1,8 @@
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::single_match)]
 use crate::cli::{
-    Cli, ClipboardRuntimeOptions, Command, ConnectionPreference, PairingRuntimeOptions,
-    RuntimeOptions, SyncMode, normalize_pin,
+    AudioMode, Cli, ClipboardRuntimeOptions, Command, ConnectionPreference,
+    PairingRuntimeOptions, RuntimeOptions, SyncMode, normalize_pin,
 };
 use crate::config::SynlyConfig;
 use crate::path_expand::expand_path_string;
@@ -87,6 +87,7 @@ struct FlowDraft {
     clipboard_only: bool,
     sync_delete: bool,
     sync_clipboard: bool,
+    audio_mode: AudioMode,
 }
 
 struct WorkspaceDraft {
@@ -147,6 +148,7 @@ enum FieldId {
     ClipboardOnly,
     SyncDelete,
     SyncClipboard,
+    AudioMode,
     WorkspacePath,
     MaxFolderDepth,
     IntervalSecs,
@@ -264,6 +266,7 @@ impl StartupApp {
                 clipboard_only: cli.clipboard_only,
                 sync_delete: cli.sync_delete,
                 sync_clipboard: cli.sync_clipboard,
+                audio_mode: cli.audio.unwrap_or(AudioMode::Off),
             },
             workspace: WorkspaceDraft {
                 path: single_line_textarea(workspace_value, ""),
@@ -535,6 +538,19 @@ impl StartupApp {
                     ));
                 }
             }
+            FieldId::AudioMode => {
+                if matches!(
+                    key.code,
+                    KeyCode::Left | KeyCode::Right | KeyCode::Enter | KeyCode::Char(' ')
+                ) {
+                    self.flow.audio_mode =
+                        cycle_audio_mode(self.flow.audio_mode, matches!(key.code, KeyCode::Left));
+                    self.push_log(format!(
+                        "音频同步已切换为{}。",
+                        self.flow.audio_mode.label()
+                    ));
+                }
+            }
             FieldId::WorkspacePath => {
                 let _ = key;
             }
@@ -679,6 +695,19 @@ impl StartupApp {
                     enabled_label(self.flow.sync_clipboard)
                 ));
             }
+            FieldId::AudioMode => {
+                if let Some(index) = self.selector_choice_at(field, column, row) {
+                    self.flow.audio_mode = match index {
+                        0 => AudioMode::Off,
+                        1 => AudioMode::Send,
+                        _ => AudioMode::Receive,
+                    };
+                    self.push_log(format!(
+                        "音频同步已切换为{}。",
+                        self.flow.audio_mode.label()
+                    ));
+                }
+            }
             FieldId::Accept => {
                 self.pairing.accept = !self.pairing.accept;
                 self.push_log(format!(
@@ -814,6 +843,8 @@ impl StartupApp {
             ),
             Span::raw(" "),
             chip(self.flow.mode.label(), colors.text, colors.primary_soft),
+            Span::raw(" "),
+            chip(self.flow.audio_mode.label(), colors.text, colors.primary_soft),
             Span::raw(" "),
             chip(
                 if self.flow.clipboard_only {
@@ -963,6 +994,20 @@ impl StartupApp {
                     "仅剪贴板模式下固定开启"
                 } else {
                     "文本、富文本、图片和小文件都走这里"
+                },
+                focused,
+                colors,
+            ),
+            FieldId::AudioMode => self.render_selector_field(
+                frame,
+                area,
+                field,
+                "音频同步",
+                &["不启用音频", "音频发送方", "音频接收方"],
+                match self.flow.audio_mode {
+                    AudioMode::Off => 0,
+                    AudioMode::Send => 1,
+                    AudioMode::Receive => 2,
                 },
                 focused,
                 colors,
@@ -1320,6 +1365,7 @@ impl StartupApp {
         let mut summary_lines = vec![
             format!("连接方式: {}", connection_label(self.flow.connection)),
             format!("同步模式: {}", self.flow.mode.label()),
+            format!("音频同步: {}", self.flow.audio_mode.label()),
         ];
         let mut notes = Vec::new();
         let mut errors = Vec::new();
@@ -1552,6 +1598,7 @@ impl StartupApp {
                 false
             },
             sync_clipboard: self.effective_sync_clipboard(),
+            audio_mode: self.flow.audio_mode,
             workspace,
             clipboard: self.context.clipboard.clone(),
             transfer_limits: self.context.transfer_limits,
@@ -1629,6 +1676,7 @@ impl StartupApp {
                 FieldId::ClipboardOnly,
                 FieldId::SyncDelete,
                 FieldId::SyncClipboard,
+                FieldId::AudioMode,
             ],
             StartupTab::Workspace => &[
                 FieldId::WorkspacePath,
@@ -1845,6 +1893,17 @@ fn cycle_mode(mode: SyncMode, reverse: bool) -> SyncMode {
         .iter()
         .position(|candidate| *candidate == mode)
         .unwrap_or(3);
+    let next = if reverse {
+        (current + modes.len() - 1) % modes.len()
+    } else {
+        (current + 1) % modes.len()
+    };
+    modes[next]
+}
+
+fn cycle_audio_mode(mode: AudioMode, reverse: bool) -> AudioMode {
+    let modes = [AudioMode::Off, AudioMode::Send, AudioMode::Receive];
+    let current = modes.iter().position(|candidate| *candidate == mode).unwrap_or(0);
     let next = if reverse {
         (current + modes.len() - 1) % modes.len()
     } else {
