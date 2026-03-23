@@ -39,7 +39,12 @@ const MIN_HEIGHT: u16 = 30;
 pub fn collect_runtime_options_tui(cli: Cli, config: &SynlyConfig) -> Result<RuntimeOptions> {
     let context = StartupContext::from_config(config)?;
     let mut app = StartupApp::from_cli(cli, context);
-    app.run()
+    let options = app.run()?;
+    println!(
+        "{}",
+        equivalent_command_from_options(&options, &app.context.cwd)
+    );
+    Ok(options)
 }
 
 #[derive(Clone)]
@@ -196,6 +201,8 @@ struct PreviewModel {
     summary_lines: Vec<String>,
     notes: Vec<String>,
     errors: Vec<String>,
+    command_line: String,
+    command_is_valid: bool,
 }
 
 struct WorkspacePreview {
@@ -209,6 +216,7 @@ struct UiState {
     tab_areas: Vec<(StartupTab, Rect)>,
     field_areas: Vec<(FieldId, Rect)>,
     selector_areas: Vec<(FieldId, usize, Rect)>,
+    launch_button_area: Option<Rect>,
 }
 
 impl UiState {
@@ -216,6 +224,7 @@ impl UiState {
         self.tab_areas.clear();
         self.field_areas.clear();
         self.selector_areas.clear();
+        self.launch_button_area = None;
     }
 }
 
@@ -340,7 +349,9 @@ impl StartupApp {
                     }
                 }
                 Event::Mouse(mouse) => {
-                    self.handle_mouse(mouse);
+                    if let Some(options) = self.handle_mouse(mouse)? {
+                        return Ok(options);
+                    }
                 }
                 Event::Resize(_, _) => {}
                 _ => {}
@@ -352,16 +363,7 @@ impl StartupApp {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
                 KeyCode::Char('c') => bail!("已取消启动"),
-                KeyCode::Char('s') => match self.build_runtime_options() {
-                    Ok(options) => {
-                        self.push_log("配置校验通过，准备进入同步主流程。");
-                        return Ok(Some(options));
-                    }
-                    Err(err) => {
-                        self.push_log(format!("启动前校验失败: {err}"));
-                        return Ok(None);
-                    }
-                },
+                KeyCode::Char('s') => return self.try_launch(),
                 KeyCode::Left => {
                     if self.is_editing_input() {
                         self.handle_active_textarea_key(key);
@@ -603,33 +605,53 @@ impl StartupApp {
         }
     }
 
-    fn handle_mouse(&mut self, mouse: MouseEvent) {
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> Result<Option<RuntimeOptions>> {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
-                self.handle_left_click(mouse.column, mouse.row);
+                self.handle_left_click(mouse.column, mouse.row)
             }
-            _ => {}
+            _ => Ok(None),
         }
     }
 
-    fn handle_left_click(&mut self, column: u16, row: u16) {
+    fn handle_left_click(&mut self, column: u16, row: u16) -> Result<Option<RuntimeOptions>> {
+        if let Some(rect) = self.ui_state.launch_button_area
+            && rect_contains(rect, column, row)
+        {
+            return self.try_launch();
+        }
+
         if let Some(tab) = self.tab_at(column, row) {
             self.set_tab(tab);
-            return;
+            return Ok(None);
         }
 
         if let Some(field) = self.field_at(column, row) {
             self.select_field(field);
             if self.field_is_text(field) {
                 self.editing_input = true;
-                return;
+                return Ok(None);
             }
             self.editing_input = false;
             self.handle_field_click(field, column, row);
-            return;
+            return Ok(None);
         }
 
         self.editing_input = false;
+        Ok(None)
+    }
+
+    fn try_launch(&mut self) -> Result<Option<RuntimeOptions>> {
+        match self.build_runtime_options() {
+            Ok(options) => {
+                self.push_log("配置校验通过，准备进入同步主流程。");
+                Ok(Some(options))
+            }
+            Err(err) => {
+                self.push_log(format!("启动前校验失败: {err}"));
+                Ok(None)
+            }
+        }
     }
 
     fn handle_field_click(&mut self, field: FieldId, column: u16, row: u16) {
@@ -723,6 +745,7 @@ impl StartupApp {
     fn draw(&mut self, frame: &mut Frame) {
         let colors = palette();
         let area = frame.area();
+        let preview = self.preview_model();
         self.ui_state.clear();
         frame.render_widget(
             Block::default().style(Style::default().bg(colors.background)),
@@ -763,7 +786,7 @@ impl StartupApp {
             ])
             .split(area);
 
-        self.render_header(frame, outer[0], colors);
+        self.render_header(frame, outer[0], colors, &preview);
 
         let body = Layout::default()
             .direction(Direction::Horizontal)
@@ -785,26 +808,50 @@ impl StartupApp {
 
         let right = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(58), Constraint::Percentage(42)])
+            .constraints([
+                Constraint::Min(10),
+                Constraint::Length(6),
+                Constraint::Min(8),
+            ])
             .split(body[1]);
 
-        let preview = self.preview_model();
         self.render_preview(frame, right[0], colors, &preview);
-        self.render_output(frame, right[1], colors, &preview);
+        self.render_command(frame, right[1], colors, &preview);
+        self.render_output(frame, right[2], colors, &preview);
         self.render_footer(frame, outer[2], colors);
     }
 
-    fn render_header(&self, frame: &mut Frame, area: Rect, colors: Palette) {
+    fn render_header(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        colors: Palette,
+        preview: &PreviewModel,
+    ) {
+        let accent = if preview.errors.is_empty() {
+            colors.success
+        } else {
+            colors.warning
+        };
+        let sections = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Min(0),
+                Constraint::Length(1),
+                Constraint::Length(18),
+            ])
+            .split(area);
+
         let block = rounded_block(
             " Synly Launchpad ",
             colors.primary,
             colors.panel,
             colors.text,
         );
-        let inner = block.inner(area);
-        frame.render_widget(block, area);
+        let inner = block.inner(sections[0]);
+        frame.render_widget(block, sections[0]);
 
-        let readiness = if self.preview_model().errors.is_empty() {
+        let readiness = if preview.errors.is_empty() {
             ("READY", colors.success)
         } else {
             ("EDITING", colors.warning)
@@ -848,6 +895,26 @@ impl StartupApp {
             Paragraph::new(Text::from(vec![top, bottom]))
                 .style(Style::default().fg(colors.text).bg(colors.panel)),
             inner,
+        );
+
+        self.ui_state.launch_button_area = Some(sections[2]);
+        frame.render_widget(
+            Paragraph::new(Text::from(vec![Line::from("启动"), Line::from("Ctrl+S")]))
+                .alignment(Alignment::Center)
+                .style(
+                    Style::default()
+                        .fg(accent)
+                        .bg(colors.panel)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
+                        .style(Style::default().bg(colors.panel))
+                        .border_style(Style::default().fg(accent)),
+                ),
+            sections[2],
         );
     }
 
@@ -1280,6 +1347,54 @@ impl StartupApp {
         );
     }
 
+    fn render_command(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        colors: Palette,
+        preview: &PreviewModel,
+    ) {
+        let title = if preview.command_is_valid {
+            " 等效命令行 "
+        } else {
+            " 等效命令行 · 当前输入待修正 "
+        };
+        let block = rounded_block(
+            title,
+            if preview.command_is_valid {
+                colors.primary
+            } else {
+                colors.warning
+            },
+            colors.panel,
+            colors.text,
+        );
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+
+        frame.render_widget(
+            Paragraph::new(Text::from(vec![
+                Line::from(Span::styled(
+                    preview.command_line.clone(),
+                    Style::default()
+                        .fg(colors.text)
+                        .add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    if preview.command_is_valid {
+                        "这条命令会直接复现当前设置。"
+                    } else {
+                        "当前仍有校验问题，这里先展示基于现有输入拼出的命令。"
+                    },
+                    Style::default().fg(colors.muted),
+                )),
+            ]))
+            .style(Style::default().fg(colors.text))
+            .wrap(Wrap { trim: false }),
+            inner,
+        );
+    }
+
     fn render_output(
         &self,
         frame: &mut Frame,
@@ -1451,11 +1566,83 @@ impl StartupApp {
             bool_label(self.pairing.trusted_only)
         ));
 
+        let command_line = self.draft_command_line();
+        let command_is_valid = errors.is_empty();
+
         PreviewModel {
             summary_lines,
             notes,
             errors,
+            command_line,
+            command_is_valid,
         }
+    }
+
+    fn draft_command_line(&self) -> String {
+        let mut args = vec!["synly".to_string()];
+        if let Some(instance_name) = trimmed_non_empty(&self.pairing.instance_name) {
+            push_flag_value(&mut args, "--name", instance_name);
+        }
+
+        push_flag_value(&mut args, "--fs", sync_mode_arg(self.flow.mode).to_string());
+        append_draft_paths(
+            &mut args,
+            self.flow.mode,
+            trimmed_text(&self.workspace.path),
+        );
+        args.push(connection_flag(self.flow.connection).to_string());
+
+        if self.flow.mode.can_receive() {
+            args.push(if self.flow.sync_delete {
+                "--sync-delete".to_string()
+            } else {
+                "--no-sync-delete".to_string()
+            });
+        }
+
+        push_flag_value(
+            &mut args,
+            "--clipboard",
+            clipboard_mode_arg(self.flow.clipboard_mode).to_string(),
+        );
+        push_flag_value(
+            &mut args,
+            "--audio",
+            audio_mode_arg(self.flow.audio_mode).to_string(),
+        );
+
+        if let Some(depth) = trimmed_non_empty(&self.workspace.max_folder_depth) {
+            push_flag_value(&mut args, "--max-folder-depth", depth);
+        }
+        if let Some(interval_secs) = trimmed_non_empty(&self.workspace.interval_secs) {
+            push_flag_value(&mut args, "--interval-secs", interval_secs);
+        }
+
+        if self.flow.connection == ConnectionPreference::Join {
+            if let Some(peer_query) = trimmed_non_empty(&self.pairing.peer_query) {
+                push_flag_value(&mut args, "--peer", peer_query);
+            }
+            if let Some(discovery_secs) = trimmed_non_empty(&self.pairing.discovery_secs) {
+                push_flag_value(&mut args, "--discovery-secs", discovery_secs);
+            }
+        } else if let Some(port) = trimmed_non_empty(&self.pairing.port) {
+            push_flag_value(&mut args, "--port", port);
+        }
+
+        if let Some(pin) = trimmed_non_empty(&self.pairing.pin) {
+            push_flag_value(&mut args, "--pin", pin);
+        }
+        if self.pairing.accept {
+            args.push("--accept".to_string());
+        }
+        if self.pairing.trust_device {
+            args.push("--trust-device".to_string());
+        }
+        if self.pairing.trusted_only {
+            args.push("--trusted-only".to_string());
+        }
+
+        shell_join(&args)
     }
 
     fn workspace_preview(&self) -> Result<WorkspacePreview> {
@@ -2174,9 +2361,207 @@ fn trimmed_non_empty(textarea: &TextArea<'_>) -> Option<String> {
     if value.is_empty() { None } else { Some(value) }
 }
 
+fn equivalent_command_from_options(options: &RuntimeOptions, cwd: &Path) -> String {
+    let mut args = vec!["synly".to_string()];
+    if let Some(instance_name) = options.instance_name.as_deref() {
+        push_flag_value(&mut args, "--name", instance_name.to_string());
+    }
+
+    push_flag_value(&mut args, "--fs", sync_mode_arg(options.mode).to_string());
+    append_workspace_paths(&mut args, &options.workspace, cwd);
+    args.push(connection_flag(options.connection).to_string());
+
+    if options.workspace.incoming_root.is_some() {
+        args.push(if options.sync_delete {
+            "--sync-delete".to_string()
+        } else {
+            "--no-sync-delete".to_string()
+        });
+    }
+
+    push_flag_value(
+        &mut args,
+        "--clipboard",
+        clipboard_mode_arg(options.clipboard_mode).to_string(),
+    );
+    push_flag_value(
+        &mut args,
+        "--audio",
+        audio_mode_arg(options.audio_mode).to_string(),
+    );
+    push_flag_value(
+        &mut args,
+        "--interval-secs",
+        options.interval_secs.to_string(),
+    );
+
+    if let Some(max_folder_depth) = workspace_max_folder_depth(&options.workspace) {
+        push_flag_value(
+            &mut args,
+            "--max-folder-depth",
+            max_folder_depth.to_string(),
+        );
+    }
+
+    if options.connection == ConnectionPreference::Join {
+        if let Some(peer_query) = options.pairing.peer_query.as_deref() {
+            push_flag_value(&mut args, "--peer", peer_query.to_string());
+        }
+        push_flag_value(
+            &mut args,
+            "--discovery-secs",
+            options.pairing.discovery_secs.to_string(),
+        );
+    } else if let Some(port) = options.pairing.port {
+        push_flag_value(&mut args, "--port", port.to_string());
+    }
+
+    if let Some(pin) = options.pairing.pin.as_deref() {
+        push_flag_value(&mut args, "--pin", pin.to_string());
+    }
+    if options.pairing.accept {
+        args.push("--accept".to_string());
+    }
+    if options.pairing.trust_device {
+        args.push("--trust-device".to_string());
+    }
+    if options.pairing.trusted_only {
+        args.push("--trusted-only".to_string());
+    }
+
+    shell_join(&args)
+}
+
+fn append_draft_paths(args: &mut Vec<String>, mode: SyncMode, raw: String) {
+    match mode {
+        SyncMode::Off => {}
+        SyncMode::Send => {
+            for path in raw
+                .split(',')
+                .map(str::trim)
+                .filter(|path| !path.is_empty())
+            {
+                args.push(path.to_string());
+            }
+        }
+        SyncMode::Receive | SyncMode::Both | SyncMode::Auto => {
+            if !raw.is_empty() {
+                args.push(raw);
+            }
+        }
+    }
+}
+
+fn append_workspace_paths(args: &mut Vec<String>, workspace: &WorkspaceSpec, cwd: &Path) {
+    match workspace.mode {
+        SyncMode::Off => {}
+        SyncMode::Send => match workspace.outgoing.as_ref() {
+            Some(crate::sync::OutgoingSpec::RootContents { root, .. }) => {
+                args.push(display_path_arg(root, cwd));
+            }
+            Some(crate::sync::OutgoingSpec::SelectedItems { items, .. }) => {
+                for item in items {
+                    args.push(display_path_arg(&item.path, cwd));
+                }
+            }
+            None => {}
+        },
+        SyncMode::Receive | SyncMode::Both | SyncMode::Auto => {
+            if let Some(path) = workspace.incoming_root.as_ref() {
+                args.push(display_path_arg(path, cwd));
+            }
+        }
+    }
+}
+
+fn workspace_max_folder_depth(workspace: &WorkspaceSpec) -> Option<usize> {
+    match workspace.outgoing.as_ref() {
+        Some(crate::sync::OutgoingSpec::RootContents {
+            max_folder_depth, ..
+        }) => *max_folder_depth,
+        Some(crate::sync::OutgoingSpec::SelectedItems {
+            max_folder_depth, ..
+        }) => *max_folder_depth,
+        None => None,
+    }
+}
+
+fn connection_flag(connection: ConnectionPreference) -> &'static str {
+    match connection {
+        ConnectionPreference::Host => "--host",
+        ConnectionPreference::Join => "--join",
+    }
+}
+
+fn sync_mode_arg(mode: SyncMode) -> &'static str {
+    match mode {
+        SyncMode::Off => "off",
+        SyncMode::Send => "send",
+        SyncMode::Receive => "receive",
+        SyncMode::Both => "both",
+        SyncMode::Auto => "auto",
+    }
+}
+
+fn clipboard_mode_arg(mode: ClipboardMode) -> &'static str {
+    match mode {
+        ClipboardMode::Off => "off",
+        ClipboardMode::Send => "send",
+        ClipboardMode::Receive => "receive",
+        ClipboardMode::Both => "both",
+    }
+}
+
+fn audio_mode_arg(mode: AudioMode) -> &'static str {
+    match mode {
+        AudioMode::Off => "off",
+        AudioMode::Send => "send",
+        AudioMode::Receive => "receive",
+    }
+}
+
+fn push_flag_value(args: &mut Vec<String>, flag: &str, value: String) {
+    args.push(flag.to_string());
+    args.push(value);
+}
+
+fn display_path_arg(path: &Path, cwd: &Path) -> String {
+    if path == cwd {
+        ".".to_string()
+    } else if let Ok(relative) = path.strip_prefix(cwd) {
+        if relative.as_os_str().is_empty() {
+            ".".to_string()
+        } else {
+            format!(".{}{}", std::path::MAIN_SEPARATOR, relative.display())
+        }
+    } else {
+        path.display().to_string()
+    }
+}
+
+fn shell_join(args: &[String]) -> String {
+    args.iter()
+        .map(|arg| shell_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_quote(arg: &str) -> String {
+    if !arg.is_empty()
+        && arg
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.' | '/' | ':' | '='))
+    {
+        arg.to_string()
+    } else {
+        format!("'{}'", arg.replace('\'', "'\"'\"'"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::{OutgoingSpec, WorkspaceSpec};
 
     #[test]
     fn tab_click_areas_follow_rendered_tab_widths() {
@@ -2256,5 +2641,60 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn equivalent_command_renders_effective_runtime_options() {
+        let workspace = WorkspaceSpec {
+            mode: SyncMode::Both,
+            outgoing: Some(OutgoingSpec::RootContents {
+                root: PathBuf::from("/tmp/demo"),
+                max_folder_depth: Some(2),
+            }),
+            incoming_root: Some(PathBuf::from("/tmp/demo")),
+        };
+        let options = RuntimeOptions {
+            mode: SyncMode::Both,
+            connection: ConnectionPreference::Join,
+            instance_name: Some("worker-a".to_string()),
+            workspace,
+            sync_delete: false,
+            clipboard_mode: ClipboardMode::Receive,
+            audio_mode: AudioMode::Send,
+            clipboard: ClipboardRuntimeOptions {
+                max_file_bytes: 1,
+                max_cache_bytes: None,
+                cache_dir: PathBuf::from("/tmp/cache"),
+            },
+            transfer_limits: TransferLimits {
+                max_meta_len: 1,
+                max_frame_data_len: 1,
+                max_clipboard_binary_len: 1,
+            },
+            interval_secs: 5,
+            pairing: PairingRuntimeOptions {
+                no_interact: false,
+                peer_query: Some("studio display".to_string()),
+                port: Some(7000),
+                pin: Some("123456".to_string()),
+                accept: true,
+                trust_device: false,
+                trusted_only: true,
+                discovery_secs: 9,
+            },
+        };
+
+        let command = equivalent_command_from_options(&options, Path::new("/tmp"));
+        assert_eq!(
+            command,
+            "synly --name worker-a --fs both ./demo --join --no-sync-delete --clipboard receive --audio send --interval-secs 5 --max-folder-depth 2 --peer 'studio display' --discovery-secs 9 --pin 123456 --accept --trusted-only"
+        );
+    }
+
+    #[test]
+    fn shell_quote_wraps_whitespace_and_quotes() {
+        assert_eq!(shell_quote("plain-value"), "plain-value");
+        assert_eq!(shell_quote("two words"), "'two words'");
+        assert_eq!(shell_quote("it's ready"), "'it'\"'\"'s ready'");
     }
 }
