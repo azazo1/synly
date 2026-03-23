@@ -141,8 +141,6 @@ impl CodecConfig {
 #[derive(Clone, Debug, Default)]
 pub struct CaptureConfig {
     pub device_name: Option<String>,
-    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
-    pub continuous_audio: bool,
 }
 
 #[derive(Clone, Debug, Default)]

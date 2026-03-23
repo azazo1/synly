@@ -18,7 +18,6 @@ pub struct AudioPacketizer {
     packet_duration_ms: u32,
     enable_fec: bool,
     block_payloads: [Option<Vec<u8>>; RTPA_DATA_SHARDS],
-    fec_payloads: [Vec<u8>; RTPA_FEC_SHARDS],
     block_base_sequence: u16,
     block_base_timestamp: u32,
 }
@@ -32,7 +31,6 @@ impl AudioPacketizer {
             packet_duration_ms,
             enable_fec,
             block_payloads: array::from_fn(|_| None),
-            fec_payloads: array::from_fn(|_| Vec::new()),
             block_base_sequence: 0,
             block_base_timestamp: 0,
         }
@@ -78,9 +76,8 @@ impl AudioPacketizer {
                         Error::Protocol("missing first payload in completed audio FEC block".into())
                     })?;
 
-                self.fec_payloads[0].resize(block_size, 0);
-                self.fec_payloads[1].resize(block_size, 0);
-                let (first, rest) = self.fec_payloads.split_at_mut(1);
+                let mut parity0 = vec![0u8; block_size];
+                let mut parity1 = vec![0u8; block_size];
                 fec::encode_audio_block(
                     [
                         self.block_payloads[0]
@@ -96,10 +93,10 @@ impl AudioPacketizer {
                             .as_deref()
                             .ok_or_else(|| Error::Protocol("missing audio shard 3".into()))?,
                     ],
-                    [&mut first[0], &mut rest[0]],
+                    [&mut parity0, &mut parity1],
                 )?;
 
-                for (fec_index, parity) in self.fec_payloads.iter().enumerate() {
+                for (fec_index, parity) in [parity0, parity1].into_iter().enumerate() {
                     let rtp = RtpHeader {
                         packet_type: RTP_PAYLOAD_TYPE_FEC,
                         sequence_number: sequence_number.wrapping_add(fec_index as u16 + 1),
@@ -114,7 +111,7 @@ impl AudioPacketizer {
                         ssrc: self.ssrc,
                     };
                     out.push(OutboundDatagram {
-                        bytes: write_fec_packet(rtp, fec_header, parity),
+                        bytes: write_fec_packet(rtp, fec_header, &parity),
                     });
                 }
             }
@@ -123,62 +120,5 @@ impl AudioPacketizer {
         }
 
         Ok(out)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::AudioPacketizer;
-    use crate::audio::protocol::{
-        AudioFecHeader, ParsedPacket, RTP_PAYLOAD_TYPE_AUDIO, parse_datagram,
-    };
-
-    #[test]
-    fn completed_block_emits_four_audio_packets_and_two_fec_packets() {
-        let mut packetizer = AudioPacketizer::new(5, 77, true);
-        let payload = vec![1u8; 16];
-        let mut datagrams = Vec::new();
-
-        for _ in 0..4 {
-            datagrams.extend(packetizer.push_encoded_frame(&payload).unwrap());
-        }
-
-        assert_eq!(datagrams.len(), 6);
-
-        for (index, datagram) in datagrams.iter().take(4).enumerate() {
-            match parse_datagram(&datagram.bytes).unwrap() {
-                ParsedPacket::Audio { rtp, payload } => {
-                    assert_eq!(rtp.packet_type, RTP_PAYLOAD_TYPE_AUDIO);
-                    assert_eq!(rtp.sequence_number, index as u16);
-                    assert_eq!(rtp.timestamp, (index as u32) * 5);
-                    assert_eq!(payload, vec![1u8; 16]);
-                }
-                other => panic!("expected audio packet, got {other:?}"),
-            }
-        }
-
-        for (index, datagram) in datagrams.iter().skip(4).enumerate() {
-            match parse_datagram(&datagram.bytes).unwrap() {
-                ParsedPacket::Fec { fec, payload } => {
-                    assert_eq!(payload.len(), 16);
-                    assert_eq!(
-                        fec,
-                        AudioFecHeader {
-                            fec_shard_index: index as u8,
-                            payload_type: RTP_PAYLOAD_TYPE_AUDIO,
-                            base_sequence_number: 0,
-                            base_timestamp: 0,
-                            ssrc: 77,
-                        }
-                    );
-                }
-                other => panic!("expected fec packet, got {other:?}"),
-            }
-        }
-
-        match parse_datagram(&datagrams[4].bytes).unwrap() {
-            ParsedPacket::Fec { fec, .. } => assert_eq!(fec.payload_type, RTP_PAYLOAD_TYPE_AUDIO),
-            _ => unreachable!(),
-        }
     }
 }

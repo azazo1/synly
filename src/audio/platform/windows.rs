@@ -40,7 +40,6 @@ const AUDCLNT_E_RESOURCES_INVALIDATED: i32 = 0x8889_0026u32 as i32;
 const E_RENDER: u32 = 0;
 const E_CONSOLE: u32 = 0;
 const WAVE_FORMAT_IEEE_FLOAT: u16 = 0x0003;
-const PRO_AUDIO_TASK_NAME: [u16; 10] = [80, 114, 111, 32, 65, 117, 100, 105, 111, 0];
 
 const CLSID_MMDEVICE_ENUMERATOR: Guid = Guid::new(
     0xBCDE_0395,
@@ -92,7 +91,6 @@ pub fn open_input(config: &CaptureConfig, stream: &StreamParams) -> Result<Box<d
     )?;
 
     Ok(Box::new(WindowsInput {
-        continuous_audio: config.continuous_audio,
         ring,
         stop_event,
         thread: Some(thread),
@@ -141,7 +139,6 @@ fn validate_stream(kind: &str, device_name: Option<&str>, stream: &StreamParams)
 }
 
 struct WindowsInput {
-    continuous_audio: bool,
     ring: Arc<SharedSampleRing>,
     stop_event: OwnedHandle,
     thread: Option<JoinHandle<()>>,
@@ -159,11 +156,6 @@ impl Drop for WindowsInput {
 
 impl AudioInput for WindowsInput {
     fn read_frame(&mut self, frame: &mut [f32], timeout: Duration) -> Result<CaptureStatus> {
-        if self.continuous_audio {
-            self.ring.read_exact_or_silence(frame, timeout)?;
-            return Ok(CaptureStatus::Ok);
-        }
-
         if self.ring.read_exact(frame, timeout)? {
             Ok(CaptureStatus::Ok)
         } else {
@@ -290,7 +282,6 @@ fn capture_thread_main(
     spec: WasapiSpec,
     ready_tx: mpsc::Sender<std::result::Result<(), String>>,
 ) {
-    let _mmcss = MmcssTask::enter_pro_audio();
     let mut ready_sent = false;
     loop {
         match CaptureThreadContext::start(spec) {
@@ -342,7 +333,6 @@ fn playback_thread_main(
     spec: WasapiSpec,
     ready_tx: mpsc::Sender<std::result::Result<(), String>>,
 ) {
-    let _mmcss = MmcssTask::enter_pro_audio();
     let mut ready_sent = false;
     loop {
         match PlaybackThreadContext::start(spec) {
@@ -808,35 +798,6 @@ impl SharedSampleRing {
         Ok(true)
     }
 
-    fn read_exact_or_silence(&self, out: &mut [f32], timeout: Duration) -> Result<()> {
-        let deadline = Instant::now() + timeout;
-        let mut state = self.lock_state()?;
-        while state.len < out.len() && !state.closed {
-            let now = Instant::now();
-            if now >= deadline {
-                break;
-            }
-
-            let remaining = deadline.saturating_duration_since(now);
-            let (next_state, _) = self.wait_for_readable(state, remaining)?;
-            state = next_state;
-        }
-
-        if state.closed {
-            return Err(self.closed_error(&state));
-        }
-
-        let count = state.len.min(out.len());
-        if count > 0 {
-            read_ring_prefix(&mut state, out, count);
-        }
-        if count < out.len() {
-            out[count..].fill(0.0);
-        }
-        self.writable.notify_all();
-        Ok(())
-    }
-
     fn write_blocking(&self, samples: &[f32], timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
         let mut state = self.lock_state()?;
@@ -1193,25 +1154,6 @@ fn last_os_error(action: &str) -> Error {
     ))
 }
 
-struct MmcssTask(Handle);
-
-impl MmcssTask {
-    fn enter_pro_audio() -> Option<Self> {
-        let mut task_index = 0u32;
-        let handle =
-            unsafe { AvSetMmThreadCharacteristicsW(PRO_AUDIO_TASK_NAME.as_ptr(), &mut task_index) };
-        (!handle.is_null()).then_some(Self(handle))
-    }
-}
-
-impl Drop for MmcssTask {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = AvRevertMmThreadCharacteristics(self.0);
-        }
-    }
-}
-
 struct ComApartment;
 
 impl ComApartment {
@@ -1504,12 +1446,6 @@ unsafe extern "system" {
         milliseconds: u32,
     ) -> u32;
     fn CloseHandle(handle: Handle) -> i32;
-}
-
-#[link(name = "avrt")]
-unsafe extern "system" {
-    fn AvSetMmThreadCharacteristicsW(task_name: *const u16, task_index: *mut u32) -> Handle;
-    fn AvRevertMmThreadCharacteristics(task_handle: Handle) -> i32;
 }
 
 #[link(name = "ole32")]
