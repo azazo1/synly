@@ -28,7 +28,7 @@ pub struct Cli {
     pub fs: Option<SyncMode>,
     #[arg(
         long,
-        help = "当前进程名称；仅影响本次运行的发现与配对显示，不会写入配置"
+        help = "当前实例名；仅影响本次运行的发现与配对显示，不会写入配置"
     )]
     pub name: Option<String>,
     #[arg(long, conflicts_with = "join")]
@@ -64,7 +64,7 @@ pub struct Cli {
     pub max_folder_depth: Option<usize>,
     #[arg(
         long,
-        help = "join 模式下要连接的设备；可填写进程名、设备名、设备 ID 前缀或广播出的 IPv4 地址 (可带端口)"
+        help = "join 模式下要连接的设备；可填写实例名、设备名、设备 ID 前缀或广播出的 IPv4 地址 (可带端口)"
     )]
     pub peer: Option<String>,
     #[arg(
@@ -215,7 +215,7 @@ pub enum ConnectionPreference {
 pub struct RuntimeOptions {
     pub mode: SyncMode,
     pub connection: ConnectionPreference,
-    pub process_name: Option<String>,
+    pub instance_name: Option<String>,
     pub workspace: WorkspaceSpec,
     pub sync_delete: bool,
     pub clipboard_mode: ClipboardMode,
@@ -290,7 +290,7 @@ fn collect_runtime_options_from_cli(cli: Cli, config: &SynlyConfig) -> Result<Ru
     Ok(RuntimeOptions {
         mode,
         connection,
-        process_name: normalize_optional_text(cli.name),
+        instance_name: normalize_optional_text(cli.name),
         workspace,
         sync_delete,
         clipboard_mode,
@@ -465,7 +465,7 @@ pub fn require_peer_query(peer_query: Option<&str>) -> Result<&str> {
         Some(query) if !query.trim().is_empty() => Ok(query.trim()),
         _ => {
             bail!(
-                "join 模式下请用 --peer 指定要连接的设备（支持进程名、设备名、设备 ID 前缀或 IPv4 地址）"
+                "join 模式下请用 --peer 指定要连接的设备（支持实例名、设备名、设备 ID 前缀或 IPv4 地址）"
             )
         }
     }
@@ -725,7 +725,7 @@ mod tests {
         let options = collect_runtime_options(cli, &test_config()).unwrap();
 
         assert!(matches!(options.connection, ConnectionPreference::Join));
-        assert_eq!(options.process_name.as_deref(), Some("worker-a"));
+        assert_eq!(options.instance_name.as_deref(), Some("worker-a"));
         assert_eq!(options.pairing.peer_query.as_deref(), Some("demo-device"));
         assert_eq!(options.pairing.port, Some(7373));
         assert_eq!(options.pairing.pin.as_deref(), Some("123456"));

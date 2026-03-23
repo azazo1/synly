@@ -96,7 +96,7 @@ struct WorkspaceDraft {
 }
 
 struct PairingDraft {
-    process_name: TextArea<'static>,
+    instance_name: TextArea<'static>,
     peer_query: TextArea<'static>,
     port: TextArea<'static>,
     pin: TextArea<'static>,
@@ -151,7 +151,7 @@ enum FieldId {
     WorkspacePath,
     MaxFolderDepth,
     IntervalSecs,
-    ProcessName,
+    InstanceName,
     PeerQuery,
     Port,
     Pin,
@@ -271,7 +271,7 @@ impl StartupApp {
                 ),
             },
             pairing: PairingDraft {
-                process_name: single_line_textarea(
+                instance_name: single_line_textarea(
                     cli.name.unwrap_or_default(),
                     "留空表示沿用设备名，仅作用于本次运行",
                 ),
@@ -546,7 +546,7 @@ impl StartupApp {
             FieldId::PeerQuery => {
                 let _ = key;
             }
-            FieldId::ProcessName => {
+            FieldId::InstanceName => {
                 let _ = key;
             }
             FieldId::Port => {
@@ -694,7 +694,7 @@ impl StartupApp {
                     ));
                 }
             }
-            FieldId::ProcessName => {}
+            FieldId::InstanceName => {}
             FieldId::Accept => {
                 self.pairing.accept = !self.pairing.accept;
                 self.push_log(format!(
@@ -1034,22 +1034,22 @@ impl StartupApp {
                 );
                 frame.render_widget(&self.workspace.interval_secs, area);
             }
-            FieldId::ProcessName => {
+            FieldId::InstanceName => {
                 apply_textarea_theme(
-                    &mut self.pairing.process_name,
-                    "当前进程名",
+                    &mut self.pairing.instance_name,
+                    "当前实例名",
                     "留空表示沿用设备名，仅作用于本次运行",
                     focused,
                     editing,
                     colors,
                 );
-                frame.render_widget(&self.pairing.process_name, area);
+                frame.render_widget(&self.pairing.instance_name, area);
             }
             FieldId::PeerQuery => {
                 apply_textarea_theme(
                     &mut self.pairing.peer_query,
                     "目标设备",
-                    "可填进程名、设备名、设备 ID 前缀或 IPv4；留空则启动后选择",
+                    "可填实例名、设备名、设备 ID 前缀或 IPv4；留空则启动后选择",
                     focused,
                     editing,
                     colors,
@@ -1418,10 +1418,10 @@ impl StartupApp {
             Err(err) => errors.push(err.to_string()),
         }
 
-        match self.parsed_process_name() {
-            Some(process_name) => summary_lines.push(format!("当前进程名: {}", process_name)),
+        match self.parsed_instance_name() {
+            Some(instance_name) => summary_lines.push(format!("当前实例名: {}", instance_name)),
             None => summary_lines.push(format!(
-                "当前进程名: 沿用设备名 {}",
+                "当前实例名: 沿用设备名 {}",
                 self.context.device_label
             )),
         }
@@ -1581,7 +1581,7 @@ impl StartupApp {
         Ok(RuntimeOptions {
             mode: self.flow.mode,
             connection: self.flow.connection,
-            process_name: self.parsed_process_name(),
+            instance_name: self.parsed_instance_name(),
             sync_delete: if workspace.incoming_root.is_some() {
                 self.flow.sync_delete
             } else {
@@ -1614,8 +1614,8 @@ impl StartupApp {
         Ok(Some(normalize_pin(raw.as_str())?))
     }
 
-    fn parsed_process_name(&self) -> Option<String> {
-        trimmed_non_empty(&self.pairing.process_name)
+    fn parsed_instance_name(&self) -> Option<String> {
+        trimmed_non_empty(&self.pairing.instance_name)
     }
 
     fn parsed_port(&self) -> Result<Option<u16>> {
@@ -1674,7 +1674,7 @@ impl StartupApp {
                 FieldId::IntervalSecs,
             ],
             StartupTab::Pairing => &[
-                FieldId::ProcessName,
+                FieldId::InstanceName,
                 FieldId::PeerQuery,
                 FieldId::Port,
                 FieldId::Pin,
@@ -1700,7 +1700,7 @@ impl StartupApp {
             FieldId::WorkspacePath
                 | FieldId::MaxFolderDepth
                 | FieldId::IntervalSecs
-                | FieldId::ProcessName
+                | FieldId::InstanceName
                 | FieldId::PeerQuery
                 | FieldId::Port
                 | FieldId::Pin
@@ -1785,7 +1785,7 @@ impl StartupApp {
             FieldId::WorkspacePath => Some(&mut self.workspace.path),
             FieldId::MaxFolderDepth => Some(&mut self.workspace.max_folder_depth),
             FieldId::IntervalSecs => Some(&mut self.workspace.interval_secs),
-            FieldId::ProcessName => Some(&mut self.pairing.process_name),
+            FieldId::InstanceName => Some(&mut self.pairing.instance_name),
             FieldId::PeerQuery => Some(&mut self.pairing.peer_query),
             FieldId::Port => Some(&mut self.pairing.port),
             FieldId::Pin => Some(&mut self.pairing.pin),

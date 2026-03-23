@@ -21,8 +21,8 @@ async fn main() -> Result<()> {
     let options = cli::collect_runtime_options(cli, &config)?;
     println!();
     println!("{}", style("本次同步确认").bold());
-    if let Some(process_name) = options.process_name.as_deref() {
-        println!("当前进程: {process_name}");
+    if let Some(instance_name) = options.instance_name.as_deref() {
+        println!("当前实例: {instance_name}");
     }
     for line in options.workspace.local_human_lines(options.clipboard_mode) {
         println!("{line}");

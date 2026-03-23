@@ -16,7 +16,7 @@ const DEFAULT_MAX_FRAME_DATA_LEN: usize = 128 * 1024 * 1024;
 const DEFAULT_MAX_CLIPBOARD_BINARY_LEN: usize = 100 * 1024 * 1024;
 const CLIPBOARD_STREAM_CHUNK_SIZE: usize = 1024 * 1024;
 
-pub const PROTOCOL_VERSION: u16 = 11;
+pub const PROTOCOL_VERSION: u16 = 12;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TransferLimits {
@@ -47,7 +47,7 @@ pub enum PairAuthMethod {
 pub struct DeviceIdentity {
     pub device_id: Uuid,
     pub device_name: String,
-    pub process_name: Option<String>,
+    pub instance_name: Option<String>,
     pub identity_public_key: String,
     pub tls_root_certificate: String,
 }
@@ -667,7 +667,7 @@ mod tests {
             server: super::DeviceIdentity {
                 device_id: uuid::Uuid::nil(),
                 device_name: "server".to_string(),
-                process_name: Some("worker-a".to_string()),
+                instance_name: Some("worker-a".to_string()),
                 identity_public_key: "pub".to_string(),
                 tls_root_certificate: "cert".to_string(),
             },

@@ -88,7 +88,7 @@ struct PairDecisionParams<'a> {
     accepted: bool,
     message: String,
     device: &'a DeviceConfig,
-    process_name: Option<&'a str>,
+    instance_name: Option<&'a str>,
     workspace: &'a WorkspaceSpec,
     clipboard_mode: ClipboardMode,
     audio_mode: AudioMode,
@@ -155,7 +155,7 @@ async fn run_host(config: &mut SynlyConfig, options: RuntimeOptions) -> Result<(
         port,
         device: device.clone(),
         mode: options.mode,
-        process_name: options.process_name.clone(),
+        instance_name: options.instance_name.clone(),
     })?;
 
     print_host_ready(&device, &options, port);
@@ -451,7 +451,7 @@ async fn handle_trusted_incoming_connection(
         accepted,
         message,
         device: &device,
-        process_name: options.process_name.as_deref(),
+        instance_name: options.instance_name.as_deref(),
         workspace: &options.workspace,
         clipboard_mode: options.clipboard_mode,
         audio_mode: options.audio_mode,
@@ -812,7 +812,7 @@ async fn handle_bootstrap_incoming_connection(
         accepted,
         message,
         device: &device,
-        process_name: options.process_name.as_deref(),
+        instance_name: options.instance_name.as_deref(),
         workspace: &options.workspace,
         clipboard_mode: options.clipboard_mode,
         audio_mode: options.audio_mode,
@@ -881,7 +881,7 @@ async fn connect_to_trusted_peer(
         crypto::export_audio_master_secret_from_client(&client_stream, &request_id)?;
     let payload = PairRequestPayload {
         protocol_version: PROTOCOL_VERSION,
-        client: device_identity(device, options.process_name.as_deref()),
+        client: device_identity(device, options.instance_name.as_deref()),
         requested_mode: options.mode,
         workspace: options.workspace.summary(options.clipboard_mode),
         audio_mode: options.audio_mode,
@@ -1087,7 +1087,7 @@ async fn connect_to_untrusted_peer(
         crypto::export_audio_master_secret_from_client(&client_stream, &request_id)?;
     let payload = PairRequestPayload {
         protocol_version: PROTOCOL_VERSION,
-        client: device_identity(device, options.process_name.as_deref()),
+        client: device_identity(device, options.instance_name.as_deref()),
         requested_mode: options.mode,
         workspace: options.workspace.summary(options.clipboard_mode),
         audio_mode: options.audio_mode,
@@ -2177,7 +2177,7 @@ fn select_peer_from_query(peers: &[DiscoveredPeer], query: &str) -> Result<Disco
                 .collect::<Vec<_>>()
                 .join("\n");
             bail!(
-                "`{query}` 匹配到多个设备，请改用更精确的进程名、设备名、设备 ID 前缀或 IPv4 地址:\n{labels}"
+                "`{query}` 匹配到多个设备，请改用更精确的实例名、设备名、设备 ID 前缀或 IPv4 地址:\n{labels}"
             )
         }
     }
@@ -2189,9 +2189,9 @@ fn peer_matches_query(peer: &DiscoveredPeer, query: &str) -> bool {
         return false;
     }
 
-    peer.process_name
+    peer.instance_name
         .as_deref()
-        .is_some_and(|process_name| process_name.eq_ignore_ascii_case(query))
+        .is_some_and(|instance_name| instance_name.eq_ignore_ascii_case(query))
         || peer.device_name.eq_ignore_ascii_case(query)
         || peer.device_id.eq_ignore_ascii_case(query)
         || peer
@@ -2204,7 +2204,7 @@ fn peer_matches_query(peer: &DiscoveredPeer, query: &str) -> bool {
 }
 
 fn preferred_peer_query(peer: &DiscoveredPeer) -> String {
-    peer.process_name
+    peer.instance_name
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case(&peer.device_name))
@@ -2213,7 +2213,7 @@ fn preferred_peer_query(peer: &DiscoveredPeer) -> String {
 }
 
 fn identity_display_name(identity: &DeviceIdentity) -> String {
-    format_display_name(identity.process_name.as_deref(), &identity.device_name)
+    format_display_name(identity.instance_name.as_deref(), &identity.device_name)
 }
 
 fn trusted_device_for_peer(
@@ -2452,7 +2452,7 @@ fn allows_local_receive(role: SessionRole, agreement: &SessionAgreement) -> bool
 
 fn signed_pair_decision(params: PairDecisionParams<'_>) -> Result<ControlMessage> {
     let summary = params.workspace.summary(params.clipboard_mode);
-    let server = device_identity(params.device, params.process_name);
+    let server = device_identity(params.device, params.instance_name);
     let proof = match params.auth_method {
         PairAuthMethod::Pin => crypto::sign_pair_decision(
             params.exporter,
@@ -2496,11 +2496,11 @@ fn signed_pair_decision(params: PairDecisionParams<'_>) -> Result<ControlMessage
     })
 }
 
-fn device_identity(device: &DeviceConfig, process_name: Option<&str>) -> DeviceIdentity {
+fn device_identity(device: &DeviceConfig, instance_name: Option<&str>) -> DeviceIdentity {
     DeviceIdentity {
         device_id: device.device_id,
         device_name: device.device_name.clone(),
-        process_name: process_name.map(ToString::to_string),
+        instance_name: instance_name.map(ToString::to_string),
         identity_public_key: device
             .identity_public_key()
             .expect("device identity public key is missing")
@@ -2513,8 +2513,8 @@ fn device_identity(device: &DeviceConfig, process_name: Option<&str>) -> DeviceI
 fn print_host_ready(device: &DeviceConfig, options: &RuntimeOptions, port: u16) {
     println!("{}", style("Synly 已就绪").bold());
     println!("设备: {} ({})", device.device_name, device.short_id());
-    if let Some(process_name) = options.process_name.as_deref() {
-        println!("当前进程: {}", process_name);
+    if let Some(instance_name) = options.instance_name.as_deref() {
+        println!("当前实例: {}", instance_name);
     }
     println!(
         "本机身份指纹: {}",
@@ -2838,7 +2838,7 @@ mod tests {
         let duplicate = DiscoveredPeer {
             fullname: "dup".to_string(),
             device_name: "demo-device".to_string(),
-            process_name: Some("worker-b".to_string()),
+            instance_name: Some("worker-b".to_string()),
             device_id: "ffffeeee-dddd-cccc-bbbb-aaaaaaaaaaaa".to_string(),
             mode: SyncMode::Auto,
             port: 9999,
@@ -2881,17 +2881,17 @@ mod tests {
     }
 
     #[test]
-    fn preferred_peer_query_uses_process_name_when_present() {
+    fn preferred_peer_query_uses_instance_name_when_present() {
         let peer = sample_peer();
         assert_eq!(preferred_peer_query(&peer), "worker-a");
     }
 
     #[test]
-    fn identity_display_name_prefers_process_name() {
+    fn identity_display_name_prefers_instance_name() {
         let identity = DeviceIdentity {
             device_id: Uuid::nil(),
             device_name: "demo-device".to_string(),
-            process_name: Some("worker-a".to_string()),
+            instance_name: Some("worker-a".to_string()),
             identity_public_key: "pub".to_string(),
             tls_root_certificate: "cert".to_string(),
         };
@@ -2923,7 +2923,7 @@ mod tests {
         DiscoveredPeer {
             fullname: "demo._synly._tcp.local.".to_string(),
             device_name: "demo-device".to_string(),
-            process_name: Some("worker-a".to_string()),
+            instance_name: Some("worker-a".to_string()),
             device_id: "abcd1234-1111-2222-3333-444455556666".to_string(),
             mode: SyncMode::Both,
             port: 8080,

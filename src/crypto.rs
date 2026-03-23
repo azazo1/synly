@@ -1232,7 +1232,7 @@ mod tests {
             client: DeviceIdentity {
                 device_id: Uuid::new_v4(),
                 device_name: "tester".into(),
-                process_name: Some("worker-a".into()),
+                instance_name: Some("worker-a".into()),
                 identity_public_key: device.identity_public_key().unwrap().to_string(),
                 tls_root_certificate: device_tls_root_certificate(&device).unwrap(),
             },
@@ -1264,7 +1264,7 @@ mod tests {
             client: DeviceIdentity {
                 device_id: Uuid::new_v4(),
                 device_name: "tester".into(),
-                process_name: Some("worker-a".into()),
+                instance_name: Some("worker-a".into()),
                 identity_public_key: public_key.clone(),
                 tls_root_certificate: device_tls_root_certificate(&device).unwrap(),
             },
@@ -1301,7 +1301,7 @@ mod tests {
         let server = DeviceIdentity {
             device_id: device.device_id,
             device_name: device.device_name.clone(),
-            process_name: Some("worker-a".into()),
+            instance_name: Some("worker-a".into()),
             identity_public_key: device.identity_public_key().unwrap().to_string(),
             tls_root_certificate: device_tls_root_certificate(&device).unwrap(),
         };
@@ -1372,7 +1372,7 @@ mod tests {
         let server = DeviceIdentity {
             device_id: device.device_id,
             device_name: device.device_name.clone(),
-            process_name: Some("worker-a".into()),
+            instance_name: Some("worker-a".into()),
             identity_public_key: public_key.clone(),
             tls_root_certificate: device_tls_root_certificate(&device).unwrap(),
         };
