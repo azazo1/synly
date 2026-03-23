@@ -1,9 +1,6 @@
 use crate::audio::capture::{CaptureStatus, open_input};
 use crate::audio::codec::{OpusDecoder, OpusEncoder};
-use crate::audio::config::{
-    CaptureConfig, CodecConfig, DEFAULT_JITTER_BUFFER_MS, DEFAULT_REDUNDANCY_WINDOW_PACKETS,
-    PlaybackConfig,
-};
+use crate::audio::config::{CaptureConfig, CodecConfig, DEFAULT_INITIAL_DROP_MS, PlaybackConfig};
 use crate::audio::playback::open_output;
 use crate::audio::receiver::{AudioDepacketizer, QueuedAudioFrame};
 use crate::audio::sender::AudioPacketizer;
@@ -115,12 +112,8 @@ fn run_sender_loop(
     let mut input = open_input(&CaptureConfig::default(), &stream).map_err(anyhow::Error::from)?;
     let mut encoder =
         OpusEncoder::new(stream.opus_config(), stream.bitrate).map_err(anyhow::Error::from)?;
-    let mut packetizer = AudioPacketizer::new(
-        stream.packet_duration_ms,
-        rand::random::<u32>(),
-        true,
-        DEFAULT_REDUNDANCY_WINDOW_PACKETS,
-    );
+    let mut packetizer =
+        AudioPacketizer::new(stream.packet_duration_ms, rand::random::<u32>(), true);
     let mut pcm_buffer = vec![0.0; stream.samples_per_frame()];
     let mut encoded_buffer = vec![0u8; 1400];
     let mut encryptor = AudioEncryptor::new(master_secret, direction)?;
@@ -173,7 +166,7 @@ fn run_receiver_loop(
         open_output(&PlaybackConfig::default(), &stream).map_err(anyhow::Error::from)?;
     let mut decoder = OpusDecoder::new(stream.opus_config()).map_err(anyhow::Error::from)?;
     let mut depacketizer =
-        AudioDepacketizer::new(stream.packet_duration_ms, DEFAULT_JITTER_BUFFER_MS);
+        AudioDepacketizer::new(stream.packet_duration_ms, DEFAULT_INITIAL_DROP_MS);
     let mut decode_buffer = vec![0.0; stream.samples_per_frame()];
     let mut read_buffer = vec![0u8; 2048];
     let decryptor = AudioDecryptor::new(master_secret, direction)?;

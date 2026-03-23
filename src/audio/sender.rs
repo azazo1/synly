@@ -5,7 +5,6 @@ use crate::audio::protocol::{
     RTPA_FEC_SHARDS, RtpHeader, write_audio_packet, write_fec_packet,
 };
 use std::array;
-use std::collections::VecDeque;
 
 #[derive(Clone, Debug)]
 pub struct OutboundDatagram {
@@ -18,36 +17,27 @@ pub struct AudioPacketizer {
     ssrc: u32,
     packet_duration_ms: u32,
     enable_fec: bool,
-    audio_redundancy_packets: usize,
     block_payloads: [Option<Vec<u8>>; RTPA_DATA_SHARDS],
     block_base_sequence: u16,
     block_base_timestamp: u32,
-    recent_audio_datagrams: VecDeque<Vec<u8>>,
 }
 
 impl AudioPacketizer {
-    pub fn new(
-        packet_duration_ms: u32,
-        ssrc: u32,
-        enable_fec: bool,
-        audio_redundancy_packets: usize,
-    ) -> Self {
+    pub fn new(packet_duration_ms: u32, ssrc: u32, enable_fec: bool) -> Self {
         Self {
             sequence_number: 0,
             timestamp: 0,
             ssrc,
             packet_duration_ms,
             enable_fec,
-            audio_redundancy_packets,
             block_payloads: array::from_fn(|_| None),
             block_base_sequence: 0,
             block_base_timestamp: 0,
-            recent_audio_datagrams: VecDeque::with_capacity(audio_redundancy_packets),
         }
     }
 
     pub fn push_encoded_frame(&mut self, payload: &[u8]) -> Result<Vec<OutboundDatagram>> {
-        let mut out = Vec::with_capacity(1 + self.audio_redundancy_packets + RTPA_FEC_SHARDS);
+        let mut out = Vec::with_capacity(1 + RTPA_FEC_SHARDS);
         let sequence_number = self.sequence_number;
         let timestamp = self.timestamp;
         let shard_index = sequence_number as usize % RTPA_DATA_SHARDS;
@@ -65,26 +55,9 @@ impl AudioPacketizer {
             timestamp,
             ssrc: self.ssrc,
         };
-        let primary_audio = write_audio_packet(rtp, payload);
         out.push(OutboundDatagram {
-            bytes: primary_audio.clone(),
+            bytes: write_audio_packet(rtp, payload),
         });
-        for redundant in self
-            .recent_audio_datagrams
-            .iter()
-            .rev()
-            .take(self.audio_redundancy_packets)
-        {
-            out.push(OutboundDatagram {
-                bytes: redundant.clone(),
-            });
-        }
-        if self.audio_redundancy_packets > 0 {
-            self.recent_audio_datagrams.push_back(primary_audio);
-            while self.recent_audio_datagrams.len() > self.audio_redundancy_packets {
-                self.recent_audio_datagrams.pop_front();
-            }
-        }
 
         self.sequence_number = self.sequence_number.wrapping_add(1);
         self.timestamp = self.timestamp.wrapping_add(self.packet_duration_ms);
@@ -147,22 +120,5 @@ impl AudioPacketizer {
         }
 
         Ok(out)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::AudioPacketizer;
-
-    #[test]
-    fn packetizer_repeats_the_previous_audio_packet_once() {
-        let mut packetizer = AudioPacketizer::new(5, 7, false, 1);
-
-        let first = packetizer.push_encoded_frame(&[1, 2, 3]).unwrap();
-        let second = packetizer.push_encoded_frame(&[4, 5, 6]).unwrap();
-
-        assert_eq!(first.len(), 1);
-        assert_eq!(second.len(), 2);
-        assert_eq!(second[1].bytes, first[0].bytes);
     }
 }

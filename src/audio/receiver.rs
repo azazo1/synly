@@ -1,8 +1,8 @@
 use crate::audio::error::{Error, Result};
 use crate::audio::fec;
 use crate::audio::protocol::{
-    self, AudioFecHeader, OOS_WAIT_TIME_MS, ParsedPacket, RTPA_DATA_SHARDS, RTPA_FEC_SHARDS,
-    parse_datagram,
+    self, AudioFecHeader, OOS_WAIT_TIME_MS, ParsedPacket, RTP_PAYLOAD_TYPE_AUDIO, RTPA_DATA_SHARDS,
+    RTPA_FEC_SHARDS, RtpHeader, parse_datagram,
 };
 use std::array;
 use std::collections::VecDeque;
@@ -349,107 +349,44 @@ impl RtpAudioQueue {
 
 pub struct AudioDepacketizer {
     queue: RtpAudioQueue,
-    startup_buffer_packets: usize,
-    buffering_startup: bool,
+    packets_to_drop: u32,
 }
 
 impl AudioDepacketizer {
-    pub fn new(packet_duration_ms: u32, initial_buffer_ms: u32) -> Self {
-        let startup_buffer_packets = if packet_duration_ms == 0 {
-            0
-        } else {
-            initial_buffer_ms.div_ceil(packet_duration_ms) as usize
-        };
+    pub fn new(packet_duration_ms: u32, initial_drop_ms: u32) -> Self {
         Self {
             queue: RtpAudioQueue::new(packet_duration_ms),
-            startup_buffer_packets,
-            buffering_startup: startup_buffer_packets > 0,
+            packets_to_drop: if packet_duration_ms == 0 {
+                0
+            } else {
+                initial_drop_ms / packet_duration_ms
+            },
         }
     }
 
     pub fn push_datagram(&mut self, datagram: &[u8]) -> Result<Vec<QueuedAudioFrame>> {
         let parsed = parse_datagram(datagram)?;
-        self.queue.add_packet(parsed)?;
-        if self.buffering_startup && self.queue.ready_packet_count() < self.startup_buffer_packets {
+        if self.packets_to_drop > 0
+            && matches!(
+                parsed,
+                ParsedPacket::Audio {
+                    rtp: RtpHeader {
+                        packet_type: RTP_PAYLOAD_TYPE_AUDIO,
+                        ..
+                    },
+                    ..
+                }
+            )
+        {
+            self.packets_to_drop -= 1;
             return Ok(Vec::new());
         }
-        self.buffering_startup = false;
+
+        self.queue.add_packet(parsed)?;
         let mut ready = Vec::new();
         while let Some(frame) = self.queue.dequeue_ready() {
             ready.push(frame);
         }
         Ok(ready)
-    }
-}
-
-impl RtpAudioQueue {
-    fn ready_packet_count(&self) -> usize {
-        let mut count = 0usize;
-        let mut next_sequence = self.next_rtp_sequence_number;
-
-        for block in &self.blocks {
-            let mut data_index = block.next_data_index;
-            while data_index < RTPA_DATA_SHARDS {
-                let expected_sequence = block
-                    .fec_header
-                    .base_sequence_number
-                    .wrapping_add(data_index as u16);
-                if expected_sequence != next_sequence {
-                    return count;
-                }
-
-                if block.data_shards[data_index].is_some() || block.allow_discontinuity {
-                    count += 1;
-                    next_sequence = next_sequence.wrapping_add(1);
-                    data_index += 1;
-                    continue;
-                }
-
-                return count;
-            }
-        }
-
-        count
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{AudioDepacketizer, QueuedAudioFrame};
-    use crate::audio::sender::AudioPacketizer;
-
-    #[test]
-    fn depacketizer_buffers_startup_audio_instead_of_dropping_it() {
-        let mut packetizer = AudioPacketizer::new(5, 11, false, 0);
-        let mut depacketizer = AudioDepacketizer::new(5, 10);
-
-        for payload in 0..4u8 {
-            let datagrams = packetizer.push_encoded_frame(&[payload]).unwrap();
-            assert!(
-                depacketizer
-                    .push_datagram(&datagrams[0].bytes)
-                    .unwrap()
-                    .is_empty()
-            );
-        }
-
-        let fifth = packetizer.push_encoded_frame(&[4]).unwrap();
-        assert!(
-            depacketizer
-                .push_datagram(&fifth[0].bytes)
-                .unwrap()
-                .is_empty()
-        );
-
-        let sixth = packetizer.push_encoded_frame(&[5]).unwrap();
-        let ready = depacketizer.push_datagram(&sixth[0].bytes).unwrap();
-        let payloads = ready
-            .into_iter()
-            .map(|frame| match frame {
-                QueuedAudioFrame::Encoded(payload) => payload,
-                QueuedAudioFrame::Missing => panic!("unexpected packet loss during startup"),
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(payloads, vec![vec![4], vec![5]]);
     }
 }
