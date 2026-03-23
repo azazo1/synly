@@ -24,7 +24,7 @@ use console::style;
 use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use rand::RngExt;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::net::SocketAddr;
+use std::net::{SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::fs::File;
@@ -122,6 +122,21 @@ struct PairingPeerState {
     blocked_until: Option<Instant>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PeerTarget {
+    Discovered(DiscoveredPeer),
+    Direct(SocketAddrV4),
+}
+
+impl PeerTarget {
+    fn reconnect_query(&self) -> String {
+        match self {
+            Self::Discovered(peer) => preferred_peer_query(peer),
+            Self::Direct(address) => address.to_string(),
+        }
+    }
+}
+
 pub async fn run(config: &mut SynlyConfig, options: RuntimeOptions) -> Result<()> {
     match options.connection {
         ConnectionPreference::Host => run_host(config, options).await,
@@ -207,7 +222,7 @@ async fn run_client(config: &mut SynlyConfig, options: RuntimeOptions) -> Result
     let mut reconnect_delay = RECONNECT_BASE_DELAY;
 
     loop {
-        let peer = match choose_peer(
+        let peer_target = match choose_peer(
             reconnect_query.as_deref(),
             discovery_timeout,
             options.pairing.no_interact,
@@ -223,9 +238,9 @@ async fn run_client(config: &mut SynlyConfig, options: RuntimeOptions) -> Result
                 return Err(err);
             }
         };
-        reconnect_query = Some(preferred_peer_query(&peer));
+        reconnect_query = Some(peer_target.reconnect_query());
 
-        match connect_to_peer(&peer, config, &options).await {
+        match connect_to_peer(&peer_target, config, &options).await {
             Ok(session) => {
                 let remote_label = format!(
                     "{} ({})",
@@ -285,29 +300,52 @@ async fn handle_incoming_connection(
 }
 
 async fn connect_to_peer(
-    peer: &DiscoveredPeer,
+    peer: &PeerTarget,
     config: &mut SynlyConfig,
     options: &RuntimeOptions,
 ) -> Result<AuthenticatedSession> {
     let device = config.device.clone();
-    let address = peer
-        .addresses
-        .first()
-        .copied()
-        .context("peer advertised no IPv4 address")?;
-    let trusted_device = trusted_device_for_peer(config, peer)?;
-    let trusted_transport = trusted_device
-        .as_ref()
-        .filter(|device| !device.tls_root_certificate.trim().is_empty());
-    if options.pairing.trusted_only && trusted_transport.is_none() {
-        bail!("目标设备尚未建立完整的可信 mTLS 信任，请先用一次 PIN 配对并加上 --trust-device");
-    }
-    match trusted_transport {
-        Some(trusted_device) => {
-            connect_to_trusted_peer(address, peer.port, &device, trusted_device, config, options)
-                .await
+    match peer {
+        PeerTarget::Discovered(peer) => {
+            let address = peer
+                .addresses
+                .first()
+                .copied()
+                .context("peer advertised no IPv4 address")?;
+            let trusted_device = trusted_device_for_peer(config, peer)?;
+            let trusted_transport = trusted_device
+                .as_ref()
+                .filter(|device| !device.tls_root_certificate.trim().is_empty());
+            if options.pairing.trusted_only && trusted_transport.is_none() {
+                bail!(
+                    "目标设备尚未建立完整的可信 mTLS 信任，请先用一次 PIN 配对并加上 --trust-device"
+                );
+            }
+            match trusted_transport {
+                Some(trusted_device) => {
+                    connect_to_trusted_peer(
+                        address,
+                        peer.port,
+                        &device,
+                        trusted_device,
+                        config,
+                        options,
+                    )
+                    .await
+                }
+                None => {
+                    connect_to_untrusted_peer(address, peer.port, &device, config, options).await
+                }
+            }
         }
-        None => connect_to_untrusted_peer(address, peer.port, &device, config, options).await,
+        PeerTarget::Direct(address) => {
+            if options.pairing.trusted_only {
+                bail!(
+                    "使用 `--peer {address}` 直连时暂不支持 `--trusted-only`；请改用 mDNS 可发现的设备名 / 设备 ID，或先移除 `--trusted-only` 完成一次 PIN 配对"
+                );
+            }
+            connect_to_untrusted_peer(*address.ip(), address.port(), &device, config, options).await
+        }
     }
 }
 
@@ -2133,10 +2171,16 @@ fn choose_peer(
     peer_query: Option<&str>,
     timeout: Duration,
     no_interact: bool,
-) -> Result<DiscoveredPeer> {
+) -> Result<PeerTarget> {
     if let Some(query) = peer_query {
+        if let Some(address) = parse_direct_peer_addr(query) {
+            return Ok(PeerTarget::Direct(address));
+        }
         let peers = discovery::browse(timeout)?;
-        return select_peer_from_query(&peers, require_peer_query(Some(query))?);
+        return Ok(PeerTarget::Discovered(select_peer_from_query(
+            &peers,
+            require_peer_query(Some(query))?,
+        )?));
     }
 
     if no_interact {
@@ -2154,8 +2198,12 @@ fn choose_peer(
 
         let options = peers.iter().map(DiscoveredPeer::label).collect::<Vec<_>>();
         let index = prompt_select("选择设备", &options, None)?;
-        return Ok(peers[index].clone());
+        return Ok(PeerTarget::Discovered(peers[index].clone()));
     }
+}
+
+fn parse_direct_peer_addr(query: &str) -> Option<SocketAddrV4> {
+    query.trim().parse().ok()
 }
 
 fn select_peer_from_query(peers: &[DiscoveredPeer], query: &str) -> Result<DiscoveredPeer> {
@@ -2710,8 +2758,8 @@ mod tests {
     use super::{
         FILE_STREAM_CHUNK_SIZE, SessionRole, accept_policy_label, choose_peer, delete_policy,
         identity_display_name, is_connection_shutdown_error, next_reconnect_delay,
-        peer_matches_query, preferred_peer_query, resolve_audio_plan, select_peer_from_query,
-        send_one_file, should_auto_accept_request,
+        parse_direct_peer_addr, peer_matches_query, preferred_peer_query, resolve_audio_plan,
+        select_peer_from_query, send_one_file, should_auto_accept_request,
     };
     use crate::audio::AudioChannelDirection;
     use crate::cli::{AudioMode, PairingRuntimeOptions, SyncMode};
@@ -2720,7 +2768,7 @@ mod tests {
     use crate::sync::{DeletePolicy, OutgoingSpec, SnapshotLayout};
     use std::env;
     use std::fs;
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, SocketAddrV4};
     use std::path::PathBuf;
     use std::time::Duration;
     use tokio::sync::mpsc;
@@ -2826,6 +2874,7 @@ mod tests {
         assert!(peer_matches_query(&peer, "worker-a"));
         assert!(peer_matches_query(&peer, "abcd1234"));
         assert!(peer_matches_query(&peer, "192.168.1.20"));
+        assert!(peer_matches_query(&peer, "192.168.1.20:8080"));
         assert!(!peer_matches_query(&peer, "unknown"));
     }
 
@@ -2878,6 +2927,27 @@ mod tests {
             .to_string();
 
         assert!(err.contains("`--peer`"));
+    }
+
+    #[test]
+    fn full_ipv4_socket_addr_uses_direct_target() {
+        let target = choose_peer(Some("192.168.1.20:8080"), Duration::from_millis(1), true)
+            .expect("full socket address should skip discovery");
+
+        assert!(matches!(
+            target,
+            super::PeerTarget::Direct(address)
+                if *address.ip() == Ipv4Addr::new(192, 168, 1, 20) && address.port() == 8080
+        ));
+    }
+
+    #[test]
+    fn parse_direct_peer_addr_requires_host_and_port() {
+        assert_eq!(
+            parse_direct_peer_addr(" 192.168.1.20:8080 "),
+            Some(SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 20), 8080))
+        );
+        assert_eq!(parse_direct_peer_addr("192.168.1.20"), None);
     }
 
     #[test]

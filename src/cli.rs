@@ -465,7 +465,7 @@ pub fn require_peer_query(peer_query: Option<&str>) -> Result<&str> {
         Some(query) if !query.trim().is_empty() => Ok(query.trim()),
         _ => {
             bail!(
-                "join 模式下请用 --peer 指定要连接的设备（支持实例名、设备名、设备 ID 前缀或 IPv4 地址）"
+                "join 模式下请用 --peer 指定要连接的设备（支持实例名、设备名、设备 ID 前缀、IPv4 地址，或完整的 IPv4:端口 直连）"
             )
         }
     }
