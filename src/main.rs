@@ -21,7 +21,7 @@ async fn main() -> Result<()> {
     let options = cli::collect_runtime_options(cli, &config)?;
     println!();
     println!("{}", style("本次同步确认").bold());
-    for line in options.workspace.local_human_lines(options.sync_clipboard) {
+    for line in options.workspace.local_human_lines(options.clipboard_mode) {
         println!("{line}");
     }
     println!("音频同步: {}", options.audio_mode.label());

@@ -1,4 +1,4 @@
-use crate::cli::SyncMode;
+use crate::cli::{ClipboardMode, SyncMode};
 use anyhow::{Context, Result, bail};
 use filetime::{FileTime, set_file_mtime};
 use ignore::gitignore::Gitignore;
@@ -51,7 +51,7 @@ pub struct WorkspaceSummary {
     #[serde(default)]
     pub max_folder_depth: Option<usize>,
     #[serde(default)]
-    pub sync_clipboard: bool,
+    pub clipboard_mode: ClipboardMode,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -130,9 +130,9 @@ struct ScopedIgnoreMatcher {
 }
 
 impl WorkspaceSpec {
-    pub fn for_clipboard_only(mode: SyncMode) -> Self {
+    pub fn for_off() -> Self {
         Self {
-            mode,
+            mode: SyncMode::Off,
             outgoing: None,
             incoming_root: None,
         }
@@ -203,7 +203,7 @@ impl WorkspaceSpec {
         self
     }
 
-    pub fn summary(&self, sync_clipboard: bool) -> WorkspaceSummary {
+    pub fn summary(&self, clipboard_mode: ClipboardMode) -> WorkspaceSummary {
         let (send_description, send_layout, send_items, max_folder_depth) = match &self.outgoing {
             Some(OutgoingSpec::RootContents {
                 root,
@@ -236,7 +236,7 @@ impl WorkspaceSpec {
                 .as_ref()
                 .map(|path| path.display().to_string()),
             max_folder_depth,
-            sync_clipboard,
+            clipboard_mode,
         }
     }
 
@@ -252,11 +252,11 @@ impl WorkspaceSpec {
         self.can_send_files() || self.can_receive_files()
     }
 
-    pub fn local_human_lines(&self, sync_clipboard: bool) -> Vec<String> {
-        let mut lines = vec![format!("模式: {}", self.mode.label())];
+    pub fn local_human_lines(&self, clipboard_mode: ClipboardMode) -> Vec<String> {
+        let mut lines = vec![format!("文件同步模式: {}", self.mode.label())];
 
         if !self.file_sync_enabled() {
-            lines.push("文件同步: 关闭（仅剪贴板）".to_string());
+            lines.push("文件同步: 关闭".to_string());
         }
 
         match &self.outgoing {
@@ -286,10 +286,7 @@ impl WorkspaceSpec {
         if let Some(root) = &self.incoming_root {
             lines.push(format!("接收目录: {}", root.display()));
         }
-        lines.push(format!(
-            "剪贴板同步: {}",
-            if sync_clipboard { "开启" } else { "关闭" }
-        ));
+        lines.push(format!("剪贴板同步: {}", clipboard_mode.label()));
 
         lines
     }
@@ -309,10 +306,10 @@ impl WorkspaceSummary {
     }
 
     pub fn human_lines(&self) -> Vec<String> {
-        let mut lines = vec![format!("模式: {}", self.mode.label())];
+        let mut lines = vec![format!("文件同步模式: {}", self.mode.label())];
 
         if !self.file_sync_enabled() {
-            lines.push("文件同步: 关闭（仅剪贴板）".to_string());
+            lines.push("文件同步: 关闭".to_string());
         }
 
         if let Some(description) = &self.send_description {
@@ -327,14 +324,7 @@ impl WorkspaceSummary {
         if let Some(root) = &self.receive_root {
             lines.push(format!("接收目录: {}", root));
         }
-        lines.push(format!(
-            "剪贴板同步: {}",
-            if self.sync_clipboard {
-                "开启"
-            } else {
-                "关闭"
-            }
-        ));
+        lines.push(format!("剪贴板同步: {}", self.clipboard_mode.label()));
 
         lines
     }
@@ -1342,27 +1332,23 @@ mod tests {
     }
 
     #[test]
-    fn clipboard_only_workspace_reports_file_sync_disabled() {
-        let workspace = WorkspaceSpec::for_clipboard_only(SyncMode::Both);
+    fn file_off_workspace_reports_file_sync_disabled() {
+        let workspace = WorkspaceSpec::for_off();
 
         assert!(!workspace.file_sync_enabled());
         assert!(!workspace.can_send_files());
         assert!(!workspace.can_receive_files());
 
-        let lines = workspace.local_human_lines(true);
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("文件同步: 关闭（仅剪贴板）"))
-        );
+        let lines = workspace.local_human_lines(ClipboardMode::Both);
+        assert!(lines.iter().any(|line| line.contains("文件同步: 关闭")));
 
-        let summary = workspace.summary(true);
+        let summary = workspace.summary(ClipboardMode::Both);
         assert!(!summary.file_sync_enabled());
         let remote_lines = summary.human_lines();
         assert!(
             remote_lines
                 .iter()
-                .any(|line| line.contains("文件同步: 关闭（仅剪贴板）"))
+                .any(|line| line.contains("文件同步: 关闭"))
         );
     }
 

@@ -1,12 +1,12 @@
-use crate::config::{DeviceConfig, SynlyConfig};
+use crate::config::SynlyConfig;
 use crate::path_expand::expand_path_string;
 use crate::protocol::TransferLimits;
 use crate::sync::WorkspaceSpec;
-use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand, ValueEnum};
+use anyhow::{Result, bail};
+use clap::{Parser, ValueEnum};
 use console::{Term, style};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -15,119 +15,108 @@ use std::path::{Path, PathBuf};
     about = "在局域网中发现设备、通过 PIN 配对、建立安全连接并持续同步文件与可选剪贴板"
 )]
 pub struct Cli {
-    #[command(subcommand)]
-    pub command: Option<Command>,
     #[arg(
         long,
-        global = true,
         help = "禁止进入启动交互；如果启动参数不完整，则直接报错并列出缺失项"
     )]
     pub no_interact: bool,
-    #[arg(long, global = true, conflicts_with = "join")]
+    #[arg(
+        long = "fs",
+        value_enum,
+        help = "文件同步模式；默认 off，可选 off / send / receive / both / auto"
+    )]
+    pub fs: Option<SyncMode>,
+    #[arg(long, conflicts_with = "join")]
     pub host: bool,
-    #[arg(long, global = true, conflicts_with = "host")]
+    #[arg(long, conflicts_with = "host")]
     pub join: bool,
-    #[arg(long, global = true, conflicts_with = "no_sync_delete")]
+    #[arg(long, conflicts_with = "no_sync_delete")]
     pub sync_delete: bool,
-    #[arg(long, global = true, conflicts_with = "sync_delete")]
+    #[arg(long, conflicts_with = "sync_delete")]
     pub no_sync_delete: bool,
     #[arg(
         long,
-        global = true,
-        conflicts_with = "no_sync_clipboard",
-        help = "开启剪贴板同步；支持文本、富文本、图片和限制大小内的文件，只有双方都开启才会生效，方向跟随当前同步模式"
+        value_enum,
+        help = "剪贴板同步方向；默认关闭，可选 off / send / receive / both"
     )]
-    pub sync_clipboard: bool,
-    #[arg(long, global = true, conflicts_with = "sync_clipboard")]
-    pub no_sync_clipboard: bool,
+    pub clipboard: Option<ClipboardMode>,
     #[arg(
         long,
-        global = true,
-        conflicts_with = "no_sync_clipboard",
-        help = "仅同步剪贴板，不进行文件同步；会自动开启剪贴板同步"
-    )]
-    pub clipboard_only: bool,
-    #[arg(
-        long,
-        global = true,
         value_enum,
         help = "音频同步模式；默认关闭，可选 off / send / receive"
     )]
     pub audio: Option<AudioMode>,
     #[arg(
         long,
-        global = true,
         default_value_t = 3,
         help = "兜底全量重扫间隔（秒），目录变化仍会实时监听"
     )]
     pub interval_secs: u64,
     #[arg(
         long,
-        global = true,
         help = "发送目录时允许递归进入的最大文件夹深度；0 表示只发送共享根目录下的直接内容，默认不限制"
     )]
     pub max_folder_depth: Option<usize>,
     #[arg(
         long,
-        global = true,
         help = "join 模式下要连接的设备；可填写设备名、设备 ID 前缀或广播出的 IPv4 地址 (可带端口)"
     )]
     pub peer: Option<String>,
     #[arg(
         long,
-        global = true,
         value_parser = clap::value_parser!(u16).range(1..),
         help = "host 模式下固定监听端口；留空则每次自动分配"
     )]
     pub port: Option<u16>,
     #[arg(
         long,
-        global = true,
         help = "当前连接使用的 6 位 PIN；host 模式下会把它作为固定 PIN，join 模式下会直接使用它而不再询问"
     )]
     pub pin: Option<String>,
     #[arg(
         long,
-        global = true,
         help = "对未受信任设备在认证通过后自动接受本次同步，不再二次确认；可信设备默认自动接受"
     )]
     pub accept: bool,
     #[arg(
         long,
-        global = true,
         help = "在 PIN 认证成功后尽量建立可信设备绑定；host 端会直接记住对端，join 端会自动同意“是否信任服务端”的提示"
     )]
     pub trust_device: bool,
     #[arg(
         long,
-        global = true,
         help = "只允许使用已建立的可信设备公钥；若未被信任则直接失败，不回退到 PIN"
     )]
     pub trusted_only: bool,
-    #[arg(
-        long,
-        global = true,
-        default_value_t = 3,
-        help = "join 模式搜索设备时等待的秒数"
-    )]
+    #[arg(long, default_value_t = 3, help = "join 模式搜索设备时等待的秒数")]
     pub discovery_secs: u64,
-}
-
-#[derive(Subcommand, Debug)]
-pub enum Command {
-    Send { paths: Vec<PathBuf> },
-    Receive { path: Option<PathBuf> },
-    Both { path: Option<PathBuf> },
-    Auto { path: Option<PathBuf> },
+    #[arg(
+        value_name = "PATH",
+        help = "文件同步路径；send 可传多个路径，receive / both / auto 只能传一个目录，off 不需要"
+    )]
+    pub paths: Vec<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, ValueEnum, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum SyncMode {
+    Off,
     Send,
     Receive,
     Both,
     Auto,
+}
+
+#[derive(
+    Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, ValueEnum, PartialOrd, Ord, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ClipboardMode {
+    #[default]
+    Off,
+    Send,
+    Receive,
+    Both,
 }
 
 #[derive(
@@ -144,9 +133,9 @@ pub enum AudioMode {
 impl AudioMode {
     pub fn label(self) -> &'static str {
         match self {
-            AudioMode::Off => "不启用音频",
-            AudioMode::Send => "音频发送方",
-            AudioMode::Receive => "音频接收方",
+            AudioMode::Off => "关闭",
+            AudioMode::Send => "发送",
+            AudioMode::Receive => "接收",
         }
     }
 }
@@ -162,6 +151,7 @@ impl SyncMode {
 
     pub fn label(self) -> &'static str {
         match self {
+            SyncMode::Off => "关闭文件同步",
             SyncMode::Send => "发送方",
             SyncMode::Receive => "接收方",
             SyncMode::Both => "双向同步",
@@ -171,6 +161,7 @@ impl SyncMode {
 
     pub fn as_wire(self) -> &'static str {
         match self {
+            SyncMode::Off => "off",
             SyncMode::Send => "send",
             SyncMode::Receive => "receive",
             SyncMode::Both => "both",
@@ -180,11 +171,31 @@ impl SyncMode {
 
     pub fn from_wire(value: &str) -> Option<Self> {
         match value {
+            "off" => Some(Self::Off),
             "send" => Some(Self::Send),
             "receive" => Some(Self::Receive),
             "both" => Some(Self::Both),
             "auto" => Some(Self::Auto),
             _ => None,
+        }
+    }
+}
+
+impl ClipboardMode {
+    pub fn can_send(self) -> bool {
+        matches!(self, ClipboardMode::Send | ClipboardMode::Both)
+    }
+
+    pub fn can_receive(self) -> bool {
+        matches!(self, ClipboardMode::Receive | ClipboardMode::Both)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            ClipboardMode::Off => "关闭",
+            ClipboardMode::Send => "发送方",
+            ClipboardMode::Receive => "接收方",
+            ClipboardMode::Both => "双向同步",
         }
     }
 }
@@ -201,7 +212,7 @@ pub struct RuntimeOptions {
     pub connection: ConnectionPreference,
     pub workspace: WorkspaceSpec,
     pub sync_delete: bool,
-    pub sync_clipboard: bool,
+    pub clipboard_mode: ClipboardMode,
     pub audio_mode: AudioMode,
     pub clipboard: ClipboardRuntimeOptions,
     pub transfer_limits: TransferLimits,
@@ -218,6 +229,7 @@ pub struct ClipboardRuntimeOptions {
 
 #[derive(Clone, Debug)]
 pub struct PairingRuntimeOptions {
+    pub no_interact: bool,
     pub peer_query: Option<String>,
     pub port: Option<u16>,
     pub pin: Option<String>,
@@ -242,7 +254,6 @@ pub fn collect_runtime_options(cli: Cli, config: &SynlyConfig) -> Result<Runtime
 }
 
 fn collect_runtime_options_from_cli(cli: Cli, config: &SynlyConfig) -> Result<RuntimeOptions> {
-    let device = &config.device;
     let sync_delete_override = if cli.sync_delete {
         Some(true)
     } else if cli.no_sync_delete {
@@ -250,62 +261,24 @@ fn collect_runtime_options_from_cli(cli: Cli, config: &SynlyConfig) -> Result<Ru
     } else {
         None
     };
-    let sync_clipboard_override = if cli.sync_clipboard {
-        Some(true)
-    } else if cli.no_sync_clipboard {
-        Some(false)
-    } else {
-        None
+
+    let connection = match (cli.host, cli.join) {
+        (true, false) => ConnectionPreference::Host,
+        (false, true) => ConnectionPreference::Join,
+        _ => bail!("missing connection preference"),
     };
 
-    let connection = if cli.host {
-        ConnectionPreference::Host
-    } else if cli.join {
-        ConnectionPreference::Join
-    } else {
-        choose_connection()?
-    };
+    let mode = cli.fs.unwrap_or(SyncMode::Off);
+    let workspace = workspace_from_cli_paths(mode, cli.paths)?;
 
-    let clipboard_only = if cli.clipboard_only {
-        true
-    } else if cli.command.is_none() {
-        choose_clipboard_only()?
+    let workspace = workspace.with_max_folder_depth(cli.max_folder_depth);
+    let sync_delete = if workspace.incoming_root.is_some() {
+        sync_delete_override.unwrap_or(false)
     } else {
         false
     };
-
-    let mode = match &cli.command {
-        Some(Command::Send { .. }) => SyncMode::Send,
-        Some(Command::Receive { .. }) => SyncMode::Receive,
-        Some(Command::Both { .. }) => SyncMode::Both,
-        Some(Command::Auto { .. }) => SyncMode::Auto,
-        None => choose_mode(device, connection, clipboard_only)?,
-    };
-
-    let workspace = if clipboard_only {
-        WorkspaceSpec::for_clipboard_only(mode)
-    } else {
-        match cli.command {
-            Some(Command::Send { paths }) => WorkspaceSpec::for_send(paths)?,
-            Some(Command::Receive { path }) => {
-                let destination = resolve_receive_path(path)?;
-                WorkspaceSpec::for_receive(destination)?
-            }
-            Some(Command::Both { path }) => {
-                let root = resolve_both_path(path)?;
-                WorkspaceSpec::for_both(root)?
-            }
-            Some(Command::Auto { path }) => {
-                let root = resolve_auto_path(path)?;
-                WorkspaceSpec::for_auto(root)?
-            }
-            None => interactive_workspace(mode)?,
-        }
-    }
-    .with_max_folder_depth(cli.max_folder_depth);
-    let sync_delete = resolve_sync_delete(sync_delete_override, &workspace)?;
-    let sync_clipboard = resolve_sync_clipboard(sync_clipboard_override, clipboard_only)?;
     let pin = cli.pin.as_deref().map(normalize_pin).transpose()?;
+    let clipboard_mode = cli.clipboard.unwrap_or(ClipboardMode::Off);
     let audio_mode = cli.audio.unwrap_or(AudioMode::Off);
 
     Ok(RuntimeOptions {
@@ -313,7 +286,7 @@ fn collect_runtime_options_from_cli(cli: Cli, config: &SynlyConfig) -> Result<Ru
         connection,
         workspace,
         sync_delete,
-        sync_clipboard,
+        clipboard_mode,
         audio_mode,
         clipboard: ClipboardRuntimeOptions {
             max_file_bytes: config.clipboard.max_file_bytes,
@@ -323,6 +296,7 @@ fn collect_runtime_options_from_cli(cli: Cli, config: &SynlyConfig) -> Result<Ru
         transfer_limits: config.transfer.to_limits()?,
         interval_secs: cli.interval_secs.max(1),
         pairing: PairingRuntimeOptions {
+            no_interact: cli.no_interact,
             peer_query: cli.peer.map(|value| value.trim().to_string()),
             port: cli.port,
             pin,
@@ -341,43 +315,26 @@ fn missing_startup_requirements(cli: &Cli) -> Vec<String> {
         missing.push("缺少连接方式：请传 `--host` 或 `--join`".to_string());
     }
 
-    if cli.command.is_none() {
-        missing.push("缺少同步模式：请传子命令 `send`、`receive`、`both` 或 `auto`".to_string());
-    }
-
-    if !sync_clipboard_is_explicit(cli) {
+    if cli.no_interact && cli.join && cli.peer.as_deref().unwrap_or("").trim().is_empty() {
         missing.push(
-            "缺少剪贴板同步策略：请传 `--sync-clipboard`、`--no-sync-clipboard`，或使用 `--clipboard-only`"
-                .to_string(),
+            "缺少目标设备：`--no-interact` + `--join` 时请传 `--peer` 指定目标设备".to_string(),
         );
     }
 
-    if cli.clipboard_only {
-        return missing;
-    }
-
-    match &cli.command {
-        Some(Command::Send { paths }) if paths.is_empty() => {
-            missing.push("缺少发送路径：请在 `send` 后至少提供一个路径".to_string());
+    match cli.fs {
+        Some(SyncMode::Send) if cli.paths.is_empty() => {
+            missing.push("缺少发送路径：请在 `--fs send` 后至少提供一个路径".to_string());
         }
-        Some(Command::Receive { path }) if path.is_none() => {
-            missing.push("缺少接收目录：请在 `receive` 后提供目录路径".to_string());
+        Some(SyncMode::Receive) if cli.paths.is_empty() => {
+            missing.push("缺少接收目录：请在 `--fs receive` 时提供目录路径".to_string());
         }
-        Some(Command::Both { path }) if path.is_none() => {
-            missing.push("缺少双向同步目录：请在 `both` 后提供目录路径".to_string());
+        Some(SyncMode::Both) if cli.paths.is_empty() => {
+            missing.push("缺少双向同步目录：请在 `--fs both` 时提供目录路径".to_string());
         }
-        Some(Command::Auto { path }) if path.is_none() => {
-            missing.push("缺少共享目录：请在 `auto` 后提供目录路径".to_string());
+        Some(SyncMode::Auto) if cli.paths.is_empty() => {
+            missing.push("缺少共享目录：请在 `--fs auto` 时提供目录路径".to_string());
         }
         _ => {}
-    }
-
-    if matches!(
-        cli.command,
-        Some(Command::Receive { .. } | Command::Both { .. } | Command::Auto { .. })
-    ) && !sync_delete_is_explicit(cli)
-    {
-        missing.push("缺少删除同步策略：请传 `--sync-delete` 或 `--no-sync-delete`".to_string());
     }
 
     missing
@@ -393,20 +350,12 @@ fn format_missing_startup_requirements(missing: &[String]) -> String {
     message
 }
 
-fn sync_delete_is_explicit(cli: &Cli) -> bool {
-    cli.sync_delete || cli.no_sync_delete
-}
-
-fn sync_clipboard_is_explicit(cli: &Cli) -> bool {
-    cli.clipboard_only || cli.sync_clipboard || cli.no_sync_clipboard
-}
-
 pub fn sync_delete_label(enabled: bool) -> &'static str {
     if enabled { "开启" } else { "关闭" }
 }
 
-pub fn sync_clipboard_label(enabled: bool) -> &'static str {
-    if enabled { "开启" } else { "关闭" }
+pub fn clipboard_mode_label(mode: ClipboardMode) -> &'static str {
+    mode.label()
 }
 
 pub fn prompt_select(
@@ -513,9 +462,14 @@ pub fn require_peer_query(peer_query: Option<&str>) -> Result<&str> {
     }
 }
 
-pub fn resolve_pairing_pin(pin: Option<&str>, prompt: &str) -> Result<String> {
+pub fn resolve_pairing_pin(pin: Option<&str>, no_interact: bool, prompt: &str) -> Result<String> {
     match pin {
         Some(pin) => normalize_pin(pin),
+        None if no_interact => {
+            bail!(
+                "当前使用 `--no-interact`，请通过 `--pin` 提供 6 位 PIN，或先建立可信设备后再连接"
+            )
+        }
         None => prompt_secret(prompt),
     }
 }
@@ -567,245 +521,38 @@ pub fn prompt_confirm(label: &str, default: bool) -> Result<bool> {
     }
 }
 
-fn resolve_sync_delete(
-    sync_delete_override: Option<bool>,
-    workspace: &WorkspaceSpec,
-) -> Result<bool> {
-    if workspace.incoming_root.is_none() {
-        return Ok(false);
-    }
-
-    if let Some(sync_delete) = sync_delete_override {
-        return Ok(sync_delete);
-    }
-
-    prompt_confirm("同步删除吗", false)
-}
-
-fn resolve_sync_clipboard(
-    sync_clipboard_override: Option<bool>,
-    clipboard_only: bool,
-) -> Result<bool> {
-    if clipboard_only {
-        return Ok(true);
-    }
-
-    if let Some(sync_clipboard) = sync_clipboard_override {
-        return Ok(sync_clipboard);
-    }
-
-    prompt_confirm(
-        "同步剪贴板吗（支持文本/富文本/图片/文件，双方都开启才会生效）",
-        false,
-    )
-}
-
-fn choose_mode(
-    device: &DeviceConfig,
-    connection: ConnectionPreference,
-    clipboard_only: bool,
-) -> Result<SyncMode> {
-    let options = match (connection, clipboard_only) {
-        (ConnectionPreference::Host, false) => vec![
-            "自动协商: 监听时根据客户端请求决定方向，使用同一个目录收发 (Recommended)".to_string(),
-            "发送方: 把本地文件同步给对方".to_string(),
-            "接收方: 接收对方同步过来的文件".to_string(),
-            "双向同步: 两边都能发送和接收".to_string(),
-        ],
-        (ConnectionPreference::Join, false) => vec![
-            "发送方: 把本地文件同步给对方".to_string(),
-            "接收方: 接收对方同步过来的文件".to_string(),
-            "双向同步: 两边都能发送和接收".to_string(),
-            "自动协商: 使用同一个目录收发，并尽量根据对端能力协商".to_string(),
-        ],
-        (ConnectionPreference::Host, true) => vec![
-            "自动协商: 监听时根据客户端请求决定剪贴板方向，不同步文件 (Recommended)".to_string(),
-            "发送方: 把本机剪贴板同步给对方".to_string(),
-            "接收方: 只接收对方剪贴板".to_string(),
-            "双向同步: 两边都能发送和接收剪贴板".to_string(),
-        ],
-        (ConnectionPreference::Join, true) => vec![
-            "发送方: 把本机剪贴板同步给对方".to_string(),
-            "接收方: 只接收对方剪贴板".to_string(),
-            "双向同步: 两边都能发送和接收剪贴板".to_string(),
-            "自动协商: 不同步文件，只协商剪贴板方向".to_string(),
-        ],
-    };
-    println!(
-        "{} {} ({})",
-        style("设备").bold(),
-        device.device_name,
-        device.short_id()
-    );
-    let default_index = match connection {
-        ConnectionPreference::Host => Some(0),
-        ConnectionPreference::Join => Some(3),
-    };
-    let index = prompt_select("同步模式", &options, default_index)?;
-    Ok(match connection {
-        ConnectionPreference::Host => match index {
-            0 => SyncMode::Auto,
-            1 => SyncMode::Send,
-            2 => SyncMode::Receive,
-            _ => SyncMode::Both,
-        },
-        ConnectionPreference::Join => match index {
-            0 => SyncMode::Send,
-            1 => SyncMode::Receive,
-            2 => SyncMode::Both,
-            _ => SyncMode::Auto,
-        },
-    })
-}
-
-fn choose_clipboard_only() -> Result<bool> {
-    prompt_confirm("仅同步剪贴板，不同步文件吗", false)
-}
-
-fn choose_connection() -> Result<ConnectionPreference> {
-    let options = vec![
-        "等待别人连接，收到请求后显示本次 PIN".to_string(),
-        "连接局域网中的设备，收到提示后输入对方当前显示的 PIN".to_string(),
-    ];
-    let index = prompt_select("连接方式", &options, Some(0))?;
-    Ok(match index {
-        0 => ConnectionPreference::Host,
-        _ => ConnectionPreference::Join,
-    })
-}
-
-fn interactive_workspace(mode: SyncMode) -> Result<WorkspaceSpec> {
-    match mode {
-        SyncMode::Send => {
-            let paths = resolve_send_paths(None)?;
-            WorkspaceSpec::for_send(paths)
-        }
-        SyncMode::Receive => {
-            let path = resolve_receive_path(None)?;
-            WorkspaceSpec::for_receive(path)
-        }
-        SyncMode::Both => {
-            let path = resolve_both_path(None)?;
-            WorkspaceSpec::for_both(path)
-        }
-        SyncMode::Auto => {
-            let path = resolve_auto_path(None)?;
-            WorkspaceSpec::for_auto(path)
-        }
-    }
-}
-
-fn resolve_send_paths(initial: Option<Vec<PathBuf>>) -> Result<Vec<PathBuf>> {
-    if let Some(paths) = initial
-        && !paths.is_empty()
-    {
-        return expand_path_list(paths);
-    }
-
-    let cwd = std::env::current_dir().context("failed to determine current directory")?;
-    let term = Term::stdout();
-    loop {
-        term.write_line("未指定同步源。")?;
-        term.write_line(&format!("回车使用当前目录: {}", cwd.display()))?;
-        term.write_line("多个路径用英文逗号分隔。")?;
-        let raw = prompt_input("路径", None)?;
-        if raw.trim().is_empty() {
-            return Ok(vec![cwd.clone()]);
-        }
-        match parse_csv_paths(&raw) {
-            Ok(paths) => return Ok(paths),
-            Err(err) => term.write_line(&format!("输入无效，请重新输入: {err:#}"))?,
-        }
-    }
-}
-
-fn resolve_receive_path(initial: Option<PathBuf>) -> Result<PathBuf> {
-    let cwd = std::env::current_dir().context("failed to determine current directory")?;
-    resolve_directory_path(initial, "未指定接收目录。", &cwd)
-}
-
-fn resolve_both_path(initial: Option<PathBuf>) -> Result<PathBuf> {
-    let cwd = std::env::current_dir().context("failed to determine current directory")?;
-    resolve_directory_path(initial, "未指定双向同步目录。", &cwd)
-}
-
-fn resolve_auto_path(initial: Option<PathBuf>) -> Result<PathBuf> {
-    let cwd = std::env::current_dir().context("failed to determine current directory")?;
-    resolve_directory_path(initial, "未指定共享目录。", &cwd)
-}
-
-fn resolve_directory_path(
-    initial: Option<PathBuf>,
-    prompt: &str,
-    default_path: &Path,
-) -> Result<PathBuf> {
-    let term = Term::stdout();
-    let mut next_candidate = initial;
-
-    loop {
-        let path = if let Some(candidate) = next_candidate.take() {
-            match expand_pathbuf(candidate) {
-                Ok(path) => path,
-                Err(err) => {
-                    term.write_line(&format!("路径无效，请重新输入: {err:#}"))?;
-                    continue;
-                }
-            }
-        } else {
-            term.write_line(prompt)?;
-            term.write_line(&format!("回车使用当前目录: {}", default_path.display()))?;
-            let raw = prompt_input("目录", None)?;
-            if raw.trim().is_empty() {
-                default_path.to_path_buf()
-            } else {
-                match expand_path_string(&raw) {
-                    Ok(path) => path,
-                    Err(err) => {
-                        term.write_line(&format!("路径无效，请重新输入: {err:#}"))?;
-                        continue;
-                    }
-                }
-            }
-        };
-
-        if path.exists() {
-            match std::fs::metadata(&path) {
-                Ok(metadata) if metadata.is_dir() => return Ok(path),
-                Ok(_) => {
-                    term.write_line("该路径存在，但不是目录，请重新输入。")?;
-                }
-                Err(err) => {
-                    term.write_line(&format!("无法访问该路径，请重新输入: {err:#}"))?;
-                }
-            }
-            continue;
-        }
-
-        term.write_line(&format!("目录不存在: {}", path.display()))?;
-        if prompt_confirm("创建该目录吗", true)? {
-            return Ok(path);
-        }
-
-        term.write_line("请重新输入目录。")?;
-    }
-}
-
-fn parse_csv_paths(raw: &str) -> Result<Vec<PathBuf>> {
-    let mut paths = Vec::new();
-    for piece in raw.split(',') {
-        let trimmed = piece.trim();
-        if !trimmed.is_empty() {
-            paths.push(expand_path_string(trimmed)?);
-        }
-    }
-    if paths.is_empty() {
-        bail!("至少需要提供一个路径");
-    }
-    Ok(paths)
-}
-
 fn expand_path_list(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
     paths.into_iter().map(expand_pathbuf).collect()
+}
+
+fn workspace_from_cli_paths(mode: SyncMode, paths: Vec<PathBuf>) -> Result<WorkspaceSpec> {
+    match mode {
+        SyncMode::Off => {
+            if !paths.is_empty() {
+                bail!("`--fs off` 不接受路径参数");
+            }
+            Ok(WorkspaceSpec::for_off())
+        }
+        SyncMode::Send => {
+            if paths.is_empty() {
+                bail!("`--fs send` 至少需要 1 个路径");
+            }
+            Ok(WorkspaceSpec::for_send(expand_path_list(paths)?)?)
+        }
+        SyncMode::Receive => Ok(WorkspaceSpec::for_receive(expand_single_path(
+            paths, "receive",
+        )?)?),
+        SyncMode::Both => Ok(WorkspaceSpec::for_both(expand_single_path(paths, "both")?)?),
+        SyncMode::Auto => Ok(WorkspaceSpec::for_auto(expand_single_path(paths, "auto")?)?),
+    }
+}
+
+fn expand_single_path(paths: Vec<PathBuf>, mode_name: &str) -> Result<PathBuf> {
+    match paths.len() {
+        0 => bail!("`--fs {mode_name}` 需要 1 个目录路径"),
+        1 => expand_pathbuf(paths.into_iter().next().expect("path length checked")),
+        _ => bail!("`--fs {mode_name}` 只能提供 1 个目录路径"),
+    }
 }
 
 fn expand_pathbuf(path: PathBuf) -> Result<PathBuf> {
@@ -815,34 +562,38 @@ fn expand_pathbuf(path: PathBuf) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ClipboardConfig, TransferConfig};
+    use crate::config::{ClipboardConfig, DeviceConfig, TransferConfig};
     use clap::Parser;
     use uuid::Uuid;
 
     #[test]
-    fn global_flags_parse_before_and_after_subcommand() {
+    fn global_flags_parse_before_and_after_paths() {
         let before = Cli::try_parse_from([
             "synly",
             "--join",
             "--no-sync-delete",
-            "--sync-clipboard",
+            "--fs",
+            "receive",
+            "--clipboard",
+            "both",
             "--port",
             "7070",
             "--interval-secs",
             "9",
             "--max-folder-depth",
             "2",
-            "receive",
             ".",
         ])
         .unwrap();
         let after = Cli::try_parse_from([
             "synly",
-            "receive",
             ".",
             "--join",
             "--no-sync-delete",
-            "--sync-clipboard",
+            "--fs",
+            "receive",
+            "--clipboard",
+            "both",
             "--port",
             "7070",
             "--interval-secs",
@@ -857,24 +608,26 @@ mod tests {
     }
 
     #[test]
-    fn conflicting_global_flags_still_conflict_after_subcommand() {
-        let result = Cli::try_parse_from(["synly", "receive", ".", "--host", "--join"]);
+    fn conflicting_connection_flags_still_conflict() {
+        let result = Cli::try_parse_from(["synly", "--fs", "receive", ".", "--host", "--join"]);
         assert!(result.is_err());
     }
 
     #[test]
-    fn collect_runtime_options_uses_subcommand_scoped_global_flags() {
+    fn collect_runtime_options_uses_fs_flag_and_paths() {
         let cli = Cli::try_parse_from([
             "synly",
-            "receive",
-            ".",
             "--join",
+            "--fs",
+            "receive",
             "--no-sync-delete",
-            "--no-sync-clipboard",
+            "--clipboard",
+            "off",
             "--interval-secs",
             "9",
             "--max-folder-depth",
             "4",
+            ".",
         ])
         .unwrap();
 
@@ -883,9 +636,15 @@ mod tests {
         assert!(matches!(options.connection, ConnectionPreference::Join));
         assert_eq!(options.mode, SyncMode::Receive);
         assert!(!options.sync_delete);
-        assert!(!options.sync_clipboard);
+        assert_eq!(options.clipboard_mode, ClipboardMode::Off);
         assert_eq!(options.interval_secs, 9);
-        assert_eq!(options.workspace.summary(false).max_folder_depth, None);
+        assert_eq!(
+            options
+                .workspace
+                .summary(ClipboardMode::Off)
+                .max_folder_depth,
+            None
+        );
         assert!(options.workspace.incoming_root.is_some());
     }
 
@@ -893,28 +652,36 @@ mod tests {
     fn collect_runtime_options_applies_max_folder_depth_to_outgoing_workspace() {
         let cli = Cli::try_parse_from([
             "synly",
-            "both",
-            ".",
             "--join",
+            "--fs",
+            "both",
             "--no-sync-delete",
-            "--no-sync-clipboard",
+            "--clipboard",
+            "send",
             "--max-folder-depth",
             "4",
+            ".",
         ])
         .unwrap();
 
         let options = collect_runtime_options(cli, &test_config()).unwrap();
 
-        assert_eq!(options.workspace.summary(false).max_folder_depth, Some(4));
+        assert_eq!(
+            options
+                .workspace
+                .summary(ClipboardMode::Send)
+                .max_folder_depth,
+            Some(4)
+        );
     }
 
     #[test]
     fn collect_runtime_options_captures_pairing_flags() {
         let cli = Cli::try_parse_from([
             "synly",
-            "both",
-            ".",
             "--join",
+            "--fs",
+            "both",
             "--peer",
             "demo-device",
             "--port",
@@ -922,12 +689,14 @@ mod tests {
             "--pin",
             "123456",
             "--no-sync-delete",
-            "--no-sync-clipboard",
+            "--clipboard",
+            "receive",
             "--accept",
             "--trust-device",
             "--trusted-only",
             "--discovery-secs",
             "7",
+            ".",
         ])
         .unwrap();
 
@@ -947,25 +716,26 @@ mod tests {
     fn collect_runtime_options_defaults_audio_mode_off_and_accepts_explicit_audio_role() {
         let default_cli = Cli::try_parse_from([
             "synly",
+            "--fs",
             "receive",
             ".",
             "--join",
             "--no-sync-delete",
-            "--no-sync-clipboard",
         ])
         .unwrap();
         let default_options = collect_runtime_options(default_cli, &test_config()).unwrap();
         assert_eq!(default_options.audio_mode, AudioMode::Off);
+        assert_eq!(default_options.clipboard_mode, ClipboardMode::Off);
 
         let explicit_cli = Cli::try_parse_from([
             "synly",
-            "receive",
-            ".",
             "--join",
+            "--fs",
+            "receive",
             "--no-sync-delete",
-            "--no-sync-clipboard",
             "--audio",
             "receive",
+            ".",
         ])
         .unwrap();
         let explicit_options = collect_runtime_options(explicit_cli, &test_config()).unwrap();
@@ -981,24 +751,13 @@ mod tests {
 
     #[test]
     fn requires_startup_tui_when_connection_or_path_is_missing() {
-        let missing_connection = Cli::try_parse_from([
-            "synly",
-            "both",
-            ".",
-            "--no-sync-delete",
-            "--no-sync-clipboard",
-        ])
-        .unwrap();
+        let missing_connection =
+            Cli::try_parse_from(["synly", "--fs", "both", ".", "--no-sync-delete"]).unwrap();
         assert!(!missing_startup_requirements(&missing_connection).is_empty());
 
-        let missing_path = Cli::try_parse_from([
-            "synly",
-            "receive",
-            "--host",
-            "--no-sync-delete",
-            "--no-sync-clipboard",
-        ])
-        .unwrap();
+        let missing_path =
+            Cli::try_parse_from(["synly", "--fs", "receive", "--host", "--no-sync-delete"])
+                .unwrap();
         assert!(!missing_startup_requirements(&missing_path).is_empty());
     }
 
@@ -1006,10 +765,10 @@ mod tests {
     fn does_not_require_startup_tui_for_complete_noninteractive_cli() {
         let cli = Cli::try_parse_from([
             "synly",
+            "--fs",
             "send",
             ".",
             "--join",
-            "--no-sync-clipboard",
             "--peer",
             "demo-device",
         ])
@@ -1019,20 +778,32 @@ mod tests {
     }
 
     #[test]
-    fn clipboard_only_send_without_path_does_not_require_startup_tui() {
-        let cli = Cli::try_parse_from(["synly", "send", "--host", "--clipboard-only"]).unwrap();
+    fn file_off_mode_without_path_does_not_require_startup_tui() {
+        let cli =
+            Cli::try_parse_from(["synly", "--fs", "off", "--host", "--clipboard", "both"]).unwrap();
 
         assert!(missing_startup_requirements(&cli).is_empty());
         let options = collect_runtime_options(cli, &test_config()).unwrap();
         assert!(matches!(options.connection, ConnectionPreference::Host));
-        assert_eq!(options.mode, SyncMode::Send);
-        assert!(options.sync_clipboard);
+        assert_eq!(options.mode, SyncMode::Off);
+        assert_eq!(options.clipboard_mode, ClipboardMode::Both);
+        assert!(!options.workspace.file_sync_enabled());
+    }
+
+    #[test]
+    fn omitted_fs_defaults_to_off() {
+        let cli = Cli::try_parse_from(["synly", "--host", "--clipboard", "both"]).unwrap();
+
+        assert!(missing_startup_requirements(&cli).is_empty());
+        let options = collect_runtime_options(cli, &test_config()).unwrap();
+        assert_eq!(options.mode, SyncMode::Off);
+        assert_eq!(options.clipboard_mode, ClipboardMode::Both);
         assert!(!options.workspace.file_sync_enabled());
     }
 
     #[test]
     fn no_interact_reports_missing_startup_requirements() {
-        let cli = Cli::try_parse_from(["synly", "receive", "--no-interact"]).unwrap();
+        let cli = Cli::try_parse_from(["synly", "--fs", "receive", "--no-interact"]).unwrap();
 
         let err = collect_runtime_options(cli, &test_config())
             .unwrap_err()
@@ -1040,18 +811,48 @@ mod tests {
 
         assert!(err.contains("已禁止进入启动交互"));
         assert!(err.contains("`--host` 或 `--join`"));
-        assert!(err.contains("`--sync-clipboard`、`--no-sync-clipboard`"));
-        assert!(err.contains("`receive` 后提供目录路径"));
-        assert!(err.contains("`--sync-delete` 或 `--no-sync-delete`"));
+        assert!(err.contains("`--fs receive`"));
+    }
+
+    #[test]
+    fn no_interact_join_requires_peer() {
+        let cli =
+            Cli::try_parse_from(["synly", "--fs", "send", ".", "--join", "--no-interact"]).unwrap();
+
+        let err = collect_runtime_options(cli, &test_config())
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("`--peer`"));
     }
 
     #[test]
     fn fixed_port_must_be_positive() {
-        let err = Cli::try_parse_from(["synly", "--port", "0", "send", ".", "--host"])
+        let err = Cli::try_parse_from(["synly", "--port", "0", "--fs", "send", ".", "--host"])
             .unwrap_err()
             .to_string();
 
         assert!(err.contains("1.."));
+    }
+
+    #[test]
+    fn receive_mode_rejects_multiple_paths() {
+        let cli =
+            Cli::try_parse_from(["synly", "--fs", "receive", "--join", ".", "./other"]).unwrap();
+
+        let err = collect_runtime_options(cli, &test_config())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("只能提供 1 个目录路径"));
+    }
+
+    #[test]
+    fn resolve_pairing_pin_requires_explicit_pin_in_no_interact() {
+        let err = resolve_pairing_pin(None, true, "unused")
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("`--pin`"));
     }
 
     fn assert_global_receive_cli(cli: Cli) {
@@ -1059,17 +860,12 @@ mod tests {
         assert!(!cli.host);
         assert!(cli.no_sync_delete);
         assert!(!cli.sync_delete);
-        assert!(cli.sync_clipboard);
-        assert!(!cli.no_sync_clipboard);
+        assert_eq!(cli.fs, Some(SyncMode::Receive));
+        assert_eq!(cli.clipboard, Some(ClipboardMode::Both));
         assert_eq!(cli.port, Some(7070));
         assert_eq!(cli.interval_secs, 9);
         assert_eq!(cli.max_folder_depth, Some(2));
-        match cli.command {
-            Some(Command::Receive { path }) => {
-                assert_eq!(path, Some(std::path::PathBuf::from(".")));
-            }
-            other => panic!("expected receive command, got {other:?}"),
-        }
+        assert_eq!(cli.paths, vec![std::path::PathBuf::from(".")]);
     }
 
     fn test_config() -> SynlyConfig {

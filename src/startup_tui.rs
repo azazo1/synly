@@ -1,8 +1,8 @@
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::single_match)]
 use crate::cli::{
-    AudioMode, Cli, ClipboardRuntimeOptions, Command, ConnectionPreference, PairingRuntimeOptions,
-    RuntimeOptions, SyncMode, normalize_pin,
+    AudioMode, Cli, ClipboardMode, ClipboardRuntimeOptions, ConnectionPreference,
+    PairingRuntimeOptions, RuntimeOptions, SyncMode, normalize_pin,
 };
 use crate::config::SynlyConfig;
 use crate::path_expand::expand_path_string;
@@ -84,9 +84,8 @@ struct StartupApp {
 struct FlowDraft {
     connection: ConnectionPreference,
     mode: SyncMode,
-    clipboard_only: bool,
     sync_delete: bool,
-    sync_clipboard: bool,
+    clipboard_mode: ClipboardMode,
     audio_mode: AudioMode,
 }
 
@@ -145,9 +144,8 @@ impl StartupTab {
 enum FieldId {
     Connection,
     Mode,
-    ClipboardOnly,
     SyncDelete,
-    SyncClipboard,
+    ClipboardMode,
     AudioMode,
     WorkspacePath,
     MaxFolderDepth,
@@ -229,43 +227,32 @@ impl StartupApp {
             ConnectionPreference::Host
         };
 
-        let mode = match &cli.command {
-            Some(Command::Send { .. }) => SyncMode::Send,
-            Some(Command::Receive { .. }) => SyncMode::Receive,
-            Some(Command::Both { .. }) => SyncMode::Both,
-            Some(Command::Auto { .. }) => SyncMode::Auto,
-            None => SyncMode::Auto,
-        };
+        let mode = cli.fs.unwrap_or(SyncMode::Off);
 
-        let workspace_value = match cli.command {
-            Some(Command::Send { paths }) => paths
+        let workspace_value = if mode == SyncMode::Off {
+            String::new()
+        } else {
+            cli.paths
                 .iter()
                 .map(|path| path.display().to_string())
                 .collect::<Vec<_>>()
-                .join(", "),
-            Some(Command::Receive { path })
-            | Some(Command::Both { path })
-            | Some(Command::Auto { path }) => path
-                .map(|value| value.display().to_string())
-                .unwrap_or_default(),
-            None => String::new(),
+                .join(", ")
         };
 
-        let initial_tab = if !cli.clipboard_only && workspace_value.trim().is_empty() {
+        let initial_tab = if mode != SyncMode::Off && workspace_value.trim().is_empty() {
             StartupTab::Workspace
         } else {
             StartupTab::Flow
         };
-        let workspace_missing = !cli.clipboard_only && workspace_value.trim().is_empty();
+        let workspace_missing = mode != SyncMode::Off && workspace_value.trim().is_empty();
 
         let mut app = Self {
             context,
             flow: FlowDraft {
                 connection,
                 mode,
-                clipboard_only: cli.clipboard_only,
                 sync_delete: cli.sync_delete,
-                sync_clipboard: cli.sync_clipboard,
+                clipboard_mode: cli.clipboard.unwrap_or(ClipboardMode::Off),
                 audio_mode: cli.audio.unwrap_or(AudioMode::Off),
             },
             workspace: WorkspaceDraft {
@@ -497,20 +484,7 @@ impl StartupApp {
                     KeyCode::Left | KeyCode::Right | KeyCode::Enter | KeyCode::Char(' ')
                 ) {
                     self.flow.mode = cycle_mode(self.flow.mode, matches!(key.code, KeyCode::Left));
-                    self.push_log(format!("同步模式已切换为{}。", self.flow.mode.label()));
-                    self.clamp_focus_current_tab();
-                }
-            }
-            FieldId::ClipboardOnly => {
-                if matches!(
-                    key.code,
-                    KeyCode::Left | KeyCode::Right | KeyCode::Enter | KeyCode::Char(' ')
-                ) {
-                    self.flow.clipboard_only = !self.flow.clipboard_only;
-                    self.push_log(format!(
-                        "仅剪贴板模式已{}。",
-                        enabled_label(self.flow.clipboard_only)
-                    ));
+                    self.push_log(format!("文件同步模式已切换为{}。", self.flow.mode.label()));
                     self.clamp_focus_current_tab();
                 }
             }
@@ -526,15 +500,18 @@ impl StartupApp {
                     ));
                 }
             }
-            FieldId::SyncClipboard => {
+            FieldId::ClipboardMode => {
                 if matches!(
                     key.code,
                     KeyCode::Left | KeyCode::Right | KeyCode::Enter | KeyCode::Char(' ')
                 ) {
-                    self.flow.sync_clipboard = !self.flow.sync_clipboard;
+                    self.flow.clipboard_mode = cycle_clipboard_mode(
+                        self.flow.clipboard_mode,
+                        matches!(key.code, KeyCode::Left),
+                    );
                     self.push_log(format!(
-                        "剪贴板同步已{}。",
-                        enabled_label(self.flow.sync_clipboard)
+                        "剪贴板同步已切换为{}。",
+                        self.flow.clipboard_mode.label()
                     ));
                 }
             }
@@ -664,22 +641,15 @@ impl StartupApp {
             FieldId::Mode => {
                 if let Some(index) = self.selector_choice_at(field, column, row) {
                     self.flow.mode = match index {
-                        0 => SyncMode::Send,
-                        1 => SyncMode::Receive,
-                        2 => SyncMode::Both,
+                        0 => SyncMode::Off,
+                        1 => SyncMode::Send,
+                        2 => SyncMode::Receive,
+                        3 => SyncMode::Both,
                         _ => SyncMode::Auto,
                     };
-                    self.push_log(format!("同步模式已切换为{}。", self.flow.mode.label()));
+                    self.push_log(format!("文件同步模式已切换为{}。", self.flow.mode.label()));
                     self.clamp_focus_current_tab();
                 }
-            }
-            FieldId::ClipboardOnly => {
-                self.flow.clipboard_only = !self.flow.clipboard_only;
-                self.push_log(format!(
-                    "仅剪贴板模式已{}。",
-                    enabled_label(self.flow.clipboard_only)
-                ));
-                self.clamp_focus_current_tab();
             }
             FieldId::SyncDelete if self.field_is_focusable(field) => {
                 self.flow.sync_delete = !self.flow.sync_delete;
@@ -688,11 +658,18 @@ impl StartupApp {
                     enabled_label(self.flow.sync_delete)
                 ));
             }
-            FieldId::SyncClipboard if self.field_is_focusable(field) => {
-                self.flow.sync_clipboard = !self.flow.sync_clipboard;
+            FieldId::ClipboardMode => {
+                if let Some(index) = self.selector_choice_at(field, column, row) {
+                    self.flow.clipboard_mode = match index {
+                        0 => ClipboardMode::Off,
+                        1 => ClipboardMode::Send,
+                        2 => ClipboardMode::Receive,
+                        _ => ClipboardMode::Both,
+                    };
+                }
                 self.push_log(format!(
-                    "剪贴板同步已{}。",
-                    enabled_label(self.flow.sync_clipboard)
+                    "剪贴板同步已切换为{}。",
+                    self.flow.clipboard_mode.label()
                 ));
             }
             FieldId::AudioMode => {
@@ -845,19 +822,13 @@ impl StartupApp {
             chip(self.flow.mode.label(), colors.text, colors.primary_soft),
             Span::raw(" "),
             chip(
-                self.flow.audio_mode.label(),
+                self.flow.clipboard_mode.label(),
                 colors.text,
                 colors.primary_soft,
             ),
             Span::raw(" "),
             chip(
-                if self.flow.clipboard_only {
-                    "Clipboard Only"
-                } else if self.effective_sync_clipboard() {
-                    "File + Clipboard"
-                } else {
-                    "Files Only"
-                },
+                self.flow.audio_mode.label(),
                 colors.text,
                 colors.primary_soft,
             ),
@@ -957,24 +928,15 @@ impl StartupApp {
                 frame,
                 area,
                 field,
-                "同步模式",
-                &["发送", "接收", "双向", "自动"],
+                "文件同步模式",
+                &["关闭", "发送", "接收", "双向", "自动"],
                 match self.flow.mode {
-                    SyncMode::Send => 0,
-                    SyncMode::Receive => 1,
-                    SyncMode::Both => 2,
-                    SyncMode::Auto => 3,
+                    SyncMode::Off => 0,
+                    SyncMode::Send => 1,
+                    SyncMode::Receive => 2,
+                    SyncMode::Both => 3,
+                    SyncMode::Auto => 4,
                 },
-                focused,
-                colors,
-            ),
-            FieldId::ClipboardOnly => self.render_toggle_field(
-                frame,
-                area,
-                "仅同步剪贴板",
-                self.flow.clipboard_only,
-                true,
-                "关闭文件同步，只保留剪贴板通道",
                 focused,
                 colors,
             ),
@@ -983,21 +945,22 @@ impl StartupApp {
                 area,
                 "删除同步",
                 self.flow.sync_delete,
-                self.flow.mode.can_receive() && !self.flow.clipboard_only,
+                self.flow.mode.can_receive(),
                 "接收方会镜像对端删除结果",
                 focused,
                 colors,
             ),
-            FieldId::SyncClipboard => self.render_toggle_field(
+            FieldId::ClipboardMode => self.render_selector_field(
                 frame,
                 area,
+                field,
                 "剪贴板同步",
-                self.effective_sync_clipboard(),
-                !self.flow.clipboard_only,
-                if self.flow.clipboard_only {
-                    "仅剪贴板模式下固定开启"
-                } else {
-                    "文本、富文本、图片和小文件都走这里"
+                &["关闭", "发送", "接收", "双向"],
+                match self.flow.clipboard_mode {
+                    ClipboardMode::Off => 0,
+                    ClipboardMode::Send => 1,
+                    ClipboardMode::Receive => 2,
+                    ClipboardMode::Both => 3,
                 },
                 focused,
                 colors,
@@ -1007,7 +970,7 @@ impl StartupApp {
                 area,
                 field,
                 "音频同步",
-                &["不启用音频", "音频发送方", "音频接收方"],
+                &["关闭", "发送", "接收"],
                 match self.flow.audio_mode {
                     AudioMode::Off => 0,
                     AudioMode::Send => 1,
@@ -1018,12 +981,14 @@ impl StartupApp {
             ),
             FieldId::WorkspacePath => {
                 let title = match self.flow.mode {
+                    SyncMode::Off => "文件同步已关闭",
                     SyncMode::Send => "发送路径",
                     SyncMode::Receive => "接收目录",
                     SyncMode::Both => "双向目录",
                     SyncMode::Auto => "共享目录",
                 };
                 let placeholder = match self.flow.mode {
+                    SyncMode::Off => "当前模式不会使用这个分区",
                     SyncMode::Send => "多个路径用英文逗号分隔；输入 . 使用当前目录",
                     _ => "请输入目录；输入 . 使用当前目录，支持 ~ 和环境变量",
                 };
@@ -1368,7 +1333,8 @@ impl StartupApp {
     fn preview_model(&self) -> PreviewModel {
         let mut summary_lines = vec![
             format!("连接方式: {}", connection_label(self.flow.connection)),
-            format!("同步模式: {}", self.flow.mode.label()),
+            format!("文件同步模式: {}", self.flow.mode.label()),
+            format!("剪贴板同步: {}", self.flow.clipboard_mode.label()),
             format!("音频同步: {}", self.flow.audio_mode.label()),
         ];
         let mut notes = Vec::new();
@@ -1378,10 +1344,6 @@ impl StartupApp {
             Ok(workspace) => {
                 summary_lines.extend(workspace.lines);
                 notes.extend(workspace.notes);
-                summary_lines.push(format!(
-                    "剪贴板同步: {}",
-                    bool_label(self.effective_sync_clipboard())
-                ));
                 summary_lines.push(if workspace.can_receive {
                     format!("删除同步: {}", bool_label(self.flow.sync_delete))
                 } else {
@@ -1390,18 +1352,14 @@ impl StartupApp {
             }
             Err(err) => {
                 errors.push(err.to_string());
-                summary_lines.push(format!(
-                    "剪贴板同步: {}",
-                    bool_label(self.effective_sync_clipboard())
-                ));
                 summary_lines.push("删除同步: 等待工作区配置通过校验".to_string());
             }
         }
 
         match self.parsed_interval_secs() {
             Ok(value) => {
-                if self.flow.clipboard_only {
-                    notes.push("仅剪贴板模式下不会使用文件重扫间隔。".to_string());
+                if !self.flow.mode.can_send() {
+                    notes.push("当前文件同步模式不会使用文件重扫间隔。".to_string());
                 } else {
                     summary_lines.push(format!("兜底重扫: {} 秒", value));
                 }
@@ -1472,9 +1430,9 @@ impl StartupApp {
     }
 
     fn workspace_preview(&self) -> Result<WorkspacePreview> {
-        if self.flow.clipboard_only {
+        if self.flow.mode == SyncMode::Off {
             return Ok(WorkspacePreview {
-                lines: vec!["文件同步: 关闭（仅剪贴板）".to_string()],
+                lines: vec!["文件同步: 关闭".to_string()],
                 can_receive: false,
                 notes: Vec::new(),
             });
@@ -1483,6 +1441,7 @@ impl StartupApp {
         let max_folder_depth = self.parsed_max_folder_depth()?;
 
         match self.flow.mode {
+            SyncMode::Off => unreachable!("off mode is handled before workspace preview"),
             SyncMode::Send => {
                 let paths = parse_send_paths(
                     trimmed_text(&self.workspace.path).as_str(),
@@ -1560,35 +1519,32 @@ impl StartupApp {
         let discovery_secs = self.parsed_discovery_secs()?;
         let port = self.parsed_port()?;
         let pin = self.parsed_pin()?;
-        let workspace = if self.flow.clipboard_only {
-            WorkspaceSpec::for_clipboard_only(self.flow.mode)
-        } else {
-            match self.flow.mode {
-                SyncMode::Send => WorkspaceSpec::for_send(parse_send_paths(
+        let workspace = match self.flow.mode {
+            SyncMode::Off => WorkspaceSpec::for_off(),
+            SyncMode::Send => WorkspaceSpec::for_send(parse_send_paths(
+                trimmed_text(&self.workspace.path).as_str(),
+                &self.context.cwd,
+            )?)?,
+            SyncMode::Receive => {
+                let path = build_directory_path(
                     trimmed_text(&self.workspace.path).as_str(),
                     &self.context.cwd,
-                )?)?,
-                SyncMode::Receive => {
-                    let path = build_directory_path(
-                        trimmed_text(&self.workspace.path).as_str(),
-                        &self.context.cwd,
-                    )?;
-                    WorkspaceSpec::for_receive(path)?
-                }
-                SyncMode::Both => {
-                    let path = build_directory_path(
-                        trimmed_text(&self.workspace.path).as_str(),
-                        &self.context.cwd,
-                    )?;
-                    WorkspaceSpec::for_both(path)?
-                }
-                SyncMode::Auto => {
-                    let path = build_directory_path(
-                        trimmed_text(&self.workspace.path).as_str(),
-                        &self.context.cwd,
-                    )?;
-                    WorkspaceSpec::for_auto(path)?
-                }
+                )?;
+                WorkspaceSpec::for_receive(path)?
+            }
+            SyncMode::Both => {
+                let path = build_directory_path(
+                    trimmed_text(&self.workspace.path).as_str(),
+                    &self.context.cwd,
+                )?;
+                WorkspaceSpec::for_both(path)?
+            }
+            SyncMode::Auto => {
+                let path = build_directory_path(
+                    trimmed_text(&self.workspace.path).as_str(),
+                    &self.context.cwd,
+                )?;
+                WorkspaceSpec::for_auto(path)?
             }
         }
         .with_max_folder_depth(max_folder_depth);
@@ -1601,13 +1557,14 @@ impl StartupApp {
             } else {
                 false
             },
-            sync_clipboard: self.effective_sync_clipboard(),
+            clipboard_mode: self.flow.clipboard_mode,
             audio_mode: self.flow.audio_mode,
             workspace,
             clipboard: self.context.clipboard.clone(),
             transfer_limits: self.context.transfer_limits,
             interval_secs,
             pairing: PairingRuntimeOptions {
+                no_interact: false,
                 peer_query: trimmed_non_empty(&self.pairing.peer_query),
                 port,
                 pin,
@@ -1668,18 +1625,13 @@ impl StartupApp {
             .with_context(|| format!("最大目录深度必须是非负整数，当前输入为 `{raw}`"))
     }
 
-    fn effective_sync_clipboard(&self) -> bool {
-        self.flow.clipboard_only || self.flow.sync_clipboard
-    }
-
     fn visible_fields(&self) -> &'static [FieldId] {
         match self.tab {
             StartupTab::Flow => &[
                 FieldId::Connection,
                 FieldId::Mode,
-                FieldId::ClipboardOnly,
                 FieldId::SyncDelete,
-                FieldId::SyncClipboard,
+                FieldId::ClipboardMode,
                 FieldId::AudioMode,
             ],
             StartupTab::Workspace => &[
@@ -1722,8 +1674,7 @@ impl StartupApp {
 
     fn field_is_focusable(&self, field: FieldId) -> bool {
         match field {
-            FieldId::SyncDelete => self.flow.mode.can_receive() && !self.flow.clipboard_only,
-            FieldId::SyncClipboard => !self.flow.clipboard_only,
+            FieldId::SyncDelete => self.flow.mode.can_receive(),
             _ => true,
         }
     }
@@ -1888,6 +1839,7 @@ fn apply_textarea_theme(
 
 fn cycle_mode(mode: SyncMode, reverse: bool) -> SyncMode {
     let modes = [
+        SyncMode::Off,
         SyncMode::Send,
         SyncMode::Receive,
         SyncMode::Both,
@@ -1896,7 +1848,26 @@ fn cycle_mode(mode: SyncMode, reverse: bool) -> SyncMode {
     let current = modes
         .iter()
         .position(|candidate| *candidate == mode)
-        .unwrap_or(3);
+        .unwrap_or(4);
+    let next = if reverse {
+        (current + modes.len() - 1) % modes.len()
+    } else {
+        (current + 1) % modes.len()
+    };
+    modes[next]
+}
+
+fn cycle_clipboard_mode(mode: ClipboardMode, reverse: bool) -> ClipboardMode {
+    let modes = [
+        ClipboardMode::Off,
+        ClipboardMode::Send,
+        ClipboardMode::Receive,
+        ClipboardMode::Both,
+    ];
+    let current = modes
+        .iter()
+        .position(|candidate| *candidate == mode)
+        .unwrap_or(0);
     let next = if reverse {
         (current + modes.len() - 1) % modes.len()
     } else {

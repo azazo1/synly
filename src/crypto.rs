@@ -1190,7 +1190,7 @@ fn decode_certificate_der(certificate: &str) -> Result<CertificateDer<'static>> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{AudioMode, SyncMode};
+    use crate::cli::{AudioMode, ClipboardMode, SyncMode};
     use crate::config::DeviceConfig;
     use crate::protocol::{
         ControlMessage, DeviceIdentity, PROTOCOL_VERSION, PairAuthMethod, PairRequestPayload,
@@ -1243,7 +1243,7 @@ mod tests {
                 send_items: vec![],
                 receive_root: Some("/tmp".into()),
                 max_folder_depth: None,
-                sync_clipboard: false,
+                clipboard_mode: ClipboardMode::Off,
             },
             audio_mode: AudioMode::Off,
             request_trust: false,
@@ -1274,7 +1274,7 @@ mod tests {
                 send_items: vec![],
                 receive_root: Some("/tmp".into()),
                 max_folder_depth: None,
-                sync_clipboard: false,
+                clipboard_mode: ClipboardMode::Off,
             },
             audio_mode: AudioMode::Off,
             request_trust: true,
@@ -1313,7 +1313,7 @@ mod tests {
             send_items: vec![],
             receive_root: Some("/tmp".into()),
             max_folder_depth: None,
-            sync_clipboard: false,
+            clipboard_mode: ClipboardMode::Off,
         };
         let proof = sign_pair_decision(
             &exporter,
@@ -1383,7 +1383,7 @@ mod tests {
             send_items: vec![],
             receive_root: Some("/tmp".into()),
             max_folder_depth: None,
-            sync_clipboard: true,
+            clipboard_mode: ClipboardMode::Both,
         };
         let proof = sign_trusted_pair_decision(
             &private_key,

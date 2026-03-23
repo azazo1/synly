@@ -16,7 +16,7 @@ const DEFAULT_MAX_FRAME_DATA_LEN: usize = 128 * 1024 * 1024;
 const DEFAULT_MAX_CLIPBOARD_BINARY_LEN: usize = 100 * 1024 * 1024;
 const CLIPBOARD_STREAM_CHUNK_SIZE: usize = 1024 * 1024;
 
-pub const PROTOCOL_VERSION: u16 = 9;
+pub const PROTOCOL_VERSION: u16 = 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TransferLimits {
@@ -614,7 +614,7 @@ mod tests {
         ControlMessage, Frame, FrameReader, FrameWriter, SessionAgreement, decode_payload,
         encode_payload,
     };
-    use crate::cli::{AudioMode, SyncMode};
+    use crate::cli::{AudioMode, ClipboardMode, SyncMode};
     use crate::sync::WorkspaceSummary;
     use tokio::io::duplex;
 
@@ -676,7 +676,7 @@ mod tests {
                 send_items: vec!["docs".to_string()],
                 receive_root: Some("/tmp".to_string()),
                 max_folder_depth: Some(2),
-                sync_clipboard: true,
+                clipboard_mode: ClipboardMode::Both,
             },
             agreement: SessionAgreement {
                 host_to_client: true,

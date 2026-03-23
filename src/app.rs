@@ -1,8 +1,8 @@
 use crate::audio::{self, AudioChannelDirection};
 use crate::cli::{
-    AudioMode, ConnectionPreference, PairingRuntimeOptions, RuntimeOptions, SyncMode,
-    TrustPromptDecision, prompt_confirm, prompt_confirm_with_trust, prompt_select,
-    require_peer_query, resolve_pairing_pin, sync_clipboard_label, sync_delete_label,
+    AudioMode, ClipboardMode, ConnectionPreference, PairingRuntimeOptions, RuntimeOptions,
+    SyncMode, TrustPromptDecision, clipboard_mode_label, prompt_confirm, prompt_confirm_with_trust,
+    prompt_select, require_peer_query, resolve_pairing_pin, sync_delete_label,
 };
 use crate::clipboard::ClipboardSync;
 use crate::config::{DeviceConfig, SynlyConfig, TrustedDeviceConfig};
@@ -89,7 +89,7 @@ struct PairDecisionParams<'a> {
     message: String,
     device: &'a DeviceConfig,
     workspace: &'a WorkspaceSpec,
-    sync_clipboard: bool,
+    clipboard_mode: ClipboardMode,
     audio_mode: AudioMode,
     agreement: &'a SessionAgreement,
     auth_method: PairAuthMethod,
@@ -175,7 +175,7 @@ async fn run_host(config: &mut SynlyConfig, options: RuntimeOptions) -> Result<(
                     SyncSessionOptions {
                         interval_secs: options.interval_secs,
                         sync_delete: options.sync_delete,
-                        sync_clipboard: options.sync_clipboard,
+                        clipboard_mode: options.clipboard_mode,
                         audio_mode: options.audio_mode,
                         clipboard_options: &options.clipboard,
                         transfer_limits: options.transfer_limits,
@@ -205,7 +205,11 @@ async fn run_client(config: &mut SynlyConfig, options: RuntimeOptions) -> Result
     let mut reconnect_delay = RECONNECT_BASE_DELAY;
 
     loop {
-        let peer = match choose_peer(reconnect_query.as_deref(), discovery_timeout) {
+        let peer = match choose_peer(
+            reconnect_query.as_deref(),
+            discovery_timeout,
+            options.pairing.no_interact,
+        ) {
             Ok(peer) => peer,
             Err(err) => {
                 if reconnect_query.is_some() {
@@ -233,7 +237,7 @@ async fn run_client(config: &mut SynlyConfig, options: RuntimeOptions) -> Result
                     SyncSessionOptions {
                         interval_secs: options.interval_secs,
                         sync_delete: options.sync_delete,
-                        sync_clipboard: options.sync_clipboard,
+                        clipboard_mode: options.clipboard_mode,
                         audio_mode: options.audio_mode,
                         clipboard_options: &options.clipboard,
                         transfer_limits: options.transfer_limits,
@@ -416,13 +420,16 @@ async fn handle_trusted_incoming_connection(
     }
 
     let agreement = negotiate(options.mode, payload.requested_mode);
+    let clipboard_agreement =
+        negotiate_clipboard(options.clipboard_mode, payload.workspace.clipboard_mode);
+    let audio_compatible = audio_modes_compatible(options.audio_mode, payload.audio_mode);
     print_pair_request_overview(&payload, options, &agreement, &remote_label)?;
-    if !agreement.any_direction() {
+    if !agreement.any_direction() && !clipboard_agreement.any_direction() && !audio_compatible {
         write_frame(
             &mut server_stream,
             transfer_limits,
             Frame::Control(ControlMessage::Error {
-                message: "双方模式不兼容，本次请求无法建立同步。".to_string(),
+                message: "文件、剪贴板和音频方向都不兼容，本次请求无法建立同步。".to_string(),
             }),
         )
         .await?;
@@ -443,7 +450,7 @@ async fn handle_trusted_incoming_connection(
         message,
         device: &device,
         workspace: &options.workspace,
-        sync_clipboard: options.sync_clipboard,
+        clipboard_mode: options.clipboard_mode,
         audio_mode: options.audio_mode,
         agreement: &agreement,
         auth_method: PairAuthMethod::TrustedDevice,
@@ -758,13 +765,16 @@ async fn handle_bootstrap_incoming_connection(
     let audio_master_secret =
         crypto::export_audio_master_secret_from_server(&server_stream, &request_id)?;
     let agreement = negotiate(options.mode, payload.requested_mode);
+    let clipboard_agreement =
+        negotiate_clipboard(options.clipboard_mode, payload.workspace.clipboard_mode);
+    let audio_compatible = audio_modes_compatible(options.audio_mode, payload.audio_mode);
     print_pair_request_overview(&payload, options, &agreement, &remote_label)?;
-    if !agreement.any_direction() {
+    if !agreement.any_direction() && !clipboard_agreement.any_direction() && !audio_compatible {
         write_frame(
             &mut server_stream,
             transfer_limits,
             Frame::Control(ControlMessage::Error {
-                message: "双方模式不兼容，本次请求无法建立同步。".to_string(),
+                message: "文件、剪贴板和音频方向都不兼容，本次请求无法建立同步。".to_string(),
             }),
         )
         .await?;
@@ -775,6 +785,9 @@ async fn handle_bootstrap_incoming_connection(
     let (accepted, remember_trusted_device) =
         if should_auto_accept_request(&options.pairing, PairAuthMethod::Pin) {
             (true, options.pairing.trust_device)
+        } else if options.pairing.no_interact {
+            println!("当前使用 --no-interact，且未开启 --accept，本次未受信任设备请求已自动拒绝。");
+            (false, false)
         } else {
             match prompt_confirm_with_trust("接受这次同步吗", options.pairing.trust_device)?
             {
@@ -797,7 +810,7 @@ async fn handle_bootstrap_incoming_connection(
         message,
         device: &device,
         workspace: &options.workspace,
-        sync_clipboard: options.sync_clipboard,
+        clipboard_mode: options.clipboard_mode,
         audio_mode: options.audio_mode,
         agreement: &agreement,
         auth_method: PairAuthMethod::Pin,
@@ -866,7 +879,7 @@ async fn connect_to_trusted_peer(
         protocol_version: PROTOCOL_VERSION,
         client: device_identity(device),
         requested_mode: options.mode,
-        workspace: options.workspace.summary(options.sync_clipboard),
+        workspace: options.workspace.summary(options.clipboard_mode),
         audio_mode: options.audio_mode,
         request_trust: options.pairing.trust_device,
     };
@@ -1005,6 +1018,7 @@ async fn connect_to_untrusted_peer(
     println!("{}", session_display.randomart);
     let pin = resolve_pairing_pin(
         options.pairing.pin.as_deref(),
+        options.pairing.no_interact,
         "先核对 host 屏幕上的 bootstrap 图和会话图都与本机一致，再输入对应的 6 位 PIN",
     )?;
     let (pake_state, client_pake_message) = crypto::start_bootstrap_pake_client(
@@ -1071,7 +1085,7 @@ async fn connect_to_untrusted_peer(
         protocol_version: PROTOCOL_VERSION,
         client: device_identity(device),
         requested_mode: options.mode,
-        workspace: options.workspace.summary(options.sync_clipboard),
+        workspace: options.workspace.summary(options.clipboard_mode),
         audio_mode: options.audio_mode,
         request_trust: options.pairing.trust_device,
     };
@@ -1133,6 +1147,11 @@ async fn connect_to_untrusted_peer(
     if server_trusts_client && !has_trusted_transport_for_device(config, &remote.device_id) {
         let remember_server = if options.pairing.trust_device {
             true
+        } else if options.pairing.no_interact {
+            println!(
+                "当前使用 --no-interact，未自动保存服务端身份；如需建立长期信任，请显式传 `--trust-device`。"
+            );
+            false
         } else {
             prompt_confirm(
                 "服务端已选择信任本机。也信任这个服务端，以便后续直接建立安全连接吗",
@@ -1178,7 +1197,7 @@ async fn connect_to_untrusted_peer(
 struct SyncSessionOptions<'a> {
     interval_secs: u64,
     sync_delete: bool,
-    sync_clipboard: bool,
+    clipboard_mode: ClipboardMode,
     audio_mode: AudioMode,
     clipboard_options: &'a crate::cli::ClipboardRuntimeOptions,
     transfer_limits: TransferLimits,
@@ -1208,28 +1227,27 @@ async fn run_sync_session(
     let file_can_receive = local_can_receive
         && workspace.can_receive_files()
         && session.remote_workspace.can_send_files();
-    let clipboard_enabled_on_both =
-        options.sync_clipboard && session.remote_workspace.sync_clipboard;
-    let clipboard_can_send = clipboard_enabled_on_both && local_can_send;
-    let clipboard_can_receive = clipboard_enabled_on_both && local_can_receive;
+    let clipboard_agreement = negotiate_clipboard_modes(
+        session.role,
+        options.clipboard_mode,
+        session.remote_workspace.clipboard_mode,
+    );
+    let clipboard_can_send = allows_local_send(session.role, &clipboard_agreement);
+    let clipboard_can_receive = allows_local_receive(session.role, &clipboard_agreement);
     let audio_plan =
         resolve_audio_plan(session.role, options.audio_mode, session.remote_audio_mode);
     let remote_audio_mode = session.remote_audio_mode;
     let remote_socket_addr = session.remote_socket_addr;
     let audio_master_secret = session.audio_master_secret;
 
-    match (
-        options.sync_clipboard,
-        session.remote_workspace.sync_clipboard,
-    ) {
-        (true, true) => println!(
-            "本次剪贴板同步: {}",
-            clipboard_agreement_label(session.role, &session.agreement)
-        ),
-        (true, false) => println!("本次剪贴板同步: 本机已开启，但对端未开启，本次不会同步。"),
-        (false, true) => println!("本次剪贴板同步: 对端已开启，但本机未开启，本次不会同步。"),
-        (false, false) => println!("本次剪贴板同步: 关闭"),
-    }
+    println!(
+        "{}",
+        clipboard_summary_line(
+            session.role,
+            options.clipboard_mode,
+            session.remote_workspace.clipboard_mode,
+        )
+    );
     println!(
         "{}",
         audio_summary_line(options.audio_mode, remote_audio_mode)
@@ -1253,7 +1271,7 @@ async fn run_sync_session(
     } else {
         None
     };
-    let clipboard_sync = clipboard_enabled_on_both.then(|| {
+    let clipboard_sync = (clipboard_can_send || clipboard_can_receive).then(|| {
         ClipboardSync::new(
             options.clipboard_options.max_file_bytes,
             options.clipboard_options.max_cache_bytes,
@@ -2107,10 +2125,18 @@ fn print_revision_result(
     );
 }
 
-fn choose_peer(peer_query: Option<&str>, timeout: Duration) -> Result<DiscoveredPeer> {
+fn choose_peer(
+    peer_query: Option<&str>,
+    timeout: Duration,
+    no_interact: bool,
+) -> Result<DiscoveredPeer> {
     if let Some(query) = peer_query {
         let peers = discovery::browse(timeout)?;
         return select_peer_from_query(&peers, require_peer_query(Some(query))?);
+    }
+
+    if no_interact {
+        bail!("当前使用 `--no-interact`，请通过 `--peer` 指定要连接的设备");
     }
 
     loop {
@@ -2323,7 +2349,7 @@ fn print_pair_request_overview(
     for line in payload.workspace.human_lines() {
         println!("{line}");
     }
-    for line in options.workspace.local_human_lines(options.sync_clipboard) {
+    for line in options.workspace.local_human_lines(options.clipboard_mode) {
         println!("本机 {line}");
     }
     println!("对端 音频同步: {}", payload.audio_mode.label());
@@ -2332,8 +2358,16 @@ fn print_pair_request_overview(
         println!("本机 删除同步: {}", sync_delete_label(options.sync_delete));
     }
     println!(
-        "协商结果: {}",
-        agreement_label(SessionRole::Host, agreement)
+        "文件协商: {}",
+        file_agreement_label(SessionRole::Host, agreement)
+    );
+    println!(
+        "{}",
+        clipboard_summary_line(
+            SessionRole::Host,
+            options.clipboard_mode,
+            payload.workspace.clipboard_mode,
+        )
     );
     Ok(())
 }
@@ -2355,18 +2389,20 @@ fn print_connected_peer(
         crypto::short_identity_fingerprint(&remote.identity_public_key)?
     );
     println!(
-        "协商结果: {}",
-        agreement_label(SessionRole::Client, agreement)
+        "文件协商: {}",
+        file_agreement_label(SessionRole::Client, agreement)
     );
     println!("对端音频同步: {}", remote_audio_mode.label());
     Ok(())
 }
 
 fn negotiate(host_mode: SyncMode, client_mode: SyncMode) -> SessionAgreement {
-    SessionAgreement {
-        host_to_client: host_mode.can_send() && client_mode.can_receive(),
-        client_to_host: client_mode.can_send() && host_mode.can_receive(),
-    }
+    negotiate_capabilities(
+        host_mode.can_send(),
+        host_mode.can_receive(),
+        client_mode.can_send(),
+        client_mode.can_receive(),
+    )
 }
 
 fn delete_policy(layout: crate::sync::SnapshotLayout, sync_delete: bool) -> DeletePolicy {
@@ -2395,7 +2431,7 @@ fn allows_local_receive(role: SessionRole, agreement: &SessionAgreement) -> bool
 }
 
 fn signed_pair_decision(params: PairDecisionParams<'_>) -> Result<ControlMessage> {
-    let summary = params.workspace.summary(params.sync_clipboard);
+    let summary = params.workspace.summary(params.clipboard_mode);
     let server = device_identity(params.device);
     let proof = match params.auth_method {
         PairAuthMethod::Pin => crypto::sign_pair_decision(
@@ -2465,13 +2501,13 @@ fn print_host_ready(device: &DeviceConfig, options: &RuntimeOptions, port: u16) 
         )
         .expect("device identity fingerprint is invalid")
     );
-    println!("模式: {}", options.mode.label());
+    println!("文件同步模式: {}", options.mode.label());
     if !options.workspace.file_sync_enabled() {
-        println!("文件同步: 关闭（仅剪贴板）");
+        println!("文件同步: 关闭");
     }
     println!(
         "剪贴板同步: {}",
-        sync_clipboard_label(options.sync_clipboard)
+        clipboard_mode_label(options.clipboard_mode)
     );
     println!("音频同步: {}", options.audio_mode.label());
     if options.workspace.incoming_root.is_some() {
@@ -2506,7 +2542,7 @@ fn print_host_ready(device: &DeviceConfig, options: &RuntimeOptions, port: u16) 
     }
 }
 
-fn agreement_label(role: SessionRole, agreement: &SessionAgreement) -> &'static str {
+fn direction_label(role: SessionRole, agreement: &SessionAgreement) -> &'static str {
     match (
         allows_local_send(role, agreement),
         allows_local_receive(role, agreement),
@@ -2518,8 +2554,65 @@ fn agreement_label(role: SessionRole, agreement: &SessionAgreement) -> &'static 
     }
 }
 
-fn clipboard_agreement_label(role: SessionRole, agreement: &SessionAgreement) -> &'static str {
-    agreement_label(role, agreement)
+fn file_agreement_label(role: SessionRole, agreement: &SessionAgreement) -> &'static str {
+    direction_label(role, agreement)
+}
+
+fn negotiate_capabilities(
+    host_can_send: bool,
+    host_can_receive: bool,
+    client_can_send: bool,
+    client_can_receive: bool,
+) -> SessionAgreement {
+    SessionAgreement {
+        host_to_client: host_can_send && client_can_receive,
+        client_to_host: client_can_send && host_can_receive,
+    }
+}
+
+fn negotiate_clipboard(host_mode: ClipboardMode, client_mode: ClipboardMode) -> SessionAgreement {
+    negotiate_capabilities(
+        host_mode.can_send(),
+        host_mode.can_receive(),
+        client_mode.can_send(),
+        client_mode.can_receive(),
+    )
+}
+
+fn negotiate_clipboard_modes(
+    role: SessionRole,
+    local_mode: ClipboardMode,
+    remote_mode: ClipboardMode,
+) -> SessionAgreement {
+    match role {
+        SessionRole::Host => negotiate_clipboard(local_mode, remote_mode),
+        SessionRole::Client => negotiate_clipboard(remote_mode, local_mode),
+    }
+}
+
+fn clipboard_summary_line(
+    role: SessionRole,
+    local_mode: ClipboardMode,
+    remote_mode: ClipboardMode,
+) -> String {
+    let agreement = negotiate_clipboard_modes(role, local_mode, remote_mode);
+    if agreement.any_direction() {
+        return format!("本次剪贴板同步: {}", direction_label(role, &agreement));
+    }
+
+    match (local_mode, remote_mode) {
+        (ClipboardMode::Off, ClipboardMode::Off) => "本次剪贴板同步: 关闭".to_string(),
+        (ClipboardMode::Off, _) => "本次剪贴板同步: 本机未开启".to_string(),
+        (_, ClipboardMode::Off) => "本次剪贴板同步: 对端未开启".to_string(),
+        _ => "本次剪贴板同步: 方向不兼容，不会同步".to_string(),
+    }
+}
+
+fn audio_modes_compatible(host_mode: AudioMode, client_mode: AudioMode) -> bool {
+    matches!(
+        (host_mode, client_mode),
+        (AudioMode::Send, AudioMode::Receive) | (AudioMode::Receive, AudioMode::Send)
+    )
 }
 
 fn resolve_audio_plan(
@@ -2591,7 +2684,7 @@ fn is_executable(_metadata: &std::fs::Metadata) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        FILE_STREAM_CHUNK_SIZE, SessionRole, accept_policy_label, delete_policy,
+        FILE_STREAM_CHUNK_SIZE, SessionRole, accept_policy_label, choose_peer, delete_policy,
         is_connection_shutdown_error, next_reconnect_delay, peer_matches_query, resolve_audio_plan,
         select_peer_from_query, send_one_file, should_auto_accept_request,
     };
@@ -2752,6 +2845,15 @@ mod tests {
     }
 
     #[test]
+    fn choose_peer_requires_explicit_query_in_no_interact() {
+        let err = choose_peer(None, Duration::from_millis(1), true)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("`--peer`"));
+    }
+
+    #[test]
     fn resolve_audio_plan_assigns_sender_direction_for_host() {
         let plan = resolve_audio_plan(SessionRole::Host, AudioMode::Send, AudioMode::Receive)
             .expect("send/receive pair should enable audio");
@@ -2784,6 +2886,7 @@ mod tests {
 
     fn sample_pairing_options() -> PairingRuntimeOptions {
         PairingRuntimeOptions {
+            no_interact: false,
             peer_query: None,
             port: None,
             pin: None,
