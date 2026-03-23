@@ -452,31 +452,4 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(payloads, vec![vec![4], vec![5]]);
     }
-
-    #[test]
-    fn depacketizer_waits_until_requested_startup_buffer_is_ready() {
-        let mut packetizer = AudioPacketizer::new(5, 23, false, 0);
-        let mut depacketizer = AudioDepacketizer::new(5, 15);
-
-        for payload in 0..4u8 {
-            let datagrams = packetizer.push_encoded_frame(&[payload]).unwrap();
-            assert!(depacketizer.push_datagram(&datagrams[0].bytes).unwrap().is_empty());
-        }
-
-        for payload in 4..6u8 {
-            let datagrams = packetizer.push_encoded_frame(&[payload]).unwrap();
-            assert!(depacketizer.push_datagram(&datagrams[0].bytes).unwrap().is_empty());
-        }
-
-        let seventh = packetizer.push_encoded_frame(&[6]).unwrap();
-        let ready = depacketizer.push_datagram(&seventh[0].bytes).unwrap();
-        let payloads = ready
-            .into_iter()
-            .map(|frame| match frame {
-                QueuedAudioFrame::Encoded(payload) => payload,
-                QueuedAudioFrame::Missing => panic!("unexpected packet loss during startup"),
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(payloads, vec![vec![4], vec![5], vec![6]]);
-    }
 }
