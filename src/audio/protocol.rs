@@ -120,4 +120,3 @@ fn write_rtp_header(rtp: RtpHeader, out: &mut Vec<u8>) {
 pub(crate) fn is_before16(a: u16, b: u16) -> bool {
     a != b && (a.wrapping_sub(b) as i16) < 0
 }
-

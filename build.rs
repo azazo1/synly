@@ -31,6 +31,10 @@ fn main() {
 
     let target = env::var("TARGET").unwrap_or_default();
     link_opus(&target, opus_link_preference());
+
+    if target.contains("apple-darwin") {
+        build_macos_native();
+    }
 }
 
 fn opus_link_preference() -> OpusLinkPreference {
@@ -80,10 +84,7 @@ fn manual_opus_link(target: &str, preference: OpusLinkPreference) -> Option<Reso
         let candidate = PathBuf::from(dir);
         if candidate.is_dir() {
             return Some(resolve_manual_opus_dir(
-                candidate,
-                lib_name,
-                target,
-                preference,
+                candidate, lib_name, target, preference,
             ));
         }
 
@@ -358,4 +359,49 @@ fn is_opus_lib_name(lib_name: &str) -> bool {
         lib_name,
         "opus" | "libopus" | "opus_static" | "libopus_static"
     )
+}
+
+fn build_macos_native() {
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR is missing"));
+    let src = PathBuf::from("native/macos_audio.m");
+    let obj = out_dir.join("macos_audio.o");
+    let lib = out_dir.join("libmacos_audio.a");
+
+    println!("cargo:rerun-if-changed={}", src.display());
+
+    let status = Command::new("clang")
+        .args([
+            "-fobjc-arc",
+            "-c",
+            src.to_str().expect("invalid macos_audio.m path"),
+            "-o",
+            obj.to_str().expect("invalid macos_audio.o path"),
+        ])
+        .status()
+        .expect("failed to run clang for native macOS audio bridge");
+
+    if !status.success() {
+        panic!("clang failed to compile native/macos_audio.m");
+    }
+
+    let status = Command::new("ar")
+        .args([
+            "crs",
+            lib.to_str().expect("invalid libmacos_audio.a path"),
+            obj.to_str().expect("invalid macos_audio.o path"),
+        ])
+        .status()
+        .expect("failed to archive native macOS audio bridge");
+
+    if !status.success() {
+        panic!("ar failed to archive native macOS audio bridge");
+    }
+
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-lib=static=macos_audio");
+    println!("cargo:rustc-link-lib=framework=Foundation");
+    println!("cargo:rustc-link-lib=framework=AVFoundation");
+    println!("cargo:rustc-link-lib=framework=AudioToolbox");
+    println!("cargo:rustc-link-lib=framework=CoreMedia");
+    println!("cargo:rustc-link-lib=framework=CoreAudio");
 }

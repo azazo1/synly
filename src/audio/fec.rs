@@ -224,4 +224,3 @@ fn gf_inv(value: u8) -> Result<u8> {
 fn gf_div(lhs: u8, rhs: u8) -> Result<u8> {
     Ok(gf_mul(lhs, gf_inv(rhs)?))
 }
-

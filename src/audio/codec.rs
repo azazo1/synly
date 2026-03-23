@@ -219,4 +219,3 @@ unsafe extern "C" {
         decode_fec: c_int,
     ) -> c_int;
 }
-

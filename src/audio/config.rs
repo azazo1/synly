@@ -173,4 +173,3 @@ impl ReceiverConfig {
         self.codec.stream_params()
     }
 }
-

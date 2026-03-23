@@ -17,4 +17,3 @@ pub fn open_output(
         "native audio output backend is not implemented for this platform yet",
     ))
 }
-
