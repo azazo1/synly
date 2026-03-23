@@ -32,7 +32,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::time::{self, Instant};
-use tokio_rustls::TlsStream;
+use tokio_rustls::{TlsStream, client::TlsStream as ClientTlsStream};
 use uuid::Uuid;
 
 const FILE_STREAM_CHUNK_SIZE: usize = 256 * 1024;
@@ -312,16 +312,13 @@ async fn connect_to_peer(
                 .first()
                 .copied()
                 .context("peer advertised no IPv4 address")?;
-            let trusted_device = trusted_device_for_peer(config, peer)?;
-            let trusted_transport = trusted_device
-                .as_ref()
-                .filter(|device| !device.tls_root_certificate.trim().is_empty());
+            let trusted_transport = trusted_transport_for_peer(config, peer)?;
             if options.pairing.trusted_only && trusted_transport.is_none() {
                 bail!(
                     "目标设备尚未建立完整的可信 mTLS 信任，请先用一次 PIN 配对并加上 --trust-device"
                 );
             }
-            match trusted_transport {
+            match trusted_transport.as_ref() {
                 Some(trusted_device) => {
                     connect_to_trusted_peer(
                         address,
@@ -340,9 +337,14 @@ async fn connect_to_peer(
         }
         PeerTarget::Direct(address) => {
             if options.pairing.trusted_only {
-                bail!(
-                    "使用 `--peer {address}` 直连时暂不支持 `--trusted-only`；请改用 mDNS 可发现的设备名 / 设备 ID，或先移除 `--trusted-only` 完成一次 PIN 配对"
-                );
+                return connect_to_direct_trusted_peer(
+                    *address.ip(),
+                    address.port(),
+                    &device,
+                    config,
+                    options,
+                )
+                .await;
             }
             connect_to_untrusted_peer(*address.ip(), address.port(), &device, config, options).await
         }
@@ -904,15 +906,73 @@ async fn connect_to_trusted_peer(
     config: &mut SynlyConfig,
     options: &RuntimeOptions,
 ) -> Result<AuthenticatedSession> {
-    let transfer_limits = options.transfer_limits;
     let socket = TcpStream::connect((address, port))
         .await
         .with_context(|| format!("failed to connect to {}:{}", address, port))?;
     let remote_socket_addr = socket.peer_addr()?;
     let connector =
         crypto::build_client_connector(device, trusted_device.tls_root_certificate.as_str())?;
-    let mut client_stream = connector.connect(crypto::server_name()?, socket).await?;
+    let client_stream = connector.connect(crypto::server_name()?, socket).await?;
 
+    complete_trusted_client_pairing(
+        client_stream,
+        remote_socket_addr,
+        device,
+        config,
+        options,
+        {
+            let trusted_device = trusted_device.clone();
+            move |_config, _remote| Ok(trusted_device.clone())
+        },
+    )
+    .await
+}
+
+async fn connect_to_direct_trusted_peer(
+    address: std::net::Ipv4Addr,
+    port: u16,
+    device: &DeviceConfig,
+    config: &mut SynlyConfig,
+    options: &RuntimeOptions,
+) -> Result<AuthenticatedSession> {
+    if !has_trusted_transport(config) {
+        bail!(
+            "本机尚未保存任何可用于长期 mTLS 的可信设备根证书；请先完成一次带 `--trust-device` 的配对"
+        );
+    }
+
+    let socket = TcpStream::connect((address, port))
+        .await
+        .with_context(|| format!("failed to connect to {}:{}", address, port))?;
+    let remote_socket_addr = socket.peer_addr()?;
+    let connector =
+        crypto::build_client_connector_for_trusted_devices(device, &config.trusted_devices)
+            .with_context(|| format!("无法为直连目标 {}:{} 构建可信 mTLS 客户端", address, port))?;
+    let client_stream = connector.connect(crypto::server_name()?, socket).await?;
+
+    complete_trusted_client_pairing(
+        client_stream,
+        remote_socket_addr,
+        device,
+        config,
+        options,
+        trusted_transport_for_identity,
+    )
+    .await
+}
+
+async fn complete_trusted_client_pairing<F>(
+    mut client_stream: ClientTlsStream<TcpStream>,
+    remote_socket_addr: SocketAddr,
+    device: &DeviceConfig,
+    config: &mut SynlyConfig,
+    options: &RuntimeOptions,
+    resolve_trusted_device: F,
+) -> Result<AuthenticatedSession>
+where
+    F: Fn(&SynlyConfig, &DeviceIdentity) -> Result<TrustedDeviceConfig>,
+{
+    let transfer_limits = options.transfer_limits;
     let request_id = Uuid::new_v4().to_string();
     let exporter = crypto::export_keying_material_from_client(&client_stream, &request_id)?;
     let audio_master_secret =
@@ -962,6 +1022,7 @@ async fn connect_to_trusted_peer(
             if auth_method != PairAuthMethod::TrustedDevice {
                 bail!("peer replied to trusted mTLS with an unexpected auth method");
             }
+            let trusted_device = resolve_trusted_device(config, &server)?;
             let decision = ControlMessage::PairDecision {
                 accepted,
                 message: message.clone(),
@@ -2264,13 +2325,44 @@ fn identity_display_name(identity: &DeviceIdentity) -> String {
     format_display_name(identity.instance_name.as_deref(), &identity.device_name)
 }
 
-fn trusted_device_for_peer(
+fn trusted_transport_for_peer(
     config: &SynlyConfig,
     peer: &DiscoveredPeer,
 ) -> Result<Option<TrustedDeviceConfig>> {
     let device_id = Uuid::parse_str(&peer.device_id)
         .with_context(|| format!("peer advertised an invalid device id: {}", peer.device_id))?;
-    Ok(config.trusted_device(&device_id).cloned())
+    Ok(trusted_transport_for_device(config, &device_id))
+}
+
+fn trusted_transport_for_identity(
+    config: &SynlyConfig,
+    identity: &DeviceIdentity,
+) -> Result<TrustedDeviceConfig> {
+    if let Some(trusted_device) = trusted_transport_for_device(config, &identity.device_id) {
+        return Ok(trusted_device);
+    }
+    if config.trusted_device(&identity.device_id).is_some() {
+        bail!(
+            "设备 `{}` 已记录身份，但尚未具备完整的长期 mTLS 信任材料",
+            identity_display_name(identity)
+        );
+    }
+    bail!(
+        "设备 `{}` 尚未被本机信任，不能使用 `--trusted-only` 直连",
+        identity_display_name(identity)
+    );
+}
+
+fn trusted_transport_for_device(
+    config: &SynlyConfig,
+    device_id: &Uuid,
+) -> Option<TrustedDeviceConfig> {
+    config.trusted_devices.iter().find_map(|device| {
+        (device.device_id == *device_id
+            && !device.public_key.trim().is_empty()
+            && !device.tls_root_certificate.trim().is_empty())
+        .then(|| device.clone())
+    })
 }
 
 async fn read_frame<R>(reader: &mut R, transfer_limits: TransferLimits) -> Result<Frame>
@@ -2389,11 +2481,7 @@ fn has_trusted_transport(config: &SynlyConfig) -> bool {
 }
 
 fn has_trusted_transport_for_device(config: &SynlyConfig, device_id: &Uuid) -> bool {
-    config.trusted_devices.iter().any(|device| {
-        device.device_id == *device_id
-            && !device.public_key.trim().is_empty()
-            && !device.tls_root_certificate.trim().is_empty()
-    })
+    trusted_transport_for_device(config, device_id).is_some()
 }
 
 fn print_pair_request_overview(
@@ -2760,9 +2848,13 @@ mod tests {
         identity_display_name, is_connection_shutdown_error, next_reconnect_delay,
         parse_direct_peer_addr, peer_matches_query, preferred_peer_query, resolve_audio_plan,
         select_peer_from_query, send_one_file, should_auto_accept_request,
+        trusted_transport_for_device, trusted_transport_for_identity,
     };
     use crate::audio::AudioChannelDirection;
     use crate::cli::{AudioMode, PairingRuntimeOptions, SyncMode};
+    use crate::config::{
+        ClipboardConfig, DeviceConfig, SynlyConfig, TransferConfig, TrustedDeviceConfig,
+    };
     use crate::discovery::DiscoveredPeer;
     use crate::protocol::{DeviceIdentity, Frame, PairAuthMethod};
     use crate::sync::{DeletePolicy, OutgoingSpec, SnapshotLayout};
@@ -2951,6 +3043,72 @@ mod tests {
     }
 
     #[test]
+    fn trusted_transport_for_device_requires_full_mtls_materials() {
+        let device_id = Uuid::new_v4();
+        let config = sample_config_with_trusted_devices(vec![TrustedDeviceConfig {
+            device_id,
+            device_name: "demo-device".to_string(),
+            public_key: "pub".to_string(),
+            tls_root_certificate: String::new(),
+            trusted_at_ms: 0,
+            last_seen_ms: 0,
+            successful_sessions: 0,
+        }]);
+
+        assert!(trusted_transport_for_device(&config, &device_id).is_none());
+    }
+
+    #[test]
+    fn trusted_transport_for_identity_accepts_fully_trusted_device() {
+        let device_id = Uuid::new_v4();
+        let config = sample_config_with_trusted_devices(vec![TrustedDeviceConfig {
+            device_id,
+            device_name: "demo-device".to_string(),
+            public_key: "pub".to_string(),
+            tls_root_certificate: "cert".to_string(),
+            trusted_at_ms: 0,
+            last_seen_ms: 0,
+            successful_sessions: 0,
+        }]);
+        let identity = DeviceIdentity {
+            device_id,
+            device_name: "demo-device".to_string(),
+            instance_name: Some("worker-a".to_string()),
+            identity_public_key: "pub".to_string(),
+            tls_root_certificate: "cert".to_string(),
+        };
+
+        let trusted = trusted_transport_for_identity(&config, &identity).unwrap();
+        assert_eq!(trusted.device_id, device_id);
+    }
+
+    #[test]
+    fn trusted_transport_for_identity_rejects_partial_trust() {
+        let device_id = Uuid::new_v4();
+        let config = sample_config_with_trusted_devices(vec![TrustedDeviceConfig {
+            device_id,
+            device_name: "demo-device".to_string(),
+            public_key: "pub".to_string(),
+            tls_root_certificate: String::new(),
+            trusted_at_ms: 0,
+            last_seen_ms: 0,
+            successful_sessions: 0,
+        }]);
+        let identity = DeviceIdentity {
+            device_id,
+            device_name: "demo-device".to_string(),
+            instance_name: None,
+            identity_public_key: "pub".to_string(),
+            tls_root_certificate: "cert".to_string(),
+        };
+
+        let err = trusted_transport_for_identity(&config, &identity)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("长期 mTLS"));
+    }
+
+    #[test]
     fn preferred_peer_query_uses_instance_name_when_present() {
         let peer = sample_peer();
         assert_eq!(preferred_peer_query(&peer), "worker-a");
@@ -3011,6 +3169,22 @@ mod tests {
             trust_device: false,
             trusted_only: false,
             discovery_secs: 3,
+        }
+    }
+
+    fn sample_config_with_trusted_devices(
+        trusted_devices: Vec<TrustedDeviceConfig>,
+    ) -> SynlyConfig {
+        SynlyConfig {
+            device: DeviceConfig {
+                device_id: Uuid::nil(),
+                device_name: "local-device".to_string(),
+                identity_private_key: None,
+                identity_public_key: None,
+            },
+            clipboard: ClipboardConfig::default(),
+            transfer: TransferConfig::default(),
+            trusted_devices,
         }
     }
 

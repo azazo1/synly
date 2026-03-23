@@ -256,15 +256,19 @@ pub fn build_client_connector(
     device: &DeviceConfig,
     trusted_server_root_certificate: &str,
 ) -> Result<TlsConnector> {
-    let tls_materials = build_device_tls_materials(device)?;
     let mut roots = RootCertStore::empty();
     roots.add(decode_certificate_der(trusted_server_root_certificate)?)?;
-    let mut config = ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_client_auth_cert(tls_materials.cert_chain, tls_materials.private_key)?;
-    config.alpn_protocols = vec![b"synly/1".to_vec()];
+    build_client_connector_with_roots(device, roots)
+}
 
-    Ok(TlsConnector::from(Arc::new(config)))
+pub fn build_client_connector_for_trusted_devices(
+    device: &DeviceConfig,
+    trusted_devices: &[TrustedDeviceConfig],
+) -> Result<TlsConnector> {
+    let Some(roots) = trusted_client_roots(trusted_devices)? else {
+        bail!("no trusted server roots configured");
+    };
+    build_client_connector_with_roots(device, roots)
 }
 
 pub fn build_bootstrap_client_connector(
@@ -1169,6 +1173,19 @@ fn trusted_client_roots(trusted_devices: &[TrustedDeviceConfig]) -> Result<Optio
     } else {
         Ok(Some(roots))
     }
+}
+
+fn build_client_connector_with_roots(
+    device: &DeviceConfig,
+    roots: RootCertStore,
+) -> Result<TlsConnector> {
+    let tls_materials = build_device_tls_materials(device)?;
+    let mut config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_client_auth_cert(tls_materials.cert_chain, tls_materials.private_key)?;
+    config.alpn_protocols = vec![b"synly/1".to_vec()];
+
+    Ok(TlsConnector::from(Arc::new(config)))
 }
 
 fn parse_certificate_public_key_bytes(certificate_der: &[u8]) -> Result<Vec<u8>> {
