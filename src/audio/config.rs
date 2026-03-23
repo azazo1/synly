@@ -3,7 +3,7 @@ use crate::audio::error::{Error, Result};
 
 pub const SAMPLE_RATE: u32 = 48_000;
 pub const DEFAULT_PACKET_DURATION_MS: u32 = 5;
-pub const DEFAULT_JITTER_BUFFER_MS: u32 = 30;
+pub const DEFAULT_JITTER_BUFFER_MS: u32 = 80;
 pub const DEFAULT_REDUNDANCY_WINDOW_PACKETS: usize = 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
