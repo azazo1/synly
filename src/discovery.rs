@@ -15,6 +15,7 @@ pub struct Advertisement {
     pub port: u16,
     pub device: DeviceConfig,
     pub mode: SyncMode,
+    pub process_name: Option<String>,
 }
 
 pub struct DiscoveryRegistration {
@@ -31,6 +32,7 @@ impl Drop for DiscoveryRegistration {
 pub struct DiscoveredPeer {
     pub fullname: String,
     pub device_name: String,
+    pub process_name: Option<String>,
     pub device_id: String,
     pub mode: SyncMode,
     pub port: u16,
@@ -38,6 +40,10 @@ pub struct DiscoveredPeer {
 }
 
 impl DiscoveredPeer {
+    pub fn display_name(&self) -> String {
+        format_display_name(self.process_name.as_deref(), &self.device_name)
+    }
+
     pub fn label(&self) -> String {
         let addresses = self
             .addresses
@@ -47,7 +53,7 @@ impl DiscoveredPeer {
             .join(", ");
         format!(
             "{} ({})  {}  {}",
-            self.device_name,
+            self.display_name(),
             &self.device_id[..8.min(self.device_id.len())],
             self.mode.label(),
             addresses
@@ -63,9 +69,15 @@ pub fn advertise(advertisement: &Advertisement) -> Result<DiscoveryRegistration>
     }
 
     let instance = format!(
-        "{}-{}",
-        sanitize_label(&advertisement.device.device_name),
-        advertisement.device.short_id()
+        "{}-{}-{}",
+        sanitize_label(
+            advertisement
+                .process_name
+                .as_deref()
+                .unwrap_or(&advertisement.device.device_name)
+        ),
+        advertisement.device.short_id(),
+        advertisement.port
     );
     let hostname = format!(
         "synly-{}.local.",
@@ -81,6 +93,14 @@ pub fn advertise(advertisement: &Advertisement) -> Result<DiscoveryRegistration>
         "device_name".to_string(),
         advertisement.device.device_name.clone(),
     );
+    if let Some(process_name) = advertisement
+        .process_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        properties.insert("process_name".to_string(), process_name.to_string());
+    }
     properties.insert("mode".to_string(), advertisement.mode.as_wire().to_string());
     properties.insert("protocol".to_string(), "1".to_string());
 
@@ -143,6 +163,11 @@ pub fn browse(timeout: Duration) -> Result<Vec<DiscoveredPeer>> {
 fn discovered_peer_from_info(info: &mdns_sd::ResolvedService) -> Option<DiscoveredPeer> {
     let mode = SyncMode::from_wire(info.get_property_val_str("mode")?)?;
     let device_name = info.get_property_val_str("device_name")?.to_string();
+    let process_name = info
+        .get_property_val_str("process_name")
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
     let device_id = info.get_property_val_str("device_id")?.to_string();
     let addresses = info.get_addresses_v4().into_iter().collect::<Vec<_>>();
 
@@ -153,6 +178,7 @@ fn discovered_peer_from_info(info: &mdns_sd::ResolvedService) -> Option<Discover
     Some(DiscoveredPeer {
         fullname: info.get_fullname().to_string(),
         device_name,
+        process_name,
         device_id,
         mode,
         port: info.get_port(),
@@ -194,5 +220,17 @@ fn sanitize_label(label: &str) -> String {
         "synly".to_string()
     } else {
         sanitized
+    }
+}
+
+pub fn format_display_name(process_name: Option<&str>, device_name: &str) -> String {
+    match process_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(process_name) if !process_name.eq_ignore_ascii_case(device_name) => {
+            format!("{process_name} @ {device_name}")
+        }
+        _ => device_name.to_string(),
     }
 }

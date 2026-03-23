@@ -7,7 +7,7 @@ use crate::cli::{
 use crate::clipboard::ClipboardSync;
 use crate::config::{DeviceConfig, SynlyConfig, TrustedDeviceConfig};
 use crate::crypto;
-use crate::discovery::{self, Advertisement, DiscoveredPeer};
+use crate::discovery::{self, Advertisement, DiscoveredPeer, format_display_name};
 use crate::protocol::{
     ClipboardPayload, ControlMessage, DeviceIdentity, FileChunkHeader, Frame, FrameReader,
     FrameWriter, PROTOCOL_VERSION, PairAuthMethod, PairRequestPayload, SessionAgreement,
@@ -88,6 +88,7 @@ struct PairDecisionParams<'a> {
     accepted: bool,
     message: String,
     device: &'a DeviceConfig,
+    process_name: Option<&'a str>,
     workspace: &'a WorkspaceSpec,
     clipboard_mode: ClipboardMode,
     audio_mode: AudioMode,
@@ -154,6 +155,7 @@ async fn run_host(config: &mut SynlyConfig, options: RuntimeOptions) -> Result<(
         port,
         device: device.clone(),
         mode: options.mode,
+        process_name: options.process_name.clone(),
     })?;
 
     print_host_ready(&device, &options, port);
@@ -166,7 +168,7 @@ async fn run_host(config: &mut SynlyConfig, options: RuntimeOptions) -> Result<(
             Ok(Some(session)) => {
                 let remote_label = format!(
                     "{} ({})",
-                    session.remote.device_name,
+                    identity_display_name(&session.remote),
                     short_uuid(&session.remote.device_id)
                 );
                 match run_sync_session(
@@ -221,13 +223,13 @@ async fn run_client(config: &mut SynlyConfig, options: RuntimeOptions) -> Result
                 return Err(err);
             }
         };
-        reconnect_query = Some(peer.device_id.clone());
+        reconnect_query = Some(preferred_peer_query(&peer));
 
         match connect_to_peer(&peer, config, &options).await {
             Ok(session) => {
                 let remote_label = format!(
                     "{} ({})",
-                    session.remote.device_name,
+                    identity_display_name(&session.remote),
                     short_uuid(&session.remote.device_id)
                 );
                 reconnect_delay = RECONNECT_BASE_DELAY;
@@ -449,6 +451,7 @@ async fn handle_trusted_incoming_connection(
         accepted,
         message,
         device: &device,
+        process_name: options.process_name.as_deref(),
         workspace: &options.workspace,
         clipboard_mode: options.clipboard_mode,
         audio_mode: options.audio_mode,
@@ -809,6 +812,7 @@ async fn handle_bootstrap_incoming_connection(
         accepted,
         message,
         device: &device,
+        process_name: options.process_name.as_deref(),
         workspace: &options.workspace,
         clipboard_mode: options.clipboard_mode,
         audio_mode: options.audio_mode,
@@ -877,7 +881,7 @@ async fn connect_to_trusted_peer(
         crypto::export_audio_master_secret_from_client(&client_stream, &request_id)?;
     let payload = PairRequestPayload {
         protocol_version: PROTOCOL_VERSION,
-        client: device_identity(device),
+        client: device_identity(device, options.process_name.as_deref()),
         requested_mode: options.mode,
         workspace: options.workspace.summary(options.clipboard_mode),
         audio_mode: options.audio_mode,
@@ -1083,7 +1087,7 @@ async fn connect_to_untrusted_peer(
         crypto::export_audio_master_secret_from_client(&client_stream, &request_id)?;
     let payload = PairRequestPayload {
         protocol_version: PROTOCOL_VERSION,
-        client: device_identity(device),
+        client: device_identity(device, options.process_name.as_deref()),
         requested_mode: options.mode,
         workspace: options.workspace.summary(options.clipboard_mode),
         audio_mode: options.audio_mode,
@@ -1212,7 +1216,7 @@ async fn run_sync_session(
     println!("{}", style("同步已开始").bold());
     println!(
         "连接到: {} ({})",
-        session.remote.device_name,
+        identity_display_name(&session.remote),
         short_uuid(&session.remote.device_id)
     );
     for line in session.remote_workspace.human_lines() {
@@ -2173,7 +2177,7 @@ fn select_peer_from_query(peers: &[DiscoveredPeer], query: &str) -> Result<Disco
                 .collect::<Vec<_>>()
                 .join("\n");
             bail!(
-                "`{query}` 匹配到多个设备，请改用更精确的名称、设备 ID 前缀或 IPv4 地址:\n{labels}"
+                "`{query}` 匹配到多个设备，请改用更精确的进程名、设备名、设备 ID 前缀或 IPv4 地址:\n{labels}"
             )
         }
     }
@@ -2185,7 +2189,10 @@ fn peer_matches_query(peer: &DiscoveredPeer, query: &str) -> bool {
         return false;
     }
 
-    peer.device_name.eq_ignore_ascii_case(query)
+    peer.process_name
+        .as_deref()
+        .is_some_and(|process_name| process_name.eq_ignore_ascii_case(query))
+        || peer.device_name.eq_ignore_ascii_case(query)
         || peer.device_id.eq_ignore_ascii_case(query)
         || peer
             .device_id
@@ -2194,6 +2201,19 @@ fn peer_matches_query(peer: &DiscoveredPeer, query: &str) -> bool {
         || peer.addresses.iter().any(|address| {
             address.to_string() == query || format!("{address}:{}", peer.port) == query
         })
+}
+
+fn preferred_peer_query(peer: &DiscoveredPeer) -> String {
+    peer.process_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case(&peer.device_name))
+        .unwrap_or(&peer.device_id)
+        .to_string()
+}
+
+fn identity_display_name(identity: &DeviceIdentity) -> String {
+    format_display_name(identity.process_name.as_deref(), &identity.device_name)
 }
 
 fn trusted_device_for_peer(
@@ -2338,7 +2358,7 @@ fn print_pair_request_overview(
     println!("{}", style("收到同步请求").bold());
     println!(
         "来自: {} ({})",
-        payload.client.device_name,
+        identity_display_name(&payload.client),
         short_uuid(&payload.client.device_id)
     );
     println!(
@@ -2381,7 +2401,7 @@ fn print_connected_peer(
     println!("{}", style("连接已建立").bold());
     println!(
         "对端: {} ({})",
-        remote.device_name,
+        identity_display_name(remote),
         short_uuid(&remote.device_id)
     );
     println!(
@@ -2432,7 +2452,7 @@ fn allows_local_receive(role: SessionRole, agreement: &SessionAgreement) -> bool
 
 fn signed_pair_decision(params: PairDecisionParams<'_>) -> Result<ControlMessage> {
     let summary = params.workspace.summary(params.clipboard_mode);
-    let server = device_identity(params.device);
+    let server = device_identity(params.device, params.process_name);
     let proof = match params.auth_method {
         PairAuthMethod::Pin => crypto::sign_pair_decision(
             params.exporter,
@@ -2476,10 +2496,11 @@ fn signed_pair_decision(params: PairDecisionParams<'_>) -> Result<ControlMessage
     })
 }
 
-fn device_identity(device: &DeviceConfig) -> DeviceIdentity {
+fn device_identity(device: &DeviceConfig, process_name: Option<&str>) -> DeviceIdentity {
     DeviceIdentity {
         device_id: device.device_id,
         device_name: device.device_name.clone(),
+        process_name: process_name.map(ToString::to_string),
         identity_public_key: device
             .identity_public_key()
             .expect("device identity public key is missing")
@@ -2492,6 +2513,9 @@ fn device_identity(device: &DeviceConfig) -> DeviceIdentity {
 fn print_host_ready(device: &DeviceConfig, options: &RuntimeOptions, port: u16) {
     println!("{}", style("Synly 已就绪").bold());
     println!("设备: {} ({})", device.device_name, device.short_id());
+    if let Some(process_name) = options.process_name.as_deref() {
+        println!("当前进程: {}", process_name);
+    }
     println!(
         "本机身份指纹: {}",
         crypto::short_identity_fingerprint(
@@ -2685,13 +2709,14 @@ fn is_executable(_metadata: &std::fs::Metadata) -> bool {
 mod tests {
     use super::{
         FILE_STREAM_CHUNK_SIZE, SessionRole, accept_policy_label, choose_peer, delete_policy,
-        is_connection_shutdown_error, next_reconnect_delay, peer_matches_query, resolve_audio_plan,
-        select_peer_from_query, send_one_file, should_auto_accept_request,
+        identity_display_name, is_connection_shutdown_error, next_reconnect_delay,
+        peer_matches_query, preferred_peer_query, resolve_audio_plan, select_peer_from_query,
+        send_one_file, should_auto_accept_request,
     };
     use crate::audio::AudioChannelDirection;
     use crate::cli::{AudioMode, PairingRuntimeOptions, SyncMode};
     use crate::discovery::DiscoveredPeer;
-    use crate::protocol::{Frame, PairAuthMethod};
+    use crate::protocol::{DeviceIdentity, Frame, PairAuthMethod};
     use crate::sync::{DeletePolicy, OutgoingSpec, SnapshotLayout};
     use std::env;
     use std::fs;
@@ -2798,6 +2823,7 @@ mod tests {
     fn peer_query_matches_name_id_prefix_and_ip() {
         let peer = sample_peer();
         assert!(peer_matches_query(&peer, "demo-device"));
+        assert!(peer_matches_query(&peer, "worker-a"));
         assert!(peer_matches_query(&peer, "abcd1234"));
         assert!(peer_matches_query(&peer, "192.168.1.20"));
         assert!(!peer_matches_query(&peer, "unknown"));
@@ -2812,6 +2838,7 @@ mod tests {
         let duplicate = DiscoveredPeer {
             fullname: "dup".to_string(),
             device_name: "demo-device".to_string(),
+            process_name: Some("worker-b".to_string()),
             device_id: "ffffeeee-dddd-cccc-bbbb-aaaaaaaaaaaa".to_string(),
             mode: SyncMode::Auto,
             port: 9999,
@@ -2854,6 +2881,25 @@ mod tests {
     }
 
     #[test]
+    fn preferred_peer_query_uses_process_name_when_present() {
+        let peer = sample_peer();
+        assert_eq!(preferred_peer_query(&peer), "worker-a");
+    }
+
+    #[test]
+    fn identity_display_name_prefers_process_name() {
+        let identity = DeviceIdentity {
+            device_id: Uuid::nil(),
+            device_name: "demo-device".to_string(),
+            process_name: Some("worker-a".to_string()),
+            identity_public_key: "pub".to_string(),
+            tls_root_certificate: "cert".to_string(),
+        };
+
+        assert_eq!(identity_display_name(&identity), "worker-a @ demo-device");
+    }
+
+    #[test]
     fn resolve_audio_plan_assigns_sender_direction_for_host() {
         let plan = resolve_audio_plan(SessionRole::Host, AudioMode::Send, AudioMode::Receive)
             .expect("send/receive pair should enable audio");
@@ -2877,6 +2923,7 @@ mod tests {
         DiscoveredPeer {
             fullname: "demo._synly._tcp.local.".to_string(),
             device_name: "demo-device".to_string(),
+            process_name: Some("worker-a".to_string()),
             device_id: "abcd1234-1111-2222-3333-444455556666".to_string(),
             mode: SyncMode::Both,
             port: 8080,
