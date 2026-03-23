@@ -336,15 +336,22 @@ async fn connect_to_peer(
             }
         }
         PeerTarget::Direct(address) => {
-            if options.pairing.trusted_only {
-                return connect_to_direct_trusted_peer(
+            if should_try_direct_trusted(config, &options.pairing) {
+                match connect_to_direct_trusted_peer(
                     *address.ip(),
                     address.port(),
                     &device,
                     config,
                     options,
                 )
-                .await;
+                .await
+                {
+                    Ok(session) => return Ok(session),
+                    Err(err) if !options.pairing.trusted_only => {
+                        eprintln!("直连 trusted mTLS 失败，回退到 bootstrap/PIN: {err:#}");
+                    }
+                    Err(err) => return Err(err),
+                }
             }
             connect_to_untrusted_peer(*address.ip(), address.port(), &device, config, options).await
         }
@@ -2480,6 +2487,10 @@ fn has_trusted_transport(config: &SynlyConfig) -> bool {
     })
 }
 
+fn should_try_direct_trusted(config: &SynlyConfig, pairing: &PairingRuntimeOptions) -> bool {
+    pairing.trusted_only || has_trusted_transport(config)
+}
+
 fn has_trusted_transport_for_device(config: &SynlyConfig, device_id: &Uuid) -> bool {
     trusted_transport_for_device(config, device_id).is_some()
 }
@@ -2848,7 +2859,7 @@ mod tests {
         identity_display_name, is_connection_shutdown_error, next_reconnect_delay,
         parse_direct_peer_addr, peer_matches_query, preferred_peer_query, resolve_audio_plan,
         select_peer_from_query, send_one_file, should_auto_accept_request,
-        trusted_transport_for_device, trusted_transport_for_identity,
+        should_try_direct_trusted, trusted_transport_for_device, trusted_transport_for_identity,
     };
     use crate::audio::AudioChannelDirection;
     use crate::cli::{AudioMode, PairingRuntimeOptions, SyncMode};
@@ -3106,6 +3117,33 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("长期 mTLS"));
+    }
+
+    #[test]
+    fn direct_ip_prefers_trusted_when_any_trusted_transport_exists() {
+        let config = sample_config_with_trusted_devices(vec![TrustedDeviceConfig {
+            device_id: Uuid::new_v4(),
+            device_name: "demo-device".to_string(),
+            public_key: "pub".to_string(),
+            tls_root_certificate: "cert".to_string(),
+            trusted_at_ms: 0,
+            last_seen_ms: 0,
+            successful_sessions: 0,
+        }]);
+
+        assert!(should_try_direct_trusted(
+            &config,
+            &sample_pairing_options()
+        ));
+    }
+
+    #[test]
+    fn direct_ip_tries_trusted_when_trusted_only_is_enabled() {
+        let config = sample_config_with_trusted_devices(Vec::new());
+        let mut pairing = sample_pairing_options();
+        pairing.trusted_only = true;
+
+        assert!(should_try_direct_trusted(&config, &pairing));
     }
 
     #[test]
