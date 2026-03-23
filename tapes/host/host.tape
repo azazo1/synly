@@ -69,6 +69,8 @@ Set Width 2560
 Set Height 1440
 Set FontFamily "JetBrainsMonoNL Nerd Font Mono"
 
+# Sleep 500ms # 抵消 justfile 的 500ms 延迟
+
 Type "# This is a synly host demo!" Sleep 500ms  Enter
 Sleep 2s
 
@@ -76,31 +78,39 @@ Type "synly" Sleep 1s Enter
 
 Sleep 1s
 
-Type "${TMPDIR}synly" Sleep 1s Enter
+# Flow
 
-Type "[" Sleep 500ms # Tab 1
+# 文件同步模式
+Down@500ms
+# 文件同步模式: 自动
+Right@2s 4
 
 Sleep 1s
 
-Type "[" Sleep 500ms # Tab 3
+# Workspace
+Type "]" Sleep 1s
 
-Down@50ms
+# Edit: 共享目录
+Enter Type "${TMPDIR}synly" Sleep 1s Escape
+Sleep 1s
 
-Enter Type "12345" Sleep 1s Enter
+# Pairing
+Type "]" Sleep 1s
 
-Sleep 100ms
+# Edit: 当前实例名
+Enter Type "sync-files-worker" Sleep 1s Escape
 
-Enter Type "123456" Sleep 1.5s Enter
+# Edit: 固定 PIN
+Down@1.5s 3
+Enter Type "123456" Sleep 1s Escape
 
-Sleep 200ms
+# Check: 认证后自动接受
+Down@500ms
+Right@500ms
 
-Right@50ms
-
-Down@50ms
-
-Sleep 200ms
-
-Right@50ms
+# Check: 倾向建立信任
+Down@500ms
+Right@500ms
 
 Sleep 1s
 

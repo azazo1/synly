@@ -28,4 +28,4 @@ vhs: vhs-join vhs-host
 
 alias rec := record
 
-record: down up cross-build vhs
+record: cross-build down up vhs

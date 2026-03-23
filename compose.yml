@@ -10,7 +10,7 @@ services:
     tty: true
     networks:
       synly-network:
-        ipv4_address: 172.20.0.20
+        ipv4_address: 172.21.0.20
 
   synly-join:
     image: alpine:latest
@@ -23,12 +23,12 @@ services:
     tty: true
     networks:
       synly-network:
-        ipv4_address: 172.20.0.21
+        ipv4_address: 172.21.0.21
 
 networks:
   synly-network:
     driver: bridge
     ipam:
       config:
-        - subnet: 172.20.0.0/24
-          gateway: 172.20.0.1
+        - subnet: 172.21.0.0/24
+          gateway: 172.21.0.1

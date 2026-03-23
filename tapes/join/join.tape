@@ -76,29 +76,38 @@ Type "synly" Sleep 1s Enter
 
 Sleep 1s
 
-Type "${TMPDIR}synly" Sleep 1s Enter
+# Flow
 
-Type "[" Sleep 500ms # Tab 1
-Left@1s
-Sleep 500ms
+# 主动连接
+Right@500ms
 
-Type "[" Sleep 500ms # Tab 3
+# 文件同步模式: 自动
+Down@500ms
+Right@2s 4
 
-Enter Type "172.20.0.20:12345" Sleep 500ms Enter
+Sleep 1s
 
-Down@50ms
+# Workspace
+Type "]" Sleep 1s
 
-Sleep 200ms
+# Edit: 共享目录
+Enter Type "${TMPDIR}synly" Sleep 1s Escape
+Sleep 1s
 
-Enter Type "123456" Sleep 1.5s Enter
+# Pairing
+Type "]" Sleep 1s
 
-Right@50ms
+# Edit: 目标设备
+Down@500ms
+Enter Type "sync-files-worker" Sleep 1s Escape
 
-Down@50ms
+# Edit: 固定 PIN
+Down@1.5s 2
+Enter Type "123456" Sleep 1s Escape
 
-Sleep 200ms
-
-Right@50ms
+# Check: 倾向建立信任
+Down@1s 2
+Right@500ms
 
 Sleep 1s
 
