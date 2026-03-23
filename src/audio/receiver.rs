@@ -390,3 +390,60 @@ impl AudioDepacketizer {
         Ok(ready)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{AudioDepacketizer, QueuedAudioFrame};
+    use crate::audio::protocol::{RTP_PAYLOAD_TYPE_AUDIO, RtpHeader, write_audio_packet};
+
+    fn audio_datagram(sequence_number: u16, timestamp: u32, payload_byte: u8) -> Vec<u8> {
+        write_audio_packet(
+            RtpHeader {
+                packet_type: RTP_PAYLOAD_TYPE_AUDIO,
+                sequence_number,
+                timestamp,
+                ssrc: 1,
+            },
+            &[payload_byte; 8],
+        )
+    }
+
+    #[test]
+    fn depacketizer_returns_missing_frame_when_block_gap_is_abandoned() {
+        let mut depacketizer = AudioDepacketizer::new(5, 0);
+
+        assert!(
+            depacketizer
+                .push_datagram(&audio_datagram(0, 0, 0))
+                .unwrap()
+                .is_empty()
+        );
+
+        let ready = depacketizer
+            .push_datagram(&audio_datagram(4, 20, 4))
+            .unwrap();
+        assert!(matches!(ready.as_slice(), [QueuedAudioFrame::Encoded(_)]));
+
+        let ready = depacketizer
+            .push_datagram(&audio_datagram(5, 25, 5))
+            .unwrap();
+        assert!(matches!(ready.as_slice(), [QueuedAudioFrame::Encoded(_)]));
+
+        let ready = depacketizer
+            .push_datagram(&audio_datagram(7, 35, 7))
+            .unwrap();
+        assert!(ready.is_empty());
+
+        let ready = depacketizer
+            .push_datagram(&audio_datagram(8, 40, 8))
+            .unwrap();
+        assert!(matches!(
+            ready.as_slice(),
+            [
+                QueuedAudioFrame::Missing,
+                QueuedAudioFrame::Encoded(_),
+                QueuedAudioFrame::Encoded(_)
+            ]
+        ));
+    }
+}
