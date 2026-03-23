@@ -69,10 +69,6 @@ impl OpusEncoder {
         Ok(Self { inner, config })
     }
 
-    pub fn max_packet_size(&self) -> usize {
-        1400
-    }
-
     pub fn encode_float(&mut self, pcm: &[f32], out: &mut [u8]) -> Result<usize> {
         if pcm.len() != self.config.samples_per_frame as usize * self.config.channel_count as usize
         {

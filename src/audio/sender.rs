@@ -1,6 +1,3 @@
-use crate::audio::capture::{AudioInput, CaptureStatus, open_input};
-use crate::audio::codec::OpusEncoder;
-use crate::audio::config::SenderConfig;
 use crate::audio::error::{Error, Result};
 use crate::audio::fec;
 use crate::audio::protocol::{
@@ -8,14 +5,9 @@ use crate::audio::protocol::{
     RTPA_FEC_SHARDS, RtpHeader, write_audio_packet, write_fec_packet,
 };
 use std::array;
-use std::net::UdpSocket;
-use std::time::Duration;
 
 #[derive(Clone, Debug)]
 pub struct OutboundDatagram {
-    pub sequence_number: u16,
-    pub packet_type: u8,
-    pub payload_len: usize,
     pub bytes: Vec<u8>,
 }
 
@@ -64,9 +56,6 @@ impl AudioPacketizer {
             ssrc: self.ssrc,
         };
         out.push(OutboundDatagram {
-            sequence_number,
-            packet_type: RTP_PAYLOAD_TYPE_AUDIO,
-            payload_len: payload.len(),
             bytes: write_audio_packet(rtp, payload),
         });
 
@@ -122,9 +111,6 @@ impl AudioPacketizer {
                         ssrc: self.ssrc,
                     };
                     out.push(OutboundDatagram {
-                        sequence_number: rtp.sequence_number,
-                        packet_type: RTP_PAYLOAD_TYPE_FEC,
-                        payload_len: parity.len(),
                         bytes: write_fec_packet(rtp, fec_header, &parity),
                     });
                 }
@@ -134,65 +120,5 @@ impl AudioPacketizer {
         }
 
         Ok(out)
-    }
-}
-
-pub struct AudioSender {
-    socket: UdpSocket,
-    input: Box<dyn AudioInput>,
-    encoder: OpusEncoder,
-    packetizer: AudioPacketizer,
-    pcm_buffer: Vec<f32>,
-    encoded_buffer: Vec<u8>,
-    timeout: Duration,
-}
-
-impl AudioSender {
-    pub fn bind(config: SenderConfig) -> Result<Self> {
-        let stream = config.stream_params()?;
-        let socket = UdpSocket::bind(config.bind_addr)?;
-        socket.connect(config.destination)?;
-        let input = open_input(&config.capture, &stream)?;
-        let encoder = OpusEncoder::new(stream.opus_config(), stream.bitrate)?;
-        let packetizer =
-            AudioPacketizer::new(stream.packet_duration_ms, config.ssrc, config.enable_fec);
-        let pcm_buffer = vec![0.0; stream.samples_per_frame()];
-        let encoded_buffer = vec![0u8; 1400];
-
-        Ok(Self {
-            socket,
-            input,
-            encoder,
-            packetizer,
-            pcm_buffer,
-            encoded_buffer,
-            timeout: config.read_timeout,
-        })
-    }
-
-    pub fn pump_once(&mut self) -> Result<usize> {
-        let status = self.input.read_frame(&mut self.pcm_buffer, self.timeout)?;
-        match status {
-            CaptureStatus::Timeout => Ok(0),
-            CaptureStatus::Ok => {
-                let encoded = self
-                    .encoder
-                    .encode_float(&self.pcm_buffer, &mut self.encoded_buffer)?;
-                let datagrams = self
-                    .packetizer
-                    .push_encoded_frame(&self.encoded_buffer[..encoded])?;
-                let sent = datagrams.len();
-                for datagram in datagrams {
-                    self.socket.send(&datagram.bytes)?;
-                }
-                Ok(sent)
-            }
-        }
-    }
-
-    pub fn run(&mut self) -> Result<()> {
-        loop {
-            self.pump_once()?;
-        }
     }
 }

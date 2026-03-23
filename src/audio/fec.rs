@@ -169,17 +169,15 @@ fn shard_len(
 ) -> Result<usize> {
     let mut len = None;
 
-    for shard in data.iter().chain(parity.iter()) {
-        if let Some(shard) = shard {
-            match len {
-                Some(existing) if existing != shard.len() => {
-                    return Err(Error::Protocol(
-                        "inconsistent audio shard sizes in FEC block".into(),
-                    ));
-                }
-                Some(_) => {}
-                None => len = Some(shard.len()),
+    for shard in data.iter().chain(parity.iter()).flatten() {
+        match len {
+            Some(existing) if existing != shard.len() => {
+                return Err(Error::Protocol(
+                    "inconsistent audio shard sizes in FEC block".into(),
+                ));
             }
+            Some(_) => {}
+            None => len = Some(shard.len()),
         }
     }
 

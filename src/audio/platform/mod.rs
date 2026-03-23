@@ -13,29 +13,29 @@ mod windows;
 pub fn open_input(config: &CaptureConfig, stream: &StreamParams) -> Result<Box<dyn AudioInput>> {
     #[cfg(target_os = "macos")]
     {
-        return macos::open_input(config, stream);
+        macos::open_input(config, stream)
     }
     #[cfg(target_os = "windows")]
     {
-        return windows::open_input(config, stream);
+        windows::open_input(config, stream)
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        return unsupported::open_input(config, stream);
+        unsupported::open_input(config, stream)
     }
 }
 
 pub fn open_output(config: &PlaybackConfig, stream: &StreamParams) -> Result<Box<dyn AudioOutput>> {
     #[cfg(target_os = "macos")]
     {
-        return macos::open_output(config, stream);
+        macos::open_output(config, stream)
     }
     #[cfg(target_os = "windows")]
     {
-        return windows::open_output(config, stream);
+        windows::open_output(config, stream)
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        return unsupported::open_output(config, stream);
+        unsupported::open_output(config, stream)
     }
 }

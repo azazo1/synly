@@ -1,9 +1,9 @@
+use crate::audio::{self, AudioChannelDirection};
 use crate::cli::{
     AudioMode, ConnectionPreference, PairingRuntimeOptions, RuntimeOptions, SyncMode,
     TrustPromptDecision, prompt_confirm, prompt_confirm_with_trust, prompt_select,
     require_peer_query, resolve_pairing_pin, sync_clipboard_label, sync_delete_label,
 };
-use crate::audio::{self, AudioChannelDirection};
 use crate::clipboard::ClipboardSync;
 use crate::config::{DeviceConfig, SynlyConfig, TrustedDeviceConfig};
 use crate::crypto;
@@ -172,12 +172,14 @@ async fn run_host(config: &mut SynlyConfig, options: RuntimeOptions) -> Result<(
                 match run_sync_session(
                     session,
                     &options.workspace,
-                    options.interval_secs,
-                    options.sync_delete,
-                    options.sync_clipboard,
-                    options.audio_mode,
-                    &options.clipboard,
-                    options.transfer_limits,
+                    SyncSessionOptions {
+                        interval_secs: options.interval_secs,
+                        sync_delete: options.sync_delete,
+                        sync_clipboard: options.sync_clipboard,
+                        audio_mode: options.audio_mode,
+                        clipboard_options: &options.clipboard,
+                        transfer_limits: options.transfer_limits,
+                    },
                 )
                 .await
                 {
@@ -228,12 +230,14 @@ async fn run_client(config: &mut SynlyConfig, options: RuntimeOptions) -> Result
                 if let Err(err) = run_sync_session(
                     session,
                     &options.workspace,
-                    options.interval_secs,
-                    options.sync_delete,
-                    options.sync_clipboard,
-                    options.audio_mode,
-                    &options.clipboard,
-                    options.transfer_limits,
+                    SyncSessionOptions {
+                        interval_secs: options.interval_secs,
+                        sync_delete: options.sync_delete,
+                        sync_clipboard: options.sync_clipboard,
+                        audio_mode: options.audio_mode,
+                        clipboard_options: &options.clipboard,
+                        transfer_limits: options.transfer_limits,
+                    },
                 )
                 .await
                 {
@@ -1107,7 +1111,12 @@ async fn connect_to_untrusted_peer(
             if !accepted {
                 bail!("{}", message);
             }
-            (server.clone(), workspace.clone(), agreement.clone(), *audio_mode)
+            (
+                server.clone(),
+                workspace.clone(),
+                agreement.clone(),
+                *audio_mode,
+            )
         }
         ControlMessage::Error { message } => bail!("{}", message),
         other => bail!("unexpected bootstrap pairing response: {other:?}"),
@@ -1166,15 +1175,19 @@ async fn connect_to_untrusted_peer(
     })
 }
 
-async fn run_sync_session(
-    session: AuthenticatedSession,
-    workspace: &WorkspaceSpec,
+struct SyncSessionOptions<'a> {
     interval_secs: u64,
     sync_delete: bool,
     sync_clipboard: bool,
     audio_mode: AudioMode,
-    clipboard_options: &crate::cli::ClipboardRuntimeOptions,
+    clipboard_options: &'a crate::cli::ClipboardRuntimeOptions,
     transfer_limits: TransferLimits,
+}
+
+async fn run_sync_session(
+    session: AuthenticatedSession,
+    workspace: &WorkspaceSpec,
+    options: SyncSessionOptions<'_>,
 ) -> Result<()> {
     println!();
     println!("{}", style("同步已开始").bold());
@@ -1195,15 +1208,20 @@ async fn run_sync_session(
     let file_can_receive = local_can_receive
         && workspace.can_receive_files()
         && session.remote_workspace.can_send_files();
-    let clipboard_enabled_on_both = sync_clipboard && session.remote_workspace.sync_clipboard;
+    let clipboard_enabled_on_both =
+        options.sync_clipboard && session.remote_workspace.sync_clipboard;
     let clipboard_can_send = clipboard_enabled_on_both && local_can_send;
     let clipboard_can_receive = clipboard_enabled_on_both && local_can_receive;
-    let audio_plan = resolve_audio_plan(session.role, audio_mode, session.remote_audio_mode);
+    let audio_plan =
+        resolve_audio_plan(session.role, options.audio_mode, session.remote_audio_mode);
     let remote_audio_mode = session.remote_audio_mode;
     let remote_socket_addr = session.remote_socket_addr;
     let audio_master_secret = session.audio_master_secret;
 
-    match (sync_clipboard, session.remote_workspace.sync_clipboard) {
+    match (
+        options.sync_clipboard,
+        session.remote_workspace.sync_clipboard,
+    ) {
         (true, true) => println!(
             "本次剪贴板同步: {}",
             clipboard_agreement_label(session.role, &session.agreement)
@@ -1212,11 +1230,14 @@ async fn run_sync_session(
         (false, true) => println!("本次剪贴板同步: 对端已开启，但本机未开启，本次不会同步。"),
         (false, false) => println!("本次剪贴板同步: 关闭"),
     }
-    println!("{}", audio_summary_line(audio_mode, remote_audio_mode));
+    println!(
+        "{}",
+        audio_summary_line(options.audio_mode, remote_audio_mode)
+    );
 
     let (read_half, write_half) = tokio::io::split(session.stream);
     let (tx, rx) = mpsc::channel::<Frame>(64);
-    let writer_task = tokio::spawn(writer_loop(write_half, rx, transfer_limits));
+    let writer_task = tokio::spawn(writer_loop(write_half, rx, options.transfer_limits));
 
     let snapshot_task = if file_can_send {
         let outgoing = workspace
@@ -1227,16 +1248,16 @@ async fn run_sync_session(
         Some(tokio::spawn(snapshot_loop(
             outgoing,
             sender,
-            interval_secs.max(1),
+            options.interval_secs.max(1),
         )))
     } else {
         None
     };
     let clipboard_sync = clipboard_enabled_on_both.then(|| {
         ClipboardSync::new(
-            clipboard_options.max_file_bytes,
-            clipboard_options.max_cache_bytes,
-            clipboard_options.cache_dir.clone(),
+            options.clipboard_options.max_file_bytes,
+            options.clipboard_options.max_cache_bytes,
+            options.clipboard_options.cache_dir.clone(),
         )
     });
     let (clipboard_watch_handle, clipboard_task) = if clipboard_can_send {
@@ -1293,7 +1314,7 @@ async fn run_sync_session(
 
     let incoming_root = workspace.incoming_root.clone();
     let outgoing_spec = workspace.outgoing.clone();
-    let mut reader = FrameReader::with_limits(read_half, transfer_limits);
+    let mut reader = FrameReader::with_limits(read_half, options.transfer_limits);
     let mut pending_revisions = BTreeMap::<u64, PendingRevision>::new();
     let mut incoming_files = HashMap::<(u64, String), IncomingFileState>::new();
     let disconnected = loop {
@@ -1313,20 +1334,15 @@ async fn run_sync_session(
                     role: LocalAudioRole::Send,
                     direction,
                 }) = audio_plan
+                    && audio_task.is_none()
                 {
-                    if audio_task.is_none() {
-                        let remote_audio_addr = SocketAddr::new(remote_socket_addr.ip(), port);
-                        match audio::spawn_sender(
-                            audio_master_secret,
-                            direction,
-                            remote_audio_addr,
-                        ) {
-                            Ok(task) => {
-                                audio_task = Some(task);
-                            }
-                            Err(err) => {
-                                eprintln!("无法启动音频发送通道，本次不会发送音频: {err:#}");
-                            }
+                    let remote_audio_addr = SocketAddr::new(remote_socket_addr.ip(), port);
+                    match audio::spawn_sender(audio_master_secret, direction, remote_audio_addr) {
+                        Ok(task) => {
+                            audio_task = Some(task);
+                        }
+                        Err(err) => {
+                            eprintln!("无法启动音频发送通道，本次不会发送音频: {err:#}");
                         }
                     }
                 }
@@ -1346,7 +1362,7 @@ async fn run_sync_session(
                     snapshot.layout,
                     snapshot.max_folder_depth,
                 );
-                let skipped_delete_count = if !sync_delete {
+                let skipped_delete_count = if !options.sync_delete {
                     let preview_policy = delete_policy(snapshot.layout, true);
                     build_apply_plan(&snapshot, &local_snapshot, preview_policy)
                         .delete_paths
@@ -1354,7 +1370,7 @@ async fn run_sync_session(
                 } else {
                     0
                 };
-                let delete_policy = delete_policy(snapshot.layout, sync_delete);
+                let delete_policy = delete_policy(snapshot.layout, options.sync_delete);
                 let plan = build_apply_plan(&snapshot, &local_snapshot, delete_policy);
                 ensure_directories(root, &snapshot)?;
 
@@ -1478,10 +1494,10 @@ async fn run_sync_session(
     if let Some(task) = clipboard_task {
         task.abort();
     }
-    if let Some(task) = audio_task {
-        if let Err(err) = task.stop().await {
-            eprintln!("关闭音频 UDP 通道时出错: {err:#}");
-        }
+    if let Some(task) = audio_task
+        && let Err(err) = task.stop().await
+    {
+        eprintln!("关闭音频 UDP 通道时出错: {err:#}");
     }
     match writer_task.await {
         Ok(Ok(())) => {}
@@ -2576,8 +2592,8 @@ fn is_executable(_metadata: &std::fs::Metadata) -> bool {
 mod tests {
     use super::{
         FILE_STREAM_CHUNK_SIZE, SessionRole, accept_policy_label, delete_policy,
-        is_connection_shutdown_error, next_reconnect_delay, peer_matches_query,
-        resolve_audio_plan, select_peer_from_query, send_one_file, should_auto_accept_request,
+        is_connection_shutdown_error, next_reconnect_delay, peer_matches_query, resolve_audio_plan,
+        select_peer_from_query, send_one_file, should_auto_accept_request,
     };
     use crate::audio::AudioChannelDirection;
     use crate::cli::{AudioMode, PairingRuntimeOptions, SyncMode};
@@ -2750,12 +2766,8 @@ mod tests {
             resolve_audio_plan(SessionRole::Client, AudioMode::Send, AudioMode::Send).is_none()
         );
         assert!(
-            resolve_audio_plan(
-                SessionRole::Client,
-                AudioMode::Receive,
-                AudioMode::Receive
-            )
-            .is_none()
+            resolve_audio_plan(SessionRole::Client, AudioMode::Receive, AudioMode::Receive)
+                .is_none()
         );
     }
 

@@ -32,10 +32,13 @@ pub fn open_input(config: &CaptureConfig, stream: &StreamParams) -> Result<Box<d
     Ok(Box::new(MacosInput { handle }))
 }
 
-pub fn open_output(
-    _config: &PlaybackConfig,
-    stream: &StreamParams,
-) -> Result<Box<dyn AudioOutput>> {
+pub fn open_output(config: &PlaybackConfig, stream: &StreamParams) -> Result<Box<dyn AudioOutput>> {
+    if config.device_name.is_some() {
+        return Err(Error::Backend(
+            "macOS playback does not support selecting a specific device yet".into(),
+        ));
+    }
+
     let handle = unsafe {
         ar_macos_playback_create(
             stream.sample_rate,

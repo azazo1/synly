@@ -6,7 +6,6 @@ pub const RTP_PAYLOAD_TYPE_AUDIO: u8 = 97;
 pub const RTP_PAYLOAD_TYPE_FEC: u8 = 127;
 pub const RTPA_DATA_SHARDS: usize = 4;
 pub const RTPA_FEC_SHARDS: usize = 2;
-pub const RTPA_TOTAL_SHARDS: usize = RTPA_DATA_SHARDS + RTPA_FEC_SHARDS;
 pub const OOS_WAIT_TIME_MS: u64 = 10;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,7 +32,6 @@ pub enum ParsedPacket {
         payload: Vec<u8>,
     },
     Fec {
-        rtp: RtpHeader,
         fec: AudioFecHeader,
         payload: Vec<u8>,
     },
@@ -85,7 +83,6 @@ pub fn parse_datagram(packet: &[u8]) -> Result<ParsedPacket> {
                 ssrc: u32::from_be_bytes([body[8], body[9], body[10], body[11]]),
             };
             Ok(ParsedPacket::Fec {
-                rtp,
                 fec,
                 payload: body[AUDIO_FEC_HEADER_LEN..].to_vec(),
             })

@@ -1,8 +1,8 @@
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::single_match)]
 use crate::cli::{
-    AudioMode, Cli, ClipboardRuntimeOptions, Command, ConnectionPreference,
-    PairingRuntimeOptions, RuntimeOptions, SyncMode, normalize_pin,
+    AudioMode, Cli, ClipboardRuntimeOptions, Command, ConnectionPreference, PairingRuntimeOptions,
+    RuntimeOptions, SyncMode, normalize_pin,
 };
 use crate::config::SynlyConfig;
 use crate::path_expand::expand_path_string;
@@ -844,7 +844,11 @@ impl StartupApp {
             Span::raw(" "),
             chip(self.flow.mode.label(), colors.text, colors.primary_soft),
             Span::raw(" "),
-            chip(self.flow.audio_mode.label(), colors.text, colors.primary_soft),
+            chip(
+                self.flow.audio_mode.label(),
+                colors.text,
+                colors.primary_soft,
+            ),
             Span::raw(" "),
             chip(
                 if self.flow.clipboard_only {
@@ -1903,7 +1907,10 @@ fn cycle_mode(mode: SyncMode, reverse: bool) -> SyncMode {
 
 fn cycle_audio_mode(mode: AudioMode, reverse: bool) -> AudioMode {
     let modes = [AudioMode::Off, AudioMode::Send, AudioMode::Receive];
-    let current = modes.iter().position(|candidate| *candidate == mode).unwrap_or(0);
+    let current = modes
+        .iter()
+        .position(|candidate| *candidate == mode)
+        .unwrap_or(0);
     let next = if reverse {
         (current + modes.len() - 1) % modes.len()
     } else {

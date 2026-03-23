@@ -1,7 +1,5 @@
 use crate::audio::codec::OpusMultistreamConfig;
 use crate::audio::error::{Error, Result};
-use std::net::SocketAddr;
-use std::time::Duration;
 
 pub const SAMPLE_RATE: u32 = 48_000;
 pub const DEFAULT_PACKET_DURATION_MS: u32 = 5;
@@ -10,7 +8,15 @@ pub const DEFAULT_INITIAL_DROP_MS: u32 = 500;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AudioLayout {
     Stereo,
+    #[expect(
+        dead_code,
+        reason = "surround layouts are supported by the codec layer but not yet exposed by the CLI"
+    )]
     Surround51,
+    #[expect(
+        dead_code,
+        reason = "surround layouts are supported by the codec layer but not yet exposed by the CLI"
+    )]
     Surround71,
 }
 
@@ -140,36 +146,4 @@ pub struct CaptureConfig {
 #[derive(Clone, Debug, Default)]
 pub struct PlaybackConfig {
     pub device_name: Option<String>,
-}
-
-#[derive(Clone, Debug)]
-pub struct SenderConfig {
-    pub bind_addr: SocketAddr,
-    pub destination: SocketAddr,
-    pub codec: CodecConfig,
-    pub capture: CaptureConfig,
-    pub read_timeout: Duration,
-    pub enable_fec: bool,
-    pub ssrc: u32,
-}
-
-impl SenderConfig {
-    pub fn stream_params(&self) -> Result<StreamParams> {
-        self.codec.stream_params()
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct ReceiverConfig {
-    pub bind_addr: SocketAddr,
-    pub codec: CodecConfig,
-    pub playback: PlaybackConfig,
-    pub read_timeout: Duration,
-    pub initial_drop_ms: u32,
-}
-
-impl ReceiverConfig {
-    pub fn stream_params(&self) -> Result<StreamParams> {
-        self.codec.stream_params()
-    }
 }

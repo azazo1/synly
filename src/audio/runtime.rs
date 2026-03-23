@@ -63,7 +63,13 @@ pub fn bind_and_spawn_receiver(
     let stop_flag = Arc::new(AtomicBool::new(false));
     let task_stop_flag = Arc::clone(&stop_flag);
     let task = tokio::task::spawn_blocking(move || {
-        run_receiver_loop(socket, task_stop_flag, master_secret, direction, expected_peer_ip)
+        run_receiver_loop(
+            socket,
+            task_stop_flag,
+            master_secret,
+            direction,
+            expected_peer_ip,
+        )
     });
     Ok((AudioTaskHandle { stop_flag, task }, local_port))
 }
@@ -83,7 +89,13 @@ pub fn spawn_sender(
     let stop_flag = Arc::new(AtomicBool::new(false));
     let task_stop_flag = Arc::clone(&stop_flag);
     let task = tokio::task::spawn_blocking(move || {
-        run_sender_loop(socket, task_stop_flag, master_secret, direction, remote_addr)
+        run_sender_loop(
+            socket,
+            task_stop_flag,
+            master_secret,
+            direction,
+            remote_addr,
+        )
     });
     Ok(AudioTaskHandle { stop_flag, task })
 }
@@ -98,9 +110,10 @@ fn run_sender_loop(
     let codec = CodecConfig::default();
     let stream = codec.stream_params().map_err(anyhow::Error::from)?;
     let mut input = open_input(&CaptureConfig::default(), &stream).map_err(anyhow::Error::from)?;
-    let mut encoder = OpusEncoder::new(stream.opus_config(), stream.bitrate)
-        .map_err(anyhow::Error::from)?;
-    let mut packetizer = AudioPacketizer::new(stream.packet_duration_ms, rand::random::<u32>(), true);
+    let mut encoder =
+        OpusEncoder::new(stream.opus_config(), stream.bitrate).map_err(anyhow::Error::from)?;
+    let mut packetizer =
+        AudioPacketizer::new(stream.packet_duration_ms, rand::random::<u32>(), true);
     let mut pcm_buffer = vec![0.0; stream.samples_per_frame()];
     let mut encoded_buffer = vec![0u8; 1400];
     let mut encryptor = AudioEncryptor::new(master_secret, direction)?;
@@ -149,9 +162,11 @@ fn run_receiver_loop(
 ) -> Result<()> {
     let codec = CodecConfig::default();
     let stream = codec.stream_params().map_err(anyhow::Error::from)?;
-    let mut output = open_output(&PlaybackConfig::default(), &stream).map_err(anyhow::Error::from)?;
+    let mut output =
+        open_output(&PlaybackConfig::default(), &stream).map_err(anyhow::Error::from)?;
     let mut decoder = OpusDecoder::new(stream.opus_config()).map_err(anyhow::Error::from)?;
-    let mut depacketizer = AudioDepacketizer::new(stream.packet_duration_ms, DEFAULT_INITIAL_DROP_MS);
+    let mut depacketizer =
+        AudioDepacketizer::new(stream.packet_duration_ms, DEFAULT_INITIAL_DROP_MS);
     let mut decode_buffer = vec![0.0; stream.samples_per_frame()];
     let mut read_buffer = vec![0u8; 2048];
     let decryptor = AudioDecryptor::new(master_secret, direction)?;
@@ -162,8 +177,7 @@ fn run_receiver_loop(
 
     println!(
         "音频 UDP 已监听: {}，等待 {} 的加密音频流。",
-        local_addr,
-        expected_peer_ip
+        local_addr, expected_peer_ip
     );
 
     while !stop_flag.load(Ordering::Relaxed) {
@@ -277,7 +291,11 @@ impl AudioDecryptor {
         let mut in_out = body.to_vec();
         let plaintext = self
             .key
-            .open_in_place(build_nonce(self.nonce_prefix, counter), Aad::from(AUDIO_AAD), &mut in_out)
+            .open_in_place(
+                build_nonce(self.nonce_prefix, counter),
+                Aad::from(AUDIO_AAD),
+                &mut in_out,
+            )
             .map_err(|_| anyhow!("failed to decrypt audio UDP packet"))?;
         Ok(plaintext.to_vec())
     }

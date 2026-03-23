@@ -1,15 +1,11 @@
-use crate::audio::codec::OpusDecoder;
-use crate::audio::config::ReceiverConfig;
 use crate::audio::error::{Error, Result};
 use crate::audio::fec;
-use crate::audio::playback::{AudioOutput, open_output};
 use crate::audio::protocol::{
     self, AudioFecHeader, OOS_WAIT_TIME_MS, ParsedPacket, RTP_PAYLOAD_TYPE_AUDIO, RTPA_DATA_SHARDS,
     RTPA_FEC_SHARDS, RtpHeader, parse_datagram,
 };
 use std::array;
 use std::collections::VecDeque;
-use std::net::UdpSocket;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, Default)]
@@ -93,10 +89,6 @@ impl RtpAudioQueue {
             stats: RtpAudioStats::default(),
             packet_duration_ms,
         }
-    }
-
-    pub fn stats(&self) -> &RtpAudioStats {
-        &self.stats
     }
 
     pub fn add_packet(&mut self, packet: ParsedPacket) -> Result<()> {
@@ -396,84 +388,5 @@ impl AudioDepacketizer {
             ready.push(frame);
         }
         Ok(ready)
-    }
-
-    pub fn stats(&self) -> &RtpAudioStats {
-        self.queue.stats()
-    }
-}
-
-pub struct AudioReceiver {
-    socket: UdpSocket,
-    decoder: OpusDecoder,
-    depacketizer: AudioDepacketizer,
-    playback: Box<dyn AudioOutput>,
-    decode_buffer: Vec<f32>,
-    read_buffer: Vec<u8>,
-    timeout: Duration,
-}
-
-impl AudioReceiver {
-    pub fn bind(config: ReceiverConfig) -> Result<Self> {
-        let stream = config.stream_params()?;
-        let socket = UdpSocket::bind(config.bind_addr)?;
-        socket.set_read_timeout(Some(config.read_timeout))?;
-        let decoder = OpusDecoder::new(stream.opus_config())?;
-        let playback = open_output(&config.playback, &stream)?;
-        let depacketizer =
-            AudioDepacketizer::new(stream.packet_duration_ms, config.initial_drop_ms);
-        let decode_buffer = vec![0.0; stream.samples_per_frame()];
-
-        Ok(Self {
-            socket,
-            decoder,
-            depacketizer,
-            playback,
-            decode_buffer,
-            read_buffer: vec![0u8; 2048],
-            timeout: config.read_timeout,
-        })
-    }
-
-    pub fn pump_once(&mut self) -> Result<usize> {
-        let packet_len = match self.socket.recv(&mut self.read_buffer) {
-            Ok(len) => len,
-            Err(err)
-                if err.kind() == std::io::ErrorKind::WouldBlock
-                    || err.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                return Ok(0);
-            }
-            Err(err) => return Err(err.into()),
-        };
-
-        let ready = self
-            .depacketizer
-            .push_datagram(&self.read_buffer[..packet_len])?;
-        let mut played = 0usize;
-        for frame in ready {
-            let decoded = match frame {
-                QueuedAudioFrame::Encoded(packet) => self
-                    .decoder
-                    .decode_float(Some(&packet), &mut self.decode_buffer)?,
-                QueuedAudioFrame::Missing => {
-                    self.decoder.decode_float(None, &mut self.decode_buffer)?
-                }
-            };
-            self.playback
-                .submit_frame(&self.decode_buffer[..decoded], self.timeout)?;
-            played += 1;
-        }
-        Ok(played)
-    }
-
-    pub fn run(&mut self) -> Result<()> {
-        loop {
-            self.pump_once()?;
-        }
-    }
-
-    pub fn stats(&self) -> &RtpAudioStats {
-        self.depacketizer.stats()
     }
 }
