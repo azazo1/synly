@@ -352,7 +352,7 @@ pub fn encode_payload<T: Serialize>(value: &T) -> Result<Vec<u8>> {
 }
 
 pub fn decode_payload<T: DeserializeOwned>(bytes: &[u8], context: &'static str) -> Result<T> {
-    bincode::deserialize(bytes).with_context(|| context.to_string())
+    bincode::deserialize(bytes).context(context)
 }
 
 pub fn frame_size_limit_message(err: &anyhow::Error) -> Option<String> {

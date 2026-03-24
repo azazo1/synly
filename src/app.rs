@@ -1609,8 +1609,7 @@ async fn run_sync_session(
                 if waiting_for_initial_remote_seed
                     && pending_initial_remote_revision == Some(revision)
                 {
-                    plan.file_requests
-                        .extend(plan.skipped_newer_paths.drain(..));
+                    plan.file_requests.append(&mut plan.skipped_newer_paths);
                 }
                 if file_can_send {
                     note_remote_snapshot_expectations(
