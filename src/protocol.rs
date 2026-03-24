@@ -16,7 +16,7 @@ const DEFAULT_MAX_FRAME_DATA_LEN: usize = 128 * 1024 * 1024;
 const DEFAULT_MAX_CLIPBOARD_BINARY_LEN: usize = 100 * 1024 * 1024;
 const CLIPBOARD_STREAM_CHUNK_SIZE: usize = 1024 * 1024;
 
-pub const PROTOCOL_VERSION: u16 = 12;
+pub const PROTOCOL_VERSION: u16 = 14;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TransferLimits {
@@ -133,8 +133,13 @@ pub enum ControlMessage {
     SnapshotAdvert {
         revision: u64,
         snapshot: ManifestSnapshot,
+        sender_time_ms: u64,
     },
     FileRequest {
+        revision: u64,
+        paths: Vec<String>,
+    },
+    OverwritePaused {
         revision: u64,
         paths: Vec<String>,
     },
@@ -709,6 +714,26 @@ mod tests {
                 assert!(trust_established);
             }
             other => panic!("expected pair decision, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn control_message_roundtrip_overwrite_paused() {
+        let message = ControlMessage::OverwritePaused {
+            revision: 7,
+            paths: vec!["docs/readme.txt".to_string(), "bin/tool".to_string()],
+        };
+
+        let encoded = encode_payload(&message).unwrap();
+        let decoded: ControlMessage =
+            decode_payload(&encoded, "failed to decode control frame").unwrap();
+
+        match decoded {
+            ControlMessage::OverwritePaused { revision, paths } => {
+                assert_eq!(revision, 7);
+                assert_eq!(paths, vec!["docs/readme.txt", "bin/tool"]);
+            }
+            other => panic!("expected overwrite paused, got {other:?}"),
         }
     }
 

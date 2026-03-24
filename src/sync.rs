@@ -96,6 +96,17 @@ pub enum DeletePolicy {
 pub struct ApplyPlan {
     pub file_requests: Vec<String>,
     pub delete_paths: Vec<String>,
+    pub skipped_newer_paths: Vec<String>,
+    pub unreliable_timestamp_paths: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TimestampComparisonContext {
+    pub remote_clock_delta_ms: i64,
+    pub local_now_ms: Option<u64>,
+    pub remote_now_ms: Option<u64>,
+    pub skew_tolerance_ms: u64,
+    pub future_guard_ms: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -463,28 +474,49 @@ pub fn build_apply_plan(
     local: &ManifestSnapshot,
     delete_policy: DeletePolicy,
 ) -> ApplyPlan {
-    let file_requests = remote
-        .entries
-        .iter()
-        .filter_map(|(path, remote_entry)| {
-            if remote_entry.kind != EntryKind::File {
-                return None;
-            }
+    build_apply_plan_with_time(
+        remote,
+        local,
+        delete_policy,
+        TimestampComparisonContext::default(),
+    )
+}
 
-            match local.entries.get(path) {
-                Some(local_entry)
-                    if local_entry.kind == EntryKind::File
-                        && local_entry.hash == remote_entry.hash
-                        && local_entry.size == remote_entry.size
-                        && local_entry.modified_ms == remote_entry.modified_ms
-                        && local_entry.executable == remote_entry.executable =>
-                {
-                    None
+pub fn build_apply_plan_with_time(
+    remote: &ManifestSnapshot,
+    local: &ManifestSnapshot,
+    delete_policy: DeletePolicy,
+    time_context: TimestampComparisonContext,
+) -> ApplyPlan {
+    let mut file_requests = Vec::new();
+    let mut skipped_newer_paths = Vec::new();
+    let mut unreliable_timestamp_paths = Vec::new();
+
+    for (path, remote_entry) in &remote.entries {
+        if remote_entry.kind != EntryKind::File {
+            continue;
+        }
+
+        match local.entries.get(path) {
+            Some(local_entry)
+                if local_entry.kind == EntryKind::File
+                    && local_entry.hash == remote_entry.hash
+                    && local_entry.size == remote_entry.size
+                    && local_entry.modified_ms == remote_entry.modified_ms
+                    && local_entry.executable == remote_entry.executable => {}
+            Some(local_entry) if local_entry.kind == EntryKind::File => {
+                match classify_timestamp_conflict(local_entry, remote_entry, time_context) {
+                    TimestampConflict::LocalNewer => skipped_newer_paths.push(path.clone()),
+                    TimestampConflict::Unreliable => {
+                        unreliable_timestamp_paths.push(path.clone());
+                        file_requests.push(path.clone());
+                    }
+                    TimestampConflict::RemoteNewerOrEqual => file_requests.push(path.clone()),
                 }
-                _ => Some(path.clone()),
             }
-        })
-        .collect::<Vec<_>>();
+            _ => file_requests.push(path.clone()),
+        }
+    }
 
     let delete_paths = match delete_policy {
         DeletePolicy::Never => Vec::new(),
@@ -502,7 +534,57 @@ pub fn build_apply_plan(
     ApplyPlan {
         file_requests,
         delete_paths,
+        skipped_newer_paths,
+        unreliable_timestamp_paths,
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TimestampConflict {
+    LocalNewer,
+    RemoteNewerOrEqual,
+    Unreliable,
+}
+
+fn classify_timestamp_conflict(
+    local_entry: &ManifestEntry,
+    remote_entry: &ManifestEntry,
+    time_context: TimestampComparisonContext,
+) -> TimestampConflict {
+    if timestamp_is_suspicious_future(
+        local_entry.modified_ms,
+        time_context.local_now_ms,
+        time_context.future_guard_ms,
+    ) || timestamp_is_suspicious_future(
+        remote_entry.modified_ms,
+        time_context.remote_now_ms,
+        time_context.future_guard_ms,
+    ) {
+        return TimestampConflict::Unreliable;
+    }
+
+    let normalized_remote_ms =
+        normalize_remote_modified_ms(remote_entry.modified_ms, time_context.remote_clock_delta_ms);
+    let local_newer_threshold = normalized_remote_ms.saturating_add(time_context.skew_tolerance_ms);
+
+    if local_entry.modified_ms > local_newer_threshold {
+        TimestampConflict::LocalNewer
+    } else {
+        TimestampConflict::RemoteNewerOrEqual
+    }
+}
+
+fn timestamp_is_suspicious_future(
+    modified_ms: u64,
+    current_ms: Option<u64>,
+    future_guard_ms: u64,
+) -> bool {
+    current_ms.is_some_and(|current_ms| modified_ms > current_ms.saturating_add(future_guard_ms))
+}
+
+fn normalize_remote_modified_ms(remote_modified_ms: u64, remote_clock_delta_ms: i64) -> u64 {
+    let normalized = i128::from(remote_modified_ms) - i128::from(remote_clock_delta_ms);
+    normalized.clamp(0, i128::from(u64::MAX)) as u64
 }
 
 pub fn resolve_outgoing_path(spec: &OutgoingSpec, wire_path: &str) -> Result<PathBuf> {
@@ -1386,6 +1468,149 @@ mod tests {
 
         let plan = build_apply_plan(&remote, &local, DeletePolicy::Never);
         assert_eq!(plan.file_requests, vec!["bin/tool".to_string()]);
+        assert!(plan.skipped_newer_paths.is_empty());
+        assert!(plan.unreliable_timestamp_paths.is_empty());
+    }
+
+    #[test]
+    fn newer_local_file_skips_overwrite_request() {
+        let remote = ManifestSnapshot {
+            layout: SnapshotLayout::RootContents,
+            max_folder_depth: None,
+            entries: BTreeMap::from([(
+                "bin/tool".to_string(),
+                ManifestEntry {
+                    kind: EntryKind::File,
+                    size: 42,
+                    modified_ms: 100,
+                    hash: Some("remote".into()),
+                    executable: false,
+                },
+            )]),
+        };
+
+        let local = ManifestSnapshot {
+            layout: SnapshotLayout::RootContents,
+            max_folder_depth: None,
+            entries: BTreeMap::from([(
+                "bin/tool".to_string(),
+                ManifestEntry {
+                    kind: EntryKind::File,
+                    size: 24,
+                    modified_ms: 200,
+                    hash: Some("local".into()),
+                    executable: false,
+                },
+            )]),
+        };
+
+        let plan = build_apply_plan(&remote, &local, DeletePolicy::Never);
+        assert!(plan.file_requests.is_empty());
+        assert_eq!(plan.skipped_newer_paths, vec!["bin/tool".to_string()]);
+        assert!(plan.unreliable_timestamp_paths.is_empty());
+    }
+
+    #[test]
+    fn clock_delta_is_applied_before_deciding_local_is_newer() {
+        let remote = ManifestSnapshot {
+            layout: SnapshotLayout::RootContents,
+            max_folder_depth: None,
+            entries: BTreeMap::from([(
+                "bin/tool".to_string(),
+                ManifestEntry {
+                    kind: EntryKind::File,
+                    size: 42,
+                    modified_ms: 3_601_000,
+                    hash: Some("remote".into()),
+                    executable: false,
+                },
+            )]),
+        };
+
+        let local = ManifestSnapshot {
+            layout: SnapshotLayout::RootContents,
+            max_folder_depth: None,
+            entries: BTreeMap::from([(
+                "bin/tool".to_string(),
+                ManifestEntry {
+                    kind: EntryKind::File,
+                    size: 24,
+                    modified_ms: 1_500,
+                    hash: Some("local".into()),
+                    executable: false,
+                },
+            )]),
+        };
+
+        let plan = build_apply_plan_with_time(
+            &remote,
+            &local,
+            DeletePolicy::Never,
+            TimestampComparisonContext {
+                remote_clock_delta_ms: 3_600_000,
+                local_now_ms: Some(10_000),
+                remote_now_ms: Some(3_610_000),
+                skew_tolerance_ms: 100,
+                future_guard_ms: 60_000,
+            },
+        );
+
+        assert!(plan.file_requests.is_empty());
+        assert_eq!(plan.skipped_newer_paths, vec!["bin/tool".to_string()]);
+        assert!(plan.unreliable_timestamp_paths.is_empty());
+    }
+
+    #[test]
+    fn suspicious_future_timestamp_disables_pause_on_local_newer() {
+        let remote = ManifestSnapshot {
+            layout: SnapshotLayout::RootContents,
+            max_folder_depth: None,
+            entries: BTreeMap::from([(
+                "bin/tool".to_string(),
+                ManifestEntry {
+                    kind: EntryKind::File,
+                    size: 42,
+                    modified_ms: 100,
+                    hash: Some("remote".into()),
+                    executable: false,
+                },
+            )]),
+        };
+
+        let local = ManifestSnapshot {
+            layout: SnapshotLayout::RootContents,
+            max_folder_depth: None,
+            entries: BTreeMap::from([(
+                "bin/tool".to_string(),
+                ManifestEntry {
+                    kind: EntryKind::File,
+                    size: 24,
+                    modified_ms: 1_000_000,
+                    hash: Some("local".into()),
+                    executable: false,
+                },
+            )]),
+        };
+
+        let plan = build_apply_plan_with_time(
+            &remote,
+            &local,
+            DeletePolicy::Never,
+            TimestampComparisonContext {
+                remote_clock_delta_ms: 0,
+                local_now_ms: Some(1_000),
+                remote_now_ms: Some(1_000),
+                skew_tolerance_ms: 100,
+                future_guard_ms: 10_000,
+            },
+        );
+
+        assert_eq!(plan.file_requests, vec!["bin/tool".to_string()]);
+        assert!(plan.skipped_newer_paths.is_empty());
+        assert_eq!(
+            plan.unreliable_timestamp_paths,
+            vec!["bin/tool".to_string()]
+        );
     }
 
     #[test]
@@ -1616,10 +1841,9 @@ mod tests {
                 .keys()
                 .any(|path| path.starts_with("cache"))
         );
-        assert_eq!(
-            plan.file_requests,
-            vec![".synlyignore".to_string(), "keep.txt".to_string()]
-        );
+        assert_eq!(plan.file_requests, vec!["keep.txt".to_string()]);
+        assert_eq!(plan.skipped_newer_paths, vec![".synlyignore".to_string()]);
+        assert!(plan.unreliable_timestamp_paths.is_empty());
         assert!(plan.delete_paths.is_empty());
 
         let _ = fs::remove_dir_all(root);

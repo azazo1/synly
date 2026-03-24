@@ -14,10 +14,10 @@ use crate::protocol::{
     TransferLimits, frame_size_limit_message,
 };
 use crate::sync::{
-    DeletePolicy, WorkspaceSpec, apply_file_metadata, build_apply_plan, build_incoming_snapshot,
-    build_snapshot, delete_paths_best_effort, ensure_directories, filter_snapshot_by_folder_depth,
-    filter_snapshot_for_incoming_root, resolve_incoming_path, resolve_outgoing_path,
-    snapshot_contains_file, watch_targets,
+    DeletePolicy, TimestampComparisonContext, WorkspaceSpec, apply_file_metadata,
+    build_apply_plan_with_time, build_incoming_snapshot, build_snapshot, delete_paths_best_effort,
+    ensure_directories, filter_snapshot_by_folder_depth, filter_snapshot_for_incoming_root,
+    resolve_incoming_path, resolve_outgoing_path, snapshot_contains_file, watch_targets,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use console::style;
@@ -26,7 +26,7 @@ use rand::RngExt;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::{SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -44,6 +44,9 @@ const PAIRING_MAX_FAILURES: u32 = 5;
 const PAIRING_BACKOFF_BASE_MS: u64 = 1_000;
 const RECONNECT_BASE_DELAY: Duration = Duration::from_secs(2);
 const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(20);
+const TIMESTAMP_SKEW_TOLERANCE_MS: u64 = 10_000;
+const FUTURE_TIMESTAMP_GUARD_MS: u64 = 10 * 60 * 1_000;
+const CLOCK_SKEW_WARNING_MS: u64 = 60_000;
 
 #[derive(Clone, Copy, Debug)]
 enum SessionRole {
@@ -69,6 +72,7 @@ struct PendingRevision {
     remaining_files: BTreeSet<String>,
     failed_files: BTreeSet<String>,
     delete_paths: Vec<String>,
+    skipped_newer_count: usize,
     transfer_done: bool,
 }
 
@@ -1445,6 +1449,7 @@ async fn run_sync_session(
     let mut reader = FrameReader::with_limits(read_half, options.transfer_limits);
     let mut pending_revisions = BTreeMap::<u64, PendingRevision>::new();
     let mut incoming_files = HashMap::<(u64, String), IncomingFileState>::new();
+    let mut last_reported_clock_skew_bucket = None;
     let disconnected = loop {
         let frame = match reader.read_frame().await {
             Ok(frame) => frame,
@@ -1475,7 +1480,11 @@ async fn run_sync_session(
                     }
                 }
             }
-            Frame::Control(ControlMessage::SnapshotAdvert { revision, snapshot }) => {
+            Frame::Control(ControlMessage::SnapshotAdvert {
+                revision,
+                snapshot,
+                sender_time_ms,
+            }) => {
                 if !file_can_receive {
                     continue;
                 }
@@ -1490,16 +1499,39 @@ async fn run_sync_session(
                     snapshot.layout,
                     snapshot.max_folder_depth,
                 );
+                let local_now_ms = current_unix_ms();
+                let remote_clock_delta_ms = sender_time_ms as i64 - local_now_ms as i64;
+                maybe_report_clock_skew(
+                    remote_clock_delta_ms,
+                    &mut last_reported_clock_skew_bucket,
+                );
+                let time_context = TimestampComparisonContext {
+                    remote_clock_delta_ms,
+                    local_now_ms: Some(local_now_ms),
+                    remote_now_ms: Some(sender_time_ms),
+                    skew_tolerance_ms: TIMESTAMP_SKEW_TOLERANCE_MS,
+                    future_guard_ms: FUTURE_TIMESTAMP_GUARD_MS,
+                };
                 let skipped_delete_count = if !options.sync_delete {
                     let preview_policy = delete_policy(snapshot.layout, true);
-                    build_apply_plan(&snapshot, &local_snapshot, preview_policy)
-                        .delete_paths
-                        .len()
+                    build_apply_plan_with_time(
+                        &snapshot,
+                        &local_snapshot,
+                        preview_policy,
+                        time_context,
+                    )
+                    .delete_paths
+                    .len()
                 } else {
                     0
                 };
                 let delete_policy = delete_policy(snapshot.layout, options.sync_delete);
-                let plan = build_apply_plan(&snapshot, &local_snapshot, delete_policy);
+                let plan = build_apply_plan_with_time(
+                    &snapshot,
+                    &local_snapshot,
+                    delete_policy,
+                    time_context,
+                );
                 ensure_directories(root, &snapshot)?;
 
                 if skipped_delete_count > 0 {
@@ -1509,10 +1541,23 @@ async fn run_sync_session(
                     );
                 }
 
+                if !plan.skipped_newer_paths.is_empty() {
+                    print_local_newer_paths(revision, &plan.skipped_newer_paths);
+                    tx.send(Frame::Control(ControlMessage::OverwritePaused {
+                        revision,
+                        paths: plan.skipped_newer_paths.clone(),
+                    }))
+                    .await?;
+                }
+
+                if !plan.unreliable_timestamp_paths.is_empty() {
+                    print_unreliable_timestamp_paths(revision, &plan.unreliable_timestamp_paths);
+                }
+
                 if plan.file_requests.is_empty() {
                     let delete_report = delete_paths_best_effort(root, &plan.delete_paths);
                     print_delete_failures(&delete_report);
-                    print_standalone_delete_result(&delete_report);
+                    print_standalone_delete_result(&delete_report, plan.skipped_newer_paths.len());
                 } else {
                     pending_revisions.insert(
                         revision,
@@ -1521,6 +1566,7 @@ async fn run_sync_session(
                             remaining_files: plan.file_requests.iter().cloned().collect(),
                             failed_files: BTreeSet::new(),
                             delete_paths: plan.delete_paths,
+                            skipped_newer_count: plan.skipped_newer_paths.len(),
                             transfer_done: false,
                         },
                     );
@@ -1553,6 +1599,9 @@ async fn run_sync_session(
                             .await;
                     }
                 });
+            }
+            Frame::Control(ControlMessage::OverwritePaused { revision, paths }) => {
+                print_remote_overwrite_paused(revision, &paths);
             }
             Frame::Control(ControlMessage::TransferDone { revision }) => {
                 if let Some(pending) = pending_revisions.get_mut(&revision) {
@@ -1740,6 +1789,7 @@ async fn publish_snapshot_if_changed(
     tx.send(Frame::Control(ControlMessage::SnapshotAdvert {
         revision: *revision,
         snapshot: snapshot.clone(),
+        sender_time_ms: current_unix_ms(),
     }))
     .await?;
     *last_snapshot = Some(snapshot);
@@ -2025,7 +2075,12 @@ fn maybe_finalize_revision(
         let updated_files = pending
             .requested_files
             .saturating_sub(pending.failed_files.len());
-        print_revision_result(updated_files, pending.failed_files.len(), &delete_report);
+        print_revision_result(
+            updated_files,
+            pending.failed_files.len(),
+            pending.skipped_newer_count,
+            &delete_report,
+        );
     }
 }
 
@@ -2195,7 +2250,67 @@ fn print_delete_failures(report: &crate::sync::DeleteReport) {
     }
 }
 
-fn print_standalone_delete_result(report: &crate::sync::DeleteReport) {
+fn print_local_newer_paths(revision: u64, paths: &[String]) {
+    println!(
+        "检测到 {} 个本地文件比对端修订版 {} 更新，已暂时停止覆盖并通知对端：",
+        paths.len(),
+        revision
+    );
+    for path in paths {
+        println!("  - {}", path);
+    }
+}
+
+fn print_unreliable_timestamp_paths(revision: u64, paths: &[String]) {
+    println!(
+        "修订版 {} 中有 {} 个文件的时间戳明显异常，已忽略时间戳保护并继续请求对端内容：",
+        revision,
+        paths.len()
+    );
+    for path in paths {
+        println!("  - {}", path);
+    }
+}
+
+fn print_remote_overwrite_paused(revision: u64, paths: &[String]) {
+    println!(
+        "对端在修订版 {} 中保留了 {} 个本地较新的文件，已暂停覆盖：",
+        revision,
+        paths.len()
+    );
+    for path in paths {
+        println!("  - {}", path);
+    }
+}
+
+fn print_standalone_delete_result(report: &crate::sync::DeleteReport, skipped_newer: usize) {
+    if skipped_newer > 0 {
+        match (report.archived_count, report.failures.len()) {
+            (0, 0) => {
+                println!("本地较新的文件已保留，共 {} 个。", skipped_newer);
+            }
+            (archived, 0) => {
+                println!(
+                    "本地较新的文件已保留 {} 个，并归档对端删除项 {} 项，位置: .synly/deleted",
+                    skipped_newer, archived
+                );
+            }
+            (0, failed) => {
+                println!(
+                    "本地较新的文件已保留 {} 个；另有 {} 项对端删除未能归档，已保留本地文件。",
+                    skipped_newer, failed
+                );
+            }
+            (archived, failed) => {
+                println!(
+                    "本地较新的文件已保留 {} 个，已归档对端删除项 {} 项，另有 {} 项未能归档。",
+                    skipped_newer, archived, failed
+                );
+            }
+        }
+        return;
+    }
+
     match (report.archived_count, report.failures.len()) {
         (0, 0) => println!("本地已是最新状态。"),
         (archived, 0) => {
@@ -2216,9 +2331,10 @@ fn print_standalone_delete_result(report: &crate::sync::DeleteReport) {
 fn print_revision_result(
     updated_files: usize,
     failed_updates: usize,
+    skipped_newer: usize,
     delete_report: &crate::sync::DeleteReport,
 ) {
-    if failed_updates == 0 && delete_report.failures.is_empty() {
+    if failed_updates == 0 && delete_report.failures.is_empty() && skipped_newer == 0 {
         println!(
             "已完成一次同步，更新 {} 个文件，归档删除 {} 项。",
             updated_files, delete_report.archived_count
@@ -2227,12 +2343,74 @@ fn print_revision_result(
     }
 
     println!(
-        "已完成一次同步，更新 {} 个文件，文件更新失败 {} 个，归档删除 {} 项，删除失败 {} 项。",
+        "已完成一次同步，更新 {} 个文件，因本地较新而暂停覆盖 {} 个，文件更新失败 {} 个，归档删除 {} 项，删除失败 {} 项。",
         updated_files,
+        skipped_newer,
         failed_updates,
         delete_report.archived_count,
         delete_report.failures.len()
     );
+}
+
+fn maybe_report_clock_skew(
+    remote_clock_delta_ms: i64,
+    last_reported_clock_skew_bucket: &mut Option<i64>,
+) {
+    let bucket = clock_skew_bucket(remote_clock_delta_ms);
+    if bucket == *last_reported_clock_skew_bucket {
+        return;
+    }
+
+    *last_reported_clock_skew_bucket = bucket;
+    if bucket.is_some() {
+        println!(
+            "检测到两端系统时间相差约 {}，同步时会按当前偏移修正时间戳比较。",
+            format_clock_delta(remote_clock_delta_ms)
+        );
+    }
+}
+
+fn clock_skew_bucket(remote_clock_delta_ms: i64) -> Option<i64> {
+    let abs_delta_ms = remote_clock_delta_ms.unsigned_abs();
+    if abs_delta_ms < CLOCK_SKEW_WARNING_MS {
+        None
+    } else {
+        Some(remote_clock_delta_ms / CLOCK_SKEW_WARNING_MS as i64)
+    }
+}
+
+fn format_clock_delta(remote_clock_delta_ms: i64) -> String {
+    let abs_delta_ms = remote_clock_delta_ms.unsigned_abs();
+    let sign = if remote_clock_delta_ms >= 0 {
+        "快"
+    } else {
+        "慢"
+    };
+
+    if abs_delta_ms >= 60 * 60 * 1_000 {
+        format!(
+            "{} {:.1} 小时",
+            sign,
+            abs_delta_ms as f64 / (60.0 * 60.0 * 1_000.0)
+        )
+    } else if abs_delta_ms >= 60 * 1_000 {
+        format!(
+            "{} {:.1} 分钟",
+            sign,
+            abs_delta_ms as f64 / (60.0 * 1_000.0)
+        )
+    } else if abs_delta_ms >= 1_000 {
+        format!("{} {:.1} 秒", sign, abs_delta_ms as f64 / 1_000.0)
+    } else {
+        format!("{} {} 毫秒", sign, abs_delta_ms)
+    }
+}
+
+fn current_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
 }
 
 fn choose_peer(
