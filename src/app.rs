@@ -2158,7 +2158,7 @@ fn snapshot_changed_paths(previous: &ManifestSnapshot, current: &ManifestSnapsho
     let mut collapsed = Vec::<String>::new();
     for path in changed_paths {
         if collapsed.iter().any(|ancestor| {
-            current.entries.get(ancestor).is_none() && is_wire_path_ancestor(ancestor, &path)
+            !current.entries.contains_key(ancestor) && is_wire_path_ancestor(ancestor, &path)
         }) {
             continue;
         }

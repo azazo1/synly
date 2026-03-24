@@ -633,14 +633,6 @@ pub fn resolve_outgoing_path(spec: &OutgoingSpec, wire_path: &str) -> Result<Pat
     }
 }
 
-pub fn snapshot_contains_file(snapshot: &ManifestSnapshot, wire_path: &str) -> Result<bool> {
-    let normalized = path_to_wire(&wire_to_relative_path(wire_path)?)?;
-    Ok(snapshot
-        .entries
-        .get(&normalized)
-        .is_some_and(|entry| entry.kind == EntryKind::File))
-}
-
 pub fn resolve_incoming_path(root: &Path, wire_path: &str) -> Result<PathBuf> {
     let relative = wire_to_relative_path(wire_path)?;
     ensure_no_symlink_ancestors(root, &relative)?;
@@ -1343,6 +1335,14 @@ mod tests {
     use std::env;
     use uuid::Uuid;
     use walkdir::WalkDir;
+
+    pub fn snapshot_contains_file(snapshot: &ManifestSnapshot, wire_path: &str) -> Result<bool> {
+        let normalized = path_to_wire(&wire_to_relative_path(wire_path)?)?;
+        Ok(snapshot
+            .entries
+            .get(&normalized)
+            .is_some_and(|entry| entry.kind == EntryKind::File))
+    }
 
     pub fn build_apply_plan(
         remote: &ManifestSnapshot,
