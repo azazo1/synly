@@ -469,19 +469,6 @@ pub fn watch_targets(spec: &OutgoingSpec) -> Result<Vec<WatchTarget>> {
         .collect())
 }
 
-pub fn build_apply_plan(
-    remote: &ManifestSnapshot,
-    local: &ManifestSnapshot,
-    delete_policy: DeletePolicy,
-) -> ApplyPlan {
-    build_apply_plan_with_time(
-        remote,
-        local,
-        delete_policy,
-        TimestampComparisonContext::default(),
-    )
-}
-
 pub fn build_apply_plan_with_time(
     remote: &ManifestSnapshot,
     local: &ManifestSnapshot,
@@ -1328,6 +1315,19 @@ mod tests {
     use std::env;
     use uuid::Uuid;
     use walkdir::WalkDir;
+
+    pub fn build_apply_plan(
+        remote: &ManifestSnapshot,
+        local: &ManifestSnapshot,
+        delete_policy: DeletePolicy,
+    ) -> ApplyPlan {
+        build_apply_plan_with_time(
+            remote,
+            local,
+            delete_policy,
+            TimestampComparisonContext::default(),
+        )
+    }
 
     fn file_entry(hash: &str) -> ManifestEntry {
         ManifestEntry {

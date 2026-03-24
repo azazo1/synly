@@ -14,10 +14,11 @@ use crate::protocol::{
     TransferLimits, frame_size_limit_message,
 };
 use crate::sync::{
-    DeletePolicy, TimestampComparisonContext, WorkspaceSpec, apply_file_metadata,
-    build_apply_plan_with_time, build_incoming_snapshot, build_snapshot, delete_paths_best_effort,
-    ensure_directories, filter_snapshot_by_folder_depth, filter_snapshot_for_incoming_root,
-    resolve_incoming_path, resolve_outgoing_path, snapshot_contains_file, watch_targets,
+    DeletePolicy, EntryKind, ManifestEntry, ManifestSnapshot, TimestampComparisonContext,
+    WorkspaceSpec, apply_file_metadata, build_apply_plan_with_time, build_incoming_snapshot,
+    build_snapshot, delete_paths_best_effort, ensure_directories, filter_snapshot_by_folder_depth,
+    filter_snapshot_for_incoming_root, resolve_incoming_path, resolve_outgoing_path,
+    snapshot_contains_file, watch_targets,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use console::style;
@@ -47,6 +48,7 @@ const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(20);
 const TIMESTAMP_SKEW_TOLERANCE_MS: u64 = 10_000;
 const FUTURE_TIMESTAMP_GUARD_MS: u64 = 10 * 60 * 1_000;
 const CLOCK_SKEW_WARNING_MS: u64 = 60_000;
+const REMOTE_ECHO_SUPPRESSION_TTL: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug)]
 enum SessionRole {
@@ -84,6 +86,37 @@ struct IncomingFileState {
     executable: bool,
     expected_size: u64,
     written: u64,
+}
+
+#[derive(Clone, Debug)]
+enum SnapshotLoopControl {
+    ExpectRemoteChanges {
+        expectations: Vec<RemoteEchoExpectation>,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct RemoteEchoExpectation {
+    wire_path: String,
+    expected: SnapshotPathExpectation,
+}
+
+#[derive(Clone, Debug)]
+struct PendingRemoteEchoExpectation {
+    expected: SnapshotPathExpectation,
+    expires_at: Instant,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum SnapshotPathExpectation {
+    Exact(ManifestEntry),
+    DirExists,
+    Missing,
+}
+
+#[derive(Default)]
+struct SnapshotEchoSuppressions {
+    paths: BTreeMap<String, PendingRemoteEchoExpectation>,
 }
 
 struct PairDecisionParams<'a> {
@@ -1371,6 +1404,7 @@ async fn run_sync_session(
     let (tx, rx) = mpsc::channel::<Frame>(64);
     let writer_task = tokio::spawn(writer_loop(write_half, rx, options.transfer_limits));
 
+    let (snapshot_control_tx, snapshot_control_rx) = mpsc::unbounded_channel();
     let snapshot_task = if file_can_send {
         let outgoing = workspace
             .outgoing
@@ -1381,6 +1415,7 @@ async fn run_sync_session(
             outgoing,
             sender,
             options.interval_secs.max(1),
+            snapshot_control_rx,
         )))
     } else {
         None
@@ -1532,6 +1567,14 @@ async fn run_sync_session(
                     delete_policy,
                     time_context,
                 );
+                if file_can_send {
+                    note_remote_snapshot_expectations(
+                        &snapshot_control_tx,
+                        &snapshot,
+                        &local_snapshot,
+                        &plan,
+                    );
+                }
                 ensure_directories(root, &snapshot)?;
 
                 if skipped_delete_count > 0 {
@@ -1723,6 +1766,7 @@ async fn snapshot_loop(
     outgoing: crate::sync::OutgoingSpec,
     tx: mpsc::Sender<Frame>,
     interval_secs: u64,
+    mut control_rx: mpsc::UnboundedReceiver<SnapshotLoopControl>,
 ) -> Result<()> {
     let (watch_tx, mut watch_rx) = mpsc::unbounded_channel::<notify::Result<Event>>();
     let mut watcher = RecommendedWatcher::new(
@@ -1748,12 +1792,30 @@ async fn snapshot_loop(
     let mut last_snapshot = None;
     let mut revision = 1u64;
     let debounce = Duration::from_millis(300);
+    let mut echo_suppressions = SnapshotEchoSuppressions::default();
 
-    publish_snapshot_if_changed(&outgoing, &tx, &mut last_snapshot, &mut revision).await?;
+    publish_snapshot_if_changed(
+        &outgoing,
+        &tx,
+        &mut last_snapshot,
+        &mut revision,
+        &mut echo_suppressions,
+    )
+    .await?;
     ticker.tick().await;
 
     loop {
         tokio::select! {
+            maybe_control = control_rx.recv() => {
+                let Some(control) = maybe_control else {
+                    bail!("snapshot control channel closed unexpectedly");
+                };
+                match control {
+                    SnapshotLoopControl::ExpectRemoteChanges { expectations } => {
+                        echo_suppressions.note_remote_expectations(expectations);
+                    }
+                }
+            }
             maybe_event = watch_rx.recv() => {
                 let event = match maybe_event {
                     Some(event) => event,
@@ -1766,10 +1828,24 @@ async fn snapshot_loop(
                 }
 
                 drain_watch_events(&mut watch_rx, debounce).await;
-                publish_snapshot_if_changed(&outgoing, &tx, &mut last_snapshot, &mut revision).await?;
+                publish_snapshot_if_changed(
+                    &outgoing,
+                    &tx,
+                    &mut last_snapshot,
+                    &mut revision,
+                    &mut echo_suppressions,
+                )
+                .await?;
             }
             _ = ticker.tick() => {
-                publish_snapshot_if_changed(&outgoing, &tx, &mut last_snapshot, &mut revision).await?;
+                publish_snapshot_if_changed(
+                    &outgoing,
+                    &tx,
+                    &mut last_snapshot,
+                    &mut revision,
+                    &mut echo_suppressions,
+                )
+                .await?;
             }
         }
     }
@@ -1780,9 +1856,15 @@ async fn publish_snapshot_if_changed(
     tx: &mpsc::Sender<Frame>,
     last_snapshot: &mut Option<crate::sync::ManifestSnapshot>,
     revision: &mut u64,
+    echo_suppressions: &mut SnapshotEchoSuppressions,
 ) -> Result<()> {
     let snapshot = build_snapshot(outgoing)?;
     if last_snapshot.as_ref() == Some(&snapshot) {
+        return Ok(());
+    }
+
+    if echo_suppressions.matches_only_remote_changes(last_snapshot.as_ref(), &snapshot) {
+        *last_snapshot = Some(snapshot);
         return Ok(());
     }
 
@@ -1818,6 +1900,192 @@ async fn drain_watch_events(
                 None => break,
             }
         }
+    }
+}
+
+impl SnapshotEchoSuppressions {
+    fn note_remote_expectations(&mut self, expectations: Vec<RemoteEchoExpectation>) {
+        let expires_at = Instant::now() + REMOTE_ECHO_SUPPRESSION_TTL;
+        for expectation in expectations {
+            self.paths.insert(
+                expectation.wire_path,
+                PendingRemoteEchoExpectation {
+                    expected: expectation.expected,
+                    expires_at,
+                },
+            );
+        }
+    }
+
+    fn matches_only_remote_changes(
+        &mut self,
+        previous: Option<&ManifestSnapshot>,
+        current: &ManifestSnapshot,
+    ) -> bool {
+        let Some(previous) = previous else {
+            return false;
+        };
+
+        self.prune_expired();
+        let changed_paths = snapshot_changed_paths(previous, current);
+        if changed_paths.is_empty() {
+            return false;
+        }
+
+        for path in &changed_paths {
+            let Some(expectation) = self.paths.get(path) else {
+                return false;
+            };
+            if !expectation_matches(&expectation.expected, current.entries.get(path)) {
+                return false;
+            }
+        }
+
+        for path in changed_paths {
+            self.paths.remove(&path);
+        }
+        true
+    }
+
+    fn prune_expired(&mut self) {
+        let now = Instant::now();
+        self.paths
+            .retain(|_, expectation| expectation.expires_at > now);
+    }
+}
+
+fn note_remote_snapshot_expectations(
+    snapshot_control_tx: &mpsc::UnboundedSender<SnapshotLoopControl>,
+    remote_snapshot: &ManifestSnapshot,
+    local_snapshot: &ManifestSnapshot,
+    plan: &crate::sync::ApplyPlan,
+) {
+    let expectations = build_remote_echo_expectations(remote_snapshot, local_snapshot, plan);
+    if expectations.is_empty() {
+        return;
+    }
+
+    let _ = snapshot_control_tx.send(SnapshotLoopControl::ExpectRemoteChanges { expectations });
+}
+
+fn build_remote_echo_expectations(
+    remote_snapshot: &ManifestSnapshot,
+    local_snapshot: &ManifestSnapshot,
+    plan: &crate::sync::ApplyPlan,
+) -> Vec<RemoteEchoExpectation> {
+    let mut expectations = BTreeMap::<String, SnapshotPathExpectation>::new();
+
+    for path in &plan.file_requests {
+        let Some(remote_entry) = remote_snapshot.entries.get(path) else {
+            continue;
+        };
+        expectations.insert(
+            path.clone(),
+            SnapshotPathExpectation::Exact(remote_entry.clone()),
+        );
+        insert_ancestor_dir_expectations(&mut expectations, remote_snapshot, path);
+    }
+
+    for path in &plan.delete_paths {
+        expectations.insert(path.clone(), SnapshotPathExpectation::Missing);
+        insert_ancestor_dir_expectations(&mut expectations, remote_snapshot, path);
+    }
+
+    for (path, remote_entry) in &remote_snapshot.entries {
+        if remote_entry.kind != EntryKind::Dir {
+            continue;
+        }
+
+        if local_snapshot
+            .entries
+            .get(path)
+            .is_none_or(|local_entry| local_entry.kind != EntryKind::Dir)
+        {
+            expectations
+                .entry(path.clone())
+                .or_insert(SnapshotPathExpectation::DirExists);
+            insert_ancestor_dir_expectations(&mut expectations, remote_snapshot, path);
+        }
+    }
+
+    expectations
+        .into_iter()
+        .map(|(wire_path, expected)| RemoteEchoExpectation {
+            wire_path,
+            expected,
+        })
+        .collect()
+}
+
+fn insert_ancestor_dir_expectations(
+    expectations: &mut BTreeMap<String, SnapshotPathExpectation>,
+    remote_snapshot: &ManifestSnapshot,
+    wire_path: &str,
+) {
+    for ancestor in wire_path_ancestors(wire_path) {
+        if remote_snapshot
+            .entries
+            .get(&ancestor)
+            .is_some_and(|entry| entry.kind == EntryKind::Dir)
+        {
+            expectations
+                .entry(ancestor)
+                .or_insert(SnapshotPathExpectation::DirExists);
+        }
+    }
+}
+
+fn wire_path_ancestors(wire_path: &str) -> Vec<String> {
+    let mut ancestors = Vec::new();
+    let mut components = wire_path.split('/').collect::<Vec<_>>();
+    while components.len() > 1 {
+        components.pop();
+        ancestors.push(components.join("/"));
+    }
+    ancestors
+}
+
+fn snapshot_changed_paths(previous: &ManifestSnapshot, current: &ManifestSnapshot) -> Vec<String> {
+    let changed_paths = previous
+        .entries
+        .keys()
+        .chain(current.entries.keys())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|path| previous.entries.get(*path) != current.entries.get(*path))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let mut collapsed = Vec::<String>::new();
+    for path in changed_paths {
+        if collapsed.iter().any(|ancestor| {
+            current.entries.get(ancestor).is_none() && is_wire_path_ancestor(ancestor, &path)
+        }) {
+            continue;
+        }
+        collapsed.push(path);
+    }
+
+    collapsed
+}
+
+fn is_wire_path_ancestor(ancestor: &str, path: &str) -> bool {
+    path != ancestor
+        && path
+            .strip_prefix(ancestor)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn expectation_matches(
+    expectation: &SnapshotPathExpectation,
+    current_entry: Option<&ManifestEntry>,
+) -> bool {
+    match expectation {
+        SnapshotPathExpectation::Exact(entry) => current_entry == Some(entry),
+        SnapshotPathExpectation::DirExists => {
+            current_entry.is_some_and(|entry| entry.kind == EntryKind::Dir)
+        }
+        SnapshotPathExpectation::Missing => current_entry.is_none(),
     }
 }
 
@@ -3033,7 +3301,8 @@ fn is_executable(_metadata: &std::fs::Metadata) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        FILE_STREAM_CHUNK_SIZE, SessionRole, accept_policy_label, choose_peer, delete_policy,
+        FILE_STREAM_CHUNK_SIZE, SessionRole, SnapshotEchoSuppressions, SnapshotPathExpectation,
+        accept_policy_label, build_remote_echo_expectations, choose_peer, delete_policy,
         identity_display_name, is_connection_shutdown_error, next_reconnect_delay,
         parse_direct_peer_addr, peer_matches_query, preferred_peer_query, resolve_audio_plan,
         select_peer_from_query, send_one_file, should_auto_accept_request,
@@ -3046,7 +3315,11 @@ mod tests {
     };
     use crate::discovery::DiscoveredPeer;
     use crate::protocol::{DeviceIdentity, Frame, PairAuthMethod};
-    use crate::sync::{DeletePolicy, OutgoingSpec, SnapshotLayout};
+    use crate::sync::{
+        ApplyPlan, DeletePolicy, EntryKind, ManifestEntry, ManifestSnapshot, OutgoingSpec,
+        SnapshotLayout,
+    };
+    use std::collections::BTreeMap;
     use std::env;
     use std::fs;
     use std::net::{Ipv4Addr, SocketAddrV4};
@@ -3109,6 +3382,128 @@ mod tests {
 
         let err = anyhow::Error::from(std::io::Error::other("other"));
         assert!(!is_connection_shutdown_error(&err));
+    }
+
+    #[test]
+    fn remote_echo_expectations_cover_files_dirs_and_deletes() {
+        let remote = ManifestSnapshot {
+            layout: SnapshotLayout::RootContents,
+            max_folder_depth: None,
+            entries: BTreeMap::from([
+                ("docs".to_string(), dir_entry()),
+                (
+                    "docs/readme.txt".to_string(),
+                    file_entry("remote-readme", 10),
+                ),
+                ("empty".to_string(), dir_entry()),
+            ]),
+        };
+        let local = ManifestSnapshot {
+            layout: SnapshotLayout::RootContents,
+            max_folder_depth: None,
+            entries: BTreeMap::from([("old.txt".to_string(), file_entry("old", 5))]),
+        };
+        let plan = ApplyPlan {
+            file_requests: vec!["docs/readme.txt".to_string()],
+            delete_paths: vec!["old.txt".to_string()],
+            skipped_newer_paths: Vec::new(),
+            unreliable_timestamp_paths: Vec::new(),
+        };
+
+        let expectations = build_remote_echo_expectations(&remote, &local, &plan)
+            .into_iter()
+            .map(|expectation| (expectation.wire_path, expectation.expected))
+            .collect::<BTreeMap<_, _>>();
+
+        assert_eq!(
+            expectations.get("docs/readme.txt"),
+            Some(&SnapshotPathExpectation::Exact(file_entry(
+                "remote-readme",
+                10
+            )))
+        );
+        assert_eq!(
+            expectations.get("docs"),
+            Some(&SnapshotPathExpectation::DirExists)
+        );
+        assert_eq!(
+            expectations.get("empty"),
+            Some(&SnapshotPathExpectation::DirExists)
+        );
+        assert_eq!(
+            expectations.get("old.txt"),
+            Some(&SnapshotPathExpectation::Missing)
+        );
+    }
+
+    #[test]
+    fn snapshot_echo_suppression_consumes_matching_remote_diff() {
+        let previous = ManifestSnapshot {
+            layout: SnapshotLayout::RootContents,
+            max_folder_depth: None,
+            entries: BTreeMap::from([("docs".to_string(), dir_entry())]),
+        };
+        let current = ManifestSnapshot {
+            layout: SnapshotLayout::RootContents,
+            max_folder_depth: None,
+            entries: BTreeMap::from([
+                ("docs".to_string(), dir_entry()),
+                (
+                    "docs/readme.txt".to_string(),
+                    file_entry("remote-readme", 10),
+                ),
+            ]),
+        };
+        let mut suppressions = SnapshotEchoSuppressions::default();
+        suppressions.note_remote_expectations(vec![super::RemoteEchoExpectation {
+            wire_path: "docs/readme.txt".to_string(),
+            expected: SnapshotPathExpectation::Exact(file_entry("remote-readme", 10)),
+        }]);
+
+        assert!(suppressions.matches_only_remote_changes(Some(&previous), &current));
+        assert!(suppressions.paths.is_empty());
+    }
+
+    #[test]
+    fn snapshot_echo_suppression_does_not_hide_unrelated_local_diff() {
+        let previous = ManifestSnapshot {
+            layout: SnapshotLayout::RootContents,
+            max_folder_depth: None,
+            entries: BTreeMap::new(),
+        };
+        let current = ManifestSnapshot {
+            layout: SnapshotLayout::RootContents,
+            max_folder_depth: None,
+            entries: BTreeMap::from([("notes.txt".to_string(), file_entry("local", 5))]),
+        };
+        let mut suppressions = SnapshotEchoSuppressions::default();
+        suppressions.note_remote_expectations(vec![super::RemoteEchoExpectation {
+            wire_path: "docs/readme.txt".to_string(),
+            expected: SnapshotPathExpectation::Exact(file_entry("remote-readme", 10)),
+        }]);
+
+        assert!(!suppressions.matches_only_remote_changes(Some(&previous), &current));
+    }
+
+    #[test]
+    fn snapshot_echo_suppression_requires_expected_entry_match() {
+        let previous = ManifestSnapshot {
+            layout: SnapshotLayout::RootContents,
+            max_folder_depth: None,
+            entries: BTreeMap::new(),
+        };
+        let current = ManifestSnapshot {
+            layout: SnapshotLayout::RootContents,
+            max_folder_depth: None,
+            entries: BTreeMap::from([("docs/readme.txt".to_string(), file_entry("local", 5))]),
+        };
+        let mut suppressions = SnapshotEchoSuppressions::default();
+        suppressions.note_remote_expectations(vec![super::RemoteEchoExpectation {
+            wire_path: "docs/readme.txt".to_string(),
+            expected: SnapshotPathExpectation::Exact(file_entry("remote-readme", 10)),
+        }]);
+
+        assert!(!suppressions.matches_only_remote_changes(Some(&previous), &current));
     }
 
     #[tokio::test]
@@ -3406,5 +3801,25 @@ mod tests {
 
     fn test_dir(prefix: &str) -> PathBuf {
         env::temp_dir().join(format!("synly-app-{prefix}-{}", Uuid::new_v4()))
+    }
+
+    fn file_entry(hash: &str, modified_ms: u64) -> ManifestEntry {
+        ManifestEntry {
+            kind: EntryKind::File,
+            size: 1,
+            modified_ms,
+            hash: Some(hash.to_string()),
+            executable: false,
+        }
+    }
+
+    fn dir_entry() -> ManifestEntry {
+        ManifestEntry {
+            kind: EntryKind::Dir,
+            size: 0,
+            modified_ms: 1,
+            hash: None,
+            executable: false,
+        }
     }
 }
