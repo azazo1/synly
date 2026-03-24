@@ -1,4 +1,4 @@
-use crate::cli::SyncMode;
+use crate::cli::{AudioMode, ClipboardMode, FileSyncMode};
 use crate::config::DeviceConfig;
 use anyhow::{Context, Result, bail};
 use if_addrs::get_if_addrs;
@@ -14,7 +14,9 @@ pub const SERVICE_TYPE: &str = "_synly._tcp.local.";
 pub struct Advertisement {
     pub port: u16,
     pub device: DeviceConfig,
-    pub mode: SyncMode,
+    pub file_sync_mode: FileSyncMode,
+    pub clipboard_mode: ClipboardMode,
+    pub audio_mode: AudioMode,
     pub instance_name: Option<String>,
 }
 
@@ -34,7 +36,9 @@ pub struct DiscoveredPeer {
     pub device_name: String,
     pub instance_name: Option<String>,
     pub device_id: String,
-    pub mode: SyncMode,
+    pub file_sync_mode: FileSyncMode,
+    pub clipboard_mode: ClipboardMode,
+    pub audio_mode: AudioMode,
     pub port: u16,
     pub addresses: Vec<Ipv4Addr>,
 }
@@ -52,10 +56,12 @@ impl DiscoveredPeer {
             .collect::<Vec<_>>()
             .join(", ");
         format!(
-            "{} ({})  {}  {}",
+            "{} ({})  文件:{}  剪贴板:{}  音频:{}  {}",
             self.display_name(),
             &self.device_id[..8.min(self.device_id.len())],
-            self.mode.label(),
+            self.file_sync_mode.label(),
+            self.clipboard_mode.label(),
+            self.audio_mode.label(),
             addresses
         )
     }
@@ -101,7 +107,18 @@ pub fn advertise(advertisement: &Advertisement) -> Result<DiscoveryRegistration>
     {
         properties.insert("instance_name".to_string(), instance_name.to_string());
     }
-    properties.insert("mode".to_string(), advertisement.mode.as_wire().to_string());
+    properties.insert(
+        "fs_mode".to_string(),
+        advertisement.file_sync_mode.as_wire().to_string(),
+    );
+    properties.insert(
+        "clipboard_mode".to_string(),
+        advertisement.clipboard_mode.as_wire().to_string(),
+    );
+    properties.insert(
+        "audio_mode".to_string(),
+        advertisement.audio_mode.as_wire().to_string(),
+    );
     properties.insert("protocol".to_string(), "1".to_string());
 
     let ip_addrs = addresses
@@ -161,11 +178,18 @@ pub fn browse(timeout: Duration) -> Result<Vec<DiscoveredPeer>> {
 }
 
 fn discovered_peer_from_info(info: &mdns_sd::ResolvedService) -> Option<DiscoveredPeer> {
-    let mode = SyncMode::from_wire(info.get_property_val_str("mode")?)?;
+    let file_sync_mode = info
+        .get_property_val_str("fs_mode")
+        .and_then(FileSyncMode::from_wire)?;
+    let clipboard_mode = info
+        .get_property_val_str("clipboard_mode")
+        .and_then(ClipboardMode::from_wire)?;
+    let audio_mode = info
+        .get_property_val_str("audio_mode")
+        .and_then(AudioMode::from_wire)?;
     let device_name = info.get_property_val_str("device_name")?.to_string();
     let instance_name = info
         .get_property_val_str("instance_name")
-        .or_else(|| info.get_property_val_str("process_name"))
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string);
@@ -181,7 +205,9 @@ fn discovered_peer_from_info(info: &mdns_sd::ResolvedService) -> Option<Discover
         device_name,
         instance_name,
         device_id,
-        mode,
+        file_sync_mode,
+        clipboard_mode,
+        audio_mode,
         port: info.get_port(),
         addresses,
     })

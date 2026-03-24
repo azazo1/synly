@@ -1,4 +1,3 @@
-use crate::cli::{AudioMode, SyncMode};
 use crate::sync::{ManifestSnapshot, WorkspaceSummary};
 use anyhow::{Context, Result, bail};
 use serde::de::DeserializeOwned;
@@ -16,7 +15,7 @@ const DEFAULT_MAX_FRAME_DATA_LEN: usize = 128 * 1024 * 1024;
 const DEFAULT_MAX_CLIPBOARD_BINARY_LEN: usize = 100 * 1024 * 1024;
 const CLIPBOARD_STREAM_CHUNK_SIZE: usize = 1024 * 1024;
 
-pub const PROTOCOL_VERSION: u16 = 14;
+pub const PROTOCOL_VERSION: u16 = 15;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TransferLimits {
@@ -56,11 +55,7 @@ pub struct DeviceIdentity {
 pub struct PairRequestPayload {
     pub protocol_version: u16,
     pub client: DeviceIdentity,
-    pub requested_mode: SyncMode,
     pub workspace: WorkspaceSummary,
-    #[serde(default)]
-    pub audio_mode: AudioMode,
-    #[serde(default)]
     pub request_trust: bool,
 }
 
@@ -117,14 +112,9 @@ pub enum ControlMessage {
         server: DeviceIdentity,
         workspace: WorkspaceSummary,
         agreement: SessionAgreement,
-        #[serde(default)]
-        audio_mode: AudioMode,
-        #[serde(default)]
         auth_method: PairAuthMethod,
-        #[serde(default)]
         server_trusts_client: bool,
         proof: String,
-        #[serde(default)]
         trust_established: bool,
     },
     AudioUdpReady {
@@ -617,11 +607,12 @@ fn read_binary(data: &[u8], meta: ClipboardBinaryMeta) -> Result<&[u8]> {
 mod tests {
     use super::{
         CLIPBOARD_STREAM_CHUNK_SIZE, ClipboardFile, ClipboardImage, ClipboardPayload,
-        ControlMessage, Frame, FrameReader, FrameWriter, SessionAgreement, decode_payload,
-        encode_payload,
+        ControlMessage, Frame, FrameReader, FrameWriter, PROTOCOL_VERSION, PairRequestPayload,
+        SessionAgreement, decode_payload, encode_payload,
     };
-    use crate::cli::{AudioMode, ClipboardMode, SyncMode};
+    use crate::cli::{AudioMode, ClipboardMode, FileSyncMode};
     use crate::sync::WorkspaceSummary;
+    use serde_json::json;
     use tokio::io::duplex;
 
     #[test]
@@ -677,7 +668,7 @@ mod tests {
                 tls_root_certificate: "cert".to_string(),
             },
             workspace: WorkspaceSummary {
-                mode: SyncMode::Both,
+                file_sync_mode: FileSyncMode::Both,
                 send_description: Some("demo".to_string()),
                 send_layout: None,
                 send_items: vec!["docs".to_string()],
@@ -685,12 +676,12 @@ mod tests {
                 initial_sync: Some(crate::cli::InitialSyncMode::This),
                 max_folder_depth: Some(2),
                 clipboard_mode: ClipboardMode::Both,
+                audio_mode: AudioMode::Receive,
             },
             agreement: SessionAgreement {
                 host_to_client: true,
                 client_to_host: true,
             },
-            audio_mode: AudioMode::Receive,
             auth_method: super::PairAuthMethod::TrustedDevice,
             server_trusts_client: true,
             proof: "proof".to_string(),
@@ -769,5 +760,88 @@ mod tests {
             Frame::Clipboard(decoded) => assert_eq!(decoded, expected),
             other => panic!("expected clipboard frame, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn workspace_summary_rejects_legacy_payload_missing_sync_modes() {
+        let err = serde_json::from_value::<WorkspaceSummary>(json!({
+            "file_sync_mode": "both",
+            "send_description": "demo",
+            "send_layout": "root_contents",
+            "send_items": ["docs"],
+            "receive_root": "/tmp",
+            "initial_sync": "this",
+            "max_folder_depth": 2
+        }))
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("clipboard_mode"));
+    }
+
+    #[test]
+    fn pair_request_payload_rejects_legacy_payload_missing_request_trust() {
+        let err = serde_json::from_value::<PairRequestPayload>(json!({
+            "protocol_version": PROTOCOL_VERSION,
+            "client": {
+                "device_id": uuid::Uuid::nil(),
+                "device_name": "server",
+                "instance_name": "worker-a",
+                "identity_public_key": "pub",
+                "tls_root_certificate": "cert"
+            },
+            "workspace": {
+                "file_sync_mode": "both",
+                "send_description": "demo",
+                "send_layout": "root_contents",
+                "send_items": ["docs"],
+                "receive_root": "/tmp",
+                "initial_sync": "this",
+                "max_folder_depth": 2,
+                "clipboard_mode": "both",
+                "audio_mode": "receive"
+            }
+        }))
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("request_trust"));
+    }
+
+    #[test]
+    fn pair_decision_rejects_legacy_payload_missing_auth_metadata() {
+        let err = serde_json::from_value::<ControlMessage>(json!({
+            "pair_decision": {
+                "accepted": true,
+                "message": "ok",
+                "server": {
+                    "device_id": uuid::Uuid::nil(),
+                    "device_name": "server",
+                    "instance_name": "worker-a",
+                    "identity_public_key": "pub",
+                    "tls_root_certificate": "cert"
+                },
+                "workspace": {
+                    "file_sync_mode": "both",
+                    "send_description": "demo",
+                    "send_layout": "root_contents",
+                    "send_items": ["docs"],
+                    "receive_root": "/tmp",
+                    "initial_sync": "this",
+                    "max_folder_depth": 2,
+                    "clipboard_mode": "both",
+                    "audio_mode": "receive"
+                },
+                "agreement": {
+                    "host_to_client": true,
+                    "client_to_host": true
+                },
+                "proof": "proof"
+            }
+        }))
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("auth_method"));
     }
 }

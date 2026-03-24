@@ -25,7 +25,7 @@ pub struct Cli {
         value_enum,
         help = "文件同步模式；默认 off，可选 off / send / receive / both / auto"
     )]
-    pub fs: Option<SyncMode>,
+    pub fs: Option<FileSyncMode>,
     #[arg(
         long,
         help = "当前实例名；仅影响本次运行的发现与配对显示，不会写入配置"
@@ -110,7 +110,7 @@ pub struct Cli {
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, ValueEnum, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
-pub enum SyncMode {
+pub enum FileSyncMode {
     Off,
     Send,
     Receive,
@@ -174,32 +174,38 @@ impl InitialSyncMode {
     }
 }
 
-impl SyncMode {
+impl FileSyncMode {
     pub fn can_send(self) -> bool {
-        matches!(self, SyncMode::Send | SyncMode::Both | SyncMode::Auto)
+        matches!(
+            self,
+            FileSyncMode::Send | FileSyncMode::Both | FileSyncMode::Auto
+        )
     }
 
     pub fn can_receive(self) -> bool {
-        matches!(self, SyncMode::Receive | SyncMode::Both | SyncMode::Auto)
+        matches!(
+            self,
+            FileSyncMode::Receive | FileSyncMode::Both | FileSyncMode::Auto
+        )
     }
 
     pub fn label(self) -> &'static str {
         match self {
-            SyncMode::Off => "关闭文件同步",
-            SyncMode::Send => "发送方",
-            SyncMode::Receive => "接收方",
-            SyncMode::Both => "双向同步",
-            SyncMode::Auto => "自动协商",
+            FileSyncMode::Off => "关闭文件同步",
+            FileSyncMode::Send => "发送方",
+            FileSyncMode::Receive => "接收方",
+            FileSyncMode::Both => "双向同步",
+            FileSyncMode::Auto => "自动协商",
         }
     }
 
     pub fn as_wire(self) -> &'static str {
         match self {
-            SyncMode::Off => "off",
-            SyncMode::Send => "send",
-            SyncMode::Receive => "receive",
-            SyncMode::Both => "both",
-            SyncMode::Auto => "auto",
+            FileSyncMode::Off => "off",
+            FileSyncMode::Send => "send",
+            FileSyncMode::Receive => "receive",
+            FileSyncMode::Both => "both",
+            FileSyncMode::Auto => "auto",
         }
     }
 
@@ -232,6 +238,44 @@ impl ClipboardMode {
             ClipboardMode::Both => "双向同步",
         }
     }
+
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            ClipboardMode::Off => "off",
+            ClipboardMode::Send => "send",
+            ClipboardMode::Receive => "receive",
+            ClipboardMode::Both => "both",
+        }
+    }
+
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "off" => Some(Self::Off),
+            "send" => Some(Self::Send),
+            "receive" => Some(Self::Receive),
+            "both" => Some(Self::Both),
+            _ => None,
+        }
+    }
+}
+
+impl AudioMode {
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            AudioMode::Off => "off",
+            AudioMode::Send => "send",
+            AudioMode::Receive => "receive",
+        }
+    }
+
+    pub fn from_wire(value: &str) -> Option<Self> {
+        match value {
+            "off" => Some(Self::Off),
+            "send" => Some(Self::Send),
+            "receive" => Some(Self::Receive),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -242,7 +286,7 @@ pub enum ConnectionPreference {
 
 #[derive(Clone, Debug)]
 pub struct RuntimeOptions {
-    pub mode: SyncMode,
+    pub file_sync_mode: FileSyncMode,
     pub connection: ConnectionPreference,
     pub instance_name: Option<String>,
     pub workspace: WorkspaceSpec,
@@ -303,8 +347,8 @@ fn collect_runtime_options_from_cli(cli: Cli, config: &SynlyConfig) -> Result<Ru
         _ => bail!("missing connection preference"),
     };
 
-    let mode = cli.fs.unwrap_or(SyncMode::Off);
-    let workspace = workspace_from_cli_paths(mode, cli.paths, cli.initial)?;
+    let file_sync_mode = cli.fs.unwrap_or(FileSyncMode::Off);
+    let workspace = workspace_from_cli_paths(file_sync_mode, cli.paths, cli.initial)?;
 
     let workspace = workspace.with_max_folder_depth(cli.max_folder_depth);
     let sync_delete = if workspace.incoming_root.is_some() {
@@ -317,7 +361,7 @@ fn collect_runtime_options_from_cli(cli: Cli, config: &SynlyConfig) -> Result<Ru
     let audio_mode = cli.audio.unwrap_or(AudioMode::Off);
 
     Ok(RuntimeOptions {
-        mode,
+        file_sync_mode,
         connection,
         instance_name: normalize_optional_text(cli.name),
         workspace,
@@ -358,23 +402,23 @@ fn missing_startup_requirements(cli: &Cli) -> Vec<String> {
     }
 
     match cli.fs {
-        Some(SyncMode::Send) if cli.paths.is_empty() => {
+        Some(FileSyncMode::Send) if cli.paths.is_empty() => {
             missing.push("缺少发送路径：请在 `--fs send` 后至少提供一个路径".to_string());
         }
-        Some(SyncMode::Receive) if cli.paths.is_empty() => {
+        Some(FileSyncMode::Receive) if cli.paths.is_empty() => {
             missing.push("缺少接收目录：请在 `--fs receive` 时提供目录路径".to_string());
         }
-        Some(SyncMode::Both) if cli.paths.is_empty() => {
+        Some(FileSyncMode::Both) if cli.paths.is_empty() => {
             missing.push("缺少双向同步目录：请在 `--fs both` 时提供目录路径".to_string());
         }
-        Some(SyncMode::Auto) if cli.paths.is_empty() => {
+        Some(FileSyncMode::Auto) if cli.paths.is_empty() => {
             missing.push("缺少共享目录：请在 `--fs auto` 时提供目录路径".to_string());
         }
         _ => {}
     }
 
     match cli.fs {
-        Some(SyncMode::Both | SyncMode::Auto) if cli.initial.is_none() => {
+        Some(FileSyncMode::Both | FileSyncMode::Auto) if cli.initial.is_none() => {
             missing.push(
                 "缺少初始状态来源：`--fs both/auto` 时请传 `--initial this` 或 `--initial other`"
                     .to_string(),
@@ -398,10 +442,6 @@ fn format_missing_startup_requirements(missing: &[String]) -> String {
 
 pub fn sync_delete_label(enabled: bool) -> &'static str {
     if enabled { "开启" } else { "关闭" }
-}
-
-pub fn clipboard_mode_label(mode: ClipboardMode) -> &'static str {
-    mode.label()
 }
 
 pub fn prompt_select(
@@ -574,12 +614,12 @@ fn expand_path_list(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
 }
 
 fn workspace_from_cli_paths(
-    mode: SyncMode,
+    file_sync_mode: FileSyncMode,
     paths: Vec<PathBuf>,
     initial: Option<InitialSyncMode>,
 ) -> Result<WorkspaceSpec> {
-    match mode {
-        SyncMode::Off => {
+    match file_sync_mode {
+        FileSyncMode::Off => {
             if initial.is_some() {
                 bail!("`--initial` 只能和 `--fs both` 或 `--fs auto` 一起使用");
             }
@@ -588,7 +628,7 @@ fn workspace_from_cli_paths(
             }
             Ok(WorkspaceSpec::for_off())
         }
-        SyncMode::Send => {
+        FileSyncMode::Send => {
             if initial.is_some() {
                 bail!("`--initial` 只能和 `--fs both` 或 `--fs auto` 一起使用");
             }
@@ -597,7 +637,7 @@ fn workspace_from_cli_paths(
             }
             Ok(WorkspaceSpec::for_send(expand_path_list(paths)?)?)
         }
-        SyncMode::Receive => {
+        FileSyncMode::Receive => {
             if initial.is_some() {
                 bail!("`--initial` 只能和 `--fs both` 或 `--fs auto` 一起使用");
             }
@@ -605,11 +645,11 @@ fn workspace_from_cli_paths(
                 paths, "receive",
             )?)?)
         }
-        SyncMode::Both => Ok(WorkspaceSpec::for_both(expand_single_path(paths, "both")?)?
+        FileSyncMode::Both => Ok(WorkspaceSpec::for_both(expand_single_path(paths, "both")?)?
             .with_initial_sync(Some(
                 initial.context("`--fs both` 时必须传 `--initial this` 或 `--initial other`")?,
             ))),
-        SyncMode::Auto => Ok(WorkspaceSpec::for_auto(expand_single_path(paths, "auto")?)?
+        FileSyncMode::Auto => Ok(WorkspaceSpec::for_auto(expand_single_path(paths, "auto")?)?
             .with_initial_sync(Some(
                 initial.context("`--fs auto` 时必须传 `--initial this` 或 `--initial other`")?,
             ))),
@@ -714,14 +754,14 @@ mod tests {
         let options = collect_runtime_options(cli, &test_config()).unwrap();
 
         assert!(matches!(options.connection, ConnectionPreference::Join));
-        assert_eq!(options.mode, SyncMode::Receive);
+        assert_eq!(options.file_sync_mode, FileSyncMode::Receive);
         assert!(!options.sync_delete);
         assert_eq!(options.clipboard_mode, ClipboardMode::Off);
         assert_eq!(options.interval_secs, 9);
         assert_eq!(
             options
                 .workspace
-                .summary(ClipboardMode::Off)
+                .workspace_summary(ClipboardMode::Off, AudioMode::Off)
                 .max_folder_depth,
             None
         );
@@ -751,12 +791,15 @@ mod tests {
         assert_eq!(
             options
                 .workspace
-                .summary(ClipboardMode::Send)
+                .workspace_summary(ClipboardMode::Send, AudioMode::Off)
                 .max_folder_depth,
             Some(4)
         );
         assert_eq!(
-            options.workspace.summary(ClipboardMode::Send).initial_sync,
+            options
+                .workspace
+                .workspace_summary(ClipboardMode::Send, AudioMode::Off)
+                .initial_sync,
             Some(InitialSyncMode::This)
         );
     }
@@ -908,7 +951,7 @@ mod tests {
         assert!(missing_startup_requirements(&cli).is_empty());
         let options = collect_runtime_options(cli, &test_config()).unwrap();
         assert!(matches!(options.connection, ConnectionPreference::Host));
-        assert_eq!(options.mode, SyncMode::Off);
+        assert_eq!(options.file_sync_mode, FileSyncMode::Off);
         assert_eq!(options.clipboard_mode, ClipboardMode::Both);
         assert!(!options.workspace.file_sync_enabled());
     }
@@ -919,7 +962,7 @@ mod tests {
 
         assert!(missing_startup_requirements(&cli).is_empty());
         let options = collect_runtime_options(cli, &test_config()).unwrap();
-        assert_eq!(options.mode, SyncMode::Off);
+        assert_eq!(options.file_sync_mode, FileSyncMode::Off);
         assert_eq!(options.clipboard_mode, ClipboardMode::Both);
         assert!(!options.workspace.file_sync_enabled());
     }
@@ -983,7 +1026,7 @@ mod tests {
         assert!(!cli.host);
         assert!(cli.no_sync_delete);
         assert!(!cli.sync_delete);
-        assert_eq!(cli.fs, Some(SyncMode::Receive));
+        assert_eq!(cli.fs, Some(FileSyncMode::Receive));
         assert_eq!(cli.clipboard, Some(ClipboardMode::Both));
         assert_eq!(cli.port, Some(7070));
         assert_eq!(cli.interval_secs, 9);

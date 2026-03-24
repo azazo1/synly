@@ -1,7 +1,7 @@
 use crate::audio::{self, AudioChannelDirection};
 use crate::cli::{
-    AudioMode, ClipboardMode, ConnectionPreference, InitialSyncMode, PairingRuntimeOptions,
-    RuntimeOptions, SyncMode, TrustPromptDecision, clipboard_mode_label, prompt_confirm,
+    AudioMode, ClipboardMode, ConnectionPreference, FileSyncMode, InitialSyncMode,
+    PairingRuntimeOptions, RuntimeOptions, TrustPromptDecision, prompt_confirm,
     prompt_confirm_with_trust, prompt_select, require_peer_query, resolve_pairing_pin,
     sync_delete_label,
 };
@@ -65,7 +65,6 @@ struct AuthenticatedSession {
     remote: DeviceIdentity,
     agreement: SessionAgreement,
     remote_workspace: crate::sync::WorkspaceSummary,
-    remote_audio_mode: AudioMode,
     remote_socket_addr: SocketAddr,
     audio_master_secret: [u8; 32],
 }
@@ -221,7 +220,9 @@ async fn run_host(config: &mut SynlyConfig, options: RuntimeOptions) -> Result<(
     let _advertisement = discovery::advertise(&Advertisement {
         port,
         device: device.clone(),
-        mode: options.mode,
+        file_sync_mode: options.file_sync_mode,
+        clipboard_mode: options.clipboard_mode,
+        audio_mode: options.audio_mode,
         instance_name: options.instance_name.clone(),
     })?;
 
@@ -270,6 +271,9 @@ async fn run_host(config: &mut SynlyConfig, options: RuntimeOptions) -> Result<(
 
 async fn run_client(config: &mut SynlyConfig, options: RuntimeOptions) -> Result<()> {
     let discovery_timeout = Duration::from_secs(options.pairing.discovery_secs);
+    let local_workspace_summary = options
+        .workspace
+        .workspace_summary(options.clipboard_mode, options.audio_mode);
     let mut reconnect_query = options.pairing.peer_query.clone();
     let mut reconnect_delay = RECONNECT_BASE_DELAY;
 
@@ -278,6 +282,7 @@ async fn run_client(config: &mut SynlyConfig, options: RuntimeOptions) -> Result
             reconnect_query.as_deref(),
             discovery_timeout,
             options.pairing.no_interact,
+            &local_workspace_summary,
         ) {
             Ok(peer) => peer,
             Err(err) => {
@@ -520,10 +525,11 @@ async fn handle_trusted_incoming_connection(
         return Ok(None);
     }
 
-    let agreement = negotiate(options.mode, payload.requested_mode);
+    let agreement =
+        negotiate_file_sync_modes(options.file_sync_mode, payload.workspace.file_sync_mode);
     let clipboard_agreement =
         negotiate_clipboard(options.clipboard_mode, payload.workspace.clipboard_mode);
-    let audio_compatible = audio_modes_compatible(options.audio_mode, payload.audio_mode);
+    let audio_compatible = audio_modes_compatible(options.audio_mode, payload.workspace.audio_mode);
     print_pair_request_overview(&payload, options, &agreement, &remote_label)?;
     if !agreement.any_direction() && !clipboard_agreement.any_direction() && !audio_compatible {
         write_frame(
@@ -576,7 +582,6 @@ async fn handle_trusted_incoming_connection(
         remote: payload.client,
         agreement,
         remote_workspace: payload.workspace,
-        remote_audio_mode: payload.audio_mode,
         remote_socket_addr: remote_addr,
         audio_master_secret,
     }))
@@ -866,10 +871,11 @@ async fn handle_bootstrap_incoming_connection(
     let exporter = crypto::export_keying_material_from_server(&server_stream, &request_id)?;
     let audio_master_secret =
         crypto::export_audio_master_secret_from_server(&server_stream, &request_id)?;
-    let agreement = negotiate(options.mode, payload.requested_mode);
+    let agreement =
+        negotiate_file_sync_modes(options.file_sync_mode, payload.workspace.file_sync_mode);
     let clipboard_agreement =
         negotiate_clipboard(options.clipboard_mode, payload.workspace.clipboard_mode);
-    let audio_compatible = audio_modes_compatible(options.audio_mode, payload.audio_mode);
+    let audio_compatible = audio_modes_compatible(options.audio_mode, payload.workspace.audio_mode);
     print_pair_request_overview(&payload, options, &agreement, &remote_label)?;
     if !agreement.any_direction() && !clipboard_agreement.any_direction() && !audio_compatible {
         write_frame(
@@ -951,7 +957,6 @@ async fn handle_bootstrap_incoming_connection(
         remote: payload.client,
         agreement,
         remote_workspace: payload.workspace,
-        remote_audio_mode: payload.audio_mode,
         remote_socket_addr: remote_addr,
         audio_master_secret,
     }))
@@ -1039,9 +1044,9 @@ where
     let payload = PairRequestPayload {
         protocol_version: PROTOCOL_VERSION,
         client: device_identity(device, options.instance_name.as_deref()),
-        requested_mode: options.mode,
-        workspace: options.workspace.summary(options.clipboard_mode),
-        audio_mode: options.audio_mode,
+        workspace: options
+            .workspace
+            .workspace_summary(options.clipboard_mode, options.audio_mode),
         request_trust: options.pairing.trust_device,
     };
     let trusted_proof = crypto::sign_trusted_pair_auth(
@@ -1065,14 +1070,13 @@ where
         Frame::Control(message) => message,
         _ => bail!("peer sent a non-control response during trusted pairing"),
     };
-    let (remote, remote_workspace, agreement, remote_audio_mode) = match reply {
+    let (remote, remote_workspace, agreement) = match reply {
         ControlMessage::PairDecision {
             accepted,
             message,
             server,
             workspace,
             agreement,
-            audio_mode,
             auth_method,
             server_trusts_client,
             proof,
@@ -1088,7 +1092,6 @@ where
                 server: server.clone(),
                 workspace: workspace.clone(),
                 agreement: agreement.clone(),
-                audio_mode,
                 auth_method,
                 server_trusts_client,
                 proof,
@@ -1105,7 +1108,7 @@ where
             if !accepted {
                 bail!("{}", message);
             }
-            (server, workspace, agreement, audio_mode)
+            (server, workspace, agreement)
         }
         ControlMessage::Error { message } => bail!("{}", message),
         other => bail!("unexpected trusted pairing response: {other:?}"),
@@ -1115,14 +1118,13 @@ where
     config.save()?;
 
     let tls_stream: TlsStream<TcpStream> = client_stream.into();
-    print_connected_peer(&remote, &agreement, remote_audio_mode)?;
+    print_connected_peer(&remote, &agreement, &remote_workspace)?;
     Ok(AuthenticatedSession {
         role: SessionRole::Client,
         stream: tls_stream,
         remote,
         agreement,
         remote_workspace,
-        remote_audio_mode,
         remote_socket_addr,
         audio_master_secret,
     })
@@ -1246,9 +1248,9 @@ async fn connect_to_untrusted_peer(
     let payload = PairRequestPayload {
         protocol_version: PROTOCOL_VERSION,
         client: device_identity(device, options.instance_name.as_deref()),
-        requested_mode: options.mode,
-        workspace: options.workspace.summary(options.clipboard_mode),
-        audio_mode: options.audio_mode,
+        workspace: options
+            .workspace
+            .workspace_summary(options.clipboard_mode, options.audio_mode),
         request_trust: options.pairing.trust_device,
     };
     write_frame(
@@ -1268,14 +1270,13 @@ async fn connect_to_untrusted_peer(
         Frame::Control(message) => message,
         _ => bail!("peer sent a non-control response during bootstrap pairing"),
     };
-    let (remote, remote_workspace, agreement, remote_audio_mode) = match &reply {
+    let (remote, remote_workspace, agreement) = match &reply {
         ControlMessage::PairDecision {
             accepted,
             message,
             server,
             workspace,
             agreement,
-            audio_mode,
             auth_method,
             ..
         } => {
@@ -1287,12 +1288,7 @@ async fn connect_to_untrusted_peer(
             if !accepted {
                 bail!("{}", message);
             }
-            (
-                server.clone(),
-                workspace.clone(),
-                agreement.clone(),
-                *audio_mode,
-            )
+            (server.clone(), workspace.clone(), agreement.clone())
         }
         ControlMessage::Error { message } => bail!("{}", message),
         other => bail!("unexpected bootstrap pairing response: {other:?}"),
@@ -1343,14 +1339,13 @@ async fn connect_to_untrusted_peer(
     }
 
     let tls_stream: TlsStream<TcpStream> = client_stream.into();
-    print_connected_peer(&remote, &agreement, remote_audio_mode)?;
+    print_connected_peer(&remote, &agreement, &remote_workspace)?;
     Ok(AuthenticatedSession {
         role: SessionRole::Client,
         stream: tls_stream,
         remote,
         agreement,
         remote_workspace,
-        remote_audio_mode,
         remote_socket_addr,
         audio_master_secret,
     })
@@ -1377,7 +1372,7 @@ async fn run_sync_session(
         identity_display_name(&session.remote),
         short_uuid(&session.remote.device_id)
     );
-    for line in session.remote_workspace.human_lines() {
+    for line in session.remote_workspace.summary_lines() {
         println!("对端 {}", line);
     }
 
@@ -1403,9 +1398,12 @@ async fn run_sync_session(
     );
     let clipboard_can_send = allows_local_send(session.role, &clipboard_agreement);
     let clipboard_can_receive = allows_local_receive(session.role, &clipboard_agreement);
-    let audio_plan =
-        resolve_audio_plan(session.role, options.audio_mode, session.remote_audio_mode);
-    let remote_audio_mode = session.remote_audio_mode;
+    let audio_plan = resolve_audio_plan(
+        session.role,
+        options.audio_mode,
+        session.remote_workspace.audio_mode,
+    );
+    let remote_audio_mode = session.remote_workspace.audio_mode;
     let remote_socket_addr = session.remote_socket_addr;
     let audio_master_secret = session.audio_master_secret;
 
@@ -2936,16 +2934,16 @@ fn choose_peer(
     peer_query: Option<&str>,
     timeout: Duration,
     no_interact: bool,
+    local_workspace: &crate::sync::WorkspaceSummary,
 ) -> Result<PeerTarget> {
     if let Some(query) = peer_query {
         if let Some(address) = parse_direct_peer_addr(query) {
             return Ok(PeerTarget::Direct(address));
         }
         let peers = discovery::browse(timeout)?;
-        return Ok(PeerTarget::Discovered(select_peer_from_query(
-            &peers,
-            require_peer_query(Some(query))?,
-        )?));
+        let peer = select_peer_from_query(&peers, require_peer_query(Some(query))?)?;
+        ensure_discovered_peer_modes_match(&peer, local_workspace)?;
+        return Ok(PeerTarget::Discovered(peer));
     }
 
     if no_interact {
@@ -2961,9 +2959,23 @@ fn choose_peer(
             continue;
         }
 
-        let options = peers.iter().map(DiscoveredPeer::label).collect::<Vec<_>>();
+        let options = peers
+            .iter()
+            .map(|peer| discovered_peer_choice_label(peer, local_workspace))
+            .collect::<Vec<_>>();
         let index = prompt_select("选择设备", &options, None)?;
-        return Ok(PeerTarget::Discovered(peers[index].clone()));
+        let peer = peers[index].clone();
+        if let Some(message) = discovered_peer_mode_mismatch_message(&peer, local_workspace) {
+            println!("{message}");
+            if prompt_confirm(
+                "这个设备当前没有任何可用的同步方向，重新选择其他设备吗",
+                true,
+            )? {
+                continue;
+            }
+            bail!("{message}");
+        }
+        return Ok(PeerTarget::Discovered(peer));
     }
 }
 
@@ -3023,6 +3035,52 @@ fn preferred_peer_query(peer: &DiscoveredPeer) -> String {
         .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case(&peer.device_name))
         .unwrap_or(&peer.device_id)
         .to_string()
+}
+
+fn discovered_peer_choice_label(
+    peer: &DiscoveredPeer,
+    local_workspace: &crate::sync::WorkspaceSummary,
+) -> String {
+    let mut label = peer.label();
+    if discovered_peer_mode_mismatch_message(peer, local_workspace).is_some() {
+        label.push_str("  [模式不匹配]");
+    }
+    label
+}
+
+fn discovered_peer_mode_mismatch_message(
+    peer: &DiscoveredPeer,
+    local_workspace: &crate::sync::WorkspaceSummary,
+) -> Option<String> {
+    let file_agreement =
+        negotiate_file_sync_modes(peer.file_sync_mode, local_workspace.file_sync_mode);
+    let clipboard_agreement =
+        negotiate_clipboard(peer.clipboard_mode, local_workspace.clipboard_mode);
+    let audio_compatible = audio_modes_compatible(peer.audio_mode, local_workspace.audio_mode);
+    if file_agreement.any_direction() || clipboard_agreement.any_direction() || audio_compatible {
+        return None;
+    }
+
+    Some(format!(
+        "找到设备 {}，但同步模式不匹配：对端广播为 文件:{} / 剪贴板:{} / 音频:{}；本机为 文件:{} / 剪贴板:{} / 音频:{}。当前没有任何可用同步方向。",
+        peer.display_name(),
+        peer.file_sync_mode.label(),
+        peer.clipboard_mode.label(),
+        peer.audio_mode.label(),
+        local_workspace.file_sync_mode.label(),
+        local_workspace.clipboard_mode.label(),
+        local_workspace.audio_mode.label(),
+    ))
+}
+
+fn ensure_discovered_peer_modes_match(
+    peer: &DiscoveredPeer,
+    local_workspace: &crate::sync::WorkspaceSummary,
+) -> Result<()> {
+    if let Some(message) = discovered_peer_mode_mismatch_message(peer, local_workspace) {
+        bail!("{message}");
+    }
+    Ok(())
 }
 
 fn identity_display_name(identity: &DeviceIdentity) -> String {
@@ -3210,20 +3268,21 @@ fn print_pair_request_overview(
         crypto::short_identity_fingerprint(&payload.client.identity_public_key)?
     );
     println!("地址: {}", remote_addr);
-    for line in payload.workspace.human_lines() {
+    for line in payload.workspace.summary_lines() {
         println!("{line}");
     }
-    for line in options.workspace.local_human_lines(options.clipboard_mode) {
+    for line in options
+        .workspace
+        .local_summary_lines(options.clipboard_mode, options.audio_mode)
+    {
         println!("本机 {line}");
     }
-    println!("对端 音频同步: {}", payload.audio_mode.label());
-    println!("本机 音频同步: {}", options.audio_mode.label());
     if options.workspace.incoming_root.is_some() {
         println!("本机 删除同步: {}", sync_delete_label(options.sync_delete));
     }
     println!(
         "文件协商: {}",
-        file_agreement_label(SessionRole::Host, agreement)
+        file_sync_agreement_label(SessionRole::Host, agreement)
     );
     println!(
         "{}",
@@ -3239,7 +3298,7 @@ fn print_pair_request_overview(
 fn print_connected_peer(
     remote: &DeviceIdentity,
     agreement: &SessionAgreement,
-    remote_audio_mode: AudioMode,
+    remote_workspace: &crate::sync::WorkspaceSummary,
 ) -> Result<()> {
     println!();
     println!("{}", style("连接已建立").bold());
@@ -3254,14 +3313,17 @@ fn print_connected_peer(
     );
     println!(
         "文件协商: {}",
-        file_agreement_label(SessionRole::Client, agreement)
+        file_sync_agreement_label(SessionRole::Client, agreement)
     );
-    println!("对端音频同步: {}", remote_audio_mode.label());
+    println!("对端音频同步: {}", remote_workspace.audio_mode.label());
     Ok(())
 }
 
-fn negotiate(host_mode: SyncMode, client_mode: SyncMode) -> SessionAgreement {
-    negotiate_capabilities(
+fn negotiate_file_sync_modes(
+    host_mode: FileSyncMode,
+    client_mode: FileSyncMode,
+) -> SessionAgreement {
+    negotiate_sync_directions(
         host_mode.can_send(),
         host_mode.can_receive(),
         client_mode.can_send(),
@@ -3346,7 +3408,9 @@ fn allows_local_receive(role: SessionRole, agreement: &SessionAgreement) -> bool
 }
 
 fn signed_pair_decision(params: PairDecisionParams<'_>) -> Result<ControlMessage> {
-    let summary = params.workspace.summary(params.clipboard_mode);
+    let summary = params
+        .workspace
+        .workspace_summary(params.clipboard_mode, params.audio_mode);
     let server = device_identity(params.device, params.instance_name);
     let proof = match params.auth_method {
         PairAuthMethod::Pin => crypto::sign_pair_decision(
@@ -3358,7 +3422,6 @@ fn signed_pair_decision(params: PairDecisionParams<'_>) -> Result<ControlMessage
             &server,
             params.agreement,
             &summary,
-            params.audio_mode,
             params.auth_method,
             params.server_trusts_client,
             params.trust_established,
@@ -3372,7 +3435,6 @@ fn signed_pair_decision(params: PairDecisionParams<'_>) -> Result<ControlMessage
             &server,
             params.agreement,
             &summary,
-            params.audio_mode,
             params.server_trusts_client,
             params.trust_established,
         )?,
@@ -3383,7 +3445,6 @@ fn signed_pair_decision(params: PairDecisionParams<'_>) -> Result<ControlMessage
         server,
         workspace: summary,
         agreement: params.agreement.clone(),
-        audio_mode: params.audio_mode,
         auth_method: params.auth_method,
         server_trusts_client: params.server_trusts_client,
         proof,
@@ -3420,15 +3481,12 @@ fn print_host_ready(device: &DeviceConfig, options: &RuntimeOptions, port: u16) 
         )
         .expect("device identity fingerprint is invalid")
     );
-    println!("文件同步模式: {}", options.mode.label());
-    if !options.workspace.file_sync_enabled() {
-        println!("文件同步: 关闭");
+    for line in options
+        .workspace
+        .local_summary_lines(options.clipboard_mode, options.audio_mode)
+    {
+        println!("{line}");
     }
-    println!(
-        "剪贴板同步: {}",
-        clipboard_mode_label(options.clipboard_mode)
-    );
-    println!("音频同步: {}", options.audio_mode.label());
     if options.workspace.incoming_root.is_some() {
         println!("删除同步: {}", sync_delete_label(options.sync_delete));
     }
@@ -3473,11 +3531,11 @@ fn direction_label(role: SessionRole, agreement: &SessionAgreement) -> &'static 
     }
 }
 
-fn file_agreement_label(role: SessionRole, agreement: &SessionAgreement) -> &'static str {
+fn file_sync_agreement_label(role: SessionRole, agreement: &SessionAgreement) -> &'static str {
     direction_label(role, agreement)
 }
 
-fn negotiate_capabilities(
+fn negotiate_sync_directions(
     host_can_send: bool,
     host_can_receive: bool,
     client_can_send: bool,
@@ -3490,7 +3548,7 @@ fn negotiate_capabilities(
 }
 
 fn negotiate_clipboard(host_mode: ClipboardMode, client_mode: ClipboardMode) -> SessionAgreement {
-    negotiate_capabilities(
+    negotiate_sync_directions(
         host_mode.can_send(),
         host_mode.can_receive(),
         client_mode.can_send(),
@@ -3601,7 +3659,9 @@ mod tests {
         trusted_transport_for_identity,
     };
     use crate::audio::AudioChannelDirection;
-    use crate::cli::{AudioMode, ClipboardMode, InitialSyncMode, PairingRuntimeOptions, SyncMode};
+    use crate::cli::{
+        AudioMode, ClipboardMode, FileSyncMode, InitialSyncMode, PairingRuntimeOptions,
+    };
     use crate::config::{
         ClipboardConfig, DeviceConfig, SynlyConfig, TransferConfig, TrustedDeviceConfig,
     };
@@ -3657,7 +3717,7 @@ mod tests {
         let remote = WorkspaceSpec::for_both(PathBuf::from("/tmp/remote"))
             .unwrap()
             .with_initial_sync(Some(InitialSyncMode::Other))
-            .summary(ClipboardMode::Off);
+            .workspace_summary(ClipboardMode::Off, AudioMode::Off);
 
         let policy =
             resolve_initial_snapshot_policy(SessionRole::Host, &local, &remote, true, true)
@@ -3674,7 +3734,7 @@ mod tests {
         let remote = WorkspaceSpec::for_both(PathBuf::from("/tmp/remote"))
             .unwrap()
             .with_initial_sync(Some(InitialSyncMode::This))
-            .summary(ClipboardMode::Off);
+            .workspace_summary(ClipboardMode::Off, AudioMode::Off);
 
         let policy =
             resolve_initial_snapshot_policy(SessionRole::Client, &local, &remote, true, true)
@@ -3691,7 +3751,7 @@ mod tests {
         let remote = WorkspaceSpec::for_both(PathBuf::from("/tmp/remote"))
             .unwrap()
             .with_initial_sync(Some(InitialSyncMode::This))
-            .summary(ClipboardMode::Off);
+            .workspace_summary(ClipboardMode::Off, AudioMode::Off);
 
         let err = resolve_initial_snapshot_policy(SessionRole::Host, &local, &remote, true, true)
             .unwrap_err()
@@ -3990,7 +4050,9 @@ mod tests {
             device_name: "demo-device".to_string(),
             instance_name: Some("worker-b".to_string()),
             device_id: "ffffeeee-dddd-cccc-bbbb-aaaaaaaaaaaa".to_string(),
-            mode: SyncMode::Auto,
+            file_sync_mode: FileSyncMode::Auto,
+            clipboard_mode: ClipboardMode::Off,
+            audio_mode: AudioMode::Off,
             port: 9999,
             addresses: vec![Ipv4Addr::new(192, 168, 1, 21)],
         };
@@ -4023,17 +4085,27 @@ mod tests {
 
     #[test]
     fn choose_peer_requires_explicit_query_in_no_interact() {
-        let err = choose_peer(None, Duration::from_millis(1), true)
-            .unwrap_err()
-            .to_string();
+        let err = choose_peer(
+            None,
+            Duration::from_millis(1),
+            true,
+            &sample_local_workspace_summary(),
+        )
+        .unwrap_err()
+        .to_string();
 
         assert!(err.contains("`--peer`"));
     }
 
     #[test]
     fn full_ipv4_socket_addr_uses_direct_target() {
-        let target = choose_peer(Some("192.168.1.20:8080"), Duration::from_millis(1), true)
-            .expect("full socket address should skip discovery");
+        let target = choose_peer(
+            Some("192.168.1.20:8080"),
+            Duration::from_millis(1),
+            true,
+            &sample_local_workspace_summary(),
+        )
+        .expect("full socket address should skip discovery");
 
         assert!(matches!(
             target,
@@ -4189,9 +4261,25 @@ mod tests {
             device_name: "demo-device".to_string(),
             instance_name: Some("worker-a".to_string()),
             device_id: "abcd1234-1111-2222-3333-444455556666".to_string(),
-            mode: SyncMode::Both,
+            file_sync_mode: FileSyncMode::Both,
+            clipboard_mode: ClipboardMode::Off,
+            audio_mode: AudioMode::Off,
             port: 8080,
             addresses: vec![Ipv4Addr::new(192, 168, 1, 20)],
+        }
+    }
+
+    fn sample_local_workspace_summary() -> crate::sync::WorkspaceSummary {
+        crate::sync::WorkspaceSummary {
+            file_sync_mode: FileSyncMode::Both,
+            send_description: None,
+            send_layout: None,
+            send_items: Vec::new(),
+            receive_root: None,
+            initial_sync: Some(InitialSyncMode::This),
+            max_folder_depth: None,
+            clipboard_mode: ClipboardMode::Off,
+            audio_mode: AudioMode::Off,
         }
     }
 

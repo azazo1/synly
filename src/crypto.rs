@@ -435,7 +435,6 @@ pub fn sign_pair_decision(
     server: &DeviceIdentity,
     agreement: &SessionAgreement,
     workspace: &WorkspaceSummary,
-    audio_mode: crate::cli::AudioMode,
     auth_method: PairAuthMethod,
     server_trusts_client: bool,
     trust_established: bool,
@@ -446,7 +445,6 @@ pub fn sign_pair_decision(
         server,
         agreement,
         workspace,
-        audio_mode,
         auth_method,
         server_trusts_client,
         trust_established,
@@ -473,7 +471,6 @@ pub fn verify_pair_decision(
             server,
             workspace,
             agreement,
-            audio_mode,
             auth_method,
             server_trusts_client,
             proof,
@@ -486,7 +483,6 @@ pub fn verify_pair_decision(
                 server,
                 agreement,
                 workspace,
-                audio_mode: *audio_mode,
                 auth_method: *auth_method,
                 server_trusts_client: *server_trusts_client,
                 trust_established: *trust_established,
@@ -548,7 +544,6 @@ pub fn sign_trusted_pair_decision(
     server: &DeviceIdentity,
     agreement: &SessionAgreement,
     workspace: &WorkspaceSummary,
-    audio_mode: crate::cli::AudioMode,
     server_trusts_client: bool,
     trust_established: bool,
 ) -> Result<String> {
@@ -558,7 +553,6 @@ pub fn sign_trusted_pair_decision(
         server,
         agreement,
         workspace,
-        audio_mode,
         auth_method: PairAuthMethod::TrustedDevice,
         server_trusts_client,
         trust_established,
@@ -585,7 +579,6 @@ pub fn verify_trusted_pair_decision(
             server,
             workspace,
             agreement,
-            audio_mode,
             auth_method,
             server_trusts_client,
             proof,
@@ -598,7 +591,6 @@ pub fn verify_trusted_pair_decision(
                 server,
                 agreement,
                 workspace,
-                audio_mode: *audio_mode,
                 auth_method: *auth_method,
                 server_trusts_client: *server_trusts_client,
                 trust_established: *trust_established,
@@ -623,7 +615,6 @@ struct DecisionProofPayload<'a> {
     server: &'a DeviceIdentity,
     agreement: &'a SessionAgreement,
     workspace: &'a WorkspaceSummary,
-    audio_mode: crate::cli::AudioMode,
     auth_method: PairAuthMethod,
     server_trusts_client: bool,
     trust_established: bool,
@@ -1207,7 +1198,7 @@ fn decode_certificate_der(certificate: &str) -> Result<CertificateDer<'static>> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{AudioMode, ClipboardMode, SyncMode};
+    use crate::cli::{AudioMode, ClipboardMode, FileSyncMode};
     use crate::config::DeviceConfig;
     use crate::protocol::{
         ControlMessage, DeviceIdentity, PROTOCOL_VERSION, PairAuthMethod, PairRequestPayload,
@@ -1253,9 +1244,8 @@ mod tests {
                 identity_public_key: device.identity_public_key().unwrap().to_string(),
                 tls_root_certificate: device_tls_root_certificate(&device).unwrap(),
             },
-            requested_mode: SyncMode::Both,
             workspace: WorkspaceSummary {
-                mode: SyncMode::Both,
+                file_sync_mode: FileSyncMode::Both,
                 send_description: Some("demo".into()),
                 send_layout: None,
                 send_items: vec![],
@@ -1263,8 +1253,8 @@ mod tests {
                 initial_sync: Some(crate::cli::InitialSyncMode::This),
                 max_folder_depth: None,
                 clipboard_mode: ClipboardMode::Off,
+                audio_mode: AudioMode::Off,
             },
-            audio_mode: AudioMode::Off,
             request_trust: false,
         };
         let exporter = [7u8; 32];
@@ -1286,9 +1276,8 @@ mod tests {
                 identity_public_key: public_key.clone(),
                 tls_root_certificate: device_tls_root_certificate(&device).unwrap(),
             },
-            requested_mode: SyncMode::Both,
             workspace: WorkspaceSummary {
-                mode: SyncMode::Both,
+                file_sync_mode: FileSyncMode::Both,
                 send_description: Some("demo".into()),
                 send_layout: None,
                 send_items: vec![],
@@ -1296,8 +1285,8 @@ mod tests {
                 initial_sync: Some(crate::cli::InitialSyncMode::This),
                 max_folder_depth: None,
                 clipboard_mode: ClipboardMode::Off,
+                audio_mode: AudioMode::Off,
             },
-            audio_mode: AudioMode::Off,
             request_trust: true,
         };
         let exporter = [9u8; 32];
@@ -1329,7 +1318,7 @@ mod tests {
             client_to_host: false,
         };
         let workspace = WorkspaceSummary {
-            mode: SyncMode::Both,
+            file_sync_mode: FileSyncMode::Both,
             send_description: Some("demo".into()),
             send_layout: None,
             send_items: vec![],
@@ -1337,6 +1326,7 @@ mod tests {
             initial_sync: Some(crate::cli::InitialSyncMode::This),
             max_folder_depth: None,
             clipboard_mode: ClipboardMode::Off,
+            audio_mode: AudioMode::Off,
         };
         let proof = sign_pair_decision(
             &exporter,
@@ -1347,7 +1337,6 @@ mod tests {
             &server,
             &agreement,
             &workspace,
-            AudioMode::Off,
             PairAuthMethod::Pin,
             true,
             false,
@@ -1359,7 +1348,6 @@ mod tests {
             server: server.clone(),
             workspace: workspace.clone(),
             agreement: agreement.clone(),
-            audio_mode: AudioMode::Off,
             auth_method: PairAuthMethod::Pin,
             server_trusts_client: true,
             proof: proof.clone(),
@@ -1371,9 +1359,11 @@ mod tests {
             accepted: true,
             message: message.into(),
             server,
-            workspace,
+            workspace: WorkspaceSummary {
+                audio_mode: AudioMode::Send,
+                ..workspace
+            },
             agreement,
-            audio_mode: AudioMode::Send,
             auth_method: PairAuthMethod::Pin,
             server_trusts_client: false,
             proof,
@@ -1401,7 +1391,7 @@ mod tests {
             client_to_host: true,
         };
         let workspace = WorkspaceSummary {
-            mode: SyncMode::Both,
+            file_sync_mode: FileSyncMode::Both,
             send_description: Some("demo".into()),
             send_layout: None,
             send_items: vec![],
@@ -1409,6 +1399,7 @@ mod tests {
             initial_sync: Some(crate::cli::InitialSyncMode::This),
             max_folder_depth: None,
             clipboard_mode: ClipboardMode::Both,
+            audio_mode: AudioMode::Off,
         };
         let proof = sign_trusted_pair_decision(
             &private_key,
@@ -1419,7 +1410,6 @@ mod tests {
             &server,
             &agreement,
             &workspace,
-            AudioMode::Off,
             true,
             false,
         )
@@ -1430,7 +1420,6 @@ mod tests {
             server: server.clone(),
             workspace: workspace.clone(),
             agreement: agreement.clone(),
-            audio_mode: AudioMode::Off,
             auth_method: PairAuthMethod::TrustedDevice,
             server_trusts_client: true,
             proof: proof.clone(),
@@ -1442,9 +1431,11 @@ mod tests {
             accepted: true,
             message: message.into(),
             server,
-            workspace,
+            workspace: WorkspaceSummary {
+                audio_mode: AudioMode::Send,
+                ..workspace
+            },
             agreement,
-            audio_mode: AudioMode::Send,
             auth_method: PairAuthMethod::TrustedDevice,
             server_trusts_client: false,
             proof,

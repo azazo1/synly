@@ -1,4 +1,4 @@
-use crate::cli::{ClipboardMode, InitialSyncMode, SyncMode};
+use crate::cli::{AudioMode, ClipboardMode, FileSyncMode, InitialSyncMode};
 use anyhow::{Context, Result, bail};
 use filetime::{FileTime, set_file_mtime};
 use ignore::gitignore::Gitignore;
@@ -17,7 +17,7 @@ const SYNLY_IGNORE_FILE: &str = ".synlyignore";
 
 #[derive(Clone, Debug)]
 pub struct WorkspaceSpec {
-    pub mode: SyncMode,
+    pub file_sync_mode: FileSyncMode,
     pub outgoing: Option<OutgoingSpec>,
     pub incoming_root: Option<PathBuf>,
     pub initial_sync: Option<InitialSyncMode>,
@@ -44,17 +44,15 @@ pub struct NamedItem {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WorkspaceSummary {
-    pub mode: SyncMode,
+    pub file_sync_mode: FileSyncMode,
     pub send_description: Option<String>,
     pub send_layout: Option<SnapshotLayout>,
     pub send_items: Vec<String>,
     pub receive_root: Option<String>,
-    #[serde(default)]
     pub initial_sync: Option<InitialSyncMode>,
-    #[serde(default)]
     pub max_folder_depth: Option<usize>,
-    #[serde(default)]
     pub clipboard_mode: ClipboardMode,
+    pub audio_mode: AudioMode,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -67,7 +65,6 @@ pub enum SnapshotLayout {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ManifestSnapshot {
     pub layout: SnapshotLayout,
-    #[serde(default)]
     pub max_folder_depth: Option<usize>,
     pub entries: BTreeMap<String, ManifestEntry>,
 }
@@ -146,7 +143,7 @@ struct ScopedIgnoreMatcher {
 impl WorkspaceSpec {
     pub fn for_off() -> Self {
         Self {
-            mode: SyncMode::Off,
+            file_sync_mode: FileSyncMode::Off,
             outgoing: None,
             incoming_root: None,
             initial_sync: None,
@@ -172,7 +169,7 @@ impl WorkspaceSpec {
         };
 
         Ok(Self {
-            mode: SyncMode::Send,
+            file_sync_mode: FileSyncMode::Send,
             outgoing: Some(outgoing),
             incoming_root: None,
             initial_sync: None,
@@ -182,7 +179,7 @@ impl WorkspaceSpec {
     pub fn for_receive(root: PathBuf) -> Result<Self> {
         let root = ensure_directory(root)?;
         Ok(Self {
-            mode: SyncMode::Receive,
+            file_sync_mode: FileSyncMode::Receive,
             outgoing: None,
             incoming_root: Some(root),
             initial_sync: None,
@@ -192,7 +189,7 @@ impl WorkspaceSpec {
     pub fn for_both(root: PathBuf) -> Result<Self> {
         let root = ensure_directory(root)?;
         Ok(Self {
-            mode: SyncMode::Both,
+            file_sync_mode: FileSyncMode::Both,
             outgoing: Some(OutgoingSpec::RootContents {
                 root: root.clone(),
                 max_folder_depth: None,
@@ -205,7 +202,7 @@ impl WorkspaceSpec {
     pub fn for_auto(root: PathBuf) -> Result<Self> {
         let root = ensure_directory(root)?;
         Ok(Self {
-            mode: SyncMode::Auto,
+            file_sync_mode: FileSyncMode::Auto,
             outgoing: Some(OutgoingSpec::RootContents {
                 root: root.clone(),
                 max_folder_depth: None,
@@ -227,7 +224,11 @@ impl WorkspaceSpec {
         self
     }
 
-    pub fn summary(&self, clipboard_mode: ClipboardMode) -> WorkspaceSummary {
+    pub fn workspace_summary(
+        &self,
+        clipboard_mode: ClipboardMode,
+        audio_mode: AudioMode,
+    ) -> WorkspaceSummary {
         let (send_description, send_layout, send_items, max_folder_depth) = match &self.outgoing {
             Some(OutgoingSpec::RootContents {
                 root,
@@ -251,7 +252,7 @@ impl WorkspaceSpec {
         };
 
         WorkspaceSummary {
-            mode: self.mode,
+            file_sync_mode: self.file_sync_mode,
             send_description,
             send_layout,
             send_items,
@@ -262,6 +263,7 @@ impl WorkspaceSpec {
             initial_sync: self.initial_sync,
             max_folder_depth,
             clipboard_mode,
+            audio_mode,
         }
     }
 
@@ -277,8 +279,12 @@ impl WorkspaceSpec {
         self.can_send_files() || self.can_receive_files()
     }
 
-    pub fn local_human_lines(&self, clipboard_mode: ClipboardMode) -> Vec<String> {
-        let mut lines = vec![format!("文件同步模式: {}", self.mode.label())];
+    pub fn local_summary_lines(
+        &self,
+        clipboard_mode: ClipboardMode,
+        audio_mode: AudioMode,
+    ) -> Vec<String> {
+        let mut lines = vec![format!("文件同步模式: {}", self.file_sync_mode.label())];
 
         if !self.file_sync_enabled() {
             lines.push("文件同步: 关闭".to_string());
@@ -315,6 +321,7 @@ impl WorkspaceSpec {
             lines.push(format!("初始状态: {}", initial_sync.label()));
         }
         lines.push(format!("剪贴板同步: {}", clipboard_mode.label()));
+        lines.push(format!("音频同步: {}", audio_mode.label()));
 
         lines
     }
@@ -333,8 +340,8 @@ impl WorkspaceSummary {
         self.can_send_files() || self.can_receive_files()
     }
 
-    pub fn human_lines(&self) -> Vec<String> {
-        let mut lines = vec![format!("文件同步模式: {}", self.mode.label())];
+    pub fn summary_lines(&self) -> Vec<String> {
+        let mut lines = vec![format!("文件同步模式: {}", self.file_sync_mode.label())];
 
         if !self.file_sync_enabled() {
             lines.push("文件同步: 关闭".to_string());
@@ -356,6 +363,7 @@ impl WorkspaceSummary {
             lines.push(format!("初始状态: {}", initial_sync.label()));
         }
         lines.push(format!("剪贴板同步: {}", self.clipboard_mode.label()));
+        lines.push(format!("音频同步: {}", self.audio_mode.label()));
 
         lines
     }
@@ -1441,12 +1449,12 @@ mod tests {
         assert!(!workspace.can_send_files());
         assert!(!workspace.can_receive_files());
 
-        let lines = workspace.local_human_lines(ClipboardMode::Both);
+        let lines = workspace.local_summary_lines(ClipboardMode::Both, AudioMode::Off);
         assert!(lines.iter().any(|line| line.contains("文件同步: 关闭")));
 
-        let summary = workspace.summary(ClipboardMode::Both);
+        let summary = workspace.workspace_summary(ClipboardMode::Both, AudioMode::Off);
         assert!(!summary.file_sync_enabled());
-        let remote_lines = summary.human_lines();
+        let remote_lines = summary.summary_lines();
         assert!(
             remote_lines
                 .iter()

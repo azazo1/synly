@@ -1,8 +1,8 @@
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::single_match)]
 use crate::cli::{
-    AudioMode, Cli, ClipboardMode, ClipboardRuntimeOptions, ConnectionPreference, InitialSyncMode,
-    PairingRuntimeOptions, RuntimeOptions, SyncMode, normalize_pin,
+    AudioMode, Cli, ClipboardMode, ClipboardRuntimeOptions, ConnectionPreference, FileSyncMode,
+    InitialSyncMode, PairingRuntimeOptions, RuntimeOptions, normalize_pin,
 };
 use crate::config::SynlyConfig;
 use crate::path_expand::expand_path_string;
@@ -88,7 +88,7 @@ struct StartupApp {
 
 struct FlowDraft {
     connection: ConnectionPreference,
-    mode: SyncMode,
+    file_sync_mode: FileSyncMode,
     initial_sync: Option<InitialSyncMode>,
     sync_delete: bool,
     clipboard_mode: ClipboardMode,
@@ -240,9 +240,9 @@ impl StartupApp {
             ConnectionPreference::Host
         };
 
-        let mode = cli.fs.unwrap_or(SyncMode::Off);
+        let file_sync_mode = cli.fs.unwrap_or(FileSyncMode::Off);
 
-        let workspace_value = if mode == SyncMode::Off {
+        let workspace_value = if file_sync_mode == FileSyncMode::Off {
             String::new()
         } else {
             cli.paths
@@ -252,18 +252,20 @@ impl StartupApp {
                 .join(", ")
         };
 
-        let initial_tab = if mode != SyncMode::Off && workspace_value.trim().is_empty() {
-            StartupTab::Workspace
-        } else {
-            StartupTab::Flow
-        };
-        let workspace_missing = mode != SyncMode::Off && workspace_value.trim().is_empty();
+        let initial_tab =
+            if file_sync_mode != FileSyncMode::Off && workspace_value.trim().is_empty() {
+                StartupTab::Workspace
+            } else {
+                StartupTab::Flow
+            };
+        let workspace_missing =
+            file_sync_mode != FileSyncMode::Off && workspace_value.trim().is_empty();
 
         let mut app = Self {
             context,
             flow: FlowDraft {
                 connection,
-                mode,
+                file_sync_mode,
                 initial_sync: cli.initial,
                 sync_delete: cli.sync_delete,
                 clipboard_mode: cli.clipboard.unwrap_or(ClipboardMode::Off),
@@ -494,8 +496,14 @@ impl StartupApp {
                     key.code,
                     KeyCode::Left | KeyCode::Right | KeyCode::Enter | KeyCode::Char(' ')
                 ) {
-                    self.flow.mode = cycle_mode(self.flow.mode, matches!(key.code, KeyCode::Left));
-                    self.push_log(format!("文件同步模式已切换为{}。", self.flow.mode.label()));
+                    self.flow.file_sync_mode = cycle_file_sync_mode(
+                        self.flow.file_sync_mode,
+                        matches!(key.code, KeyCode::Left),
+                    );
+                    self.push_log(format!(
+                        "文件同步模式已切换为{}。",
+                        self.flow.file_sync_mode.label()
+                    ));
                     self.clamp_focus_current_tab();
                 }
             }
@@ -689,14 +697,17 @@ impl StartupApp {
             }
             FieldId::Mode => {
                 if let Some(index) = self.selector_choice_at(field, column, row) {
-                    self.flow.mode = match index {
-                        0 => SyncMode::Off,
-                        1 => SyncMode::Send,
-                        2 => SyncMode::Receive,
-                        3 => SyncMode::Both,
-                        _ => SyncMode::Auto,
+                    self.flow.file_sync_mode = match index {
+                        0 => FileSyncMode::Off,
+                        1 => FileSyncMode::Send,
+                        2 => FileSyncMode::Receive,
+                        3 => FileSyncMode::Both,
+                        _ => FileSyncMode::Auto,
                     };
-                    self.push_log(format!("文件同步模式已切换为{}。", self.flow.mode.label()));
+                    self.push_log(format!(
+                        "文件同步模式已切换为{}。",
+                        self.flow.file_sync_mode.label()
+                    ));
                     self.clamp_focus_current_tab();
                 }
             }
@@ -907,7 +918,11 @@ impl StartupApp {
                 colors.primary_soft,
             ),
             Span::raw(" "),
-            chip(self.flow.mode.label(), colors.text, colors.primary_soft),
+            chip(
+                self.flow.file_sync_mode.label(),
+                colors.text,
+                colors.primary_soft,
+            ),
             Span::raw(" "),
             chip(
                 self.flow.clipboard_mode.label(),
@@ -1039,12 +1054,12 @@ impl StartupApp {
                 field,
                 "文件同步模式",
                 &["关闭", "发送", "接收", "双向", "自动"],
-                match self.flow.mode {
-                    SyncMode::Off => 0,
-                    SyncMode::Send => 1,
-                    SyncMode::Receive => 2,
-                    SyncMode::Both => 3,
-                    SyncMode::Auto => 4,
+                match self.flow.file_sync_mode {
+                    FileSyncMode::Off => 0,
+                    FileSyncMode::Send => 1,
+                    FileSyncMode::Receive => 2,
+                    FileSyncMode::Both => 3,
+                    FileSyncMode::Auto => 4,
                 },
                 true,
                 focused,
@@ -1070,7 +1085,7 @@ impl StartupApp {
                 area,
                 "删除同步",
                 self.flow.sync_delete,
-                self.flow.mode.can_receive(),
+                self.flow.file_sync_mode.can_receive(),
                 "接收方会镜像对端删除结果",
                 focused,
                 colors,
@@ -1107,16 +1122,16 @@ impl StartupApp {
                 colors,
             ),
             FieldId::WorkspacePath => {
-                let title = match self.flow.mode {
-                    SyncMode::Off => "文件同步已关闭",
-                    SyncMode::Send => "发送路径",
-                    SyncMode::Receive => "接收目录",
-                    SyncMode::Both => "双向目录",
-                    SyncMode::Auto => "共享目录",
+                let title = match self.flow.file_sync_mode {
+                    FileSyncMode::Off => "文件同步已关闭",
+                    FileSyncMode::Send => "发送路径",
+                    FileSyncMode::Receive => "接收目录",
+                    FileSyncMode::Both => "双向目录",
+                    FileSyncMode::Auto => "共享目录",
                 };
-                let placeholder = match self.flow.mode {
-                    SyncMode::Off => "当前模式不会使用这个分区",
-                    SyncMode::Send => "多个路径用英文逗号分隔；输入 . 使用当前目录",
+                let placeholder = match self.flow.file_sync_mode {
+                    FileSyncMode::Off => "当前模式不会使用这个分区",
+                    FileSyncMode::Send => "多个路径用英文逗号分隔；输入 . 使用当前目录",
                     _ => "请输入目录；输入 . 使用当前目录，支持 ~ 和环境变量",
                 };
                 apply_textarea_theme(
@@ -1529,7 +1544,7 @@ impl StartupApp {
     fn preview_model(&self) -> PreviewModel {
         let mut summary_lines = vec![
             format!("连接方式: {}", connection_label(self.flow.connection)),
-            format!("文件同步模式: {}", self.flow.mode.label()),
+            format!("文件同步模式: {}", self.flow.file_sync_mode.label()),
             format!("剪贴板同步: {}", self.flow.clipboard_mode.label()),
             format!("音频同步: {}", self.flow.audio_mode.label()),
         ];
@@ -1541,7 +1556,10 @@ impl StartupApp {
                 summary_lines.push(format!("初始状态: {}", initial_sync.label()));
             }
             Ok(None) => {
-                if matches!(self.flow.mode, SyncMode::Both | SyncMode::Auto) {
+                if matches!(
+                    self.flow.file_sync_mode,
+                    FileSyncMode::Both | FileSyncMode::Auto
+                ) {
                     errors.push(
                         "双向/自动文件同步需要选择初始状态来源：本机目录或对端目录。".to_string(),
                     );
@@ -1570,7 +1588,7 @@ impl StartupApp {
 
         match self.parsed_interval_secs() {
             Ok(value) => {
-                if !self.flow.mode.can_send() {
+                if !self.flow.file_sync_mode.can_send() {
                     notes.push("当前文件同步模式不会使用文件重扫间隔。".to_string());
                 } else {
                     summary_lines.push(format!("兜底重扫: {} 秒", value));
@@ -1660,20 +1678,26 @@ impl StartupApp {
             push_flag_value(&mut args, "--name", instance_name);
         }
 
-        push_flag_value(&mut args, "--fs", sync_mode_arg(self.flow.mode).to_string());
-        if matches!(self.flow.mode, SyncMode::Both | SyncMode::Auto)
-            && let Some(initial_sync) = self.flow.initial_sync
+        push_flag_value(
+            &mut args,
+            "--fs",
+            file_sync_mode_arg(self.flow.file_sync_mode).to_string(),
+        );
+        if matches!(
+            self.flow.file_sync_mode,
+            FileSyncMode::Both | FileSyncMode::Auto
+        ) && let Some(initial_sync) = self.flow.initial_sync
         {
             push_flag_value(&mut args, "--initial", initial_sync.as_arg().to_string());
         }
         append_draft_paths(
             &mut args,
-            self.flow.mode,
+            self.flow.file_sync_mode,
             trimmed_text(&self.workspace.path),
         );
         args.push(connection_flag(self.flow.connection).to_string());
 
-        if self.flow.mode.can_receive() {
+        if self.flow.file_sync_mode.can_receive() {
             args.push(if self.flow.sync_delete {
                 "--sync-delete".to_string()
             } else {
@@ -1727,7 +1751,7 @@ impl StartupApp {
     }
 
     fn workspace_preview(&self) -> Result<WorkspacePreview> {
-        if self.flow.mode == SyncMode::Off {
+        if self.flow.file_sync_mode == FileSyncMode::Off {
             return Ok(WorkspacePreview {
                 lines: vec!["文件同步: 关闭".to_string()],
                 can_receive: false,
@@ -1737,9 +1761,9 @@ impl StartupApp {
 
         let max_folder_depth = self.parsed_max_folder_depth()?;
 
-        match self.flow.mode {
-            SyncMode::Off => unreachable!("off mode is handled before workspace preview"),
-            SyncMode::Send => {
+        match self.flow.file_sync_mode {
+            FileSyncMode::Off => unreachable!("off mode is handled before workspace preview"),
+            FileSyncMode::Send => {
                 let paths = parse_send_paths(
                     trimmed_text(&self.workspace.path).as_str(),
                     &self.context.cwd,
@@ -1761,7 +1785,7 @@ impl StartupApp {
                     notes: Vec::new(),
                 })
             }
-            SyncMode::Receive => {
+            FileSyncMode::Receive => {
                 let (path, will_create) = preview_directory_path(
                     trimmed_text(&self.workspace.path).as_str(),
                     &self.context.cwd,
@@ -1782,7 +1806,7 @@ impl StartupApp {
                     notes,
                 })
             }
-            SyncMode::Both | SyncMode::Auto => {
+            FileSyncMode::Both | FileSyncMode::Auto => {
                 let (path, will_create) = preview_directory_path(
                     trimmed_text(&self.workspace.path).as_str(),
                     &self.context.cwd,
@@ -1825,20 +1849,20 @@ impl StartupApp {
         let port = self.parsed_port()?;
         let pin = self.parsed_pin()?;
         let initial_sync = self.parsed_initial_sync()?;
-        let workspace = match self.flow.mode {
-            SyncMode::Off => WorkspaceSpec::for_off(),
-            SyncMode::Send => WorkspaceSpec::for_send(parse_send_paths(
+        let workspace = match self.flow.file_sync_mode {
+            FileSyncMode::Off => WorkspaceSpec::for_off(),
+            FileSyncMode::Send => WorkspaceSpec::for_send(parse_send_paths(
                 trimmed_text(&self.workspace.path).as_str(),
                 &self.context.cwd,
             )?)?,
-            SyncMode::Receive => {
+            FileSyncMode::Receive => {
                 let path = build_directory_path(
                     trimmed_text(&self.workspace.path).as_str(),
                     &self.context.cwd,
                 )?;
                 WorkspaceSpec::for_receive(path)?
             }
-            SyncMode::Both => {
+            FileSyncMode::Both => {
                 let path = build_directory_path(
                     trimmed_text(&self.workspace.path).as_str(),
                     &self.context.cwd,
@@ -1847,7 +1871,7 @@ impl StartupApp {
                     initial_sync.context("双向文件同步必须选择初始状态来源")?,
                 ))
             }
-            SyncMode::Auto => {
+            FileSyncMode::Auto => {
                 let path = build_directory_path(
                     trimmed_text(&self.workspace.path).as_str(),
                     &self.context.cwd,
@@ -1860,7 +1884,7 @@ impl StartupApp {
         .with_max_folder_depth(max_folder_depth);
 
         Ok(RuntimeOptions {
-            mode: self.flow.mode,
+            file_sync_mode: self.flow.file_sync_mode,
             connection: self.flow.connection,
             instance_name: self.parsed_instance_name(),
             sync_delete: if workspace.incoming_root.is_some() {
@@ -1888,7 +1912,10 @@ impl StartupApp {
     }
 
     fn parsed_initial_sync(&self) -> Result<Option<InitialSyncMode>> {
-        if matches!(self.flow.mode, SyncMode::Both | SyncMode::Auto) {
+        if matches!(
+            self.flow.file_sync_mode,
+            FileSyncMode::Both | FileSyncMode::Auto
+        ) {
             Ok(self.flow.initial_sync)
         } else {
             Ok(None)
@@ -2000,8 +2027,13 @@ impl StartupApp {
 
     fn field_is_focusable(&self, field: FieldId) -> bool {
         match field {
-            FieldId::InitialSync => matches!(self.flow.mode, SyncMode::Both | SyncMode::Auto),
-            FieldId::SyncDelete => self.flow.mode.can_receive(),
+            FieldId::InitialSync => {
+                matches!(
+                    self.flow.file_sync_mode,
+                    FileSyncMode::Both | FileSyncMode::Auto
+                )
+            }
+            FieldId::SyncDelete => self.flow.file_sync_mode.can_receive(),
             _ => true,
         }
     }
@@ -2165,17 +2197,17 @@ fn apply_textarea_theme(
     ));
 }
 
-fn cycle_mode(mode: SyncMode, reverse: bool) -> SyncMode {
+fn cycle_file_sync_mode(file_sync_mode: FileSyncMode, reverse: bool) -> FileSyncMode {
     let modes = [
-        SyncMode::Off,
-        SyncMode::Send,
-        SyncMode::Receive,
-        SyncMode::Both,
-        SyncMode::Auto,
+        FileSyncMode::Off,
+        FileSyncMode::Send,
+        FileSyncMode::Receive,
+        FileSyncMode::Both,
+        FileSyncMode::Auto,
     ];
     let current = modes
         .iter()
-        .position(|candidate| *candidate == mode)
+        .position(|candidate| *candidate == file_sync_mode)
         .unwrap_or(4);
     let next = if reverse {
         (current + modes.len() - 1) % modes.len()
@@ -2492,9 +2524,15 @@ fn equivalent_command_from_options(options: &RuntimeOptions, cwd: &Path) -> Stri
         push_flag_value(&mut args, "--name", instance_name.to_string());
     }
 
-    push_flag_value(&mut args, "--fs", sync_mode_arg(options.mode).to_string());
-    if matches!(options.mode, SyncMode::Both | SyncMode::Auto)
-        && let Some(initial_sync) = options.workspace.initial_sync
+    push_flag_value(
+        &mut args,
+        "--fs",
+        file_sync_mode_arg(options.file_sync_mode).to_string(),
+    );
+    if matches!(
+        options.file_sync_mode,
+        FileSyncMode::Both | FileSyncMode::Auto
+    ) && let Some(initial_sync) = options.workspace.initial_sync
     {
         push_flag_value(&mut args, "--initial", initial_sync.as_arg().to_string());
     }
@@ -2562,10 +2600,10 @@ fn equivalent_command_from_options(options: &RuntimeOptions, cwd: &Path) -> Stri
     shell_join(&args)
 }
 
-fn append_draft_paths(args: &mut Vec<String>, mode: SyncMode, raw: String) {
-    match mode {
-        SyncMode::Off => {}
-        SyncMode::Send => {
+fn append_draft_paths(args: &mut Vec<String>, file_sync_mode: FileSyncMode, raw: String) {
+    match file_sync_mode {
+        FileSyncMode::Off => {}
+        FileSyncMode::Send => {
             for path in raw
                 .split(',')
                 .map(str::trim)
@@ -2574,7 +2612,7 @@ fn append_draft_paths(args: &mut Vec<String>, mode: SyncMode, raw: String) {
                 args.push(path.to_string());
             }
         }
-        SyncMode::Receive | SyncMode::Both | SyncMode::Auto => {
+        FileSyncMode::Receive | FileSyncMode::Both | FileSyncMode::Auto => {
             if !raw.is_empty() {
                 args.push(raw);
             }
@@ -2583,9 +2621,9 @@ fn append_draft_paths(args: &mut Vec<String>, mode: SyncMode, raw: String) {
 }
 
 fn append_workspace_paths(args: &mut Vec<String>, workspace: &WorkspaceSpec, cwd: &Path) {
-    match workspace.mode {
-        SyncMode::Off => {}
-        SyncMode::Send => match workspace.outgoing.as_ref() {
+    match workspace.file_sync_mode {
+        FileSyncMode::Off => {}
+        FileSyncMode::Send => match workspace.outgoing.as_ref() {
             Some(crate::sync::OutgoingSpec::RootContents { root, .. }) => {
                 args.push(display_path_arg(root, cwd));
             }
@@ -2596,7 +2634,7 @@ fn append_workspace_paths(args: &mut Vec<String>, workspace: &WorkspaceSpec, cwd
             }
             None => {}
         },
-        SyncMode::Receive | SyncMode::Both | SyncMode::Auto => {
+        FileSyncMode::Receive | FileSyncMode::Both | FileSyncMode::Auto => {
             if let Some(path) = workspace.incoming_root.as_ref() {
                 args.push(display_path_arg(path, cwd));
             }
@@ -2623,13 +2661,13 @@ fn connection_flag(connection: ConnectionPreference) -> &'static str {
     }
 }
 
-fn sync_mode_arg(mode: SyncMode) -> &'static str {
-    match mode {
-        SyncMode::Off => "off",
-        SyncMode::Send => "send",
-        SyncMode::Receive => "receive",
-        SyncMode::Both => "both",
-        SyncMode::Auto => "auto",
+fn file_sync_mode_arg(file_sync_mode: FileSyncMode) -> &'static str {
+    match file_sync_mode {
+        FileSyncMode::Off => "off",
+        FileSyncMode::Send => "send",
+        FileSyncMode::Receive => "receive",
+        FileSyncMode::Both => "both",
+        FileSyncMode::Auto => "auto",
     }
 }
 
@@ -2776,7 +2814,7 @@ mod tests {
     #[test]
     fn equivalent_command_renders_effective_runtime_options() {
         let workspace = WorkspaceSpec {
-            mode: SyncMode::Both,
+            file_sync_mode: FileSyncMode::Both,
             outgoing: Some(OutgoingSpec::RootContents {
                 root: PathBuf::from("/tmp/demo"),
                 max_folder_depth: Some(2),
@@ -2785,7 +2823,7 @@ mod tests {
             initial_sync: Some(InitialSyncMode::Other),
         };
         let options = RuntimeOptions {
-            mode: SyncMode::Both,
+            file_sync_mode: FileSyncMode::Both,
             connection: ConnectionPreference::Join,
             instance_name: Some("worker-a".to_string()),
             workspace,

@@ -24,10 +24,12 @@ async fn main() -> Result<()> {
     if let Some(instance_name) = options.instance_name.as_deref() {
         println!("当前实例: {instance_name}");
     }
-    for line in options.workspace.local_human_lines(options.clipboard_mode) {
+    for line in options
+        .workspace
+        .local_summary_lines(options.clipboard_mode, options.audio_mode)
+    {
         println!("{line}");
     }
-    println!("音频同步: {}", options.audio_mode.label());
     if options.workspace.incoming_root.is_some() {
         println!("删除同步: {}", cli::sync_delete_label(options.sync_delete));
     }
