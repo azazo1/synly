@@ -1260,6 +1260,7 @@ mod tests {
                 send_layout: None,
                 send_items: vec![],
                 receive_root: Some("/tmp".into()),
+                initial_sync: Some(crate::cli::InitialSyncMode::This),
                 max_folder_depth: None,
                 clipboard_mode: ClipboardMode::Off,
             },
@@ -1292,6 +1293,7 @@ mod tests {
                 send_layout: None,
                 send_items: vec![],
                 receive_root: Some("/tmp".into()),
+                initial_sync: Some(crate::cli::InitialSyncMode::This),
                 max_folder_depth: None,
                 clipboard_mode: ClipboardMode::Off,
             },
@@ -1332,6 +1334,7 @@ mod tests {
             send_layout: None,
             send_items: vec![],
             receive_root: Some("/tmp".into()),
+            initial_sync: Some(crate::cli::InitialSyncMode::This),
             max_folder_depth: None,
             clipboard_mode: ClipboardMode::Off,
         };
@@ -1403,6 +1406,7 @@ mod tests {
             send_layout: None,
             send_items: vec![],
             receive_root: Some("/tmp".into()),
+            initial_sync: Some(crate::cli::InitialSyncMode::This),
             max_folder_depth: None,
             clipboard_mode: ClipboardMode::Both,
         };

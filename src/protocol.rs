@@ -682,6 +682,7 @@ mod tests {
                 send_layout: None,
                 send_items: vec!["docs".to_string()],
                 receive_root: Some("/tmp".to_string()),
+                initial_sync: Some(crate::cli::InitialSyncMode::This),
                 max_folder_depth: Some(2),
                 clipboard_mode: ClipboardMode::Both,
             },

@@ -2,7 +2,7 @@ use crate::config::SynlyConfig;
 use crate::path_expand::expand_path_string;
 use crate::protocol::TransferLimits;
 use crate::sync::WorkspaceSpec;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use console::{Term, style};
 use serde::{Deserialize, Serialize};
@@ -51,6 +51,12 @@ pub struct Cli {
         help = "音频同步模式；默认关闭，可选 off / send / receive"
     )]
     pub audio: Option<AudioMode>,
+    #[arg(
+        long,
+        value_enum,
+        help = "双向/自动文件同步时的初始状态来源；this 表示本机目录先作为初始状态，other 表示先采用对端目录"
+    )]
+    pub initial: Option<InitialSyncMode>,
     #[arg(
         long,
         default_value_t = 3,
@@ -135,12 +141,35 @@ pub enum AudioMode {
     Receive,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, ValueEnum, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum InitialSyncMode {
+    This,
+    Other,
+}
+
 impl AudioMode {
     pub fn label(self) -> &'static str {
         match self {
             AudioMode::Off => "关闭",
             AudioMode::Send => "发送",
             AudioMode::Receive => "接收",
+        }
+    }
+}
+
+impl InitialSyncMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            InitialSyncMode::This => "本机目录",
+            InitialSyncMode::Other => "对端目录",
+        }
+    }
+
+    pub fn as_arg(self) -> &'static str {
+        match self {
+            InitialSyncMode::This => "this",
+            InitialSyncMode::Other => "other",
         }
     }
 }
@@ -275,7 +304,7 @@ fn collect_runtime_options_from_cli(cli: Cli, config: &SynlyConfig) -> Result<Ru
     };
 
     let mode = cli.fs.unwrap_or(SyncMode::Off);
-    let workspace = workspace_from_cli_paths(mode, cli.paths)?;
+    let workspace = workspace_from_cli_paths(mode, cli.paths, cli.initial)?;
 
     let workspace = workspace.with_max_folder_depth(cli.max_folder_depth);
     let sync_delete = if workspace.incoming_root.is_some() {
@@ -340,6 +369,16 @@ fn missing_startup_requirements(cli: &Cli) -> Vec<String> {
         }
         Some(SyncMode::Auto) if cli.paths.is_empty() => {
             missing.push("缺少共享目录：请在 `--fs auto` 时提供目录路径".to_string());
+        }
+        _ => {}
+    }
+
+    match cli.fs {
+        Some(SyncMode::Both | SyncMode::Auto) if cli.initial.is_none() => {
+            missing.push(
+                "缺少初始状态来源：`--fs both/auto` 时请传 `--initial this` 或 `--initial other`"
+                    .to_string(),
+            );
         }
         _ => {}
     }
@@ -534,25 +573,46 @@ fn expand_path_list(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
     paths.into_iter().map(expand_pathbuf).collect()
 }
 
-fn workspace_from_cli_paths(mode: SyncMode, paths: Vec<PathBuf>) -> Result<WorkspaceSpec> {
+fn workspace_from_cli_paths(
+    mode: SyncMode,
+    paths: Vec<PathBuf>,
+    initial: Option<InitialSyncMode>,
+) -> Result<WorkspaceSpec> {
     match mode {
         SyncMode::Off => {
+            if initial.is_some() {
+                bail!("`--initial` 只能和 `--fs both` 或 `--fs auto` 一起使用");
+            }
             if !paths.is_empty() {
                 bail!("`--fs off` 不接受路径参数");
             }
             Ok(WorkspaceSpec::for_off())
         }
         SyncMode::Send => {
+            if initial.is_some() {
+                bail!("`--initial` 只能和 `--fs both` 或 `--fs auto` 一起使用");
+            }
             if paths.is_empty() {
                 bail!("`--fs send` 至少需要 1 个路径");
             }
             Ok(WorkspaceSpec::for_send(expand_path_list(paths)?)?)
         }
-        SyncMode::Receive => Ok(WorkspaceSpec::for_receive(expand_single_path(
-            paths, "receive",
-        )?)?),
-        SyncMode::Both => Ok(WorkspaceSpec::for_both(expand_single_path(paths, "both")?)?),
-        SyncMode::Auto => Ok(WorkspaceSpec::for_auto(expand_single_path(paths, "auto")?)?),
+        SyncMode::Receive => {
+            if initial.is_some() {
+                bail!("`--initial` 只能和 `--fs both` 或 `--fs auto` 一起使用");
+            }
+            Ok(WorkspaceSpec::for_receive(expand_single_path(
+                paths, "receive",
+            )?)?)
+        }
+        SyncMode::Both => Ok(WorkspaceSpec::for_both(expand_single_path(paths, "both")?)?
+            .with_initial_sync(Some(
+                initial.context("`--fs both` 时必须传 `--initial this` 或 `--initial other`")?,
+            ))),
+        SyncMode::Auto => Ok(WorkspaceSpec::for_auto(expand_single_path(paths, "auto")?)?
+            .with_initial_sync(Some(
+                initial.context("`--fs auto` 时必须传 `--initial this` 或 `--initial other`")?,
+            ))),
     }
 }
 
@@ -675,6 +735,8 @@ mod tests {
             "--join",
             "--fs",
             "both",
+            "--initial",
+            "this",
             "--no-sync-delete",
             "--clipboard",
             "send",
@@ -693,6 +755,10 @@ mod tests {
                 .max_folder_depth,
             Some(4)
         );
+        assert_eq!(
+            options.workspace.summary(ClipboardMode::Send).initial_sync,
+            Some(InitialSyncMode::This)
+        );
     }
 
     #[test]
@@ -704,6 +770,8 @@ mod tests {
             "--join",
             "--fs",
             "both",
+            "--initial",
+            "other",
             "--peer",
             "demo-device",
             "--port",
@@ -774,14 +842,46 @@ mod tests {
 
     #[test]
     fn requires_startup_tui_when_connection_or_path_is_missing() {
-        let missing_connection =
-            Cli::try_parse_from(["synly", "--fs", "both", ".", "--no-sync-delete"]).unwrap();
+        let missing_connection = Cli::try_parse_from([
+            "synly",
+            "--fs",
+            "both",
+            "--initial",
+            "this",
+            ".",
+            "--no-sync-delete",
+        ])
+        .unwrap();
         assert!(!missing_startup_requirements(&missing_connection).is_empty());
 
         let missing_path =
             Cli::try_parse_from(["synly", "--fs", "receive", "--host", "--no-sync-delete"])
                 .unwrap();
         assert!(!missing_startup_requirements(&missing_path).is_empty());
+    }
+
+    #[test]
+    fn both_and_auto_require_initial_choice() {
+        let both = Cli::try_parse_from(["synly", "--fs", "both", ".", "--host"]).unwrap();
+        let auto = Cli::try_parse_from(["synly", "--fs", "auto", ".", "--join"]).unwrap();
+
+        let both_missing = missing_startup_requirements(&both).join("\n");
+        let auto_missing = missing_startup_requirements(&auto).join("\n");
+
+        assert!(both_missing.contains("--initial this"));
+        assert!(auto_missing.contains("--initial other"));
+    }
+
+    #[test]
+    fn initial_is_rejected_for_non_bidirectional_modes() {
+        let cli =
+            Cli::try_parse_from(["synly", "--fs", "send", "--initial", "this", ".", "--host"])
+                .unwrap();
+
+        let err = collect_runtime_options(cli, &test_config())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`--initial` 只能和 `--fs both` 或 `--fs auto` 一起使用"));
     }
 
     #[test]

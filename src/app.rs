@@ -1,8 +1,9 @@
 use crate::audio::{self, AudioChannelDirection};
 use crate::cli::{
-    AudioMode, ClipboardMode, ConnectionPreference, PairingRuntimeOptions, RuntimeOptions,
-    SyncMode, TrustPromptDecision, clipboard_mode_label, prompt_confirm, prompt_confirm_with_trust,
-    prompt_select, require_peer_query, resolve_pairing_pin, sync_delete_label,
+    AudioMode, ClipboardMode, ConnectionPreference, InitialSyncMode, PairingRuntimeOptions,
+    RuntimeOptions, SyncMode, TrustPromptDecision, clipboard_mode_label, prompt_confirm,
+    prompt_confirm_with_trust, prompt_select, require_peer_query, resolve_pairing_pin,
+    sync_delete_label,
 };
 use crate::clipboard::ClipboardSync;
 use crate::config::{DeviceConfig, SynlyConfig, TrustedDeviceConfig};
@@ -93,6 +94,7 @@ enum SnapshotLoopControl {
     ExpectRemoteChanges {
         expectations: Vec<RemoteEchoExpectation>,
     },
+    AdoptCurrentSnapshotAsBaselineAndEnable,
 }
 
 #[derive(Clone, Debug)]
@@ -146,6 +148,12 @@ enum LocalAudioRole {
 struct AudioPlan {
     role: LocalAudioRole,
     direction: AudioChannelDirection,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InitialSnapshotPolicy {
+    PublishImmediately,
+    WaitForRemoteSeed,
 }
 
 #[derive(Default)]
@@ -1374,6 +1382,13 @@ async fn run_sync_session(
     let file_can_receive = local_can_receive
         && workspace.can_receive_files()
         && session.remote_workspace.can_send_files();
+    let initial_snapshot_policy = resolve_initial_snapshot_policy(
+        session.role,
+        workspace,
+        &session.remote_workspace,
+        file_can_send,
+        file_can_receive,
+    )?;
     let clipboard_agreement = negotiate_clipboard_modes(
         session.role,
         options.clipboard_mode,
@@ -1416,6 +1431,10 @@ async fn run_sync_session(
             sender,
             options.interval_secs.max(1),
             snapshot_control_rx,
+            matches!(
+                initial_snapshot_policy,
+                InitialSnapshotPolicy::PublishImmediately
+            ),
         )))
     } else {
         None
@@ -1485,6 +1504,11 @@ async fn run_sync_session(
     let mut pending_revisions = BTreeMap::<u64, PendingRevision>::new();
     let mut incoming_files = HashMap::<(u64, String), IncomingFileState>::new();
     let mut last_reported_clock_skew_bucket = None;
+    let waiting_for_initial_remote_seed = matches!(
+        initial_snapshot_policy,
+        InitialSnapshotPolicy::WaitForRemoteSeed
+    );
+    let mut pending_initial_remote_revision = None;
     let disconnected = loop {
         let frame = match reader.read_frame().await {
             Ok(frame) => frame,
@@ -1525,6 +1549,9 @@ async fn run_sync_session(
                 }
                 discard_superseded_revisions(&mut pending_revisions, &mut incoming_files, revision)
                     .await?;
+                if waiting_for_initial_remote_seed {
+                    pending_initial_remote_revision = Some(revision);
+                }
                 let root = incoming_root.as_ref().context(
                     "session negotiated receiving, but local workspace has no destination",
                 )?;
@@ -1561,12 +1588,18 @@ async fn run_sync_session(
                     0
                 };
                 let delete_policy = delete_policy(snapshot.layout, options.sync_delete);
-                let plan = build_apply_plan_with_time(
+                let mut plan = build_apply_plan_with_time(
                     &snapshot,
                     &local_snapshot,
                     delete_policy,
                     time_context,
                 );
+                if waiting_for_initial_remote_seed
+                    && pending_initial_remote_revision == Some(revision)
+                {
+                    plan.file_requests
+                        .extend(plan.skipped_newer_paths.drain(..));
+                }
                 if file_can_send {
                     note_remote_snapshot_expectations(
                         &snapshot_control_tx,
@@ -1601,6 +1634,11 @@ async fn run_sync_session(
                     let delete_report = delete_paths_best_effort(root, &plan.delete_paths);
                     print_delete_failures(&delete_report);
                     print_standalone_delete_result(&delete_report, plan.skipped_newer_paths.len());
+                    maybe_activate_initial_sender(
+                        &snapshot_control_tx,
+                        &mut pending_initial_remote_revision,
+                        revision,
+                    );
                 } else {
                     pending_revisions.insert(
                         revision,
@@ -1650,11 +1688,22 @@ async fn run_sync_session(
                 if let Some(pending) = pending_revisions.get_mut(&revision) {
                     pending.transfer_done = true;
                 }
-                maybe_finalize_revision(&incoming_root, &mut pending_revisions, revision);
+                if maybe_finalize_revision(&incoming_root, &mut pending_revisions, revision) {
+                    maybe_activate_initial_sender(
+                        &snapshot_control_tx,
+                        &mut pending_initial_remote_revision,
+                        revision,
+                    );
+                }
             }
             Frame::Control(ControlMessage::TransferAborted { revision, message }) => {
                 eprintln!("对端中止了修订版 {revision} 的传输: {message}");
                 abort_revision(&mut pending_revisions, &mut incoming_files, revision).await?;
+                maybe_activate_initial_sender(
+                    &snapshot_control_tx,
+                    &mut pending_initial_remote_revision,
+                    revision,
+                );
             }
             Frame::Control(ControlMessage::Error { message }) => {
                 eprintln!("对端报告错误: {}", message);
@@ -1767,6 +1816,7 @@ async fn snapshot_loop(
     tx: mpsc::Sender<Frame>,
     interval_secs: u64,
     mut control_rx: mpsc::UnboundedReceiver<SnapshotLoopControl>,
+    publish_initial_snapshot: bool,
 ) -> Result<()> {
     let (watch_tx, mut watch_rx) = mpsc::unbounded_channel::<notify::Result<Event>>();
     let mut watcher = RecommendedWatcher::new(
@@ -1793,15 +1843,18 @@ async fn snapshot_loop(
     let mut revision = 1u64;
     let debounce = Duration::from_millis(300);
     let mut echo_suppressions = SnapshotEchoSuppressions::default();
+    let mut publishing_enabled = publish_initial_snapshot;
 
-    publish_snapshot_if_changed(
-        &outgoing,
-        &tx,
-        &mut last_snapshot,
-        &mut revision,
-        &mut echo_suppressions,
-    )
-    .await?;
+    if publishing_enabled {
+        publish_snapshot_if_changed(
+            &outgoing,
+            &tx,
+            &mut last_snapshot,
+            &mut revision,
+            &mut echo_suppressions,
+        )
+        .await?;
+    }
     ticker.tick().await;
 
     loop {
@@ -1813,6 +1866,10 @@ async fn snapshot_loop(
                 match control {
                     SnapshotLoopControl::ExpectRemoteChanges { expectations } => {
                         echo_suppressions.note_remote_expectations(expectations);
+                    }
+                    SnapshotLoopControl::AdoptCurrentSnapshotAsBaselineAndEnable => {
+                        last_snapshot = Some(build_snapshot(&outgoing)?);
+                        publishing_enabled = true;
                     }
                 }
             }
@@ -1828,6 +1885,9 @@ async fn snapshot_loop(
                 }
 
                 drain_watch_events(&mut watch_rx, debounce).await;
+                if !publishing_enabled {
+                    continue;
+                }
                 publish_snapshot_if_changed(
                     &outgoing,
                     &tx,
@@ -1838,6 +1898,9 @@ async fn snapshot_loop(
                 .await?;
             }
             _ = ticker.tick() => {
+                if !publishing_enabled {
+                    continue;
+                }
                 publish_snapshot_if_changed(
                     &outgoing,
                     &tx,
@@ -2315,7 +2378,7 @@ async fn handle_file_chunk(
         if let Some(pending) = pending_revisions.get_mut(&header.revision) {
             pending.remaining_files.remove(&header.path);
         }
-        maybe_finalize_revision(
+        let _ = maybe_finalize_revision(
             &Some(root.to_path_buf()),
             pending_revisions,
             header.revision,
@@ -2329,7 +2392,7 @@ fn maybe_finalize_revision(
     incoming_root: &Option<PathBuf>,
     pending_revisions: &mut BTreeMap<u64, PendingRevision>,
     revision: u64,
-) {
+) -> bool {
     let should_finalize = pending_revisions
         .get(&revision)
         .is_some_and(|pending| pending.transfer_done && pending.remaining_files.is_empty());
@@ -2349,7 +2412,10 @@ fn maybe_finalize_revision(
             pending.skipped_newer_count,
             &delete_report,
         );
+        return true;
     }
+
+    false
 }
 
 async fn discard_superseded_revisions(
@@ -2504,7 +2570,7 @@ async fn report_incoming_file_failure(
         .unwrap_or_else(|| wire_path.to_string());
     eprintln!("无法更新文件 {}: {err:#}", target);
 
-    maybe_finalize_revision(&Some(root.to_path_buf()), pending_revisions, revision);
+    let _ = maybe_finalize_revision(&Some(root.to_path_buf()), pending_revisions, revision);
 }
 
 fn print_delete_failures(report: &crate::sync::DeleteReport) {
@@ -3029,6 +3095,57 @@ fn delete_policy(layout: crate::sync::SnapshotLayout, sync_delete: bool) -> Dele
     }
 }
 
+fn resolve_initial_snapshot_policy(
+    _role: SessionRole,
+    workspace: &WorkspaceSpec,
+    remote_workspace: &crate::sync::WorkspaceSummary,
+    file_can_send: bool,
+    file_can_receive: bool,
+) -> Result<InitialSnapshotPolicy> {
+    if !file_can_send {
+        return Ok(InitialSnapshotPolicy::PublishImmediately);
+    }
+
+    if !file_can_receive {
+        return Ok(InitialSnapshotPolicy::PublishImmediately);
+    }
+
+    let local_initial = workspace
+        .initial_sync
+        .context("本机双向文件同步缺少初始状态来源配置")?;
+    let remote_initial = remote_workspace
+        .initial_sync
+        .context("对端双向文件同步缺少初始状态来源配置")?;
+
+    match (local_initial, remote_initial) {
+        (InitialSyncMode::This, InitialSyncMode::Other) => {
+            Ok(InitialSnapshotPolicy::PublishImmediately)
+        }
+        (InitialSyncMode::Other, InitialSyncMode::This) => {
+            Ok(InitialSnapshotPolicy::WaitForRemoteSeed)
+        }
+        (InitialSyncMode::This, InitialSyncMode::This) => bail!(
+            "双向初始状态冲突：本机和对端都选择了 `--initial this`；请让一端选 `this`，另一端选 `other`"
+        ),
+        (InitialSyncMode::Other, InitialSyncMode::Other) => bail!(
+            "双向初始状态冲突：本机和对端都选择了 `--initial other`；请让一端选 `this`，另一端选 `other`"
+        ),
+    }
+}
+
+fn maybe_activate_initial_sender(
+    snapshot_control_tx: &mpsc::UnboundedSender<SnapshotLoopControl>,
+    pending_initial_remote_revision: &mut Option<u64>,
+    revision: u64,
+) {
+    if *pending_initial_remote_revision != Some(revision) {
+        return;
+    }
+
+    *pending_initial_remote_revision = None;
+    let _ = snapshot_control_tx.send(SnapshotLoopControl::AdoptCurrentSnapshotAsBaselineAndEnable);
+}
+
 fn allows_local_send(role: SessionRole, agreement: &SessionAgreement) -> bool {
     match role {
         SessionRole::Host => agreement.host_to_client,
@@ -3301,15 +3418,16 @@ fn is_executable(_metadata: &std::fs::Metadata) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        FILE_STREAM_CHUNK_SIZE, SessionRole, SnapshotEchoSuppressions, SnapshotPathExpectation,
-        accept_policy_label, build_remote_echo_expectations, choose_peer, delete_policy,
-        identity_display_name, is_connection_shutdown_error, next_reconnect_delay,
+        FILE_STREAM_CHUNK_SIZE, InitialSnapshotPolicy, SessionRole, SnapshotEchoSuppressions,
+        SnapshotPathExpectation, accept_policy_label, build_remote_echo_expectations, choose_peer,
+        delete_policy, identity_display_name, is_connection_shutdown_error, next_reconnect_delay,
         parse_direct_peer_addr, peer_matches_query, preferred_peer_query, resolve_audio_plan,
-        select_peer_from_query, send_one_file, should_auto_accept_request,
-        should_try_direct_trusted, trusted_transport_for_device, trusted_transport_for_identity,
+        resolve_initial_snapshot_policy, select_peer_from_query, send_one_file,
+        should_auto_accept_request, should_try_direct_trusted, trusted_transport_for_device,
+        trusted_transport_for_identity,
     };
     use crate::audio::AudioChannelDirection;
-    use crate::cli::{AudioMode, PairingRuntimeOptions, SyncMode};
+    use crate::cli::{AudioMode, ClipboardMode, InitialSyncMode, PairingRuntimeOptions, SyncMode};
     use crate::config::{
         ClipboardConfig, DeviceConfig, SynlyConfig, TransferConfig, TrustedDeviceConfig,
     };
@@ -3317,7 +3435,7 @@ mod tests {
     use crate::protocol::{DeviceIdentity, Frame, PairAuthMethod};
     use crate::sync::{
         ApplyPlan, DeletePolicy, EntryKind, ManifestEntry, ManifestSnapshot, OutgoingSpec,
-        SnapshotLayout,
+        SnapshotLayout, WorkspaceSpec,
     };
     use std::collections::BTreeMap;
     use std::env;
@@ -3354,6 +3472,58 @@ mod tests {
             delete_policy(SnapshotLayout::SelectedItems, true),
             DeletePolicy::MirrorSelectedItems
         ));
+    }
+
+    #[test]
+    fn initial_snapshot_policy_publishes_when_local_is_initial_source() {
+        let local = WorkspaceSpec::for_both(PathBuf::from("/tmp/local"))
+            .unwrap()
+            .with_initial_sync(Some(InitialSyncMode::This));
+        let remote = WorkspaceSpec::for_both(PathBuf::from("/tmp/remote"))
+            .unwrap()
+            .with_initial_sync(Some(InitialSyncMode::Other))
+            .summary(ClipboardMode::Off);
+
+        let policy =
+            resolve_initial_snapshot_policy(SessionRole::Host, &local, &remote, true, true)
+                .unwrap();
+
+        assert_eq!(policy, InitialSnapshotPolicy::PublishImmediately);
+    }
+
+    #[test]
+    fn initial_snapshot_policy_waits_when_remote_is_initial_source() {
+        let local = WorkspaceSpec::for_both(PathBuf::from("/tmp/local"))
+            .unwrap()
+            .with_initial_sync(Some(InitialSyncMode::Other));
+        let remote = WorkspaceSpec::for_both(PathBuf::from("/tmp/remote"))
+            .unwrap()
+            .with_initial_sync(Some(InitialSyncMode::This))
+            .summary(ClipboardMode::Off);
+
+        let policy =
+            resolve_initial_snapshot_policy(SessionRole::Client, &local, &remote, true, true)
+                .unwrap();
+
+        assert_eq!(policy, InitialSnapshotPolicy::WaitForRemoteSeed);
+    }
+
+    #[test]
+    fn initial_snapshot_policy_rejects_conflicting_initial_sources() {
+        let local = WorkspaceSpec::for_both(PathBuf::from("/tmp/local"))
+            .unwrap()
+            .with_initial_sync(Some(InitialSyncMode::This));
+        let remote = WorkspaceSpec::for_both(PathBuf::from("/tmp/remote"))
+            .unwrap()
+            .with_initial_sync(Some(InitialSyncMode::This))
+            .summary(ClipboardMode::Off);
+
+        let err = resolve_initial_snapshot_policy(SessionRole::Host, &local, &remote, true, true)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("双向初始状态冲突"));
+        assert!(err.contains("--initial this"));
     }
 
     #[test]

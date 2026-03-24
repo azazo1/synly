@@ -1,7 +1,7 @@
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::single_match)]
 use crate::cli::{
-    AudioMode, Cli, ClipboardMode, ClipboardRuntimeOptions, ConnectionPreference,
+    AudioMode, Cli, ClipboardMode, ClipboardRuntimeOptions, ConnectionPreference, InitialSyncMode,
     PairingRuntimeOptions, RuntimeOptions, SyncMode, normalize_pin,
 };
 use crate::config::SynlyConfig;
@@ -89,6 +89,7 @@ struct StartupApp {
 struct FlowDraft {
     connection: ConnectionPreference,
     mode: SyncMode,
+    initial_sync: Option<InitialSyncMode>,
     sync_delete: bool,
     clipboard_mode: ClipboardMode,
     audio_mode: AudioMode,
@@ -150,6 +151,7 @@ impl StartupTab {
 enum FieldId {
     Connection,
     Mode,
+    InitialSync,
     SyncDelete,
     ClipboardMode,
     AudioMode,
@@ -262,6 +264,7 @@ impl StartupApp {
             flow: FlowDraft {
                 connection,
                 mode,
+                initial_sync: cli.initial,
                 sync_delete: cli.sync_delete,
                 clipboard_mode: cli.clipboard.unwrap_or(ClipboardMode::Off),
                 audio_mode: cli.audio.unwrap_or(AudioMode::Off),
@@ -496,6 +499,21 @@ impl StartupApp {
                     self.clamp_focus_current_tab();
                 }
             }
+            FieldId::InitialSync => {
+                if matches!(
+                    key.code,
+                    KeyCode::Left | KeyCode::Right | KeyCode::Enter | KeyCode::Char(' ')
+                ) {
+                    self.flow.initial_sync = cycle_initial_sync(
+                        self.flow.initial_sync,
+                        matches!(key.code, KeyCode::Left),
+                    );
+                    self.push_log(match self.flow.initial_sync {
+                        Some(mode) => format!("初始状态来源已切换为{}。", mode.label()),
+                        None => "已清除初始状态来源选择。".to_string(),
+                    });
+                }
+            }
             FieldId::SyncDelete => {
                 if matches!(
                     key.code,
@@ -680,6 +698,19 @@ impl StartupApp {
                     };
                     self.push_log(format!("文件同步模式已切换为{}。", self.flow.mode.label()));
                     self.clamp_focus_current_tab();
+                }
+            }
+            FieldId::InitialSync if self.field_is_focusable(field) => {
+                if let Some(index) = self.selector_choice_at(field, column, row) {
+                    self.flow.initial_sync = match index {
+                        0 => None,
+                        1 => Some(InitialSyncMode::This),
+                        _ => Some(InitialSyncMode::Other),
+                    };
+                    self.push_log(match self.flow.initial_sync {
+                        Some(mode) => format!("初始状态来源已切换为{}。", mode.label()),
+                        None => "已清除初始状态来源选择。".to_string(),
+                    });
                 }
             }
             FieldId::SyncDelete if self.field_is_focusable(field) => {
@@ -998,6 +1029,7 @@ impl StartupApp {
                     ConnectionPreference::Host => 0,
                     ConnectionPreference::Join => 1,
                 },
+                true,
                 focused,
                 colors,
             ),
@@ -1014,6 +1046,22 @@ impl StartupApp {
                     SyncMode::Both => 3,
                     SyncMode::Auto => 4,
                 },
+                true,
+                focused,
+                colors,
+            ),
+            FieldId::InitialSync => self.render_selector_field(
+                frame,
+                area,
+                field,
+                "初始状态来源",
+                &["未选", "本机目录", "对端目录"],
+                match self.flow.initial_sync {
+                    None => 0,
+                    Some(InitialSyncMode::This) => 1,
+                    Some(InitialSyncMode::Other) => 2,
+                },
+                self.field_is_focusable(field),
                 focused,
                 colors,
             ),
@@ -1039,6 +1087,7 @@ impl StartupApp {
                     ClipboardMode::Receive => 2,
                     ClipboardMode::Both => 3,
                 },
+                true,
                 focused,
                 colors,
             ),
@@ -1053,6 +1102,7 @@ impl StartupApp {
                     AudioMode::Send => 1,
                     AudioMode::Receive => 2,
                 },
+                true,
                 focused,
                 colors,
             ),
@@ -1197,19 +1247,27 @@ impl StartupApp {
         title: &str,
         labels: &[&str],
         selected: usize,
+        interactive: bool,
         focused: bool,
         colors: Palette,
     ) {
-        let border = if focused {
+        let border = if focused && interactive {
             colors.primary
-        } else {
+        } else if interactive {
             colors.border
+        } else {
+            colors.muted
         };
         let spans = labels
             .iter()
             .enumerate()
             .flat_map(|(index, label)| {
-                let selected_style = if index == selected {
+                let selected_style = if !interactive {
+                    Style::default()
+                        .fg(colors.tag_text)
+                        .bg(colors.primary_soft)
+                        .add_modifier(Modifier::BOLD)
+                } else if index == selected {
                     Style::default()
                         .fg(colors.background)
                         .bg(colors.primary)
@@ -1224,18 +1282,20 @@ impl StartupApp {
             title,
             border,
             colors.panel,
-            if focused {
+            if focused && interactive {
                 colors.text
             } else {
                 colors.tag_text
             },
         );
-        self.ui_state.selector_areas.extend(
-            selector_choice_areas(block.inner(area), labels)
-                .into_iter()
-                .enumerate()
-                .map(|(index, rect)| (field, index, rect)),
-        );
+        if interactive {
+            self.ui_state.selector_areas.extend(
+                selector_choice_areas(block.inner(area), labels)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, rect)| (field, index, rect)),
+            );
+        }
         frame.render_widget(
             Paragraph::new(Line::from(spans))
                 .style(Style::default().bg(colors.panel))
@@ -1476,6 +1536,22 @@ impl StartupApp {
         let mut notes = Vec::new();
         let mut errors = Vec::new();
 
+        match self.parsed_initial_sync() {
+            Ok(Some(initial_sync)) => {
+                summary_lines.push(format!("初始状态: {}", initial_sync.label()));
+            }
+            Ok(None) => {
+                if matches!(self.flow.mode, SyncMode::Both | SyncMode::Auto) {
+                    errors.push(
+                        "双向/自动文件同步需要选择初始状态来源：本机目录或对端目录。".to_string(),
+                    );
+                } else {
+                    notes.push("当前文件同步模式不会使用初始状态来源。".to_string());
+                }
+            }
+            Err(err) => errors.push(err.to_string()),
+        }
+
         match self.workspace_preview() {
             Ok(workspace) => {
                 summary_lines.extend(workspace.lines);
@@ -1585,6 +1661,11 @@ impl StartupApp {
         }
 
         push_flag_value(&mut args, "--fs", sync_mode_arg(self.flow.mode).to_string());
+        if matches!(self.flow.mode, SyncMode::Both | SyncMode::Auto)
+            && let Some(initial_sync) = self.flow.initial_sync
+        {
+            push_flag_value(&mut args, "--initial", initial_sync.as_arg().to_string());
+        }
         append_draft_paths(
             &mut args,
             self.flow.mode,
@@ -1714,6 +1795,14 @@ impl StartupApp {
                     lines.push(format!("发送最大目录深度: {}", depth));
                 }
                 let mut notes = Vec::new();
+                match self.parsed_initial_sync()? {
+                    Some(initial_sync) => {
+                        notes.push(format!("初始状态来源: {}", initial_sync.label()))
+                    }
+                    None => {
+                        notes.push("启动前还需要选择初始状态来源：本机目录或对端目录。".to_string())
+                    }
+                }
                 if will_create {
                     notes.push(format!(
                         "共享目录不存在，启动时会自动创建: {}",
@@ -1735,6 +1824,7 @@ impl StartupApp {
         let discovery_secs = self.parsed_discovery_secs()?;
         let port = self.parsed_port()?;
         let pin = self.parsed_pin()?;
+        let initial_sync = self.parsed_initial_sync()?;
         let workspace = match self.flow.mode {
             SyncMode::Off => WorkspaceSpec::for_off(),
             SyncMode::Send => WorkspaceSpec::for_send(parse_send_paths(
@@ -1753,14 +1843,18 @@ impl StartupApp {
                     trimmed_text(&self.workspace.path).as_str(),
                     &self.context.cwd,
                 )?;
-                WorkspaceSpec::for_both(path)?
+                WorkspaceSpec::for_both(path)?.with_initial_sync(Some(
+                    initial_sync.context("双向文件同步必须选择初始状态来源")?,
+                ))
             }
             SyncMode::Auto => {
                 let path = build_directory_path(
                     trimmed_text(&self.workspace.path).as_str(),
                     &self.context.cwd,
                 )?;
-                WorkspaceSpec::for_auto(path)?
+                WorkspaceSpec::for_auto(path)?.with_initial_sync(Some(
+                    initial_sync.context("自动文件同步必须选择初始状态来源")?,
+                ))
             }
         }
         .with_max_folder_depth(max_folder_depth);
@@ -1791,6 +1885,14 @@ impl StartupApp {
                 discovery_secs,
             },
         })
+    }
+
+    fn parsed_initial_sync(&self) -> Result<Option<InitialSyncMode>> {
+        if matches!(self.flow.mode, SyncMode::Both | SyncMode::Auto) {
+            Ok(self.flow.initial_sync)
+        } else {
+            Ok(None)
+        }
     }
 
     fn parsed_pin(&self) -> Result<Option<String>> {
@@ -1851,6 +1953,7 @@ impl StartupApp {
             StartupTab::Flow => &[
                 FieldId::Connection,
                 FieldId::Mode,
+                FieldId::InitialSync,
                 FieldId::SyncDelete,
                 FieldId::ClipboardMode,
                 FieldId::AudioMode,
@@ -1897,6 +2000,7 @@ impl StartupApp {
 
     fn field_is_focusable(&self, field: FieldId) -> bool {
         match field {
+            FieldId::InitialSync => matches!(self.flow.mode, SyncMode::Both | SyncMode::Auto),
             FieldId::SyncDelete => self.flow.mode.can_receive(),
             _ => true,
         }
@@ -2073,6 +2177,27 @@ fn cycle_mode(mode: SyncMode, reverse: bool) -> SyncMode {
         .iter()
         .position(|candidate| *candidate == mode)
         .unwrap_or(4);
+    let next = if reverse {
+        (current + modes.len() - 1) % modes.len()
+    } else {
+        (current + 1) % modes.len()
+    };
+    modes[next]
+}
+
+fn cycle_initial_sync(
+    initial_sync: Option<InitialSyncMode>,
+    reverse: bool,
+) -> Option<InitialSyncMode> {
+    let modes = [
+        None,
+        Some(InitialSyncMode::This),
+        Some(InitialSyncMode::Other),
+    ];
+    let current = modes
+        .iter()
+        .position(|candidate| *candidate == initial_sync)
+        .unwrap_or(0);
     let next = if reverse {
         (current + modes.len() - 1) % modes.len()
     } else {
@@ -2368,6 +2493,11 @@ fn equivalent_command_from_options(options: &RuntimeOptions, cwd: &Path) -> Stri
     }
 
     push_flag_value(&mut args, "--fs", sync_mode_arg(options.mode).to_string());
+    if matches!(options.mode, SyncMode::Both | SyncMode::Auto)
+        && let Some(initial_sync) = options.workspace.initial_sync
+    {
+        push_flag_value(&mut args, "--initial", initial_sync.as_arg().to_string());
+    }
     append_workspace_paths(&mut args, &options.workspace, cwd);
     args.push(connection_flag(options.connection).to_string());
 
@@ -2652,6 +2782,7 @@ mod tests {
                 max_folder_depth: Some(2),
             }),
             incoming_root: Some(PathBuf::from("/tmp/demo")),
+            initial_sync: Some(InitialSyncMode::Other),
         };
         let options = RuntimeOptions {
             mode: SyncMode::Both,
@@ -2687,7 +2818,7 @@ mod tests {
         let command = equivalent_command_from_options(&options, Path::new("/tmp"));
         assert_eq!(
             command,
-            "synly --name worker-a --fs both ./demo --join --no-sync-delete --clipboard receive --audio send --interval-secs 5 --max-folder-depth 2 --peer 'studio display' --discovery-secs 9 --pin 123456 --accept --trusted-only"
+            "synly --name worker-a --fs both --initial other ./demo --join --no-sync-delete --clipboard receive --audio send --interval-secs 5 --max-folder-depth 2 --peer 'studio display' --discovery-secs 9 --pin 123456 --accept --trusted-only"
         );
     }
 

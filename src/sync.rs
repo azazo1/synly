@@ -1,4 +1,4 @@
-use crate::cli::{ClipboardMode, SyncMode};
+use crate::cli::{ClipboardMode, InitialSyncMode, SyncMode};
 use anyhow::{Context, Result, bail};
 use filetime::{FileTime, set_file_mtime};
 use ignore::gitignore::Gitignore;
@@ -20,6 +20,7 @@ pub struct WorkspaceSpec {
     pub mode: SyncMode,
     pub outgoing: Option<OutgoingSpec>,
     pub incoming_root: Option<PathBuf>,
+    pub initial_sync: Option<InitialSyncMode>,
 }
 
 #[derive(Clone, Debug)]
@@ -48,6 +49,8 @@ pub struct WorkspaceSummary {
     pub send_layout: Option<SnapshotLayout>,
     pub send_items: Vec<String>,
     pub receive_root: Option<String>,
+    #[serde(default)]
+    pub initial_sync: Option<InitialSyncMode>,
     #[serde(default)]
     pub max_folder_depth: Option<usize>,
     #[serde(default)]
@@ -146,6 +149,7 @@ impl WorkspaceSpec {
             mode: SyncMode::Off,
             outgoing: None,
             incoming_root: None,
+            initial_sync: None,
         }
     }
 
@@ -171,6 +175,7 @@ impl WorkspaceSpec {
             mode: SyncMode::Send,
             outgoing: Some(outgoing),
             incoming_root: None,
+            initial_sync: None,
         })
     }
 
@@ -180,6 +185,7 @@ impl WorkspaceSpec {
             mode: SyncMode::Receive,
             outgoing: None,
             incoming_root: Some(root),
+            initial_sync: None,
         })
     }
 
@@ -192,6 +198,7 @@ impl WorkspaceSpec {
                 max_folder_depth: None,
             }),
             incoming_root: Some(root),
+            initial_sync: None,
         })
     }
 
@@ -204,6 +211,7 @@ impl WorkspaceSpec {
                 max_folder_depth: None,
             }),
             incoming_root: Some(root),
+            initial_sync: None,
         })
     }
 
@@ -211,6 +219,11 @@ impl WorkspaceSpec {
         if let Some(outgoing) = &mut self.outgoing {
             outgoing.set_max_folder_depth(max_folder_depth);
         }
+        self
+    }
+
+    pub fn with_initial_sync(mut self, initial_sync: Option<InitialSyncMode>) -> Self {
+        self.initial_sync = initial_sync;
         self
     }
 
@@ -246,6 +259,7 @@ impl WorkspaceSpec {
                 .incoming_root
                 .as_ref()
                 .map(|path| path.display().to_string()),
+            initial_sync: self.initial_sync,
             max_folder_depth,
             clipboard_mode,
         }
@@ -297,6 +311,9 @@ impl WorkspaceSpec {
         if let Some(root) = &self.incoming_root {
             lines.push(format!("接收目录: {}", root.display()));
         }
+        if let Some(initial_sync) = self.initial_sync {
+            lines.push(format!("初始状态: {}", initial_sync.label()));
+        }
         lines.push(format!("剪贴板同步: {}", clipboard_mode.label()));
 
         lines
@@ -334,6 +351,9 @@ impl WorkspaceSummary {
         }
         if let Some(root) = &self.receive_root {
             lines.push(format!("接收目录: {}", root));
+        }
+        if let Some(initial_sync) = self.initial_sync {
+            lines.push(format!("初始状态: {}", initial_sync.label()));
         }
         lines.push(format!("剪贴板同步: {}", self.clipboard_mode.label()));
 
