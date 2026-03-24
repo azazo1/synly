@@ -18,13 +18,13 @@ use crate::sync::{
     DeletePolicy, EntryKind, ManifestEntry, ManifestSnapshot, TimestampComparisonContext,
     WorkspaceSpec, apply_file_metadata, build_apply_plan_with_time, build_incoming_snapshot,
     build_snapshot, delete_paths_best_effort, ensure_directories, filter_snapshot_by_folder_depth,
-    filter_snapshot_for_incoming_root, resolve_incoming_path, resolve_outgoing_path,
-    snapshot_contains_file, watch_targets,
+    filter_snapshot_for_incoming_root, resolve_incoming_path, resolve_outgoing_path, watch_targets,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use console::style;
 use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use rand::RngExt;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::{SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
@@ -50,6 +50,7 @@ const TIMESTAMP_SKEW_TOLERANCE_MS: u64 = 10_000;
 const FUTURE_TIMESTAMP_GUARD_MS: u64 = 10 * 60 * 1_000;
 const CLOCK_SKEW_WARNING_MS: u64 = 60_000;
 const REMOTE_ECHO_SUPPRESSION_TTL: Duration = Duration::from_secs(10);
+const ADVERTISED_SNAPSHOT_CACHE_LIMIT: usize = 8;
 
 #[derive(Clone, Copy, Debug)]
 enum SessionRole {
@@ -74,6 +75,7 @@ struct PendingRevision {
     requested_files: usize,
     remaining_files: BTreeSet<String>,
     failed_files: BTreeSet<String>,
+    expected_files: BTreeMap<String, ManifestEntry>,
     delete_paths: Vec<String>,
     skipped_newer_count: usize,
     transfer_done: bool,
@@ -83,10 +85,15 @@ struct IncomingFileState {
     file: File,
     temp_path: PathBuf,
     final_path: PathBuf,
-    modified_ms: u64,
-    executable: bool,
-    expected_size: u64,
+    expected_entry: ManifestEntry,
+    hasher: Sha256,
     written: u64,
+}
+
+#[derive(Clone, Debug)]
+struct AdvertisedSnapshot {
+    revision: u64,
+    snapshot: ManifestSnapshot,
 }
 
 #[derive(Clone, Debug)]
@@ -1420,6 +1427,8 @@ async fn run_sync_session(
     let writer_task = tokio::spawn(writer_loop(write_half, rx, options.transfer_limits));
 
     let (snapshot_control_tx, snapshot_control_rx) = mpsc::unbounded_channel();
+    let (advertised_snapshot_tx, mut advertised_snapshot_rx) =
+        mpsc::unbounded_channel::<AdvertisedSnapshot>();
     let snapshot_task = if file_can_send {
         let outgoing = workspace
             .outgoing
@@ -1435,6 +1444,7 @@ async fn run_sync_session(
                 initial_snapshot_policy,
                 InitialSnapshotPolicy::PublishImmediately
             ),
+            advertised_snapshot_tx,
         )))
     } else {
         None
@@ -1503,6 +1513,7 @@ async fn run_sync_session(
     let mut reader = FrameReader::with_limits(read_half, options.transfer_limits);
     let mut pending_revisions = BTreeMap::<u64, PendingRevision>::new();
     let mut incoming_files = HashMap::<(u64, String), IncomingFileState>::new();
+    let mut advertised_snapshots = BTreeMap::<u64, ManifestSnapshot>::new();
     let mut last_reported_clock_skew_bucket = None;
     let waiting_for_initial_remote_seed = matches!(
         initial_snapshot_policy,
@@ -1519,6 +1530,7 @@ async fn run_sync_session(
                 return Err(err);
             }
         };
+        drain_advertised_snapshots(&mut advertised_snapshot_rx, &mut advertised_snapshots);
 
         match frame {
             Frame::Control(ControlMessage::AudioUdpReady { port }) => {
@@ -1640,12 +1652,14 @@ async fn run_sync_session(
                         revision,
                     );
                 } else {
+                    let expected_files = expected_file_entries(&snapshot, &plan.file_requests)?;
                     pending_revisions.insert(
                         revision,
                         PendingRevision {
                             requested_files: plan.file_requests.len(),
                             remaining_files: plan.file_requests.iter().cloned().collect(),
                             failed_files: BTreeSet::new(),
+                            expected_files,
                             delete_paths: plan.delete_paths,
                             skipped_newer_count: plan.skipped_newer_paths.len(),
                             transfer_done: false,
@@ -1666,9 +1680,25 @@ async fn run_sync_session(
                 let outgoing = outgoing_spec
                     .clone()
                     .context("no outgoing spec available for file request")?;
+                let Some(advertised_snapshot) = advertised_snapshots.get(&revision).cloned() else {
+                    let message = format!("收到未知或已过期的修订版 {revision} 文件请求");
+                    eprintln!("{message}");
+                    tx.send(Frame::Control(ControlMessage::TransferAborted {
+                        revision,
+                        message,
+                    }))
+                    .await?;
+                    continue;
+                };
                 tokio::spawn(async move {
-                    if let Err(err) =
-                        send_requested_files(sender.clone(), outgoing, revision, paths).await
+                    if let Err(err) = send_requested_files(
+                        sender.clone(),
+                        outgoing,
+                        advertised_snapshot,
+                        revision,
+                        paths,
+                    )
+                    .await
                     {
                         let message = format!("发送修订版 {revision} 失败: {err:#}");
                         eprintln!("{message}");
@@ -1817,6 +1847,7 @@ async fn snapshot_loop(
     interval_secs: u64,
     mut control_rx: mpsc::UnboundedReceiver<SnapshotLoopControl>,
     publish_initial_snapshot: bool,
+    advertised_snapshot_tx: mpsc::UnboundedSender<AdvertisedSnapshot>,
 ) -> Result<()> {
     let (watch_tx, mut watch_rx) = mpsc::unbounded_channel::<notify::Result<Event>>();
     let mut watcher = RecommendedWatcher::new(
@@ -1852,6 +1883,7 @@ async fn snapshot_loop(
             &mut last_snapshot,
             &mut revision,
             &mut echo_suppressions,
+            &advertised_snapshot_tx,
         )
         .await?;
     }
@@ -1894,6 +1926,7 @@ async fn snapshot_loop(
                     &mut last_snapshot,
                     &mut revision,
                     &mut echo_suppressions,
+                    &advertised_snapshot_tx,
                 )
                 .await?;
             }
@@ -1907,6 +1940,7 @@ async fn snapshot_loop(
                     &mut last_snapshot,
                     &mut revision,
                     &mut echo_suppressions,
+                    &advertised_snapshot_tx,
                 )
                 .await?;
             }
@@ -1920,6 +1954,7 @@ async fn publish_snapshot_if_changed(
     last_snapshot: &mut Option<crate::sync::ManifestSnapshot>,
     revision: &mut u64,
     echo_suppressions: &mut SnapshotEchoSuppressions,
+    advertised_snapshot_tx: &mpsc::UnboundedSender<AdvertisedSnapshot>,
 ) -> Result<()> {
     let snapshot = build_snapshot(outgoing)?;
     if last_snapshot.as_ref() == Some(&snapshot) {
@@ -1937,6 +1972,10 @@ async fn publish_snapshot_if_changed(
         sender_time_ms: current_unix_ms(),
     }))
     .await?;
+    let _ = advertised_snapshot_tx.send(AdvertisedSnapshot {
+        revision: *revision,
+        snapshot: snapshot.clone(),
+    });
     *last_snapshot = Some(snapshot);
     *revision += 1;
     Ok(())
@@ -2155,15 +2194,18 @@ fn expectation_matches(
 async fn send_requested_files(
     tx: mpsc::Sender<Frame>,
     outgoing: crate::sync::OutgoingSpec,
+    advertised_snapshot: ManifestSnapshot,
     revision: u64,
     paths: Vec<String>,
 ) -> Result<()> {
-    let snapshot = build_snapshot(&outgoing)?;
     for path in paths {
-        if !snapshot_contains_file(&snapshot, &path)? {
-            bail!("requested path `{path}` is not part of the advertised snapshot");
+        let advertised_entry = advertised_snapshot.entries.get(&path).with_context(|| {
+            format!("requested path `{path}` is not part of revision {revision}")
+        })?;
+        if advertised_entry.kind != EntryKind::File {
+            bail!("requested path `{path}` is not a file in revision {revision}");
         }
-        send_one_file(&tx, &outgoing, revision, &path).await?;
+        send_one_file(&tx, &outgoing, revision, &path, advertised_entry).await?;
     }
 
     tx.send(Frame::Control(ControlMessage::TransferDone { revision }))
@@ -2176,7 +2218,11 @@ async fn send_one_file(
     outgoing: &crate::sync::OutgoingSpec,
     revision: u64,
     wire_path: &str,
+    advertised_entry: &ManifestEntry,
 ) -> Result<()> {
+    if advertised_entry.kind != EntryKind::File {
+        bail!("requested path {wire_path} is not a file in the advertised snapshot");
+    }
     let path = resolve_outgoing_path(outgoing, wire_path)?;
     let metadata = tokio::fs::metadata(&path)
         .await
@@ -2185,30 +2231,37 @@ async fn send_one_file(
         bail!("requested path {} is not a regular file", path.display());
     }
 
-    let modified_ms = metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or_default();
-    let executable = is_executable(&metadata);
+    let expected_hash = advertised_entry
+        .hash
+        .as_deref()
+        .context("advertised file entry is missing a content hash")?;
 
     let mut file = File::open(&path)
         .await
         .with_context(|| format!("failed to open {}", path.display()))?;
     let mut offset = 0u64;
-    let total_size = metadata.len();
     let mut buffer = vec![0u8; FILE_STREAM_CHUNK_SIZE];
+    let mut hasher = Sha256::new();
 
-    if total_size == 0 {
+    if advertised_entry.size == 0 {
+        let actual_hash = format!("{:x}", Sha256::digest([]));
+        if actual_hash != expected_hash {
+            bail!(
+                "共享文件 {} 在修订版 {} 发送前已变化：期望哈希 {}，当前空内容哈希 {}",
+                path.display(),
+                revision,
+                expected_hash,
+                actual_hash
+            );
+        }
         tx.send(Frame::FileChunk(
             FileChunkHeader {
                 revision,
                 path: wire_path.to_string(),
                 offset: 0,
                 total_size: 0,
-                modified_ms,
-                executable,
+                modified_ms: advertised_entry.modified_ms,
+                executable: advertised_entry.executable,
                 final_chunk: true,
             },
             Vec::new(),
@@ -2217,29 +2270,48 @@ async fn send_one_file(
         return Ok(());
     }
 
-    loop {
-        let read = file.read(&mut buffer).await?;
+    while offset < advertised_entry.size {
+        let remaining = advertised_entry.size - offset;
+        let read_limit = usize::try_from(remaining.min(FILE_STREAM_CHUNK_SIZE as u64))
+            .expect("chunk size bound should fit usize");
+        let read = file.read(&mut buffer[..read_limit]).await?;
         if read == 0 {
-            break;
+            bail!(
+                "共享文件 {} 在修订版 {} 发送时长度发生变化：期望 {} 字节，实际只读到 {} 字节",
+                path.display(),
+                revision,
+                advertised_entry.size,
+                offset
+            );
         }
-        let final_chunk = offset + read as u64 >= total_size;
+        hasher.update(&buffer[..read]);
+        let next_offset = offset + read as u64;
+        let final_chunk = next_offset >= advertised_entry.size;
         tx.send(Frame::FileChunk(
             FileChunkHeader {
                 revision,
                 path: wire_path.to_string(),
                 offset,
-                total_size,
-                modified_ms,
-                executable,
+                total_size: advertised_entry.size,
+                modified_ms: advertised_entry.modified_ms,
+                executable: advertised_entry.executable,
                 final_chunk,
             },
             buffer[..read].to_vec(),
         ))
         .await?;
-        offset += read as u64;
-        if final_chunk {
-            break;
-        }
+        offset = next_offset;
+    }
+
+    let actual_hash = format!("{:x}", hasher.finalize());
+    if actual_hash != expected_hash {
+        bail!(
+            "共享文件 {} 在修订版 {} 发送时内容发生变化：期望哈希 {}，实际发送哈希 {}",
+            path.display(),
+            revision,
+            expected_hash,
+            actual_hash
+        );
     }
 
     Ok(())
@@ -2261,7 +2333,28 @@ async fn handle_file_chunk(
 
     let key = (header.revision, header.path.clone());
     if header.offset == 0 {
-        match begin_incoming_file(root, &header).await {
+        let expected_entry = match pending_revisions
+            .get(&header.revision)
+            .and_then(|pending| pending.expected_files.get(&header.path))
+            .cloned()
+        {
+            Some(entry) => entry,
+            None => {
+                report_incoming_file_failure(
+                    root,
+                    incoming_files,
+                    pending_revisions,
+                    header.revision,
+                    &header.path,
+                    None,
+                    None,
+                    anyhow!("missing advertised file metadata for {}", header.path),
+                )
+                .await;
+                return Ok(());
+            }
+        };
+        match begin_incoming_file(root, &header, expected_entry).await {
             Ok(state) => {
                 incoming_files.insert(key.clone(), state);
             }
@@ -2305,11 +2398,24 @@ async fn handle_file_chunk(
             Err((
                 Some(state.final_path.clone()),
                 Some(state.temp_path.clone()),
+                anyhow!("incoming chunk metadata mismatch for {}", header.path,),
+            ))
+        } else if header.total_size != state.expected_entry.size
+            || header.modified_ms != state.expected_entry.modified_ms
+            || header.executable != state.expected_entry.executable
+        {
+            Err((
+                Some(state.final_path.clone()),
+                Some(state.temp_path.clone()),
                 anyhow!(
-                    "unexpected file chunk offset for {}: expected {}, got {}",
+                    "incoming chunk metadata drifted for {}: expected size={}, modified_ms={}, executable={}, got size={}, modified_ms={}, executable={}",
                     header.path,
-                    state.written,
-                    header.offset
+                    state.expected_entry.size,
+                    state.expected_entry.modified_ms,
+                    state.expected_entry.executable,
+                    header.total_size,
+                    header.modified_ms,
+                    header.executable
                 ),
             ))
         } else if let Err(err) = state.file.write_all(&data).await {
@@ -2319,6 +2425,7 @@ async fn handle_file_chunk(
                 err.into(),
             ))
         } else {
+            state.hasher.update(&data);
             state.written += data.len() as u64;
             Ok(())
         }
@@ -2377,6 +2484,7 @@ async fn handle_file_chunk(
 
         if let Some(pending) = pending_revisions.get_mut(&header.revision) {
             pending.remaining_files.remove(&header.path);
+            pending.expected_files.remove(&header.path);
         }
         let _ = maybe_finalize_revision(
             &Some(root.to_path_buf()),
@@ -2386,6 +2494,187 @@ async fn handle_file_chunk(
     }
 
     Ok(())
+}
+
+fn drain_advertised_snapshots(
+    advertised_snapshot_rx: &mut mpsc::UnboundedReceiver<AdvertisedSnapshot>,
+    advertised_snapshots: &mut BTreeMap<u64, ManifestSnapshot>,
+) {
+    while let Ok(advertised) = advertised_snapshot_rx.try_recv() {
+        advertised_snapshots.insert(advertised.revision, advertised.snapshot);
+    }
+
+    while advertised_snapshots.len() > ADVERTISED_SNAPSHOT_CACHE_LIMIT {
+        let Some(oldest_revision) = advertised_snapshots.keys().next().copied() else {
+            break;
+        };
+        advertised_snapshots.remove(&oldest_revision);
+    }
+}
+
+fn expected_file_entries(
+    snapshot: &ManifestSnapshot,
+    paths: &[String],
+) -> Result<BTreeMap<String, ManifestEntry>> {
+    paths
+        .iter()
+        .map(|path| {
+            let entry = snapshot
+                .entries
+                .get(path)
+                .with_context(|| format!("snapshot is missing requested path `{path}`"))?;
+            if entry.kind != EntryKind::File {
+                bail!("snapshot path `{path}` is not a file");
+            }
+            Ok((path.clone(), entry.clone()))
+        })
+        .collect()
+}
+
+async fn begin_incoming_file(
+    root: &Path,
+    header: &FileChunkHeader,
+    expected_entry: ManifestEntry,
+) -> std::result::Result<IncomingFileState, (Option<PathBuf>, anyhow::Error)> {
+    if expected_entry.kind != EntryKind::File {
+        return Err((
+            None,
+            anyhow!("advertised path {} is not a file", header.path),
+        ));
+    }
+    if header.total_size != expected_entry.size
+        || header.modified_ms != expected_entry.modified_ms
+        || header.executable != expected_entry.executable
+    {
+        return Err((
+            None,
+            anyhow!(
+                "incoming file metadata mismatch for {}: expected size={}, modified_ms={}, executable={}, got size={}, modified_ms={}, executable={}",
+                header.path,
+                expected_entry.size,
+                expected_entry.modified_ms,
+                expected_entry.executable,
+                header.total_size,
+                header.modified_ms,
+                header.executable
+            ),
+        ));
+    }
+
+    let final_path = match resolve_incoming_path(root, &header.path) {
+        Ok(path) => path,
+        Err(err) => return Err((None, err)),
+    };
+
+    if let Some(parent) = final_path.parent()
+        && let Err(err) = tokio::fs::create_dir_all(parent).await
+    {
+        return Err((Some(final_path), err.into()));
+    }
+
+    let temp_path = temp_file_path(&final_path);
+    let _ = tokio::fs::remove_file(&temp_path).await;
+    let file = match File::create(&temp_path).await {
+        Ok(file) => file,
+        Err(err) => return Err((Some(final_path), err.into())),
+    };
+
+    Ok(IncomingFileState {
+        file,
+        temp_path,
+        final_path,
+        expected_entry,
+        hasher: Sha256::new(),
+        written: 0,
+    })
+}
+
+async fn finalize_incoming_file(state: IncomingFileState) -> Result<()> {
+    let IncomingFileState {
+        mut file,
+        temp_path,
+        final_path,
+        expected_entry,
+        hasher,
+        written,
+    } = state;
+
+    file.flush().await?;
+    drop(file);
+
+    if written != expected_entry.size {
+        bail!(
+            "received size mismatch for {}: expected {}, got {}",
+            final_path.display(),
+            expected_entry.size,
+            written
+        );
+    }
+
+    let expected_hash = expected_entry
+        .hash
+        .as_deref()
+        .context("advertised file entry is missing a content hash")?;
+    let actual_hash = format!("{:x}", hasher.finalize());
+    if actual_hash != expected_hash {
+        bail!(
+            "received hash mismatch for {}: expected {}, got {}",
+            final_path.display(),
+            expected_hash,
+            actual_hash
+        );
+    }
+
+    replace_destination(&final_path, &temp_path).await?;
+    apply_file_metadata(
+        &final_path,
+        expected_entry.modified_ms,
+        expected_entry.executable,
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn report_incoming_file_failure(
+    root: &Path,
+    incoming_files: &mut HashMap<(u64, String), IncomingFileState>,
+    pending_revisions: &mut BTreeMap<u64, PendingRevision>,
+    revision: u64,
+    wire_path: &str,
+    final_path: Option<PathBuf>,
+    temp_path: Option<PathBuf>,
+    err: anyhow::Error,
+) {
+    let key = (revision, wire_path.to_string());
+    let mut final_path = final_path;
+    let mut temp_path = temp_path;
+
+    if let Some(state) = incoming_files.remove(&key) {
+        if final_path.is_none() {
+            final_path = Some(state.final_path);
+        }
+        if temp_path.is_none() {
+            temp_path = Some(state.temp_path);
+        }
+    }
+
+    if let Some(temp_path) = temp_path {
+        let _ = tokio::fs::remove_file(temp_path).await;
+    }
+
+    if let Some(pending) = pending_revisions.get_mut(&revision) {
+        pending.remaining_files.remove(wire_path);
+        pending.failed_files.insert(wire_path.to_string());
+        pending.expected_files.remove(wire_path);
+    }
+
+    let target = final_path
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| wire_path.to_string());
+    eprintln!("无法更新文件 {}: {err:#}", target);
+
+    let _ = maybe_finalize_revision(&Some(root.to_path_buf()), pending_revisions, revision);
 }
 
 fn maybe_finalize_revision(
@@ -2468,109 +2757,6 @@ async fn replace_destination(destination: &Path, temp_path: &Path) -> Result<()>
     }
     tokio::fs::rename(temp_path, destination).await?;
     Ok(())
-}
-
-async fn begin_incoming_file(
-    root: &Path,
-    header: &FileChunkHeader,
-) -> std::result::Result<IncomingFileState, (Option<PathBuf>, anyhow::Error)> {
-    let final_path = match resolve_incoming_path(root, &header.path) {
-        Ok(path) => path,
-        Err(err) => return Err((None, err)),
-    };
-
-    if let Some(parent) = final_path.parent()
-        && let Err(err) = tokio::fs::create_dir_all(parent).await
-    {
-        return Err((Some(final_path), err.into()));
-    }
-
-    let temp_path = temp_file_path(&final_path);
-    let _ = tokio::fs::remove_file(&temp_path).await;
-    let file = match File::create(&temp_path).await {
-        Ok(file) => file,
-        Err(err) => return Err((Some(final_path), err.into())),
-    };
-
-    Ok(IncomingFileState {
-        file,
-        temp_path,
-        final_path,
-        modified_ms: header.modified_ms,
-        executable: header.executable,
-        expected_size: header.total_size,
-        written: 0,
-    })
-}
-
-async fn finalize_incoming_file(state: IncomingFileState) -> Result<()> {
-    let IncomingFileState {
-        mut file,
-        temp_path,
-        final_path,
-        modified_ms,
-        executable,
-        expected_size,
-        written,
-    } = state;
-
-    file.flush().await?;
-    drop(file);
-
-    if written != expected_size {
-        bail!(
-            "received size mismatch for {}: expected {}, got {}",
-            final_path.display(),
-            expected_size,
-            written
-        );
-    }
-
-    replace_destination(&final_path, &temp_path).await?;
-    apply_file_metadata(&final_path, modified_ms, executable)?;
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn report_incoming_file_failure(
-    root: &Path,
-    incoming_files: &mut HashMap<(u64, String), IncomingFileState>,
-    pending_revisions: &mut BTreeMap<u64, PendingRevision>,
-    revision: u64,
-    wire_path: &str,
-    final_path: Option<PathBuf>,
-    temp_path: Option<PathBuf>,
-    err: anyhow::Error,
-) {
-    let key = (revision, wire_path.to_string());
-    let mut final_path = final_path;
-    let mut temp_path = temp_path;
-
-    if let Some(state) = incoming_files.remove(&key) {
-        if final_path.is_none() {
-            final_path = Some(state.final_path);
-        }
-        if temp_path.is_none() {
-            temp_path = Some(state.temp_path);
-        }
-    }
-
-    if let Some(temp_path) = temp_path {
-        let _ = tokio::fs::remove_file(temp_path).await;
-    }
-
-    if let Some(pending) = pending_revisions.get_mut(&revision) {
-        pending.remaining_files.remove(wire_path);
-        pending.failed_files.insert(wire_path.to_string());
-    }
-
-    let target = final_path
-        .as_ref()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| wire_path.to_string());
-    eprintln!("无法更新文件 {}: {err:#}", target);
-
-    let _ = maybe_finalize_revision(&Some(root.to_path_buf()), pending_revisions, revision);
 }
 
 fn print_delete_failures(report: &crate::sync::DeleteReport) {
@@ -3404,25 +3590,14 @@ fn short_uuid(id: &Uuid) -> String {
     id.to_string().chars().take(8).collect()
 }
 
-#[cfg(unix)]
-fn is_executable(metadata: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    metadata.permissions().mode() & 0o111 != 0
-}
-
-#[cfg(not(unix))]
-fn is_executable(_metadata: &std::fs::Metadata) -> bool {
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         FILE_STREAM_CHUNK_SIZE, InitialSnapshotPolicy, SessionRole, SnapshotEchoSuppressions,
         SnapshotPathExpectation, accept_policy_label, build_remote_echo_expectations, choose_peer,
-        delete_policy, identity_display_name, is_connection_shutdown_error, next_reconnect_delay,
-        parse_direct_peer_addr, peer_matches_query, preferred_peer_query, resolve_audio_plan,
-        resolve_initial_snapshot_policy, select_peer_from_query, send_one_file,
+        delete_policy, handle_file_chunk, identity_display_name, is_connection_shutdown_error,
+        next_reconnect_delay, parse_direct_peer_addr, peer_matches_query, preferred_peer_query,
+        resolve_audio_plan, resolve_initial_snapshot_policy, select_peer_from_query, send_one_file,
         should_auto_accept_request, should_try_direct_trusted, trusted_transport_for_device,
         trusted_transport_for_identity,
     };
@@ -3432,12 +3607,13 @@ mod tests {
         ClipboardConfig, DeviceConfig, SynlyConfig, TransferConfig, TrustedDeviceConfig,
     };
     use crate::discovery::DiscoveredPeer;
-    use crate::protocol::{DeviceIdentity, Frame, PairAuthMethod};
+    use crate::protocol::{DeviceIdentity, FileChunkHeader, Frame, PairAuthMethod};
     use crate::sync::{
         ApplyPlan, DeletePolicy, EntryKind, ManifestEntry, ManifestSnapshot, OutgoingSpec,
-        SnapshotLayout, WorkspaceSpec,
+        SnapshotLayout, WorkspaceSpec, build_snapshot,
     };
-    use std::collections::BTreeMap;
+    use sha2::{Digest, Sha256};
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::env;
     use std::fs;
     use std::net::{Ipv4Addr, SocketAddrV4};
@@ -3688,9 +3864,17 @@ mod tests {
             root: dir.clone(),
             max_folder_depth: None,
         };
+        let advertised_snapshot = build_snapshot(&outgoing).unwrap();
+        let advertised_entry = advertised_snapshot
+            .entries
+            .get("large.bin")
+            .unwrap()
+            .clone();
         let (tx, mut rx) = mpsc::channel(16);
 
-        send_one_file(&tx, &outgoing, 1, "large.bin").await.unwrap();
+        send_one_file(&tx, &outgoing, 1, "large.bin", &advertised_entry)
+            .await
+            .unwrap();
         drop(tx);
 
         let mut chunk_count = 0usize;
@@ -3711,6 +3895,78 @@ mod tests {
         assert!(chunk_count >= 3);
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn send_one_file_rejects_drift_from_advertised_snapshot() {
+        let dir = test_dir("file-drift");
+        fs::create_dir_all(&dir).unwrap();
+        let file_path = dir.join("note.txt");
+        fs::write(&file_path, b"before").unwrap();
+
+        let outgoing = OutgoingSpec::RootContents {
+            root: dir.clone(),
+            max_folder_depth: None,
+        };
+        let advertised_snapshot = build_snapshot(&outgoing).unwrap();
+        let advertised_entry = advertised_snapshot.entries.get("note.txt").unwrap().clone();
+
+        fs::write(&file_path, b"after!").unwrap();
+
+        let (tx, _rx) = mpsc::channel(16);
+        let err = send_one_file(&tx, &outgoing, 7, "note.txt", &advertised_entry)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("内容发生变化"));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn handle_file_chunk_rejects_hash_mismatch_against_advertised_entry() {
+        let root = test_dir("incoming-hash-mismatch");
+        fs::create_dir_all(&root).unwrap();
+        let expected_entry = file_entry_for_bytes(b"good", 1234);
+        let wire_path = "demo.txt".to_string();
+        let mut incoming_files = HashMap::new();
+        let mut pending_revisions = BTreeMap::from([(
+            1,
+            super::PendingRevision {
+                requested_files: 1,
+                remaining_files: BTreeSet::from([wire_path.clone()]),
+                failed_files: BTreeSet::new(),
+                expected_files: BTreeMap::from([(wire_path.clone(), expected_entry.clone())]),
+                delete_paths: Vec::new(),
+                skipped_newer_count: 0,
+                transfer_done: true,
+            },
+        )]);
+
+        handle_file_chunk(
+            &root,
+            &mut incoming_files,
+            &mut pending_revisions,
+            FileChunkHeader {
+                revision: 1,
+                path: wire_path.clone(),
+                offset: 0,
+                total_size: expected_entry.size,
+                modified_ms: expected_entry.modified_ms,
+                executable: expected_entry.executable,
+                final_chunk: true,
+            },
+            b"oops".to_vec(),
+        )
+        .await
+        .unwrap();
+
+        assert!(!root.join(&wire_path).exists());
+        assert!(incoming_files.is_empty());
+        assert!(pending_revisions.is_empty());
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -3979,6 +4235,16 @@ mod tests {
             size: 1,
             modified_ms,
             hash: Some(hash.to_string()),
+            executable: false,
+        }
+    }
+
+    fn file_entry_for_bytes(bytes: &[u8], modified_ms: u64) -> ManifestEntry {
+        ManifestEntry {
+            kind: EntryKind::File,
+            size: bytes.len() as u64,
+            modified_ms,
+            hash: Some(format!("{:x}", Sha256::digest(bytes))),
             executable: false,
         }
     }
