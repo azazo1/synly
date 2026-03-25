@@ -10,7 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use url::Url;
 
@@ -199,6 +199,10 @@ impl LocalClipboardHandler {
 
 impl ClipboardHandler for LocalClipboardHandler {
     fn on_clipboard_change(&mut self) {
+        // 检测到剪贴板变化是需要读取剪贴板的, 然后下面也要读取剪贴板,
+        // 在 windows 下读取剪贴板过快可能导致拒绝, 因此这里延迟一下.
+        #[cfg(windows)]
+        thread::sleep(Duration::from_millis(100));
         let captured = capture_clipboard(&self.ctx, self.max_file_bytes);
         emit_warnings(&captured.warnings);
 
