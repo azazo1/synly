@@ -10,7 +10,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(windows)]
+use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use url::Url;
 
@@ -45,6 +47,11 @@ struct LocalClipboardHandler {
 struct CapturedClipboard {
     payload: Option<ClipboardPayload>,
     warnings: Vec<String>,
+}
+
+struct ClipboardFileCapture {
+    files: Vec<ClipboardFile>,
+    had_file_content: bool,
 }
 
 impl ClipboardSync {
@@ -222,18 +229,52 @@ impl ClipboardHandler for LocalClipboardHandler {
 
 fn capture_clipboard(ctx: &ClipboardContext, max_file_bytes: u64) -> CapturedClipboard {
     let mut warnings = Vec::new();
+    let file_capture = read_file_content(ctx, max_file_bytes, &mut warnings);
+    if file_capture.had_file_content {
+        return capture_file_clipboard(file_capture, warnings);
+    }
+
+    capture_non_file_clipboard(ctx)
+}
+
+fn capture_file_clipboard(
+    file_capture: ClipboardFileCapture,
+    mut warnings: Vec<String>,
+) -> CapturedClipboard {
+    let mut files = file_capture.files;
+
+    if files.is_empty() {
+        warnings.push(
+            "检测到本次剪贴板复制的是文件，但所有文件都因限制被跳过；本次不做剪贴板同步。"
+                .to_string(),
+        );
+    }
+
+    let payload = ClipboardPayload {
+        text: None,
+        rich_text: None,
+        html: None,
+        image: None,
+        files: std::mem::take(&mut files),
+    };
+
+    let payload = (!payload.is_empty()).then_some(payload);
+    CapturedClipboard { payload, warnings }
+}
+
+fn capture_non_file_clipboard(ctx: &ClipboardContext) -> CapturedClipboard {
+    let mut warnings = Vec::new();
     let text = read_text_content(ctx, &mut warnings);
     let rich_text = read_rich_text_content(ctx, &mut warnings);
     let html = read_html_content(ctx, &mut warnings);
     let image = read_image_content(ctx, &mut warnings);
-    let files = read_file_content(ctx, max_file_bytes, &mut warnings);
 
     let payload = ClipboardPayload {
         text,
         rich_text,
         html,
         image,
-        files,
+        files: Vec::new(),
     };
 
     CapturedClipboard {
@@ -313,20 +354,29 @@ fn read_file_content(
     ctx: &ClipboardContext,
     max_file_bytes: u64,
     warnings: &mut Vec<String>,
-) -> Vec<ClipboardFile> {
+) -> ClipboardFileCapture {
     if !ctx.has(ContentFormat::Files) {
-        return Vec::new();
+        return ClipboardFileCapture {
+            files: Vec::new(),
+            had_file_content: false,
+        };
     }
 
     let raw_files = match ctx.get_files() {
         Ok(files) => files,
         Err(err) => {
             warnings.push(format!("无法读取剪贴板文件列表: {}", err));
-            return Vec::new();
+            return ClipboardFileCapture {
+                files: Vec::new(),
+                had_file_content: true,
+            };
         }
     };
 
-    capture_files_from_paths(raw_files, max_file_bytes, warnings)
+    ClipboardFileCapture {
+        files: capture_files_from_paths(raw_files, max_file_bytes, warnings),
+        had_file_content: true,
+    }
 }
 
 fn capture_files_from_paths(
@@ -811,8 +861,9 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClipboardFile, ClipboardSyncState, capture_files_from_paths, payload_signature,
-        sanitize_remote_payload, write_clipboard_files_to_cache,
+        ClipboardFile, ClipboardFileCapture, ClipboardSyncState, capture_file_clipboard,
+        capture_files_from_paths, payload_signature, sanitize_remote_payload,
+        write_clipboard_files_to_cache,
     };
     use crate::protocol::ClipboardPayload;
     use std::fs;
@@ -895,6 +946,54 @@ mod tests {
         assert_eq!(filtered.files[0].name, "keep.txt");
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("drop.txt"));
+    }
+
+    #[test]
+    fn file_clipboard_without_syncable_files_is_not_forwarded() {
+        let captured = capture_file_clipboard(
+            ClipboardFileCapture {
+                files: Vec::new(),
+                had_file_content: true,
+            },
+            vec!["已跳过剪贴板文件 `huge.bin`: 大小 8 B 超过配置上限 4 B".to_string()],
+        );
+
+        assert!(captured.payload.is_none());
+        assert!(
+            captured
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("本次不做剪贴板同步"))
+        );
+    }
+
+    #[test]
+    fn file_clipboard_payload_contains_only_files() {
+        let captured = capture_file_clipboard(
+            ClipboardFileCapture {
+                files: vec![ClipboardFile {
+                    name: "note.txt".to_string(),
+                    bytes: b"hello".to_vec(),
+                }],
+                had_file_content: true,
+            },
+            Vec::new(),
+        );
+
+        let payload = captured.payload.expect("expected clipboard payload");
+        assert_eq!(
+            payload,
+            ClipboardPayload {
+                text: None,
+                rich_text: None,
+                html: None,
+                image: None,
+                files: vec![ClipboardFile {
+                    name: "note.txt".to_string(),
+                    bytes: b"hello".to_vec(),
+                }],
+            }
+        );
     }
 
     #[test]
