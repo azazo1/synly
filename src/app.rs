@@ -20,12 +20,16 @@ use crate::sync::{
     build_snapshot, delete_paths_best_effort, ensure_directories, filter_snapshot_by_folder_depth,
     filter_snapshot_for_incoming_root, resolve_incoming_path, resolve_outgoing_path, watch_targets,
 };
+use crate::system_notification::{
+    ConnectionEvent, NotificationPeer, SessionNotifier, SystemNotifier,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use console::style;
 use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use rand::RngExt;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::future::Future;
 use std::net::{SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -213,60 +217,81 @@ fn accept_policy_label(pairing: &PairingRuntimeOptions) -> &'static str {
 async fn run_host(config: &mut SynlyConfig, options: RuntimeOptions) -> Result<()> {
     let device = config.device.clone();
     let mut pairing_throttle = PairingThrottle::default();
+    let notifier = SystemNotifier::new(options.notifications_enabled);
     let listener = TcpListener::bind(("0.0.0.0", options.pairing.port.unwrap_or(0)))
         .await
         .context("failed to bind TCP listener")?;
     let port = listener.local_addr()?.port();
-    let _advertisement = discovery::advertise(&Advertisement {
-        port,
-        device: device.clone(),
-        file_sync_mode: options.file_sync_mode,
-        clipboard_mode: options.clipboard_mode,
-        audio_mode: options.audio_mode,
-        instance_name: options.instance_name.clone(),
-    })?;
+    let advertisement = discovery::advertise(
+        &Advertisement {
+            port,
+            device: device.clone(),
+            file_sync_mode: options.file_sync_mode,
+            clipboard_mode: options.clipboard_mode,
+            audio_mode: options.audio_mode,
+            instance_name: options.instance_name.clone(),
+        },
+        &options.discovery,
+    )
+    .await?;
 
     print_host_ready(&device, &options, port);
 
-    loop {
-        let (socket, address) = listener.accept().await?;
-        match handle_incoming_connection(socket, address, &mut pairing_throttle, config, &options)
+    let result = async {
+        loop {
+            let (socket, address) = listener.accept().await?;
+            match handle_incoming_connection(
+                socket,
+                address,
+                &mut pairing_throttle,
+                config,
+                &options,
+            )
             .await
-        {
-            Ok(Some(session)) => {
-                let remote_label = format!(
-                    "{} ({})",
-                    identity_display_name(&session.remote),
-                    short_uuid(&session.remote.device_id)
-                );
-                match run_sync_session(
-                    session,
-                    &options.workspace,
-                    SyncSessionOptions {
-                        interval_secs: options.interval_secs,
-                        sync_delete: options.sync_delete,
-                        clipboard_mode: options.clipboard_mode,
-                        audio_mode: options.audio_mode,
-                        clipboard_options: &options.clipboard,
-                        transfer_limits: options.transfer_limits,
-                    },
-                )
-                .await
-                {
-                    Ok(()) => {
-                        println!("与 {remote_label} 的连接已断开，继续等待重连。");
-                    }
-                    Err(err) => {
-                        eprintln!("与 {remote_label} 的同步会话中断: {err:#}");
+            {
+                Ok(Some(session)) => {
+                    let remote_label = format!(
+                        "{} ({})",
+                        identity_display_name(&session.remote),
+                        short_uuid(&session.remote.device_id)
+                    );
+                    let peer = notification_peer(&session.remote);
+                    match run_with_session_notifications(
+                        &notifier,
+                        peer,
+                        run_sync_session(
+                            session,
+                            &options.workspace,
+                            SyncSessionOptions {
+                                interval_secs: options.interval_secs,
+                                sync_delete: options.sync_delete,
+                                clipboard_mode: options.clipboard_mode,
+                                audio_mode: options.audio_mode,
+                                clipboard_options: &options.clipboard,
+                                transfer_limits: options.transfer_limits,
+                            },
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(()) => {
+                            println!("与 {remote_label} 的连接已断开, 继续等待重连.");
+                        }
+                        Err(err) => {
+                            eprintln!("与 {remote_label} 的同步会话中断: {err:#}");
+                        }
                     }
                 }
-            }
-            Ok(None) => continue,
-            Err(err) => {
-                eprintln!("连接失败: {err:#}");
+                Ok(None) => continue,
+                Err(err) => {
+                    eprintln!("连接失败: {err:#}");
+                }
             }
         }
     }
+    .await;
+    advertisement.stop().await;
+    result
 }
 
 async fn run_client(config: &mut SynlyConfig, options: RuntimeOptions) -> Result<()> {
@@ -276,6 +301,7 @@ async fn run_client(config: &mut SynlyConfig, options: RuntimeOptions) -> Result
         .workspace_summary(options.clipboard_mode, options.audio_mode);
     let mut reconnect_query = options.pairing.peer_query.clone();
     let mut reconnect_delay = RECONNECT_BASE_DELAY;
+    let notifier = SystemNotifier::new(options.notifications_enabled);
 
     loop {
         let peer_target = match choose_peer(
@@ -283,7 +309,10 @@ async fn run_client(config: &mut SynlyConfig, options: RuntimeOptions) -> Result
             discovery_timeout,
             options.pairing.no_interact,
             &local_workspace_summary,
-        ) {
+            &options.discovery,
+        )
+        .await
+        {
             Ok(peer) => peer,
             Err(err) => {
                 if reconnect_query.is_some() {
@@ -305,17 +334,22 @@ async fn run_client(config: &mut SynlyConfig, options: RuntimeOptions) -> Result
                     short_uuid(&session.remote.device_id)
                 );
                 reconnect_delay = RECONNECT_BASE_DELAY;
-                if let Err(err) = run_sync_session(
-                    session,
-                    &options.workspace,
-                    SyncSessionOptions {
-                        interval_secs: options.interval_secs,
-                        sync_delete: options.sync_delete,
-                        clipboard_mode: options.clipboard_mode,
-                        audio_mode: options.audio_mode,
-                        clipboard_options: &options.clipboard,
-                        transfer_limits: options.transfer_limits,
-                    },
+                let peer = notification_peer(&session.remote);
+                if let Err(err) = run_with_session_notifications(
+                    &notifier,
+                    peer,
+                    run_sync_session(
+                        session,
+                        &options.workspace,
+                        SyncSessionOptions {
+                            interval_secs: options.interval_secs,
+                            sync_delete: options.sync_delete,
+                            clipboard_mode: options.clipboard_mode,
+                            audio_mode: options.audio_mode,
+                            clipboard_options: &options.clipboard,
+                            transfer_limits: options.transfer_limits,
+                        },
+                    ),
                 )
                 .await
                 {
@@ -333,6 +367,28 @@ async fn run_client(config: &mut SynlyConfig, options: RuntimeOptions) -> Result
             }
         }
     }
+}
+
+fn notification_peer(identity: &DeviceIdentity) -> NotificationPeer {
+    NotificationPeer {
+        display_name: identity_display_name(identity),
+        short_device_id: short_uuid(&identity.device_id),
+    }
+}
+
+async fn run_with_session_notifications<N, F, T>(
+    notifier: &N,
+    peer: NotificationPeer,
+    session: F,
+) -> Result<T>
+where
+    N: SessionNotifier,
+    F: Future<Output = Result<T>>,
+{
+    notifier.notify(ConnectionEvent::Connected, &peer);
+    let result = session.await;
+    notifier.notify(ConnectionEvent::Disconnected, &peer);
+    result
 }
 
 async fn handle_incoming_connection(
@@ -2930,17 +2986,18 @@ fn current_unix_ms() -> u64 {
         .unwrap_or_default()
 }
 
-fn choose_peer(
+async fn choose_peer(
     peer_query: Option<&str>,
     timeout: Duration,
     no_interact: bool,
     local_workspace: &crate::sync::WorkspaceSummary,
+    discovery_config: &crate::config::DiscoveryConfig,
 ) -> Result<PeerTarget> {
     if let Some(query) = peer_query {
         if let Some(address) = parse_direct_peer_addr(query) {
             return Ok(PeerTarget::Direct(address));
         }
-        let peers = discovery::browse(timeout)?;
+        let peers = discovery::browse(timeout, discovery_config).await?;
         let peer = select_peer_from_query(&peers, require_peer_query(Some(query))?)?;
         ensure_discovered_peer_modes_match(&peer, local_workspace)?;
         return Ok(PeerTarget::Discovered(peer));
@@ -2951,7 +3008,7 @@ fn choose_peer(
     }
 
     loop {
-        let peers = discovery::browse(timeout)?;
+        let peers = discovery::browse(timeout, discovery_config).await?;
         if peers.is_empty() {
             if !prompt_confirm("继续搜索设备吗", true)? {
                 bail!("no peer selected");
@@ -3654,16 +3711,17 @@ mod tests {
         SnapshotPathExpectation, accept_policy_label, build_remote_echo_expectations, choose_peer,
         delete_policy, handle_file_chunk, identity_display_name, is_connection_shutdown_error,
         next_reconnect_delay, parse_direct_peer_addr, peer_matches_query, preferred_peer_query,
-        resolve_audio_plan, resolve_initial_snapshot_policy, select_peer_from_query, send_one_file,
-        should_auto_accept_request, should_try_direct_trusted, trusted_transport_for_device,
-        trusted_transport_for_identity,
+        resolve_audio_plan, resolve_initial_snapshot_policy, run_with_session_notifications,
+        select_peer_from_query, send_one_file, should_auto_accept_request, should_try_direct_trusted,
+        trusted_transport_for_device, trusted_transport_for_identity,
     };
     use crate::audio::AudioChannelDirection;
     use crate::cli::{
         AudioMode, ClipboardMode, FileSyncMode, InitialSyncMode, PairingRuntimeOptions,
     };
     use crate::config::{
-        ClipboardConfig, DeviceConfig, SynlyConfig, TransferConfig, TrustedDeviceConfig,
+        ClipboardConfig, DeviceConfig, DiscoveryConfig, NotificationConfig, SynlyConfig,
+        TransferConfig, TrustedDeviceConfig,
     };
     use crate::discovery::DiscoveredPeer;
     use crate::protocol::{DeviceIdentity, FileChunkHeader, Frame, PairAuthMethod};
@@ -3671,12 +3729,14 @@ mod tests {
         ApplyPlan, DeletePolicy, EntryKind, ManifestEntry, ManifestSnapshot, OutgoingSpec,
         SnapshotLayout, WorkspaceSpec, build_snapshot,
     };
+    use crate::system_notification::{ConnectionEvent, NotificationPeer, SessionNotifier};
     use sha2::{Digest, Sha256};
     use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::env;
     use std::fs;
     use std::net::{Ipv4Addr, SocketAddrV4};
     use std::path::PathBuf;
+    use std::sync::Mutex;
     use std::time::Duration;
     use tokio::sync::mpsc;
     use uuid::Uuid;
@@ -4083,28 +4143,32 @@ mod tests {
         assert_eq!(accept_policy_label(&pairing), "认证通过后自动接受");
     }
 
-    #[test]
-    fn choose_peer_requires_explicit_query_in_no_interact() {
+    #[tokio::test]
+    async fn choose_peer_requires_explicit_query_in_no_interact() {
         let err = choose_peer(
             None,
             Duration::from_millis(1),
             true,
             &sample_local_workspace_summary(),
+            &DiscoveryConfig::default(),
         )
+        .await
         .unwrap_err()
         .to_string();
 
         assert!(err.contains("`--peer`"));
     }
 
-    #[test]
-    fn full_ipv4_socket_addr_uses_direct_target() {
+    #[tokio::test]
+    async fn full_ipv4_socket_addr_uses_direct_target() {
         let target = choose_peer(
             Some("192.168.1.20:8080"),
             Duration::from_millis(1),
             true,
             &sample_local_workspace_summary(),
+            &DiscoveryConfig::default(),
         )
+        .await
         .expect("full socket address should skip discovery");
 
         assert!(matches!(
@@ -4112,6 +4176,36 @@ mod tests {
             super::PeerTarget::Direct(address)
                 if *address.ip() == Ipv4Addr::new(192, 168, 1, 20) && address.port() == 8080
         ));
+    }
+
+    #[tokio::test]
+    async fn session_notifications_cover_success_and_error() {
+        let notifier = RecordingNotifier::default();
+        let peer = NotificationPeer {
+            display_name: "demo".to_string(),
+            short_device_id: "12345678".to_string(),
+        };
+
+        run_with_session_notifications(&notifier, peer.clone(), async { Ok(()) })
+            .await
+            .unwrap();
+        let error_result: anyhow::Result<()> = run_with_session_notifications(
+            &notifier,
+            peer,
+            async { anyhow::bail!("session failed") },
+        )
+        .await;
+
+        assert!(error_result.is_err());
+        assert_eq!(
+            *notifier.events.lock().unwrap(),
+            vec![
+                ConnectionEvent::Connected,
+                ConnectionEvent::Disconnected,
+                ConnectionEvent::Connected,
+                ConnectionEvent::Disconnected,
+            ]
+        );
     }
 
     #[test]
@@ -4308,7 +4402,20 @@ mod tests {
             },
             clipboard: ClipboardConfig::default(),
             transfer: TransferConfig::default(),
+            notifications: NotificationConfig::default(),
+            discovery: DiscoveryConfig::default(),
             trusted_devices,
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingNotifier {
+        events: Mutex<Vec<ConnectionEvent>>,
+    }
+
+    impl SessionNotifier for RecordingNotifier {
+        fn notify(&self, event: ConnectionEvent, _peer: &NotificationPeer) {
+            self.events.lock().unwrap().push(event);
         }
     }
 

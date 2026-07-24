@@ -1,4 +1,4 @@
-use crate::config::SynlyConfig;
+use crate::config::{DiscoveryConfig, SynlyConfig};
 use crate::path_expand::expand_path_string;
 use crate::protocol::TransferLimits;
 use crate::sync::WorkspaceSpec;
@@ -20,6 +20,18 @@ pub struct Cli {
         help = "禁止进入启动交互；如果启动参数不完整，则直接报错并列出缺失项"
     )]
     pub no_interact: bool,
+    #[arg(
+        long,
+        conflicts_with = "no_notifications",
+        help = "为本次运行启用连接成功和断开的系统提醒"
+    )]
+    pub notifications: bool,
+    #[arg(
+        long,
+        conflicts_with = "notifications",
+        help = "为本次运行关闭连接成功和断开的系统提醒"
+    )]
+    pub no_notifications: bool,
     #[arg(
         long = "fs",
         value_enum,
@@ -293,6 +305,8 @@ pub struct RuntimeOptions {
     pub sync_delete: bool,
     pub clipboard_mode: ClipboardMode,
     pub audio_mode: AudioMode,
+    pub notifications_enabled: bool,
+    pub discovery: DiscoveryConfig,
     pub clipboard: ClipboardRuntimeOptions,
     pub transfer_limits: TransferLimits,
     pub interval_secs: u64,
@@ -347,6 +361,8 @@ fn collect_runtime_options_from_cli(cli: Cli, config: &SynlyConfig) -> Result<Ru
         _ => bail!("missing connection preference"),
     };
 
+    let notifications_enabled =
+        resolve_notifications_enabled(&cli, config.notifications.enabled);
     let file_sync_mode = cli.fs.unwrap_or(FileSyncMode::Off);
     let workspace = workspace_from_cli_paths(file_sync_mode, cli.paths, cli.initial)?;
 
@@ -359,7 +375,6 @@ fn collect_runtime_options_from_cli(cli: Cli, config: &SynlyConfig) -> Result<Ru
     let pin = cli.pin.as_deref().map(normalize_pin).transpose()?;
     let clipboard_mode = cli.clipboard.unwrap_or(ClipboardMode::Off);
     let audio_mode = cli.audio.unwrap_or(AudioMode::Off);
-
     Ok(RuntimeOptions {
         file_sync_mode,
         connection,
@@ -368,6 +383,8 @@ fn collect_runtime_options_from_cli(cli: Cli, config: &SynlyConfig) -> Result<Ru
         sync_delete,
         clipboard_mode,
         audio_mode,
+        notifications_enabled,
+        discovery: config.discovery.clone(),
         clipboard: ClipboardRuntimeOptions {
             max_file_bytes: config.clipboard.max_file_bytes,
             max_cache_bytes: config.clipboard.max_cache_bytes,
@@ -386,6 +403,16 @@ fn collect_runtime_options_from_cli(cli: Cli, config: &SynlyConfig) -> Result<Ru
             discovery_secs: cli.discovery_secs.max(1),
         },
     })
+}
+
+pub fn resolve_notifications_enabled(cli: &Cli, configured: bool) -> bool {
+    if cli.notifications {
+        true
+    } else if cli.no_notifications {
+        false
+    } else {
+        configured
+    }
 }
 
 fn missing_startup_requirements(cli: &Cli) -> Vec<String> {
@@ -682,7 +709,9 @@ fn normalize_optional_text(value: Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{ClipboardConfig, DeviceConfig, TransferConfig};
+    use crate::config::{
+        ClipboardConfig, DeviceConfig, DiscoveryConfig, NotificationConfig, TransferConfig,
+    };
     use clap::Parser;
     use uuid::Uuid;
 
@@ -731,6 +760,44 @@ mod tests {
     fn conflicting_connection_flags_still_conflict() {
         let result = Cli::try_parse_from(["synly", "--fs", "receive", ".", "--host", "--join"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn notification_flags_conflict_and_override_config() {
+        assert!(
+            Cli::try_parse_from([
+                "synly",
+                "--fs",
+                "off",
+                "--host",
+                "--notifications",
+                "--no-notifications",
+            ])
+            .is_err()
+        );
+
+        let mut config = test_config();
+        config.notifications.enabled = false;
+        let default_options = collect_runtime_options(
+            Cli::try_parse_from(["synly", "--fs", "off", "--host"]).unwrap(),
+            &config,
+        )
+        .unwrap();
+        let overridden_options = collect_runtime_options(
+            Cli::try_parse_from([
+                "synly",
+                "--fs",
+                "off",
+                "--host",
+                "--notifications",
+            ])
+            .unwrap(),
+            &config,
+        )
+        .unwrap();
+
+        assert!(!default_options.notifications_enabled);
+        assert!(overridden_options.notifications_enabled);
     }
 
     #[test]
@@ -1044,6 +1111,8 @@ mod tests {
             },
             clipboard: ClipboardConfig::default(),
             transfer: TransferConfig::default(),
+            notifications: NotificationConfig::default(),
+            discovery: DiscoveryConfig::default(),
             trusted_devices: Vec::new(),
         }
     }

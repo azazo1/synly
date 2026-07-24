@@ -8,7 +8,7 @@ Synly 是一个面向局域网的跨平台 Rust CLI，用来发现附近设备�
 
 当前版本已经实现：
 
-- 局域网内通过 mDNS 自动发现设备
+- 默认通过 mDNS 自动发现设备, 配置 LND 后会并行使用中心注册表并聚合结果
 - 文件同步支持关闭 / 发送 / 接收 / 双向 / 自动协商五种模式
 - 未信任设备先只交换一次性 bootstrap 公钥，服务端显示客户端 bootstrap 指纹 ASCII 图和该会话专属 PIN
 - 客户端输入 PIN 后，双方先完成基于 PIN 的 SPAKE2 PAKE，再派生临时 mTLS，在加密信道内传输设备身份、请求模式和同步摘要
@@ -21,6 +21,7 @@ Synly 是一个面向局域网的跨平台 Rust CLI，用来发现附近设备�
 - 可选地单向同步系统音频；音频方向由独立的 `--audio off|send|receive` 控制，默认关闭，只有一端 `send`、另一端 `receive` 时才会建立音频通道
 - 文件和大剪贴板内容使用分段流式传输，线上 payload 使用二进制编码而不是 JSON
 - 连接意外断开后会自动重连；如果只是某个内容超过大小限制，会跳过那次发送，不会直接退出整个程序
+- 已认证连接建立和断开时发送桌面系统提醒, 支持配置文件和本次运行参数开关
 - 支持用 `.synlyignore` 排除不想参与同步的路径，语法兼容 gitignore
 - 默认通过启动 TUI 补全参数，也支持通过命令行显式指定模式、目标设备、PIN、自动接受和可信设备策略
 
@@ -323,6 +324,8 @@ synly [OPTIONS] [PATH ...]
 
 Options:
   --no-interact
+  --notifications
+  --no-notifications
   --fs <MODE>
   --name <NAME>
   --host
@@ -348,6 +351,7 @@ Options:
 - 不传 `--fs` 时默认就是 `off`
 - `--name` 是当前 Synly 实例的临时名称，只作用于本次运行，不会写回配置；`--peer` 可以按这个名称匹配
 - 剪贴板和音频方向仍然分别通过 `--clipboard <MODE>`、`--audio <MODE>` 独立指定
+- `--notifications` 和 `--no-notifications` 会覆盖配置文件中的提醒默认值, 两个参数不能同时使用
 
 ### `--fs auto`
 
@@ -616,13 +620,21 @@ Synly 当前的安全连接模型是：
 
 ## 设备发现
 
-Synly 使用 mDNS 广播和发现设备，服务类型为：
+Synly 始终尝试使用 mDNS 广播和发现设备, 服务类型为:
 
 ```text
 _synly._tcp.local.
 ```
 
-当前实现优先使用非回环 IPv4 地址。
+当前实现优先使用非回环 IPv4 地址.
+
+配置 `[discovery.lnd]` 后, Synly 还会作为 client 连接外部 `lnd-server`. host 会同时注册 mDNS 服务和 LND 租约, join 会并行查询两个后端, 再按设备 ID, 实例名和端口去重并合并地址. 任一后端可用时程序会继续运行并报告另一个后端的错误, 只有两个后端都失败时发现操作才会失败.
+
+Synly 不会内嵌或自动启动 `lnd-server`. server base URL 应指向服务根路径或反向代理前缀, 不要追加 `/v1`. 例如:
+
+```shell
+lnd-server --listen-addr 0.0.0.0:8765 --bearer-token dev-token
+```
 
 如果局域网里搜不到设备，优先检查：
 
@@ -632,7 +644,7 @@ _synly._tcp.local.
 
 ## 配置文件
 
-首次运行时，Synly 会为当前设备生成一个本地配置文件，保存设备信息、剪贴板策略和传输大小限制。
+首次运行时, Synly 会为当前设备生成一个本地配置文件, 保存设备信息, 提醒开关, 发现后端, 剪贴板策略和传输大小限制.
 
 典型位置：
 
@@ -661,6 +673,14 @@ max_meta_bytes = 20971520
 max_frame_data_bytes = 134217728
 max_clipboard_bytes = 104857600
 
+[notifications]
+enabled = true
+
+[discovery.lnd]
+server_url = "http://127.0.0.1:8765"
+bearer_token = "dev-token"
+discovery_domain = "office-a"
+
 [[trusted_devices]]
 device_id = "6fce44a6-2a07-4f72-9192-a4ec4a1e6df0"
 device_name = "laptop"
@@ -680,6 +700,10 @@ successful_sessions = 3
 - `transfer.max_meta_bytes` 是单帧元数据上限，单位为字节
 - `transfer.max_frame_data_bytes` 是单个二进制帧的数据上限，单位为字节
 - `transfer.max_clipboard_bytes` 是单次剪贴板二进制总载荷上限，单位为字节
+- `notifications.enabled` 默认是 `true`, 可由 `--notifications` 或 `--no-notifications` 为本次运行覆盖
+- 缺少 `[discovery.lnd]` 时只使用 mDNS; 添加该配置节后启用 LND 聚合发现
+- `discovery.lnd.server_url` 不能包含 `/v1`; `bearer_token` 可以留空, `discovery_domain` 可以省略
+- `bearer_token` 会以明文保存在配置文件中, 不会写入运行日志或系统提醒
 - `device.identity_private_key` / `device.identity_public_key` 是当前设备的长期身份密钥
 - `trusted_devices` 可选；只有在一次 PIN 认证成功后，本机明确同意信任对端时，这里才会出现记录；以后会用这里保存的公钥和根证书建立 mTLS，并校验对端签名
 

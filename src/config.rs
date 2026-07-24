@@ -25,6 +25,10 @@ pub struct SynlyConfig {
     #[serde(default)]
     pub transfer: TransferConfig,
     #[serde(default)]
+    pub notifications: NotificationConfig,
+    #[serde(default)]
+    pub discovery: DiscoveryConfig,
+    #[serde(default)]
     pub trusted_devices: Vec<TrustedDeviceConfig>,
 }
 
@@ -56,6 +60,38 @@ pub struct TransferConfig {
     pub max_frame_data_bytes: u64,
     #[serde(default = "default_transfer_max_clipboard_bytes")]
     pub max_clipboard_bytes: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NotificationConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiscoveryConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lnd: Option<LndDiscoveryConfig>,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LndDiscoveryConfig {
+    pub server_url: String,
+    #[serde(default)]
+    pub bearer_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery_domain: Option<String>,
+}
+
+impl std::fmt::Debug for LndDiscoveryConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("LndDiscoveryConfig")
+            .field("server_url", &self.server_url)
+            .field("bearer_token", &"<redacted>")
+            .field("discovery_domain", &self.discovery_domain)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -91,6 +127,12 @@ impl Default for TransferConfig {
             max_frame_data_bytes: default_transfer_max_frame_data_bytes(),
             max_clipboard_bytes: default_transfer_max_clipboard_bytes(),
         }
+    }
+}
+
+impl Default for NotificationConfig {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 
@@ -176,6 +218,8 @@ impl SynlyConfig {
                 device,
                 clipboard: ClipboardConfig::default(),
                 transfer: TransferConfig::default(),
+                notifications: NotificationConfig::default(),
+                discovery: DiscoveryConfig::default(),
                 trusted_devices: Vec::new(),
             }
         } else {
@@ -201,6 +245,8 @@ impl SynlyConfig {
             },
             clipboard: ClipboardConfig::default(),
             transfer: TransferConfig::default(),
+            notifications: NotificationConfig::default(),
+            discovery: DiscoveryConfig::default(),
             trusted_devices: Vec::new(),
         }
     }
@@ -341,6 +387,10 @@ fn default_clipboard_max_file_bytes() -> u64 {
     DEFAULT_CLIPBOARD_MAX_FILE_BYTES
 }
 
+fn default_true() -> bool {
+    true
+}
+
 fn default_transfer_max_meta_bytes() -> u64 {
     TransferLimits::default().max_meta_len as u64
 }
@@ -454,8 +504,9 @@ fn detect_device_name(device_id: Uuid) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClipboardConfig, DeviceConfig, SynlyConfig, TransferConfig, TrustedDeviceConfig,
-        config_path_in, legacy_device_config_path_in, resolve_configured_path,
+        ClipboardConfig, DeviceConfig, DiscoveryConfig, LndDiscoveryConfig, NotificationConfig,
+        SynlyConfig, TransferConfig, TrustedDeviceConfig, config_path_in,
+        legacy_device_config_path_in, resolve_configured_path,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -475,6 +526,8 @@ mod tests {
         assert!(saved.contains("[transfer]"));
         assert_eq!(config.clipboard, ClipboardConfig::default());
         assert_eq!(config.transfer, TransferConfig::default());
+        assert_eq!(config.notifications, NotificationConfig::default());
+        assert_eq!(config.discovery, DiscoveryConfig::default());
         assert!(config.trusted_devices.is_empty());
 
         cleanup_dir(&dir);
@@ -506,6 +559,8 @@ mod tests {
         assert!(config.device.identity_public_key.is_some());
         assert_eq!(config.clipboard, ClipboardConfig::default());
         assert_eq!(config.transfer, TransferConfig::default());
+        assert_eq!(config.notifications, NotificationConfig::default());
+        assert_eq!(config.discovery, DiscoveryConfig::default());
         assert!(config.trusted_devices.is_empty());
         assert!(config_path_in(&dir).exists());
 
@@ -529,6 +584,8 @@ mod tests {
         assert!(config.device.identity_public_key.is_some());
         assert_eq!(config.clipboard, ClipboardConfig::default());
         assert_eq!(config.transfer, TransferConfig::default());
+        assert_eq!(config.notifications, NotificationConfig::default());
+        assert_eq!(config.discovery, DiscoveryConfig::default());
         assert!(config.trusted_devices.is_empty());
 
         cleanup_dir(&dir);
@@ -551,6 +608,8 @@ mod tests {
         assert_eq!(config.clipboard.max_file_bytes, 42);
         assert_eq!(config.clipboard.max_cache_bytes, Some(99));
         assert_eq!(config.transfer, TransferConfig::default());
+        assert_eq!(config.notifications, NotificationConfig::default());
+        assert_eq!(config.discovery, DiscoveryConfig::default());
         assert_eq!(
             config.clipboard.cache_dir,
             Some(PathBuf::from("custom-cache"))
@@ -620,6 +679,32 @@ mod tests {
                 max_frame_data_bytes: 456,
                 max_clipboard_bytes: 789,
             }
+        );
+
+        cleanup_dir(&dir);
+    }
+
+    #[test]
+    fn notification_and_lnd_config_are_loaded() {
+        let dir = unique_test_dir("notification-lnd");
+        fs::create_dir_all(&dir).unwrap();
+        let path = config_path_in(&dir);
+        let toml = format!(
+            "[device]\ndevice_id = \"{}\"\ndevice_name = \"demo\"\n\n[notifications]\nenabled = false\n\n[discovery.lnd]\nserver_url = \"https://example.com/lnd\"\nbearer_token = \"secret\"\ndiscovery_domain = \"office-a\"\n",
+            Uuid::new_v4()
+        );
+        fs::write(&path, toml).unwrap();
+
+        let config = SynlyConfig::load_or_create_in_dir(&dir).unwrap();
+
+        assert!(!config.notifications.enabled);
+        assert_eq!(
+            config.discovery.lnd,
+            Some(LndDiscoveryConfig {
+                server_url: "https://example.com/lnd".to_string(),
+                bearer_token: "secret".to_string(),
+                discovery_domain: Some("office-a".to_string()),
+            })
         );
 
         cleanup_dir(&dir);

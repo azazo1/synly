@@ -3,8 +3,9 @@
 use crate::cli::{
     AudioMode, Cli, ClipboardMode, ClipboardRuntimeOptions, ConnectionPreference, FileSyncMode,
     InitialSyncMode, PairingRuntimeOptions, RuntimeOptions, normalize_pin,
+    resolve_notifications_enabled,
 };
-use crate::config::SynlyConfig;
+use crate::config::{DiscoveryConfig, SynlyConfig};
 use crate::path_expand::expand_path_string;
 use crate::protocol::TransferLimits;
 use crate::sync::WorkspaceSpec;
@@ -53,6 +54,8 @@ struct StartupContext {
     cwd: PathBuf,
     clipboard: ClipboardRuntimeOptions,
     transfer_limits: TransferLimits,
+    notifications_enabled: bool,
+    discovery: DiscoveryConfig,
 }
 
 impl StartupContext {
@@ -70,6 +73,8 @@ impl StartupContext {
                 cache_dir: config.clipboard_cache_dir()?,
             },
             transfer_limits: config.transfer.to_limits()?,
+            notifications_enabled: config.notifications.enabled,
+            discovery: config.discovery.clone(),
         })
     }
 }
@@ -93,6 +98,7 @@ struct FlowDraft {
     sync_delete: bool,
     clipboard_mode: ClipboardMode,
     audio_mode: AudioMode,
+    notifications_enabled: bool,
 }
 
 struct WorkspaceDraft {
@@ -155,6 +161,7 @@ enum FieldId {
     SyncDelete,
     ClipboardMode,
     AudioMode,
+    Notifications,
     WorkspacePath,
     MaxFolderDepth,
     IntervalSecs,
@@ -241,6 +248,8 @@ impl StartupApp {
         };
 
         let file_sync_mode = cli.fs.unwrap_or(FileSyncMode::Off);
+        let notifications_enabled =
+            resolve_notifications_enabled(&cli, context.notifications_enabled);
 
         let workspace_value = if file_sync_mode == FileSyncMode::Off {
             String::new()
@@ -270,6 +279,7 @@ impl StartupApp {
                 sync_delete: cli.sync_delete,
                 clipboard_mode: cli.clipboard.unwrap_or(ClipboardMode::Off),
                 audio_mode: cli.audio.unwrap_or(AudioMode::Off),
+                notifications_enabled,
             },
             workspace: WorkspaceDraft {
                 path: single_line_textarea(workspace_value, ""),
@@ -562,6 +572,18 @@ impl StartupApp {
                     ));
                 }
             }
+            FieldId::Notifications => {
+                if matches!(
+                    key.code,
+                    KeyCode::Left | KeyCode::Right | KeyCode::Enter | KeyCode::Char(' ')
+                ) {
+                    self.flow.notifications_enabled = !self.flow.notifications_enabled;
+                    self.push_log(format!(
+                        "系统连接提醒已{}.",
+                        enabled_label(self.flow.notifications_enabled)
+                    ));
+                }
+            }
             FieldId::WorkspacePath => {
                 let _ = key;
             }
@@ -757,6 +779,13 @@ impl StartupApp {
                         self.flow.audio_mode.label()
                     ));
                 }
+            }
+            FieldId::Notifications => {
+                self.flow.notifications_enabled = !self.flow.notifications_enabled;
+                self.push_log(format!(
+                    "系统连接提醒已{}.",
+                    enabled_label(self.flow.notifications_enabled)
+                ));
             }
             FieldId::InstanceName => {}
             FieldId::Accept => {
@@ -1118,6 +1147,16 @@ impl StartupApp {
                     AudioMode::Receive => 2,
                 },
                 true,
+                focused,
+                colors,
+            ),
+            FieldId::Notifications => self.render_toggle_field(
+                frame,
+                area,
+                "系统连接提醒",
+                self.flow.notifications_enabled,
+                true,
+                "连接成功和断开时发送桌面系统提醒",
                 focused,
                 colors,
             ),
@@ -1547,6 +1586,7 @@ impl StartupApp {
             format!("文件同步模式: {}", self.flow.file_sync_mode.label()),
             format!("剪贴板同步: {}", self.flow.clipboard_mode.label()),
             format!("音频同步: {}", self.flow.audio_mode.label()),
+            format!("系统连接提醒: {}", bool_label(self.flow.notifications_enabled)),
         ];
         let mut notes = Vec::new();
         let mut errors = Vec::new();
@@ -1715,6 +1755,11 @@ impl StartupApp {
             "--audio",
             audio_mode_arg(self.flow.audio_mode).to_string(),
         );
+        args.push(if self.flow.notifications_enabled {
+            "--notifications".to_string()
+        } else {
+            "--no-notifications".to_string()
+        });
 
         if let Some(depth) = trimmed_non_empty(&self.workspace.max_folder_depth) {
             push_flag_value(&mut args, "--max-folder-depth", depth);
@@ -1894,6 +1939,8 @@ impl StartupApp {
             },
             clipboard_mode: self.flow.clipboard_mode,
             audio_mode: self.flow.audio_mode,
+            notifications_enabled: self.flow.notifications_enabled,
+            discovery: self.context.discovery.clone(),
             workspace,
             clipboard: self.context.clipboard.clone(),
             transfer_limits: self.context.transfer_limits,
@@ -1984,6 +2031,7 @@ impl StartupApp {
                 FieldId::SyncDelete,
                 FieldId::ClipboardMode,
                 FieldId::AudioMode,
+                FieldId::Notifications,
             ],
             StartupTab::Workspace => &[
                 FieldId::WorkspacePath,
@@ -2557,6 +2605,11 @@ fn equivalent_command_from_options(options: &RuntimeOptions, cwd: &Path) -> Stri
         "--audio",
         audio_mode_arg(options.audio_mode).to_string(),
     );
+    args.push(if options.notifications_enabled {
+        "--notifications".to_string()
+    } else {
+        "--no-notifications".to_string()
+    });
     push_flag_value(
         &mut args,
         "--interval-secs",
@@ -2830,6 +2883,8 @@ mod tests {
             sync_delete: false,
             clipboard_mode: ClipboardMode::Receive,
             audio_mode: AudioMode::Send,
+            notifications_enabled: false,
+            discovery: DiscoveryConfig::default(),
             clipboard: ClipboardRuntimeOptions {
                 max_file_bytes: 1,
                 max_cache_bytes: None,
@@ -2856,7 +2911,7 @@ mod tests {
         let command = equivalent_command_from_options(&options, Path::new("/tmp"));
         assert_eq!(
             command,
-            "synly --name worker-a --fs both --initial other ./demo --join --no-sync-delete --clipboard receive --audio send --interval-secs 5 --max-folder-depth 2 --peer 'studio display' --discovery-secs 9 --pin 123456 --accept --trusted-only"
+            "synly --name worker-a --fs both --initial other ./demo --join --no-sync-delete --clipboard receive --audio send --no-notifications --interval-secs 5 --max-folder-depth 2 --peer 'studio display' --discovery-secs 9 --pin 123456 --accept --trusted-only"
         );
     }
 

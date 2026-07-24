@@ -8,6 +8,8 @@ mod discovery;
 mod path_expand;
 mod protocol;
 mod startup_tui;
+mod system_notification;
+mod tracing_utils;
 mod sync;
 
 use anyhow::Result;
@@ -19,6 +21,7 @@ async fn main() -> Result<()> {
     let cli = cli::Cli::parse();
     let mut config = config::SynlyConfig::load_or_create()?;
     let options = cli::collect_runtime_options(cli, &config)?;
+    tracing_utils::init_tracing();
     println!();
     println!("{}", style("本次同步确认").bold());
     if let Some(instance_name) = options.instance_name.as_deref() {
