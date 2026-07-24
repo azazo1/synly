@@ -646,13 +646,11 @@ lnd-server --listen-addr 0.0.0.0:8765 --bearer-token dev-token
 
 首次运行时, Synly 会为当前设备生成一个本地配置文件, 保存设备信息, 提醒开关, 发现后端, 剪贴板策略和传输大小限制.
 
-典型位置：
+所有平台统一使用:
 
-- macOS: `~/Library/Application Support/synly/config.toml`
-- Linux: `~/.config/synly/config.toml`
-- Windows: `%APPDATA%/synly/config.toml`
+- `~/.config/synly/config.toml`
 
-如果旧版本目录下已经存在 `device.json`，首次运行新版本时会自动迁移到 `config.toml`。
+剪贴板缓存使用由 `dirs::cache_dir()` 确定的平台专用缓存目录. 默认位置是 macOS 的 `~/Library/Caches/synly/clipboard-cache`, Linux 的 `${XDG_CACHE_HOME:-~/.cache}/synly/clipboard-cache` 或 Windows 的 `%LOCALAPPDATA%/synly/clipboard-cache`. 相对 `clipboard.cache_dir` 也以该目录为基准.
 
 一个典型配置如下：
 

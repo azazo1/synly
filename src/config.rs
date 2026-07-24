@@ -1,4 +1,4 @@
-use crate::path_expand::expand_config_path_string;
+use crate::path_expand::{expand_config_path_string, home_dir};
 use crate::protocol::TransferLimits;
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
@@ -142,7 +142,7 @@ impl SynlyConfig {
     }
 
     pub fn clipboard_cache_dir(&self) -> Result<PathBuf> {
-        let base_dir = config_dir()?;
+        let base_dir = clipboard_cache_base_dir()?;
         match &self.clipboard.cache_dir {
             Some(path) => resolve_configured_path(path, &base_dir),
             None => Ok(base_dir.join(CLIPBOARD_CACHE_DIR_NAME)),
@@ -440,38 +440,14 @@ fn resolve_configured_path(path: &Path, base_dir: &Path) -> Result<PathBuf> {
 }
 
 fn config_dir() -> Result<PathBuf> {
-    #[cfg(windows)]
-    {
-        if let Ok(appdata) = env::var("APPDATA") {
-            return Ok(Path::new(&appdata).join("synly"));
-        }
-        if let Ok(home) = env::var("USERPROFILE") {
-            return Ok(Path::new(&home)
-                .join("AppData")
-                .join("Roaming")
-                .join("synly"));
-        }
-    }
+    let home = home_dir().context("unable to determine home directory")?;
+    Ok(Path::new(&home).join(".config").join("synly"))
+}
 
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(home) = env::var("HOME") {
-            return Ok(Path::new(&home)
-                .join("Library")
-                .join("Application Support")
-                .join("synly"));
-        }
-    }
-
-    if let Ok(xdg) = env::var("XDG_CONFIG_HOME") {
-        return Ok(Path::new(&xdg).join("synly"));
-    }
-
-    if let Ok(home) = env::var("HOME") {
-        return Ok(Path::new(&home).join(".config").join("synly"));
-    }
-
-    bail!("unable to determine config directory")
+fn clipboard_cache_base_dir() -> Result<PathBuf> {
+    dirs::cache_dir()
+        .map(|dir| dir.join("synly"))
+        .context("unable to determine platform cache directory")
 }
 
 fn detect_device_name(device_id: Uuid) -> String {
@@ -504,9 +480,10 @@ fn detect_device_name(device_id: Uuid) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClipboardConfig, DeviceConfig, DiscoveryConfig, LndDiscoveryConfig, NotificationConfig,
-        SynlyConfig, TransferConfig, TrustedDeviceConfig, config_path_in,
-        legacy_device_config_path_in, resolve_configured_path,
+        CLIPBOARD_CACHE_DIR_NAME, ClipboardConfig, DeviceConfig, DiscoveryConfig,
+        LndDiscoveryConfig, NotificationConfig, SynlyConfig, TransferConfig, TrustedDeviceConfig,
+        clipboard_cache_base_dir, config_dir, config_path_in, legacy_device_config_path_in,
+        resolve_configured_path,
     };
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -592,7 +569,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_relative_cache_dir_is_resolved_under_config_dir() {
+    fn custom_relative_cache_dir_is_loaded() {
         let dir = unique_test_dir("cache-relative");
         fs::create_dir_all(&dir).unwrap();
         let path = config_path_in(&dir);
@@ -727,6 +704,28 @@ mod tests {
         let config = SynlyConfig::new_generated();
         assert!(config.device.identity_private_key.is_some());
         assert!(config.device.identity_public_key.is_some());
+    }
+
+    #[test]
+    fn config_dir_is_always_under_home_dot_config() {
+        let dir = config_dir().unwrap();
+        assert!(dir.ends_with(Path::new(".config").join("synly")));
+    }
+
+    #[test]
+    fn clipboard_cache_uses_platform_cache_dir() {
+        let mut config = SynlyConfig::new_generated();
+        let cache_dir = clipboard_cache_base_dir().unwrap();
+        assert_eq!(
+            config.clipboard_cache_dir().unwrap(),
+            cache_dir.join(CLIPBOARD_CACHE_DIR_NAME)
+        );
+
+        config.clipboard.cache_dir = Some(PathBuf::from("custom-cache"));
+        assert_eq!(
+            config.clipboard_cache_dir().unwrap(),
+            cache_dir.join("custom-cache")
+        );
     }
 
     fn unique_test_dir(label: &str) -> PathBuf {

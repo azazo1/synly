@@ -54,25 +54,8 @@ fn starts_with_expandable_tilde(raw: &str) -> bool {
     rest.is_empty() || rest.starts_with('/') || rest.starts_with('\\')
 }
 
-fn home_dir() -> Option<String> {
-    #[cfg(windows)]
-    {
-        if let Ok(profile) = env::var("USERPROFILE")
-            && !profile.trim().is_empty()
-        {
-            return Some(profile);
-        }
-
-        let drive = env::var("HOMEDRIVE").ok()?;
-        let path = env::var("HOMEPATH").ok()?;
-        if !drive.trim().is_empty() && !path.trim().is_empty() {
-            return Some(format!("{drive}{path}"));
-        }
-    }
-
-    env::var("HOME")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
+pub(crate) fn home_dir() -> Option<String> {
+    dirs::home_dir().map(|path| path.to_string_lossy().into_owned())
 }
 
 fn normalize_percent_env_vars(raw: &str) -> Cow<'_, str> {

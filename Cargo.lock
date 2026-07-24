@@ -3137,6 +3137,7 @@ dependencies = [
  "clipboard-rs",
  "console",
  "crossterm",
+ "dirs",
  "filetime",
  "hmac",
  "if-addrs 0.15.0",
