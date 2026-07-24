@@ -652,7 +652,7 @@ lnd-server --listen-addr 0.0.0.0:8765 --bearer-token dev-token
 
 剪贴板缓存使用由 `dirs::cache_dir()` 确定的平台专用缓存目录. 默认位置是 macOS 的 `~/Library/Caches/synly/clipboard-cache`, Linux 的 `${XDG_CACHE_HOME:-~/.cache}/synly/clipboard-cache` 或 Windows 的 `%LOCALAPPDATA%/synly/clipboard-cache`. 相对 `clipboard.cache_dir` 也以该目录为基准.
 
-一个典型配置如下：
+可直接编辑的示例见 [`config.toml.example`](config.toml.example). 程序补全设备身份后的配置结构如下:
 
 ```toml
 [device]
@@ -693,8 +693,8 @@ successful_sessions = 3
 
 - `clipboard.max_file_bytes` 是单个剪贴板文件的大小上限，单位为字节
 - `clipboard.max_cache_bytes` 可选；是剪贴板缓存目录总占用上限，单位为字节；超过后会按最早出现顺序清理旧缓存
-- `clipboard.cache_dir` 可选；可以写绝对路径，也可以写相对配置目录的路径
-- 未设置 `clipboard.cache_dir` 时，剪贴板文件缓存默认保存在同一配置目录下的 `clipboard-cache/`
+- `clipboard.cache_dir` 可选; 可以写绝对路径, 也可以写相对于 `dirs::cache_dir()/synly` 的路径
+- 未设置 `clipboard.cache_dir` 时, 剪贴板文件缓存默认保存在 `dirs::cache_dir()/synly/clipboard-cache`
 - `transfer.max_meta_bytes` 是单帧元数据上限，单位为字节
 - `transfer.max_frame_data_bytes` 是单个二进制帧的数据上限，单位为字节
 - `transfer.max_clipboard_bytes` 是单次剪贴板二进制总载荷上限，单位为字节

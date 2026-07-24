@@ -1,0 +1,25 @@
+# 每台设备必须使用不同的 UUID.
+[device]
+device_id = "2d0d69d8-0f7f-40e4-8fd3-fd0a29a2ed84"
+device_name = "workstation"
+
+[clipboard]
+max_file_bytes = 104857600
+max_cache_bytes = 536870912
+# 可选. 相对路径基于 dirs::cache_dir()/synly.
+# cache_dir = "clipboard-cache-custom"
+
+[transfer]
+max_meta_bytes = 20971520
+max_frame_data_bytes = 134217728
+max_clipboard_bytes = 104857600
+
+[notifications]
+enabled = true
+
+# 可选. 取消以下注释以启用 LND 聚合发现.
+# server_url 是服务根 URL, 不包含 /v1.
+# [discovery.lnd]
+# server_url = "http://127.0.0.1:8765"
+# bearer_token = "replace-me"
+# discovery_domain = "office-a"

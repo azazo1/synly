@@ -728,6 +728,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn example_config_is_valid() {
+        let config: SynlyConfig = toml::from_str(include_str!("../config.toml.example")).unwrap();
+        assert!(config.device.identity_private_key.is_none());
+        assert!(config.device.identity_public_key.is_none());
+        assert!(config.discovery.lnd.is_none());
+        assert!(config.notifications.enabled);
+    }
+
     fn unique_test_dir(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!("synly-config-test-{label}-{}", Uuid::new_v4()))
     }
