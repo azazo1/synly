@@ -324,6 +324,14 @@ async fn run_client(config: &mut SynlyConfig, options: RuntimeOptions) -> Result
                 return Err(err);
             }
         };
+        if let PeerTarget::Discovered(peer) = &peer_target {
+            println!(
+                "已发现设备: {} ({})  来源:{}",
+                peer.display_name(),
+                &peer.device_id[..8.min(peer.device_id.len())],
+                peer.source.label()
+            );
+        }
         reconnect_query = Some(peer_target.reconnect_query());
 
         match connect_to_peer(&peer_target, config, &options).await {
@@ -4113,6 +4121,7 @@ mod tests {
             file_sync_mode: FileSyncMode::Auto,
             clipboard_mode: ClipboardMode::Off,
             audio_mode: AudioMode::Off,
+            source: crate::discovery::DiscoverySource::Mdns,
             port: 9999,
             addresses: vec![Ipv4Addr::new(192, 168, 1, 21)],
         };
@@ -4358,6 +4367,7 @@ mod tests {
             file_sync_mode: FileSyncMode::Both,
             clipboard_mode: ClipboardMode::Off,
             audio_mode: AudioMode::Off,
+            source: crate::discovery::DiscoverySource::Mdns,
             port: 8080,
             addresses: vec![Ipv4Addr::new(192, 168, 1, 20)],
         }

@@ -630,6 +630,8 @@ _synly._tcp.local.
 
 配置 `[discovery.lnd]` 后, Synly 还会作为 client 连接外部 `lnd-server`. host 会同时注册 mDNS 服务和 LND 租约, join 会并行查询两个后端, 再按设备 ID, 实例名和端口去重并合并地址. 任一后端可用时程序会继续运行并报告另一个后端的错误, 只有两个后端都失败时发现操作才会失败.
 
+发现结果会标记来源为 `mDNS`, `LND` 或 `mDNS+LND`. 交互选择和 `--peer` 自动匹配都会在连接前显示该信息.
+
 Synly 不会内嵌或自动启动 `lnd-server`. server base URL 应指向服务根路径或反向代理前缀, 不要追加 `/v1`. 例如:
 
 ```shell

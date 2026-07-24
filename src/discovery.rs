@@ -50,6 +50,31 @@ impl DiscoveryRegistration {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, PartialOrd, Ord)]
+pub enum DiscoverySource {
+    Mdns,
+    Lnd,
+    MdnsAndLnd,
+}
+
+impl DiscoverySource {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Mdns => "mDNS",
+            Self::Lnd => "LND",
+            Self::MdnsAndLnd => "mDNS+LND",
+        }
+    }
+
+    fn merge(self, other: Self) -> Self {
+        if self == other {
+            self
+        } else {
+            Self::MdnsAndLnd
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 pub struct DiscoveredPeer {
     pub fullname: String,
@@ -59,6 +84,7 @@ pub struct DiscoveredPeer {
     pub file_sync_mode: FileSyncMode,
     pub clipboard_mode: ClipboardMode,
     pub audio_mode: AudioMode,
+    pub source: DiscoverySource,
     pub port: u16,
     pub addresses: Vec<Ipv4Addr>,
 }
@@ -76,12 +102,13 @@ impl DiscoveredPeer {
             .collect::<Vec<_>>()
             .join(", ");
         format!(
-            "{} ({})  文件:{}  剪贴板:{}  音频:{}  {}",
+            "{} ({})  文件:{}  剪贴板:{}  音频:{}  来源:{}  {}",
             self.display_name(),
             &self.device_id[..8.min(self.device_id.len())],
             self.file_sync_mode.label(),
             self.clipboard_mode.label(),
             self.audio_mode.label(),
+            self.source.label(),
             addresses
         )
     }
@@ -469,6 +496,7 @@ fn discovered_peer_from_mdns(info: &mdns_sd::ResolvedService) -> Option<Discover
         file_sync_mode,
         clipboard_mode,
         audio_mode,
+        source: DiscoverySource::Mdns,
         port: info.get_port(),
         addresses,
     })
@@ -525,6 +553,7 @@ fn discovered_peer_from_lnd(node: &DiscoveredNode) -> Option<DiscoveredPeer> {
         file_sync_mode,
         clipboard_mode,
         audio_mode,
+        source: DiscoverySource::Lnd,
         port: node.port,
         addresses,
     })
@@ -546,6 +575,7 @@ fn merge_peers(
                 existing.addresses.extend(peer.addresses);
                 existing.addresses.sort();
                 existing.addresses.dedup();
+                existing.source = existing.source.merge(peer.source);
             }
             None => {
                 merged.insert(key, peer);
@@ -606,8 +636,8 @@ pub fn format_display_name(instance_name: Option<&str>, device_name: &str) -> St
 #[cfg(test)]
 mod tests {
     use super::{
-        Advertisement, LND_SERVICE_TYPE, build_lnd_announce_spec, combine_browse_results,
-        discovered_peer_from_lnd, merge_peers, normalize_lnd_config,
+        Advertisement, DiscoverySource, LND_SERVICE_TYPE, build_lnd_announce_spec,
+        combine_browse_results, discovered_peer_from_lnd, merge_peers, normalize_lnd_config,
     };
     use crate::cli::{AudioMode, ClipboardMode, FileSyncMode};
     use crate::config::{DeviceConfig, LndDiscoveryConfig};
@@ -621,9 +651,9 @@ mod tests {
 
     #[test]
     fn merge_peers_unions_addresses_for_same_instance() {
-        let mut mdns = sample_peer();
+        let mut mdns = sample_peer(DiscoverySource::Mdns);
         mdns.fullname = "mdns".to_string();
-        let mut lnd = sample_peer();
+        let mut lnd = sample_peer(DiscoverySource::Lnd);
         lnd.fullname = "lnd".to_string();
         lnd.addresses = vec![Ipv4Addr::new(10, 0, 0, 8)];
 
@@ -632,12 +662,13 @@ mod tests {
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].fullname, "mdns");
         assert_eq!(peers[0].addresses.len(), 2);
+        assert_eq!(peers[0].source, DiscoverySource::MdnsAndLnd);
     }
 
     #[test]
     fn browse_results_degrade_when_one_backend_fails() {
-        let mdns_peer = sample_peer();
-        let lnd_peer = sample_peer();
+        let mdns_peer = sample_peer(DiscoverySource::Mdns);
+        let lnd_peer = sample_peer(DiscoverySource::Lnd);
 
         let from_mdns = combine_browse_results(
             Ok(vec![mdns_peer.clone()]),
@@ -646,7 +677,7 @@ mod tests {
         .unwrap();
         let from_lnd = combine_browse_results(
             Err(anyhow::anyhow!("mDNS unavailable")),
-            Ok(vec![lnd_peer]),
+            Ok(vec![lnd_peer.clone()]),
         )
         .unwrap();
         let both_failed = combine_browse_results(
@@ -654,8 +685,8 @@ mod tests {
             Err(anyhow::anyhow!("LND unavailable")),
         );
 
-        assert_eq!(from_mdns, vec![mdns_peer.clone()]);
-        assert_eq!(from_lnd, vec![mdns_peer]);
+        assert_eq!(from_mdns, vec![mdns_peer]);
+        assert_eq!(from_lnd, vec![lnd_peer]);
         assert!(both_failed.is_err());
     }
 
@@ -743,6 +774,7 @@ mod tests {
         assert_eq!(peer.file_sync_mode, FileSyncMode::Both);
         assert_eq!(peer.clipboard_mode, ClipboardMode::Receive);
         assert_eq!(peer.audio_mode, AudioMode::Send);
+        assert_eq!(peer.source, DiscoverySource::Lnd);
         assert_eq!(peer.addresses, vec![Ipv4Addr::LOCALHOST]);
 
         let _ = shutdown_tx.send(());
@@ -765,7 +797,7 @@ mod tests {
         }
     }
 
-    fn sample_peer() -> super::DiscoveredPeer {
+    fn sample_peer(source: DiscoverySource) -> super::DiscoveredPeer {
         super::DiscoveredPeer {
             fullname: String::new(),
             device_name: "demo-device".to_string(),
@@ -774,6 +806,7 @@ mod tests {
             file_sync_mode: FileSyncMode::Both,
             clipboard_mode: ClipboardMode::Off,
             audio_mode: AudioMode::Off,
+            source,
             port: 8080,
             addresses: vec![Ipv4Addr::new(192, 168, 1, 20)],
         }
