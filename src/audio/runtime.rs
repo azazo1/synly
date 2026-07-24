@@ -34,16 +34,23 @@ impl AudioChannelDirection {
 
 pub struct AudioTaskHandle {
     stop_flag: Arc<AtomicBool>,
-    task: JoinHandle<Result<()>>,
+    task: Option<JoinHandle<Result<()>>>,
 }
 
 impl AudioTaskHandle {
-    pub async fn stop(self) -> Result<()> {
+    pub async fn stop(mut self) -> Result<()> {
         self.stop_flag.store(true, Ordering::Relaxed);
-        match self.task.await {
+        let task = self.task.take().context("audio task handle is missing")?;
+        match task.await {
             Ok(result) => result,
             Err(err) => Err(err.into()),
         }
+    }
+}
+
+impl Drop for AudioTaskHandle {
+    fn drop(&mut self) {
+        self.stop_flag.store(true, Ordering::Relaxed);
     }
 }
 
@@ -71,7 +78,13 @@ pub fn bind_and_spawn_receiver(
             expected_peer_ip,
         )
     });
-    Ok((AudioTaskHandle { stop_flag, task }, local_port))
+    Ok((
+        AudioTaskHandle {
+            stop_flag,
+            task: Some(task),
+        },
+        local_port,
+    ))
 }
 
 pub fn spawn_sender(
@@ -97,7 +110,10 @@ pub fn spawn_sender(
             remote_addr,
         )
     });
-    Ok(AudioTaskHandle { stop_flag, task })
+    Ok(AudioTaskHandle {
+        stop_flag,
+        task: Some(task),
+    })
 }
 
 fn run_sender_loop(
@@ -343,7 +359,9 @@ impl hkdf::KeyType for HkdfLen {
 
 #[cfg(test)]
 mod tests {
-    use super::{AudioChannelDirection, AudioDecryptor, AudioEncryptor};
+    use super::{AudioChannelDirection, AudioDecryptor, AudioEncryptor, AudioTaskHandle};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
     fn audio_crypto_roundtrip_preserves_payload() {
@@ -356,5 +374,21 @@ mod tests {
         let decoded = receiver.decrypt(&packet).unwrap();
 
         assert_eq!(decoded, payload);
+    }
+
+    #[tokio::test]
+    async fn dropping_audio_task_requests_stop() {
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let task = tokio::spawn(std::future::pending::<anyhow::Result<()>>());
+        let abort_handle = task.abort_handle();
+        let handle = AudioTaskHandle {
+            stop_flag: Arc::clone(&stop_flag),
+            task: Some(task),
+        };
+
+        drop(handle);
+
+        assert!(stop_flag.load(Ordering::Relaxed));
+        abort_handle.abort();
     }
 }

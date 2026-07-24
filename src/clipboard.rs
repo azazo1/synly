@@ -156,12 +156,22 @@ impl ClipboardSync {
 
 impl ClipboardWatcherHandle {
     pub fn stop(mut self) {
+        self.stop_inner();
+    }
+
+    fn stop_inner(&mut self) {
         if let Some(shutdown) = self.shutdown.take() {
             shutdown.stop();
         }
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
+    }
+}
+
+impl Drop for ClipboardWatcherHandle {
+    fn drop(&mut self) {
+        self.stop_inner();
     }
 }
 

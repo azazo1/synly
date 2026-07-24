@@ -218,78 +218,85 @@ async fn run_host(config: &mut SynlyConfig, options: RuntimeOptions) -> Result<(
     let device = config.device.clone();
     let mut pairing_throttle = PairingThrottle::default();
     let notifier = SystemNotifier::new(options.notifications_enabled);
-    let listener = TcpListener::bind(("0.0.0.0", options.pairing.port.unwrap_or(0)))
-        .await
-        .context("failed to bind TCP listener")?;
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+    let listener = tokio::select! {
+        result = TcpListener::bind(("0.0.0.0", options.pairing.port.unwrap_or(0))) => {
+            result.context("failed to bind TCP listener")?
+        }
+        signal_result = &mut ctrl_c => return finish_ctrl_c(signal_result),
+    };
     let port = listener.local_addr()?.port();
-    let advertisement = discovery::advertise(
-        &Advertisement {
-            port,
-            device: device.clone(),
-            file_sync_mode: options.file_sync_mode,
-            clipboard_mode: options.clipboard_mode,
-            audio_mode: options.audio_mode,
-            instance_name: options.instance_name.clone(),
-        },
-        &options.discovery,
-    )
-    .await?;
+    let advertisement_details = Advertisement {
+        port,
+        device: device.clone(),
+        file_sync_mode: options.file_sync_mode,
+        clipboard_mode: options.clipboard_mode,
+        audio_mode: options.audio_mode,
+        instance_name: options.instance_name.clone(),
+    };
+    let advertisement = tokio::select! {
+        result = discovery::advertise(&advertisement_details, &options.discovery) => result?,
+        signal_result = &mut ctrl_c => return finish_ctrl_c(signal_result),
+    };
 
     print_host_ready(&device, &options, port);
 
-    let result = async {
-        loop {
-            let (socket, address) = listener.accept().await?;
-            match handle_incoming_connection(
-                socket,
-                address,
-                &mut pairing_throttle,
-                config,
-                &options,
-            )
-            .await
-            {
-                Ok(Some(session)) => {
-                    let remote_label = format!(
-                        "{} ({})",
-                        identity_display_name(&session.remote),
-                        short_uuid(&session.remote.device_id)
-                    );
-                    let peer = notification_peer(&session.remote);
-                    match run_with_session_notifications(
-                        &notifier,
-                        peer,
-                        run_sync_session(
-                            session,
-                            &options.workspace,
-                            SyncSessionOptions {
-                                interval_secs: options.interval_secs,
-                                sync_delete: options.sync_delete,
-                                clipboard_mode: options.clipboard_mode,
-                                audio_mode: options.audio_mode,
-                                clipboard_options: &options.clipboard,
-                                transfer_limits: options.transfer_limits,
-                            },
-                        ),
-                    )
-                    .await
-                    {
-                        Ok(()) => {
-                            println!("与 {remote_label} 的连接已断开, 继续等待重连.");
-                        }
-                        Err(err) => {
-                            eprintln!("与 {remote_label} 的同步会话中断: {err:#}");
+    let result = tokio::select! {
+        result = async {
+            loop {
+                let (socket, address) = listener.accept().await?;
+                match handle_incoming_connection(
+                    socket,
+                    address,
+                    &mut pairing_throttle,
+                    config,
+                    &options,
+                )
+                .await
+                {
+                    Ok(Some(session)) => {
+                        let remote_label = format!(
+                            "{} ({})",
+                            identity_display_name(&session.remote),
+                            short_uuid(&session.remote.device_id)
+                        );
+                        let peer = notification_peer(&session.remote);
+                        match run_with_session_notifications(
+                            &notifier,
+                            peer,
+                            run_sync_session(
+                                session,
+                                &options.workspace,
+                                SyncSessionOptions {
+                                    interval_secs: options.interval_secs,
+                                    sync_delete: options.sync_delete,
+                                    clipboard_mode: options.clipboard_mode,
+                                    audio_mode: options.audio_mode,
+                                    clipboard_options: &options.clipboard,
+                                    transfer_limits: options.transfer_limits,
+                                },
+                            ),
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                println!("与 {remote_label} 的连接已断开, 继续等待重连.");
+                            }
+                            Err(err) => {
+                                eprintln!("与 {remote_label} 的同步会话中断: {err:#}");
+                            }
                         }
                     }
-                }
-                Ok(None) => continue,
-                Err(err) => {
-                    eprintln!("连接失败: {err:#}");
+                    Ok(None) => continue,
+                    Err(err) => {
+                        eprintln!("连接失败: {err:#}");
+                    }
                 }
             }
-        }
-    }
-    .await;
+        } => result,
+        signal_result = &mut ctrl_c => finish_ctrl_c(signal_result),
+    };
     advertisement.stop().await;
     result
 }
@@ -302,79 +309,92 @@ async fn run_client(config: &mut SynlyConfig, options: RuntimeOptions) -> Result
     let mut reconnect_query = options.pairing.peer_query.clone();
     let mut reconnect_delay = RECONNECT_BASE_DELAY;
     let notifier = SystemNotifier::new(options.notifications_enabled);
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
 
-    loop {
-        let peer_target = match choose_peer(
-            reconnect_query.as_deref(),
-            discovery_timeout,
-            options.pairing.no_interact,
-            &local_workspace_summary,
-            &options.discovery,
-        )
-        .await
-        {
-            Ok(peer) => peer,
-            Err(err) => {
-                if reconnect_query.is_some() {
-                    eprintln!("等待目标设备重新出现: {err:#}");
-                    sleep_before_reconnect(reconnect_delay).await;
-                    reconnect_delay = next_reconnect_delay(reconnect_delay);
-                    continue;
-                }
-                return Err(err);
-            }
-        };
-        if let PeerTarget::Discovered(peer) = &peer_target {
-            println!(
-                "已发现设备: {} ({})  来源:{}",
-                peer.display_name(),
-                &peer.device_id[..8.min(peer.device_id.len())],
-                peer.source.label()
-            );
-        }
-        reconnect_query = Some(peer_target.reconnect_query());
-
-        match connect_to_peer(&peer_target, config, &options).await {
-            Ok(session) => {
-                let remote_label = format!(
-                    "{} ({})",
-                    identity_display_name(&session.remote),
-                    short_uuid(&session.remote.device_id)
-                );
-                reconnect_delay = RECONNECT_BASE_DELAY;
-                let peer = notification_peer(&session.remote);
-                if let Err(err) = run_with_session_notifications(
-                    &notifier,
-                    peer,
-                    run_sync_session(
-                        session,
-                        &options.workspace,
-                        SyncSessionOptions {
-                            interval_secs: options.interval_secs,
-                            sync_delete: options.sync_delete,
-                            clipboard_mode: options.clipboard_mode,
-                            audio_mode: options.audio_mode,
-                            clipboard_options: &options.clipboard,
-                            transfer_limits: options.transfer_limits,
-                        },
-                    ),
+    tokio::select! {
+        result = async {
+            loop {
+                let peer_target = match choose_peer(
+                    reconnect_query.as_deref(),
+                    discovery_timeout,
+                    options.pairing.no_interact,
+                    &local_workspace_summary,
+                    &options.discovery,
                 )
                 .await
                 {
-                    eprintln!("与 {remote_label} 的同步会话中断: {err:#}");
-                } else {
-                    eprintln!("与 {remote_label} 的连接已断开。");
+                    Ok(peer) => peer,
+                    Err(err) => {
+                        if reconnect_query.is_some() {
+                            eprintln!("等待目标设备重新出现: {err:#}");
+                            sleep_before_reconnect(reconnect_delay).await;
+                            reconnect_delay = next_reconnect_delay(reconnect_delay);
+                            continue;
+                        }
+                        return Err(err);
+                    }
+                };
+                if let PeerTarget::Discovered(peer) = &peer_target {
+                    println!(
+                        "已发现设备: {} ({})  来源:{}",
+                        peer.display_name(),
+                        &peer.device_id[..8.min(peer.device_id.len())],
+                        peer.source.label()
+                    );
                 }
-                sleep_before_reconnect(reconnect_delay).await;
-                reconnect_delay = next_reconnect_delay(reconnect_delay);
+                reconnect_query = Some(peer_target.reconnect_query());
+
+                match connect_to_peer(&peer_target, config, &options).await {
+                    Ok(session) => {
+                        let remote_label = format!(
+                            "{} ({})",
+                            identity_display_name(&session.remote),
+                            short_uuid(&session.remote.device_id)
+                        );
+                        reconnect_delay = RECONNECT_BASE_DELAY;
+                        let peer = notification_peer(&session.remote);
+                        if let Err(err) = run_with_session_notifications(
+                            &notifier,
+                            peer,
+                            run_sync_session(
+                                session,
+                                &options.workspace,
+                                SyncSessionOptions {
+                                    interval_secs: options.interval_secs,
+                                    sync_delete: options.sync_delete,
+                                    clipboard_mode: options.clipboard_mode,
+                                    audio_mode: options.audio_mode,
+                                    clipboard_options: &options.clipboard,
+                                    transfer_limits: options.transfer_limits,
+                                },
+                            ),
+                        )
+                        .await
+                        {
+                            eprintln!("与 {remote_label} 的同步会话中断: {err:#}");
+                        } else {
+                            eprintln!("与 {remote_label} 的连接已断开.");
+                        }
+                        sleep_before_reconnect(reconnect_delay).await;
+                        reconnect_delay = next_reconnect_delay(reconnect_delay);
+                    }
+                    Err(err) => {
+                        eprintln!("连接失败: {err:#}");
+                        sleep_before_reconnect(reconnect_delay).await;
+                        reconnect_delay = next_reconnect_delay(reconnect_delay);
+                    }
+                }
             }
-            Err(err) => {
-                eprintln!("连接失败: {err:#}");
-                sleep_before_reconnect(reconnect_delay).await;
-                reconnect_delay = next_reconnect_delay(reconnect_delay);
-            }
-        }
+        } => result,
+        signal_result = &mut ctrl_c => finish_ctrl_c(signal_result),
     }
+}
+
+fn finish_ctrl_c(signal_result: std::io::Result<()>) -> Result<()> {
+    signal_result.context("failed to listen for Ctrl-C")?;
+    println!("收到 Ctrl-C, 正在安全退出.");
+    Ok(())
 }
 
 fn notification_peer(identity: &DeviceIdentity) -> NotificationPeer {
@@ -394,9 +414,20 @@ where
     F: Future<Output = Result<T>>,
 {
     notifier.notify(ConnectionEvent::Connected, &peer);
-    let result = session.await;
-    notifier.notify(ConnectionEvent::Disconnected, &peer);
-    result
+    let _guard = SessionNotificationGuard { notifier, peer };
+    session.await
+}
+
+struct SessionNotificationGuard<'a, N: SessionNotifier> {
+    notifier: &'a N,
+    peer: NotificationPeer,
+}
+
+impl<N: SessionNotifier> Drop for SessionNotificationGuard<'_, N> {
+    fn drop(&mut self) {
+        self.notifier
+            .notify(ConnectionEvent::Disconnected, &self.peer);
+    }
 }
 
 async fn handle_incoming_connection(
@@ -1424,6 +1455,25 @@ struct SyncSessionOptions<'a> {
     transfer_limits: TransferLimits,
 }
 
+#[derive(Default)]
+struct SessionTaskAbortGuard {
+    handles: Vec<tokio::task::AbortHandle>,
+}
+
+impl SessionTaskAbortGuard {
+    fn track<T>(&mut self, task: &tokio::task::JoinHandle<T>) {
+        self.handles.push(task.abort_handle());
+    }
+}
+
+impl Drop for SessionTaskAbortGuard {
+    fn drop(&mut self) {
+        for handle in &self.handles {
+            handle.abort();
+        }
+    }
+}
+
 async fn run_sync_session(
     session: AuthenticatedSession,
     workspace: &WorkspaceSpec,
@@ -1486,7 +1536,9 @@ async fn run_sync_session(
 
     let (read_half, write_half) = tokio::io::split(session.stream);
     let (tx, rx) = mpsc::channel::<Frame>(64);
+    let mut session_tasks = SessionTaskAbortGuard::default();
     let writer_task = tokio::spawn(writer_loop(write_half, rx, options.transfer_limits));
+    session_tasks.track(&writer_task);
 
     let (snapshot_control_tx, snapshot_control_rx) = mpsc::unbounded_channel();
     let (advertised_snapshot_tx, mut advertised_snapshot_rx) =
@@ -1497,7 +1549,7 @@ async fn run_sync_session(
             .clone()
             .context("session negotiated sending, but local workspace has no outgoing selection")?;
         let sender = tx.clone();
-        Some(tokio::spawn(snapshot_loop(
+        let task = tokio::spawn(snapshot_loop(
             outgoing,
             sender,
             options.interval_secs.max(1),
@@ -1507,7 +1559,9 @@ async fn run_sync_session(
                 InitialSnapshotPolicy::PublishImmediately
             ),
             advertised_snapshot_tx,
-        )))
+        ));
+        session_tasks.track(&task);
+        Some(task)
     } else {
         None
     };
@@ -1536,8 +1590,9 @@ async fn run_sync_session(
             eprintln!("无法读取当前剪贴板内容，已跳过初始剪贴板同步: {err:#}");
         }
         let sender = tx.clone();
-        let task = Some(tokio::spawn(clipboard_sender_loop(clipboard_rx, sender)));
-        (watcher, task)
+        let task = tokio::spawn(clipboard_sender_loop(clipboard_rx, sender));
+        session_tasks.track(&task);
+        (watcher, Some(task))
     } else {
         (None, None)
     };
@@ -3715,12 +3770,13 @@ fn short_uuid(id: &Uuid) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        FILE_STREAM_CHUNK_SIZE, InitialSnapshotPolicy, SessionRole, SnapshotEchoSuppressions,
-        SnapshotPathExpectation, accept_policy_label, build_remote_echo_expectations, choose_peer,
-        delete_policy, handle_file_chunk, identity_display_name, is_connection_shutdown_error,
-        next_reconnect_delay, parse_direct_peer_addr, peer_matches_query, preferred_peer_query,
-        resolve_audio_plan, resolve_initial_snapshot_policy, run_with_session_notifications,
-        select_peer_from_query, send_one_file, should_auto_accept_request, should_try_direct_trusted,
+        FILE_STREAM_CHUNK_SIZE, InitialSnapshotPolicy, SessionRole, SessionTaskAbortGuard,
+        SnapshotEchoSuppressions, SnapshotPathExpectation, accept_policy_label,
+        build_remote_echo_expectations, choose_peer, delete_policy, handle_file_chunk,
+        identity_display_name, is_connection_shutdown_error, next_reconnect_delay,
+        parse_direct_peer_addr, peer_matches_query, preferred_peer_query, resolve_audio_plan,
+        resolve_initial_snapshot_policy, run_with_session_notifications, select_peer_from_query,
+        send_one_file, should_auto_accept_request, should_try_direct_trusted,
         trusted_transport_for_device, trusted_transport_for_identity,
     };
     use crate::audio::AudioChannelDirection;
@@ -4215,6 +4271,43 @@ mod tests {
                 ConnectionEvent::Disconnected,
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn session_notifications_cover_cancellation() {
+        let notifier = RecordingNotifier::default();
+        let peer = NotificationPeer {
+            display_name: "demo".to_string(),
+            short_device_id: "12345678".to_string(),
+        };
+        let mut session = Box::pin(run_with_session_notifications(
+            &notifier,
+            peer,
+            std::future::pending::<anyhow::Result<()>>(),
+        ));
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), session.as_mut())
+                .await
+                .is_err()
+        );
+        drop(session);
+
+        assert_eq!(
+            *notifier.events.lock().unwrap(),
+            vec![ConnectionEvent::Connected, ConnectionEvent::Disconnected]
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_session_task_guard_aborts_tracked_tasks() {
+        let task = tokio::spawn(std::future::pending::<()>());
+        let mut guard = SessionTaskAbortGuard::default();
+        guard.track(&task);
+
+        drop(guard);
+
+        assert!(task.await.unwrap_err().is_cancelled());
     }
 
     #[test]

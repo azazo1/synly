@@ -6,12 +6,16 @@ use lnd::{AnnounceHandle, AnnounceSpec, DiscoveryFilter, DiscoveredNode, LndClie
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use url::Url;
 use uuid::Uuid;
 
 pub const MDNS_SERVICE_TYPE: &str = "_synly._tcp.local.";
 pub const LND_SERVICE_TYPE: &str = "_synly._tcp";
+const MDNS_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const LND_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug)]
 pub struct Advertisement {
@@ -41,12 +45,14 @@ pub struct DiscoveryRegistration {
 impl DiscoveryRegistration {
     pub async fn stop(self) {
         let Self { mdns, lnd } = self;
-        if let Some(handle) = lnd
-            && let Err(err) = handle.stop().await
-        {
-            eprintln!("停止 LND 租约续期时出错: {err}");
-        }
         drop(mdns);
+        if let Some(handle) = lnd {
+            match tokio::time::timeout(LND_STOP_TIMEOUT, handle.stop()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => eprintln!("停止 LND 租约续期时出错: {err}"),
+                Err(_) => eprintln!("停止 LND 租约续期超时, 已继续退出."),
+            }
+        }
     }
 }
 
@@ -186,7 +192,10 @@ pub async fn browse(
     timeout: Duration,
     discovery: &DiscoveryConfig,
 ) -> Result<Vec<DiscoveredPeer>> {
-    let mdns_task = tokio::task::spawn_blocking(move || browse_mdns(timeout));
+    let mdns_cancelled = Arc::new(AtomicBool::new(false));
+    let _mdns_cancellation = BrowseCancellation(Arc::clone(&mdns_cancelled));
+    let mdns_task =
+        tokio::task::spawn_blocking(move || browse_mdns(timeout, &mdns_cancelled));
     let lnd_config = discovery.lnd.clone();
     let lnd_task = async move {
         match lnd_config.as_ref() {
@@ -202,6 +211,14 @@ pub async fn browse(
     match lnd_result {
         None => mdns_result,
         Some(lnd_result) => combine_browse_results(mdns_result, lnd_result),
+    }
+}
+
+struct BrowseCancellation(Arc<AtomicBool>);
+
+impl Drop for BrowseCancellation {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
     }
 }
 
@@ -364,7 +381,7 @@ fn advertisement_metadata(advertisement: &Advertisement) -> BTreeMap<String, Str
     metadata
 }
 
-fn browse_mdns(timeout: Duration) -> Result<Vec<DiscoveredPeer>> {
+fn browse_mdns(timeout: Duration, cancelled: &AtomicBool) -> Result<Vec<DiscoveredPeer>> {
     let daemon = ServiceDaemon::new().context("failed to start mDNS browsing daemon")?;
     let receiver = daemon
         .browse(MDNS_SERVICE_TYPE)
@@ -373,11 +390,16 @@ fn browse_mdns(timeout: Duration) -> Result<Vec<DiscoveredPeer>> {
     let mut peers = BTreeMap::<String, DiscoveredPeer>::new();
 
     loop {
+        if cancelled.load(Ordering::Relaxed) {
+            break;
+        }
         let now = Instant::now();
         if now >= deadline {
             break;
         }
-        let wait = deadline.saturating_duration_since(now);
+        let wait = deadline
+            .saturating_duration_since(now)
+            .min(MDNS_CANCEL_POLL_INTERVAL);
         match receiver.recv_timeout(wait) {
             Ok(ServiceEvent::ServiceResolved(info)) => {
                 if let Some(peer) = discovered_peer_from_mdns(&info) {
@@ -388,7 +410,8 @@ fn browse_mdns(timeout: Duration) -> Result<Vec<DiscoveredPeer>> {
                 peers.remove(&fullname);
             }
             Ok(_) => {}
-            Err(_) => break,
+            Err(_) if receiver.is_disconnected() => break,
+            Err(_) => {}
         }
     }
 
@@ -636,8 +659,9 @@ pub fn format_display_name(instance_name: Option<&str>, device_name: &str) -> St
 #[cfg(test)]
 mod tests {
     use super::{
-        Advertisement, DiscoverySource, LND_SERVICE_TYPE, build_lnd_announce_spec,
-        combine_browse_results, discovered_peer_from_lnd, merge_peers, normalize_lnd_config,
+        Advertisement, BrowseCancellation, DiscoverySource, LND_SERVICE_TYPE,
+        build_lnd_announce_spec, combine_browse_results, discovered_peer_from_lnd, merge_peers,
+        normalize_lnd_config,
     };
     use crate::cli::{AudioMode, ClipboardMode, FileSyncMode};
     use crate::config::{DeviceConfig, LndDiscoveryConfig};
@@ -646,6 +670,8 @@ mod tests {
         build_router,
     };
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::sync::oneshot;
     use uuid::Uuid;
 
@@ -663,6 +689,16 @@ mod tests {
         assert_eq!(peers[0].fullname, "mdns");
         assert_eq!(peers[0].addresses.len(), 2);
         assert_eq!(peers[0].source, DiscoverySource::MdnsAndLnd);
+    }
+
+    #[test]
+    fn dropping_browse_cancellation_requests_stop() {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let cancellation = BrowseCancellation(Arc::clone(&cancelled));
+
+        drop(cancellation);
+
+        assert!(cancelled.load(Ordering::Relaxed));
     }
 
     #[test]
