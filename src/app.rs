@@ -30,7 +30,7 @@ use rand::RngExt;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
-use std::net::{SocketAddr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs::File;
@@ -44,6 +44,7 @@ use uuid::Uuid;
 const FILE_STREAM_CHUNK_SIZE: usize = 256 * 1024;
 const PAIRING_TIMEOUT: Duration = Duration::from_secs(90);
 const TLS_UPGRADE_TIMEOUT: Duration = Duration::from_secs(15);
+const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const PAIRING_FAILURE_WINDOW: Duration = Duration::from_secs(5 * 60);
 const PAIRING_COOLDOWN: Duration = Duration::from_secs(3 * 60);
 const PAIRING_MAX_FAILURES: u32 = 5;
@@ -459,22 +460,17 @@ async fn connect_to_peer(
     let device = config.device.clone();
     match peer {
         PeerTarget::Discovered(peer) => {
-            let address = peer
-                .addresses
-                .first()
-                .copied()
-                .context("peer advertised no IPv4 address")?;
             let trusted_transport = trusted_transport_for_peer(config, peer)?;
             if options.pairing.trusted_only && trusted_transport.is_none() {
                 bail!(
                     "目标设备尚未建立完整的可信 mTLS 信任，请先用一次 PIN 配对并加上 --trust-device"
                 );
             }
+            let socket = connect_to_discovered_peer(peer).await?;
             match trusted_transport.as_ref() {
                 Some(trusted_device) => {
                     connect_to_trusted_peer(
-                        address,
-                        peer.port,
+                        socket,
                         &device,
                         trusted_device,
                         config,
@@ -482,9 +478,7 @@ async fn connect_to_peer(
                     )
                     .await
                 }
-                None => {
-                    connect_to_untrusted_peer(address, peer.port, &device, config, options).await
-                }
+                None => connect_to_untrusted_peer(socket, &device, config, options).await,
             }
         }
         PeerTarget::Direct(address) => {
@@ -505,8 +499,100 @@ async fn connect_to_peer(
                     Err(err) => return Err(err),
                 }
             }
-            connect_to_untrusted_peer(*address.ip(), address.port(), &device, config, options).await
+            let socket = connect_tcp(*address.ip(), address.port()).await?;
+            connect_to_untrusted_peer(socket, &device, config, options).await
         }
+    }
+}
+
+async fn connect_to_discovered_peer(peer: &DiscoveredPeer) -> Result<TcpStream> {
+    if peer.addresses.is_empty() {
+        bail!("peer advertised no IPv4 address");
+    }
+    let groups = match discovery::group_peer_addresses(&peer.addresses) {
+        Ok(groups) => groups,
+        Err(err) => {
+            eprintln!("无法读取本机网卡子网, 将并发尝试全部广播地址: {err:#}");
+            discovery::PeerAddressGroups {
+                same_subnet: Vec::new(),
+                fallback: peer.addresses.clone(),
+            }
+        }
+    };
+    let mut failures = Vec::new();
+    if let Some(socket) = race_peer_addresses(
+        "同子网地址",
+        &groups.same_subnet,
+        peer.port,
+        &mut failures,
+    )
+    .await
+    {
+        return Ok(socket);
+    }
+    if !groups.same_subnet.is_empty() && !groups.fallback.is_empty() {
+        eprintln!("同子网地址均无法连接, 正在尝试其余地址.");
+    }
+    if let Some(socket) = race_peer_addresses(
+        "其余地址",
+        &groups.fallback,
+        peer.port,
+        &mut failures,
+    )
+    .await
+    {
+        return Ok(socket);
+    }
+    bail!("无法连接目标设备, 已尝试地址: {}", failures.join("; "))
+}
+
+async fn race_peer_addresses(
+    group_label: &str,
+    addresses: &[Ipv4Addr],
+    port: u16,
+    failures: &mut Vec<String>,
+) -> Option<TcpStream> {
+    if addresses.is_empty() {
+        return None;
+    }
+    let endpoints = addresses
+        .iter()
+        .map(|address| format!("{address}:{port}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("并发尝试{group_label}: {endpoints}.");
+
+    let mut attempts = tokio::task::JoinSet::new();
+    for address in addresses.iter().copied() {
+        attempts.spawn(async move { (address, connect_tcp(address, port).await) });
+    }
+    while let Some(result) = attempts.join_next().await {
+        match result {
+            Ok((address, Ok(socket))) => {
+                attempts.abort_all();
+                println!("已连接 {address}:{port}.");
+                return Some(socket);
+            }
+            Ok((address, Err(err))) => {
+                eprintln!("连接 {address}:{port} 失败: {err:#}");
+                failures.push(format!("{address}:{port}: {err:#}"));
+            }
+            Err(err) => {
+                eprintln!("连接任务异常结束: {err}");
+                failures.push(format!("连接任务异常结束: {err}"));
+            }
+        }
+    }
+    None
+}
+
+async fn connect_tcp(address: Ipv4Addr, port: u16) -> Result<TcpStream> {
+    match time::timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect((address, port))).await {
+        Ok(result) => result.with_context(|| format!("failed to connect to {address}:{port}")),
+        Err(_) => bail!(
+            "连接 {address}:{port} 超过 {} 秒",
+            TCP_CONNECT_TIMEOUT.as_secs()
+        ),
     }
 }
 
@@ -1058,16 +1144,12 @@ async fn handle_bootstrap_incoming_connection(
 }
 
 async fn connect_to_trusted_peer(
-    address: std::net::Ipv4Addr,
-    port: u16,
+    socket: TcpStream,
     device: &DeviceConfig,
     trusted_device: &TrustedDeviceConfig,
     config: &mut SynlyConfig,
     options: &RuntimeOptions,
 ) -> Result<AuthenticatedSession> {
-    let socket = TcpStream::connect((address, port))
-        .await
-        .with_context(|| format!("failed to connect to {}:{}", address, port))?;
     let remote_socket_addr = socket.peer_addr()?;
     let connector =
         crypto::build_client_connector(device, trusted_device.tls_root_certificate.as_str())?;
@@ -1100,9 +1182,7 @@ async fn connect_to_direct_trusted_peer(
         );
     }
 
-    let socket = TcpStream::connect((address, port))
-        .await
-        .with_context(|| format!("failed to connect to {}:{}", address, port))?;
+    let socket = connect_tcp(address, port).await?;
     let remote_socket_addr = socket.peer_addr()?;
     let connector =
         crypto::build_client_connector_for_trusted_devices(device, &config.trusted_devices)
@@ -1226,16 +1306,12 @@ where
 }
 
 async fn connect_to_untrusted_peer(
-    address: std::net::Ipv4Addr,
-    port: u16,
+    mut socket: TcpStream,
     device: &DeviceConfig,
     config: &mut SynlyConfig,
     options: &RuntimeOptions,
 ) -> Result<AuthenticatedSession> {
     let transfer_limits = options.transfer_limits;
-    let mut socket = TcpStream::connect((address, port))
-        .await
-        .with_context(|| format!("failed to connect to {}:{}", address, port))?;
     let remote_socket_addr = socket.peer_addr()?;
     let client_bootstrap_key = crypto::generate_bootstrap_key_material()?;
     let client_bootstrap_public_key = client_bootstrap_key.public_key_encoded();
@@ -3774,9 +3850,9 @@ mod tests {
         SnapshotEchoSuppressions, SnapshotPathExpectation, accept_policy_label,
         build_remote_echo_expectations, choose_peer, delete_policy, handle_file_chunk,
         identity_display_name, is_connection_shutdown_error, next_reconnect_delay,
-        parse_direct_peer_addr, peer_matches_query, preferred_peer_query, resolve_audio_plan,
-        resolve_initial_snapshot_policy, run_with_session_notifications, select_peer_from_query,
-        send_one_file, should_auto_accept_request, should_try_direct_trusted,
+        parse_direct_peer_addr, peer_matches_query, preferred_peer_query, race_peer_addresses,
+        resolve_audio_plan, resolve_initial_snapshot_policy, run_with_session_notifications,
+        select_peer_from_query, send_one_file, should_auto_accept_request, should_try_direct_trusted,
         trusted_transport_for_device, trusted_transport_for_identity,
     };
     use crate::audio::AudioChannelDirection;
@@ -4308,6 +4384,36 @@ mod tests {
         drop(guard);
 
         assert!(task.await.unwrap_err().is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn peer_address_race_returns_the_first_successful_connection() {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept_task = tokio::spawn(async move { listener.accept().await.unwrap() });
+        let mut failures = Vec::new();
+
+        let socket = tokio::time::timeout(
+            Duration::from_secs(1),
+            race_peer_addresses(
+                "测试地址",
+                &[Ipv4Addr::new(192, 0, 2, 1), Ipv4Addr::LOCALHOST],
+                port,
+                &mut failures,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(socket.peer_addr().unwrap().ip(), Ipv4Addr::LOCALHOST);
+        drop(socket);
+        tokio::time::timeout(Duration::from_secs(1), accept_task)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[test]

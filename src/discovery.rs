@@ -1,7 +1,7 @@
 use crate::cli::{AudioMode, ClipboardMode, FileSyncMode};
 use crate::config::{DeviceConfig, DiscoveryConfig, LndDiscoveryConfig};
 use anyhow::{Context, Result, anyhow, bail};
-use if_addrs::get_if_addrs;
+use if_addrs::{IfAddr, get_if_addrs};
 use lnd::{AnnounceHandle, AnnounceSpec, DiscoveryFilter, DiscoveredNode, LndClient};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use std::collections::{BTreeMap, HashMap};
@@ -125,6 +125,17 @@ struct PeerKey {
     device_id: String,
     instance_name: Option<String>,
     port: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct LocalIpv4Interface {
+    address: Ipv4Addr,
+    netmask: Ipv4Addr,
+}
+
+pub struct PeerAddressGroups {
+    pub same_subnet: Vec<Ipv4Addr>,
+    pub fallback: Vec<Ipv4Addr>,
 }
 
 struct LndRegistrationStart {
@@ -608,20 +619,61 @@ fn merge_peers(
     merged.into_values().collect()
 }
 
+pub fn group_peer_addresses(addresses: &[Ipv4Addr]) -> Result<PeerAddressGroups> {
+    let interfaces = local_ipv4_interfaces()?;
+    Ok(group_peer_addresses_for_interfaces(addresses, &interfaces))
+}
+
+fn group_peer_addresses_for_interfaces(
+    addresses: &[Ipv4Addr],
+    interfaces: &[LocalIpv4Interface],
+) -> PeerAddressGroups {
+    let (mut same_subnet, mut fallback): (Vec<Ipv4Addr>, Vec<Ipv4Addr>) =
+        addresses.iter().copied().partition(|address| {
+            interfaces
+                .iter()
+                .any(|interface| same_ipv4_subnet(*address, interface.address, interface.netmask))
+        });
+    same_subnet.sort();
+    same_subnet.dedup();
+    fallback.sort();
+    fallback.dedup();
+    PeerAddressGroups {
+        same_subnet,
+        fallback,
+    }
+}
+
+fn same_ipv4_subnet(remote: Ipv4Addr, local: Ipv4Addr, netmask: Ipv4Addr) -> bool {
+    u32::from(remote) & u32::from(netmask) == u32::from(local) & u32::from(netmask)
+}
+
 fn local_ipv4_addresses() -> Result<Vec<Ipv4Addr>> {
+    let interfaces = local_ipv4_interfaces()?;
+    let mut addrs = interfaces
+        .into_iter()
+        .map(|interface| interface.address)
+        .collect::<Vec<_>>();
+    addrs.sort();
+    addrs.dedup();
+    Ok(addrs)
+}
+
+fn local_ipv4_interfaces() -> Result<Vec<LocalIpv4Interface>> {
     let interfaces = get_if_addrs().context("failed to enumerate local network interfaces")?;
-    let mut addrs = Vec::new();
+    let mut ipv4_interfaces = Vec::new();
     for interface in interfaces {
         if interface.is_loopback() {
             continue;
         }
-        if let IpAddr::V4(v4) = interface.ip() {
-            addrs.push(v4);
+        if let IfAddr::V4(v4) = interface.addr {
+            ipv4_interfaces.push(LocalIpv4Interface {
+                address: v4.ip,
+                netmask: v4.netmask,
+            });
         }
     }
-    addrs.sort();
-    addrs.dedup();
-    Ok(addrs)
+    Ok(ipv4_interfaces)
 }
 
 fn sanitize_label(label: &str) -> String {
@@ -659,9 +711,9 @@ pub fn format_display_name(instance_name: Option<&str>, device_name: &str) -> St
 #[cfg(test)]
 mod tests {
     use super::{
-        Advertisement, BrowseCancellation, DiscoverySource, LND_SERVICE_TYPE,
-        build_lnd_announce_spec, combine_browse_results, discovered_peer_from_lnd, merge_peers,
-        normalize_lnd_config,
+        Advertisement, BrowseCancellation, DiscoverySource, LND_SERVICE_TYPE, LocalIpv4Interface,
+        build_lnd_announce_spec, combine_browse_results, discovered_peer_from_lnd,
+        group_peer_addresses_for_interfaces, merge_peers, normalize_lnd_config,
     };
     use crate::cli::{AudioMode, ClipboardMode, FileSyncMode};
     use crate::config::{DeviceConfig, LndDiscoveryConfig};
@@ -689,6 +741,39 @@ mod tests {
         assert_eq!(peers[0].fullname, "mdns");
         assert_eq!(peers[0].addresses.len(), 2);
         assert_eq!(peers[0].source, DiscoverySource::MdnsAndLnd);
+    }
+
+    #[test]
+    fn peer_addresses_are_grouped_by_local_subnet() {
+        let addresses = vec![
+            Ipv4Addr::new(172, 18, 144, 1),
+            Ipv4Addr::new(192, 168, 110, 138),
+            Ipv4Addr::new(192, 168, 137, 1),
+        ];
+        let interfaces = vec![
+            LocalIpv4Interface {
+                address: Ipv4Addr::new(192, 168, 110, 42),
+                netmask: Ipv4Addr::new(255, 255, 255, 0),
+            },
+            LocalIpv4Interface {
+                address: Ipv4Addr::new(172, 16, 0, 2),
+                netmask: Ipv4Addr::new(255, 240, 0, 0),
+            },
+        ];
+
+        let groups = group_peer_addresses_for_interfaces(&addresses, &interfaces);
+
+        assert_eq!(
+            groups.same_subnet,
+            vec![
+                Ipv4Addr::new(172, 18, 144, 1),
+                Ipv4Addr::new(192, 168, 110, 138),
+            ]
+        );
+        assert_eq!(
+            groups.fallback,
+            vec![Ipv4Addr::new(192, 168, 137, 1)]
+        );
     }
 
     #[test]
