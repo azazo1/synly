@@ -1,3 +1,0 @@
-#!/bin/bash
-# this is used for synly host to demo launch in tape
-docker compose exec synly-host synly $@
