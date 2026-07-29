@@ -1,12 +1,15 @@
-use crate::config::{DiscoveryConfig, SynlyConfig};
+use crate::config::{DiscoveryConfig, RuntimeConfig, SynlyConfig};
+use crate::clipboard::ClipboardRuntimeOptions;
 use crate::input::{Hotkey, InputMode, InputRuntimeOptions, ScreenEdge};
 use crate::path_expand::expand_path_string;
-use crate::protocol::TransferLimits;
+use crate::protocol::{RuntimeCapabilities, TransferLimits};
+use crate::runtime_control::{RuntimeControl, RuntimeTuning};
+pub use crate::settings::{
+    AudioMode, ClipboardMode, ConnectionPreference, FileSyncMode, InitialSyncMode,
+};
 use crate::sync::WorkspaceSpec;
 use anyhow::{Context, Result, bail};
-use clap::{Parser, ValueEnum};
-use console::{Term, style};
-use serde::{Deserialize, Serialize};
+use clap::Parser;
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -16,11 +19,8 @@ use std::path::PathBuf;
     about = "在局域网中发现设备、通过 PIN 配对、建立安全连接并持续同步文件与可选剪贴板"
 )]
 pub struct Cli {
-    #[arg(
-        long,
-        help = "禁止进入启动交互；如果启动参数不完整，则直接报错并列出缺失项"
-    )]
-    pub no_interact: bool,
+    #[arg(long, help = "以无界面模式运行; 所有必要参数必须显式提供")]
+    pub headless: bool,
     #[arg(
         long,
         conflicts_with = "no_notifications",
@@ -139,182 +139,6 @@ pub struct Cli {
     pub paths: Vec<PathBuf>,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, ValueEnum, PartialOrd, Ord)]
-#[serde(rename_all = "snake_case")]
-pub enum FileSyncMode {
-    Off,
-    Send,
-    Receive,
-    Both,
-    Auto,
-}
-
-#[derive(
-    Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, ValueEnum, PartialOrd, Ord, Default,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum ClipboardMode {
-    #[default]
-    Off,
-    Send,
-    Receive,
-    Both,
-}
-
-#[derive(
-    Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, ValueEnum, PartialOrd, Ord, Default,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum AudioMode {
-    #[default]
-    Off,
-    Send,
-    Receive,
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, ValueEnum, PartialOrd, Ord)]
-#[serde(rename_all = "snake_case")]
-pub enum InitialSyncMode {
-    This,
-    Other,
-}
-
-impl AudioMode {
-    pub fn label(self) -> &'static str {
-        match self {
-            AudioMode::Off => "关闭",
-            AudioMode::Send => "发送",
-            AudioMode::Receive => "接收",
-        }
-    }
-}
-
-impl InitialSyncMode {
-    pub fn label(self) -> &'static str {
-        match self {
-            InitialSyncMode::This => "本机目录",
-            InitialSyncMode::Other => "对端目录",
-        }
-    }
-
-    pub fn as_arg(self) -> &'static str {
-        match self {
-            InitialSyncMode::This => "this",
-            InitialSyncMode::Other => "other",
-        }
-    }
-}
-
-impl FileSyncMode {
-    pub fn can_send(self) -> bool {
-        matches!(
-            self,
-            FileSyncMode::Send | FileSyncMode::Both | FileSyncMode::Auto
-        )
-    }
-
-    pub fn can_receive(self) -> bool {
-        matches!(
-            self,
-            FileSyncMode::Receive | FileSyncMode::Both | FileSyncMode::Auto
-        )
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            FileSyncMode::Off => "关闭文件同步",
-            FileSyncMode::Send => "发送方",
-            FileSyncMode::Receive => "接收方",
-            FileSyncMode::Both => "双向同步",
-            FileSyncMode::Auto => "自动协商",
-        }
-    }
-
-    pub fn as_wire(self) -> &'static str {
-        match self {
-            FileSyncMode::Off => "off",
-            FileSyncMode::Send => "send",
-            FileSyncMode::Receive => "receive",
-            FileSyncMode::Both => "both",
-            FileSyncMode::Auto => "auto",
-        }
-    }
-
-    pub fn from_wire(value: &str) -> Option<Self> {
-        match value {
-            "off" => Some(Self::Off),
-            "send" => Some(Self::Send),
-            "receive" => Some(Self::Receive),
-            "both" => Some(Self::Both),
-            "auto" => Some(Self::Auto),
-            _ => None,
-        }
-    }
-}
-
-impl ClipboardMode {
-    pub fn can_send(self) -> bool {
-        matches!(self, ClipboardMode::Send | ClipboardMode::Both)
-    }
-
-    pub fn can_receive(self) -> bool {
-        matches!(self, ClipboardMode::Receive | ClipboardMode::Both)
-    }
-
-    pub fn label(self) -> &'static str {
-        match self {
-            ClipboardMode::Off => "关闭",
-            ClipboardMode::Send => "发送方",
-            ClipboardMode::Receive => "接收方",
-            ClipboardMode::Both => "双向同步",
-        }
-    }
-
-    pub fn as_wire(self) -> &'static str {
-        match self {
-            ClipboardMode::Off => "off",
-            ClipboardMode::Send => "send",
-            ClipboardMode::Receive => "receive",
-            ClipboardMode::Both => "both",
-        }
-    }
-
-    pub fn from_wire(value: &str) -> Option<Self> {
-        match value {
-            "off" => Some(Self::Off),
-            "send" => Some(Self::Send),
-            "receive" => Some(Self::Receive),
-            "both" => Some(Self::Both),
-            _ => None,
-        }
-    }
-}
-
-impl AudioMode {
-    pub fn as_wire(self) -> &'static str {
-        match self {
-            AudioMode::Off => "off",
-            AudioMode::Send => "send",
-            AudioMode::Receive => "receive",
-        }
-    }
-
-    pub fn from_wire(value: &str) -> Option<Self> {
-        match value {
-            "off" => Some(Self::Off),
-            "send" => Some(Self::Send),
-            "receive" => Some(Self::Receive),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ConnectionPreference {
-    Host,
-    Join,
-}
-
 #[derive(Clone, Debug)]
 pub struct RuntimeOptions {
     pub file_sync_mode: FileSyncMode,
@@ -332,18 +156,12 @@ pub struct RuntimeOptions {
     pub transfer_limits: TransferLimits,
     pub interval_secs: u64,
     pub pairing: PairingRuntimeOptions,
-}
-
-#[derive(Clone, Debug)]
-pub struct ClipboardRuntimeOptions {
-    pub max_file_bytes: u64,
-    pub max_cache_bytes: Option<u64>,
-    pub cache_dir: PathBuf,
+    pub control: RuntimeControl,
 }
 
 #[derive(Clone, Debug)]
 pub struct PairingRuntimeOptions {
-    pub no_interact: bool,
+    pub headless: bool,
     pub peer_query: Option<String>,
     pub port: Option<u16>,
     pub pin: Option<String>,
@@ -355,16 +173,47 @@ pub struct PairingRuntimeOptions {
 
 pub fn collect_runtime_options(cli: Cli, config: &SynlyConfig) -> Result<RuntimeOptions> {
     let startup_requirements = missing_startup_requirements(&cli);
-    if cli.no_interact && !startup_requirements.is_empty() {
+    if !startup_requirements.is_empty() {
         bail!(
             "{}",
             format_missing_startup_requirements(&startup_requirements)
         );
     }
-    if !startup_requirements.is_empty() {
-        return crate::startup_tui::collect_runtime_options_tui(cli, config);
-    }
     collect_runtime_options_from_cli(cli, config)
+}
+
+pub fn cli_from_runtime_config(
+    runtime: &RuntimeConfig,
+    pin: Option<String>,
+    headless: bool,
+) -> Cli {
+    Cli {
+        headless,
+        notifications: false,
+        no_notifications: false,
+        fs: Some(runtime.file_sync_mode),
+        name: normalize_optional_text(Some(runtime.instance_name.clone())),
+        host: runtime.connection == Some(ConnectionPreference::Host),
+        join: runtime.connection == Some(ConnectionPreference::Join),
+        sync_delete: runtime.sync_delete,
+        no_sync_delete: !runtime.sync_delete,
+        clipboard: Some(runtime.clipboard_mode),
+        audio: Some(runtime.audio_mode),
+        input_mode: Some(runtime.input_mode),
+        input_edge: (runtime.input_mode == InputMode::Send).then_some(runtime.input_edge),
+        input_hotkey: runtime.input_hotkey.clone(),
+        initial: runtime.initial,
+        interval_secs: runtime.interval_secs.max(1),
+        max_folder_depth: runtime.max_folder_depth,
+        peer: normalize_optional_text(Some(runtime.peer_query.clone())),
+        port: runtime.port,
+        pin,
+        accept: runtime.accept,
+        trust_device: runtime.trust_device,
+        trusted_only: runtime.trusted_only,
+        discovery_secs: 3,
+        paths: runtime.paths.clone(),
+    }
 }
 
 fn collect_runtime_options_from_cli(cli: Cli, config: &SynlyConfig) -> Result<RuntimeOptions> {
@@ -405,10 +254,31 @@ fn collect_runtime_options_from_cli(cli: Cli, config: &SynlyConfig) -> Result<Ru
         edge: cli.input_edge.unwrap_or(ScreenEdge::Right),
         hotkey: cli.input_hotkey.parse()?,
     };
+    let clipboard = ClipboardRuntimeOptions {
+        max_file_bytes: config.clipboard.max_file_bytes,
+        max_cache_bytes: config.clipboard.max_cache_bytes,
+        cache_dir: config.clipboard_cache_dir()?,
+    };
+    let capabilities = RuntimeCapabilities {
+        clipboard_mode,
+        audio_mode,
+        input_mode,
+    };
+    let instance_name = normalize_optional_text(cli.name.clone());
+    let tuning = RuntimeTuning {
+        interval_secs: cli.interval_secs.max(1),
+        sync_delete,
+        notifications_enabled,
+        device_name: config.device.device_name.clone(),
+        instance_name: instance_name.clone(),
+        discovery: config.discovery.clone(),
+        input: input.clone(),
+        clipboard: clipboard.clone(),
+    };
     Ok(RuntimeOptions {
         file_sync_mode,
         connection,
-        instance_name: normalize_optional_text(cli.name),
+        instance_name,
         workspace,
         sync_delete,
         clipboard_mode,
@@ -417,15 +287,11 @@ fn collect_runtime_options_from_cli(cli: Cli, config: &SynlyConfig) -> Result<Ru
         input,
         notifications_enabled,
         discovery: config.discovery.clone(),
-        clipboard: ClipboardRuntimeOptions {
-            max_file_bytes: config.clipboard.max_file_bytes,
-            max_cache_bytes: config.clipboard.max_cache_bytes,
-            cache_dir: config.clipboard_cache_dir()?,
-        },
+        clipboard,
         transfer_limits: config.transfer.to_limits()?,
         interval_secs: cli.interval_secs.max(1),
         pairing: PairingRuntimeOptions {
-            no_interact: cli.no_interact,
+            headless: cli.headless,
             peer_query: cli.peer.map(|value| value.trim().to_string()),
             port: cli.port,
             pin,
@@ -434,6 +300,7 @@ fn collect_runtime_options_from_cli(cli: Cli, config: &SynlyConfig) -> Result<Ru
             trusted_only: cli.trusted_only,
             discovery_secs: cli.discovery_secs.max(1),
         },
+        control: RuntimeControl::detached(capabilities, tuning),
     })
 }
 
@@ -454,9 +321,16 @@ fn missing_startup_requirements(cli: &Cli) -> Vec<String> {
         missing.push("缺少连接方式：请传 `--host` 或 `--join`".to_string());
     }
 
-    if cli.no_interact && cli.join && cli.peer.as_deref().unwrap_or("").trim().is_empty() {
+    if cli.headless && cli.join && cli.peer.as_deref().unwrap_or("").trim().is_empty() {
         missing.push(
-            "缺少目标设备：`--no-interact` + `--join` 时请传 `--peer` 指定目标设备".to_string(),
+            "缺少目标设备: headless join 需要通过 `--peer` 指定目标设备".to_string(),
+        );
+    }
+
+    if cli.headless && cli.host && !cli.trusted_only && cli.pin.is_none() {
+        missing.push(
+            "缺少固定 PIN: headless host 需要通过 `--pin` 提供 6 位 PIN, 或启用 `--trusted-only`"
+                .to_string(),
         );
     }
 
@@ -490,8 +364,7 @@ fn missing_startup_requirements(cli: &Cli) -> Vec<String> {
 }
 
 fn format_missing_startup_requirements(missing: &[String]) -> String {
-    let mut message =
-        String::from("已禁止进入启动交互（`--no-interact`），但当前参数还不足以完成启动：");
+    let mut message = String::from("headless 参数不足, 无法启动:");
     for item in missing {
         message.push_str("\n- ");
         message.push_str(item);
@@ -501,93 +374,6 @@ fn format_missing_startup_requirements(missing: &[String]) -> String {
 
 pub fn sync_delete_label(enabled: bool) -> &'static str {
     if enabled { "开启" } else { "关闭" }
-}
-
-pub fn prompt_select(
-    title: &str,
-    options: &[String],
-    default_index: Option<usize>,
-) -> Result<usize> {
-    if options.is_empty() {
-        bail!("no options available for selection");
-    }
-    if let Some(default_index) = default_index
-        && default_index >= options.len()
-    {
-        bail!("default selection index out of range");
-    }
-
-    let term = Term::stdout();
-    term.write_line("")?;
-    term.write_line(&style(title).bold().to_string())?;
-    for (idx, option) in options.iter().enumerate() {
-        let default_suffix = if default_index == Some(idx) {
-            " [默认]"
-        } else {
-            ""
-        };
-        term.write_line(&format!("  {}. {}{}", idx + 1, option, default_suffix))?;
-    }
-    if let Some(index) = default_index {
-        term.write_line(&format!("回车选择默认项 {}", index + 1))?;
-    }
-
-    loop {
-        let raw = prompt_input("编号", None)?;
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            if let Some(index) = default_index {
-                return Ok(index);
-            }
-            term.write_line("请输入编号。")?;
-            continue;
-        }
-
-        match trimmed.parse::<usize>() {
-            Ok(number) if (1..=options.len()).contains(&number) => return Ok(number - 1),
-            Ok(_) => {
-                term.write_line("编号超出范围，请重新输入。")?;
-            }
-            Err(_) => {
-                term.write_line("请输入有效编号。")?;
-            }
-        }
-    }
-}
-
-pub fn prompt_input(label: &str, default: Option<&str>) -> Result<String> {
-    let term = Term::stdout();
-    let prompt = match default {
-        Some(value) => format!("{} [{}]: ", label, value),
-        None => format!("{}: ", label),
-    };
-    term.write_str(&prompt)?;
-    let line = term.read_line()?;
-    let trimmed = line.trim();
-    if trimmed.is_empty()
-        && let Some(value) = default
-    {
-        return Ok(value.to_string());
-    }
-    Ok(trimmed.to_string())
-}
-
-pub fn prompt_secret(label: &str) -> Result<String> {
-    let term = Term::stdout();
-    loop {
-        term.write_line(label)?;
-        let value = prompt_input("PIN", None)?;
-        if value.is_empty() {
-            term.write_line("输入不能为空，请重新输入。")?;
-            continue;
-        }
-        match normalize_pin(&value) {
-            Ok(pin) => return Ok(pin),
-            Err(err) => {
-                term.write_line(&format!("PIN 无效，请重新输入: {err:#}"))?;
-            }
-        }
-    }
 }
 
 pub fn normalize_pin(pin: &str) -> Result<String> {
@@ -603,67 +389,8 @@ pub fn require_peer_query(peer_query: Option<&str>) -> Result<&str> {
         Some(query) if !query.trim().is_empty() => Ok(query.trim()),
         _ => {
             bail!(
-                "join 模式下请用 --peer 指定要连接的设备（支持实例名、设备名、设备 ID 前缀、IPv4 地址，或完整的 IPv4:端口 直连）"
+                "join 模式下请用 `--peer` 指定要连接的设备(支持实例名, 设备名, 设备 ID 前缀, IPv4 地址, 或完整的 IPv4:端口直连)"
             )
-        }
-    }
-}
-
-pub fn resolve_pairing_pin(pin: Option<&str>, no_interact: bool, prompt: &str) -> Result<String> {
-    match pin {
-        Some(pin) => normalize_pin(pin),
-        None if no_interact => {
-            bail!(
-                "当前使用 `--no-interact`，请通过 `--pin` 提供 6 位 PIN，或先建立可信设备后再连接"
-            )
-        }
-        None => prompt_secret(prompt),
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TrustPromptDecision {
-    Accept,
-    AcceptAndTrust,
-    Reject,
-}
-
-pub fn prompt_confirm_with_trust(label: &str, default_trust: bool) -> Result<TrustPromptDecision> {
-    let term = Term::stdout();
-    loop {
-        term.write_line(label)?;
-        let raw = prompt_input("确认 [T/Y/n]", None)?;
-        let trimmed = raw.trim().to_ascii_lowercase();
-        if trimmed.is_empty() {
-            return Ok(if default_trust {
-                TrustPromptDecision::AcceptAndTrust
-            } else {
-                TrustPromptDecision::Accept
-            });
-        }
-        match trimmed.as_str() {
-            "t" | "trust" => return Ok(TrustPromptDecision::AcceptAndTrust),
-            "y" | "yes" => return Ok(TrustPromptDecision::Accept),
-            "n" | "no" => return Ok(TrustPromptDecision::Reject),
-            _ => term.write_line("请输入 t、y 或 n。")?,
-        }
-    }
-}
-
-pub fn prompt_confirm(label: &str, default: bool) -> Result<bool> {
-    let suffix = if default { "[Y/n]" } else { "[y/N]" };
-    let term = Term::stdout();
-    loop {
-        term.write_line(label)?;
-        let raw = prompt_input(&format!("确认 {}", suffix), None)?;
-        let trimmed = raw.trim().to_ascii_lowercase();
-        if trimmed.is_empty() {
-            return Ok(default);
-        }
-        match trimmed.as_str() {
-            "y" | "yes" => return Ok(true),
-            "n" | "no" => return Ok(false),
-            _ => term.write_line("请输入 y 或 n。")?,
         }
     }
 }
@@ -1020,7 +747,7 @@ mod tests {
     }
 
     #[test]
-    fn requires_startup_tui_when_connection_or_path_is_missing() {
+    fn reports_missing_headless_connection_or_path_requirements() {
         let missing_connection = Cli::try_parse_from([
             "synly",
             "--fs",
@@ -1064,7 +791,7 @@ mod tests {
     }
 
     #[test]
-    fn does_not_require_startup_tui_for_complete_noninteractive_cli() {
+    fn accepts_complete_headless_cli_without_interaction() {
         let cli = Cli::try_parse_from([
             "synly",
             "--fs",
@@ -1080,7 +807,7 @@ mod tests {
     }
 
     #[test]
-    fn file_off_mode_without_path_does_not_require_startup_tui() {
+    fn accepts_headless_file_off_mode_without_path() {
         let cli =
             Cli::try_parse_from(["synly", "--fs", "off", "--host", "--clipboard", "both"]).unwrap();
 
@@ -1104,28 +831,46 @@ mod tests {
     }
 
     #[test]
-    fn no_interact_reports_missing_startup_requirements() {
-        let cli = Cli::try_parse_from(["synly", "--fs", "receive", "--no-interact"]).unwrap();
+    fn headless_reports_missing_startup_requirements() {
+        let cli = Cli::try_parse_from(["synly", "--fs", "receive", "--headless"]).unwrap();
 
         let err = collect_runtime_options(cli, &test_config())
             .unwrap_err()
             .to_string();
 
-        assert!(err.contains("已禁止进入启动交互"));
+        assert!(err.contains("headless 参数不足"));
         assert!(err.contains("`--host` 或 `--join`"));
         assert!(err.contains("`--fs receive`"));
     }
 
     #[test]
-    fn no_interact_join_requires_peer() {
+    fn headless_join_requires_peer() {
         let cli =
-            Cli::try_parse_from(["synly", "--fs", "send", ".", "--join", "--no-interact"]).unwrap();
+            Cli::try_parse_from(["synly", "--fs", "send", ".", "--join", "--headless"]).unwrap();
 
         let err = collect_runtime_options(cli, &test_config())
             .unwrap_err()
             .to_string();
 
         assert!(err.contains("`--peer`"));
+    }
+
+    #[test]
+    fn headless_host_requires_pin_unless_trusted_only() {
+        let missing_pin = Cli::try_parse_from(["synly", "--host", "--headless"]).unwrap();
+        let err = collect_runtime_options(missing_pin, &test_config())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("`--pin`"));
+
+        let trusted_only = Cli::try_parse_from([
+            "synly",
+            "--host",
+            "--headless",
+            "--trusted-only",
+        ])
+        .unwrap();
+        assert!(collect_runtime_options(trusted_only, &test_config()).is_ok());
     }
 
     #[test]
@@ -1146,15 +891,6 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("只能提供 1 个目录路径"));
-    }
-
-    #[test]
-    fn resolve_pairing_pin_requires_explicit_pin_in_no_interact() {
-        let err = resolve_pairing_pin(None, true, "unused")
-            .unwrap_err()
-            .to_string();
-
-        assert!(err.contains("`--pin`"));
     }
 
     fn assert_global_receive_cli(cli: Cli) {
@@ -1182,6 +918,8 @@ mod tests {
             transfer: TransferConfig::default(),
             notifications: NotificationConfig::default(),
             discovery: DiscoveryConfig::default(),
+            ui: crate::config::UiConfig::default(),
+            runtime: crate::config::RuntimeConfig::default(),
             trusted_devices: Vec::new(),
         }
     }

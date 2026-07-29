@@ -693,6 +693,8 @@ pub fn delete_paths_best_effort(root: &Path, wire_paths: &[String]) -> DeleteRep
 }
 
 pub fn apply_file_metadata(path: &Path, modified_ms: u64, executable: bool) -> Result<()> {
+    #[cfg(not(unix))]
+    let _ = executable;
     let secs = (modified_ms / 1_000) as i64;
     let nanos = ((modified_ms % 1_000) * 1_000_000) as u32;
     set_file_mtime(path, FileTime::from_unix_time(secs, nanos))

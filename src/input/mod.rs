@@ -6,12 +6,14 @@ pub mod mock;
 mod platform;
 mod protocol;
 mod runtime;
+#[cfg(windows)]
+pub mod windows_agent;
 
 pub use channel::{InputChannelOffer, InputChannelRole, InputHostChannel};
 pub use geometry::{DesktopLayout, DisplayRect, Point, ScreenEdge};
 pub use hotkey::{Hotkey, ModifierMask};
 pub use protocol::KeySnapshot;
-pub use runtime::{InputRuntimeOptions, InputSessionContext, run_input_session};
+pub use runtime::{InputRuntimeOptions, InputSessionContext, InputSocketInbox, run_input_session};
 
 use anyhow::Result;
 use clap::ValueEnum;
@@ -81,6 +83,14 @@ pub fn ensure_platform_supported(mode: InputMode) -> Result<()> {
     {
         Err(anyhow::anyhow!("鼠标键盘同步目前只支持 macOS 和 Windows"))
     }
+}
+
+#[cfg(windows)]
+pub use windows_agent::{request_elevation as request_windows_input_elevation, run_agent};
+
+#[cfg(windows)]
+pub fn windows_input_agent_ready() -> bool {
+    windows_agent::is_ready()
 }
 
 #[cfg(test)]

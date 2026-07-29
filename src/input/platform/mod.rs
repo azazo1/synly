@@ -3,17 +3,18 @@ use anyhow::Result;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use tokio::sync::mpsc;
+use serde::{Deserialize, Serialize};
 
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(not(any(target_os = "macos", windows)))]
 mod unsupported;
 #[cfg(windows)]
-mod windows;
+pub(in crate::input) mod windows;
 
 const EVENT_QUEUE_CAPACITY: usize = 256;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum NativeEvent {
     Key {
         usage: u16,
@@ -138,6 +139,7 @@ pub struct PlatformHandle {
     pub failed: Arc<AtomicBool>,
 }
 
+#[derive(Clone)]
 pub struct CaptureContext {
     pub mode: InputMode,
     pub hotkey: Hotkey,

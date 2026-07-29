@@ -18,12 +18,17 @@ use url::Url;
 
 const CLIPBOARD_CACHE_BATCH_PREFIX: &str = "batch-";
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClipboardRuntimeOptions {
+    pub max_file_bytes: u64,
+    pub max_cache_bytes: Option<u64>,
+    pub cache_dir: PathBuf,
+}
+
 #[derive(Clone)]
 pub struct ClipboardSync {
     state: Arc<Mutex<ClipboardSyncState>>,
-    max_file_bytes: u64,
-    max_cache_bytes: Option<u64>,
-    cache_dir: PathBuf,
+    options: Arc<Mutex<ClipboardRuntimeOptions>>,
 }
 
 pub struct ClipboardWatcherHandle {
@@ -41,7 +46,7 @@ struct LocalClipboardHandler {
     ctx: ClipboardContext,
     state: Arc<Mutex<ClipboardSyncState>>,
     tx: mpsc::UnboundedSender<ClipboardPayload>,
-    max_file_bytes: u64,
+    options: Arc<Mutex<ClipboardRuntimeOptions>>,
 }
 
 struct CapturedClipboard {
@@ -55,20 +60,30 @@ struct ClipboardFileCapture {
 }
 
 impl ClipboardSync {
-    pub fn new(max_file_bytes: u64, max_cache_bytes: Option<u64>, cache_dir: PathBuf) -> Self {
+    pub fn new(options: &ClipboardRuntimeOptions) -> Self {
         Self {
             state: Arc::new(Mutex::new(ClipboardSyncState::default())),
-            max_file_bytes,
-            max_cache_bytes,
-            cache_dir,
+            options: Arc::new(Mutex::new(options.clone())),
         }
+    }
+
+    pub fn update_options(&self, options: ClipboardRuntimeOptions) -> Result<()> {
+        *self
+            .options
+            .lock()
+            .map_err(|_| anyhow!("clipboard runtime options poisoned"))? = options;
+        Ok(())
     }
 
     pub fn start_local_watcher(
         &self,
         tx: mpsc::UnboundedSender<ClipboardPayload>,
     ) -> Result<ClipboardWatcherHandle> {
-        let handler = LocalClipboardHandler::new(self.state.clone(), tx, self.max_file_bytes)?;
+        let handler = LocalClipboardHandler::new(
+            self.state.clone(),
+            tx,
+            Arc::clone(&self.options),
+        )?;
         let mut watcher: ClipboardWatcherContext<LocalClipboardHandler> =
             ClipboardWatcherContext::new().map_err(clipboard_error)?;
         let shutdown = watcher.add_handler(handler).get_shutdown_channel();
@@ -98,14 +113,17 @@ impl ClipboardSync {
     }
 
     pub async fn apply_remote_payload(&self, payload: ClipboardPayload) -> Result<()> {
-        let max_file_bytes = self.max_file_bytes;
-        let max_cache_bytes = self.max_cache_bytes;
-        let cache_dir = self.cache_dir.clone();
+        let options = self
+            .options
+            .lock()
+            .map_err(|_| anyhow!("clipboard runtime options poisoned"))?
+            .clone();
         let state = self.state.clone();
 
         tokio::task::spawn_blocking(move || -> Result<()> {
             let mut warnings = Vec::new();
-            let payload = sanitize_remote_payload(payload, max_file_bytes, &mut warnings);
+            let payload =
+                sanitize_remote_payload(payload, options.max_file_bytes, &mut warnings);
             emit_warnings(&warnings);
 
             if payload.is_empty() {
@@ -113,11 +131,18 @@ impl ClipboardSync {
             }
 
             let ctx = ClipboardContext::new().map_err(clipboard_error)?;
-            let already_matches =
-                capture_clipboard(&ctx, max_file_bytes).payload.as_ref() == Some(&payload);
+            let already_matches = capture_clipboard(&ctx, options.max_file_bytes)
+                .payload
+                .as_ref()
+                == Some(&payload);
 
             if !already_matches {
-                apply_payload_to_clipboard(&ctx, &payload, &cache_dir, max_cache_bytes)?;
+                apply_payload_to_clipboard(
+                    &ctx,
+                    &payload,
+                    &options.cache_dir,
+                    options.max_cache_bytes,
+                )?;
             }
 
             let signature = payload_signature(&payload);
@@ -142,7 +167,11 @@ impl ClipboardSync {
     }
 
     async fn read_local_payload(&self) -> Result<Option<ClipboardPayload>> {
-        let max_file_bytes = self.max_file_bytes;
+        let max_file_bytes = self
+            .options
+            .lock()
+            .map_err(|_| anyhow!("clipboard runtime options poisoned"))?
+            .max_file_bytes;
         tokio::task::spawn_blocking(move || -> Result<Option<ClipboardPayload>> {
             let ctx = ClipboardContext::new().map_err(clipboard_error)?;
             let captured = capture_clipboard(&ctx, max_file_bytes);
@@ -155,10 +184,6 @@ impl ClipboardSync {
 }
 
 impl ClipboardWatcherHandle {
-    pub fn stop(mut self) {
-        self.stop_inner();
-    }
-
     fn stop_inner(&mut self) {
         if let Some(shutdown) = self.shutdown.take() {
             shutdown.stop();
@@ -202,14 +227,14 @@ impl LocalClipboardHandler {
     fn new(
         state: Arc<Mutex<ClipboardSyncState>>,
         tx: mpsc::UnboundedSender<ClipboardPayload>,
-        max_file_bytes: u64,
+        options: Arc<Mutex<ClipboardRuntimeOptions>>,
     ) -> Result<Self> {
         let ctx = ClipboardContext::new().map_err(clipboard_error)?;
         Ok(Self {
             ctx,
             state,
             tx,
-            max_file_bytes,
+            options,
         })
     }
 }
@@ -220,7 +245,11 @@ impl ClipboardHandler for LocalClipboardHandler {
         // 在 windows 下读取剪贴板过快可能导致拒绝, 因此这里延迟一下.
         #[cfg(windows)]
         thread::sleep(Duration::from_millis(100));
-        let captured = capture_clipboard(&self.ctx, self.max_file_bytes);
+        let max_file_bytes = match self.options.lock() {
+            Ok(options) => options.max_file_bytes,
+            Err(_) => return,
+        };
+        let captured = capture_clipboard(&self.ctx, max_file_bytes);
         emit_warnings(&captured.warnings);
 
         let Some(payload) = captured.payload else {
@@ -802,7 +831,7 @@ fn unix_time_ms() -> u64 {
 
 fn emit_warnings(warnings: &[String]) {
     for warning in warnings {
-        eprintln!("{warning}");
+        tracing::warn!(message = %warning, "剪贴板内容已按限制跳过");
     }
 }
 
@@ -871,14 +900,33 @@ fn format_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClipboardFile, ClipboardFileCapture, ClipboardSyncState, capture_file_clipboard,
-        capture_files_from_paths, payload_signature, sanitize_remote_payload,
-        write_clipboard_files_to_cache,
+        ClipboardFile, ClipboardFileCapture, ClipboardRuntimeOptions, ClipboardSync,
+        ClipboardSyncState, capture_file_clipboard, capture_files_from_paths, payload_signature,
+        sanitize_remote_payload, write_clipboard_files_to_cache,
     };
     use crate::protocol::ClipboardPayload;
     use std::fs;
     use std::path::Path;
     use uuid::Uuid;
+
+    #[test]
+    fn runtime_limits_update_without_rebuilding_clipboard_sync() {
+        let initial = ClipboardRuntimeOptions {
+            max_file_bytes: 10,
+            max_cache_bytes: Some(20),
+            cache_dir: std::path::PathBuf::from("cache-a"),
+        };
+        let sync = ClipboardSync::new(&initial);
+        let updated = ClipboardRuntimeOptions {
+            max_file_bytes: 30,
+            max_cache_bytes: None,
+            cache_dir: std::path::PathBuf::from("cache-b"),
+        };
+
+        sync.update_options(updated.clone()).unwrap();
+
+        assert_eq!(*sync.options.lock().unwrap(), updated);
+    }
 
     #[test]
     fn remote_apply_is_suppressed_once() {

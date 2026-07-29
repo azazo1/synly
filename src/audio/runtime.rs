@@ -137,7 +137,7 @@ fn run_sender_loop(
         .local_addr()
         .context("failed to read local audio UDP sender address")?;
 
-    println!("音频 UDP 已连接: {} -> {}", local_addr, remote_addr);
+    tracing::info!(%local_addr, %remote_addr, "音频 UDP 发送端已连接");
 
     while !stop_flag.load(Ordering::Relaxed) {
         match input
@@ -165,7 +165,7 @@ fn run_sender_loop(
         }
     }
 
-    println!("音频 UDP 发送已停止。");
+    tracing::info!("音频 UDP 发送已停止");
     Ok(())
 }
 
@@ -191,10 +191,7 @@ fn run_receiver_loop(
         .context("failed to read local audio UDP receiver address")?;
     let mut bound_peer = None;
 
-    println!(
-        "音频 UDP 已监听: {}，等待 {} 的加密音频流。",
-        local_addr, expected_peer_ip
-    );
+    tracing::info!(%local_addr, %expected_peer_ip, "音频 UDP 接收端已监听");
 
     while !stop_flag.load(Ordering::Relaxed) {
         let (packet_len, remote_addr) = match socket.recv_from(&mut read_buffer) {
@@ -224,7 +221,7 @@ fn run_receiver_loop(
 
         if bound_peer.is_none() {
             bound_peer = Some(remote_addr);
-            println!("音频 UDP 已连接: {} -> {}", remote_addr, local_addr);
+            tracing::info!(%remote_addr, %local_addr, "音频 UDP 接收端已连接");
         }
 
         let ready = depacketizer
@@ -245,7 +242,7 @@ fn run_receiver_loop(
         }
     }
 
-    println!("音频 UDP 接收已停止。");
+    tracing::info!("音频 UDP 接收已停止");
     Ok(())
 }
 

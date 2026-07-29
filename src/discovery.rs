@@ -17,9 +17,14 @@ pub const MDNS_SERVICE_TYPE: &str = "_synly._tcp.local.";
 pub const LND_SERVICE_TYPE: &str = "_synly._tcp";
 const MDNS_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const LND_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+const CONTINUOUS_LND_INTERVAL: Duration = Duration::from_secs(5);
+const CONTINUOUS_LND_TIMEOUT: Duration = Duration::from_secs(3);
+const MDNS_STALE_AFTER: Duration = Duration::from_secs(120);
+const LND_STALE_AFTER: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Debug)]
 pub struct Advertisement {
+    pub protocol_version: u16,
     pub port: u16,
     pub device: DeviceConfig,
     pub file_sync_mode: FileSyncMode,
@@ -51,8 +56,8 @@ impl DiscoveryRegistration {
         if let Some(handle) = lnd {
             match tokio::time::timeout(LND_STOP_TIMEOUT, handle.stop()).await {
                 Ok(Ok(())) => {}
-                Ok(Err(err)) => eprintln!("停止 LND 租约续期时出错: {err}"),
-                Err(_) => eprintln!("停止 LND 租约续期超时, 已继续退出."),
+                Ok(Err(err)) => tracing::warn!(error = %err, "停止 LND 租约续期失败"),
+                Err(_) => tracing::warn!("停止 LND 租约续期超时, 已继续退出"),
             }
         }
     }
@@ -89,6 +94,7 @@ pub struct DiscoveredPeer {
     pub device_name: String,
     pub instance_name: Option<String>,
     pub device_id: String,
+    pub protocol_version: u16,
     pub file_sync_mode: FileSyncMode,
     pub clipboard_mode: ClipboardMode,
     pub audio_mode: AudioMode,
@@ -131,6 +137,73 @@ struct PeerKey {
     port: u16,
 }
 
+#[derive(Clone)]
+struct SeenPeer {
+    peer: DiscoveredPeer,
+    last_seen: Instant,
+}
+
+#[derive(Default)]
+struct DiscoveryCache {
+    mdns: BTreeMap<String, SeenPeer>,
+    lnd: BTreeMap<PeerKey, SeenPeer>,
+}
+
+impl DiscoveryCache {
+    fn upsert_mdns(&mut self, peer: DiscoveredPeer, now: Instant) {
+        self.mdns.insert(
+            peer.fullname.clone(),
+            SeenPeer {
+                peer,
+                last_seen: now,
+            },
+        );
+    }
+
+    fn remove_mdns(&mut self, fullname: &str) {
+        self.mdns.remove(fullname);
+    }
+
+    fn update_lnd(&mut self, peers: Vec<DiscoveredPeer>, now: Instant) {
+        for peer in peers {
+            let key = PeerKey {
+                device_id: peer.device_id.clone(),
+                instance_name: peer.instance_name.clone(),
+                port: peer.port,
+            };
+            self.lnd.insert(
+                key,
+                SeenPeer {
+                    peer,
+                    last_seen: now,
+                },
+            );
+        }
+    }
+
+    fn expire(&mut self, now: Instant) -> bool {
+        let mdns_len = self.mdns.len();
+        let lnd_len = self.lnd.len();
+        self.mdns
+            .retain(|_, seen| now.duration_since(seen.last_seen) <= MDNS_STALE_AFTER);
+        self.lnd
+            .retain(|_, seen| now.duration_since(seen.last_seen) <= LND_STALE_AFTER);
+        mdns_len != self.mdns.len() || lnd_len != self.lnd.len()
+    }
+
+    fn snapshot(&self) -> Vec<DiscoveredPeer> {
+        merge_peers(
+            self.mdns.values().map(|seen| seen.peer.clone()).collect(),
+            self.lnd.values().map(|seen| seen.peer.clone()).collect(),
+        )
+    }
+}
+
+enum ContinuousMdnsEvent {
+    Resolved(DiscoveredPeer),
+    Removed(String),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct LocalIpv4Interface {
     address: Ipv4Addr,
@@ -151,40 +224,48 @@ pub async fn advertise(
     advertisement: &Advertisement,
     discovery: &DiscoveryConfig,
 ) -> Result<DiscoveryRegistration> {
-    let mdns_result = advertise_mdns(advertisement);
+    let mdns_result = discovery
+        .mdns_enabled
+        .then(|| advertise_mdns(advertisement));
     let Some(lnd_config) = discovery.lnd.as_ref() else {
-        return mdns_result.map(|mdns| DiscoveryRegistration {
-            mdns: Some(mdns),
-            lnd: None,
-        });
+        return match mdns_result {
+            Some(result) => result.map(|mdns| DiscoveryRegistration {
+                mdns: Some(mdns),
+                lnd: None,
+            }),
+            None => Ok(DiscoveryRegistration {
+                mdns: None,
+                lnd: None,
+            }),
+        };
     };
 
     let lnd_result = start_lnd_registration(advertisement, lnd_config).await;
     match (mdns_result, lnd_result) {
-        (Ok(mdns), Ok(lnd)) => {
+        (Some(Ok(mdns)), Ok(lnd)) => {
             if let Some(err) = &lnd.initial_error {
-                eprintln!("LND 初始注册失败, 将保留 mDNS 并在后台重试: {err:#}");
+                tracing::warn!(error = %err, "LND 初始注册失败, 将保留 mDNS 并在后台重试");
             }
             Ok(DiscoveryRegistration {
                 mdns: Some(mdns),
                 lnd: Some(lnd.handle),
             })
         }
-        (Ok(mdns), Err(err)) => {
-            eprintln!("LND 发现后端无法启动, 本次仅使用 mDNS: {err:#}");
+        (Some(Ok(mdns)), Err(err)) => {
+            tracing::warn!(error = %err, "LND 发现后端无法启动, 本次仅使用 mDNS");
             Ok(DiscoveryRegistration {
                 mdns: Some(mdns),
                 lnd: None,
             })
         }
-        (Err(mdns_err), Ok(lnd)) if lnd.initial_error.is_none() => {
-            eprintln!("mDNS 发现后端无法启动, 本次仅使用 LND: {mdns_err:#}");
+        (Some(Err(mdns_err)), Ok(lnd)) if lnd.initial_error.is_none() => {
+            tracing::warn!(error = %mdns_err, "mDNS 发现后端无法启动, 本次仅使用 LND");
             Ok(DiscoveryRegistration {
                 mdns: None,
                 lnd: Some(lnd.handle),
             })
         }
-        (Err(mdns_err), Ok(lnd)) => {
+        (Some(Err(mdns_err)), Ok(lnd)) => {
             let lnd_err = lnd
                 .initial_error
                 .as_ref()
@@ -193,14 +274,37 @@ pub async fn advertise(
                 "mDNS 与 LND 注册均失败; mDNS: {mdns_err:#}; LND: {lnd_err:#}"
             );
             if let Err(err) = lnd.handle.stop().await {
-                eprintln!("清理失败的 LND 注册任务时出错: {err}");
+                tracing::warn!(error = %err, "清理失败的 LND 注册任务失败");
             }
             bail!("{message}")
         }
-        (Err(mdns_err), Err(lnd_err)) => {
+        (Some(Err(mdns_err)), Err(lnd_err)) => {
             bail!("mDNS 与 LND 注册均失败; mDNS: {mdns_err:#}; LND: {lnd_err:#}")
         }
+        (None, Ok(lnd)) if lnd.initial_error.is_none() => Ok(DiscoveryRegistration {
+            mdns: None,
+            lnd: Some(lnd.handle),
+        }),
+        (None, Ok(lnd)) => {
+            let error = lnd
+                .initial_error
+                .as_ref()
+                .expect("LND 初始错误已经过分支判断");
+            let message = format!("LND 注册失败: {error:#}");
+            if let Err(stop_error) = lnd.handle.stop().await {
+                tracing::warn!(error = %stop_error, "清理失败的 LND 注册任务失败");
+            }
+            bail!("{message}")
+        }
+        (None, Err(error)) => Err(error).context("LND 发现后端无法启动"),
     }
+}
+
+pub fn validate_config(discovery: &DiscoveryConfig) -> Result<()> {
+    if let Some(config) = discovery.lnd.as_ref() {
+        normalize_lnd_config(config)?;
+    }
+    Ok(())
 }
 
 pub async fn browse(
@@ -209,8 +313,9 @@ pub async fn browse(
 ) -> Result<Vec<DiscoveredPeer>> {
     let mdns_cancelled = Arc::new(AtomicBool::new(false));
     let _mdns_cancellation = BrowseCancellation(Arc::clone(&mdns_cancelled));
-    let mdns_task =
-        tokio::task::spawn_blocking(move || browse_mdns(timeout, &mdns_cancelled));
+    let mdns_task = discovery.mdns_enabled.then(|| {
+        tokio::task::spawn_blocking(move || browse_mdns(timeout, &mdns_cancelled))
+    });
     let lnd_config = discovery.lnd.clone();
     let lnd_task = async move {
         match lnd_config.as_ref() {
@@ -218,15 +323,130 @@ pub async fn browse(
             None => None,
         }
     };
-    let (mdns_result, lnd_result) = tokio::join!(mdns_task, lnd_task);
-    let mdns_result = mdns_result
-        .map_err(|err| anyhow!("mDNS discovery task failed: {err}"))
-        .and_then(|result| result);
+    let (mdns_result, lnd_result) = tokio::join!(async move {
+        match mdns_task {
+            Some(task) => Some(
+                task.await
+                    .map_err(|err| anyhow!("mDNS discovery task failed: {err}"))
+                    .and_then(|result| result),
+            ),
+            None => None,
+        }
+    }, lnd_task);
 
-    match lnd_result {
-        None => mdns_result,
-        Some(lnd_result) => combine_browse_results(mdns_result, lnd_result),
+    match (mdns_result, lnd_result) {
+        (Some(mdns_result), Some(lnd_result)) => {
+            combine_browse_results(mdns_result, lnd_result)
+        }
+        (Some(mdns_result), None) => mdns_result,
+        (None, Some(lnd_result)) => lnd_result,
+        (None, None) => Ok(Vec::new()),
     }
+}
+
+pub fn continuous_browse(
+    discovery: DiscoveryConfig,
+) -> tokio::sync::watch::Receiver<Vec<DiscoveredPeer>> {
+    let (updates, receiver) = tokio::sync::watch::channel(Vec::new());
+    tokio::spawn(run_continuous_browse(discovery, updates));
+    receiver
+}
+
+async fn run_continuous_browse(
+    discovery: DiscoveryConfig,
+    updates: tokio::sync::watch::Sender<Vec<DiscoveredPeer>>,
+) {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let _cancellation = BrowseCancellation(Arc::clone(&cancelled));
+    let (mdns_tx, mut mdns_rx) = tokio::sync::mpsc::unbounded_channel();
+    if discovery.mdns_enabled {
+        tokio::task::spawn_blocking(move || {
+            if let Err(error) = browse_mdns_events(mdns_tx, &cancelled) {
+                tracing::warn!(error = %error, "持续 mDNS 发现已停止");
+            }
+        });
+    }
+
+    let mut cache = DiscoveryCache::default();
+    let mut mdns_open = discovery.mdns_enabled;
+    let mut lnd_tick = tokio::time::interval(CONTINUOUS_LND_INTERVAL);
+    lnd_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut expiry_tick = tokio::time::interval(Duration::from_secs(1));
+    expiry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        if updates.is_closed() {
+            break;
+        }
+        let changed = tokio::select! {
+            event = mdns_rx.recv(), if mdns_open => {
+                match event {
+                    Some(ContinuousMdnsEvent::Resolved(peer)) => {
+                        cache.upsert_mdns(peer, Instant::now());
+                        true
+                    }
+                    Some(ContinuousMdnsEvent::Removed(fullname)) => {
+                        cache.remove_mdns(&fullname);
+                        true
+                    }
+                    None => {
+                        mdns_open = false;
+                        false
+                    }
+                }
+            }
+            _ = lnd_tick.tick(), if discovery.lnd.is_some() => {
+                let config = discovery.lnd.as_ref().expect("LND config checked");
+                match browse_lnd(config, CONTINUOUS_LND_TIMEOUT).await {
+                    Ok(peers) => {
+                        cache.update_lnd(peers, Instant::now());
+                        true
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %error, "持续 LND 发现刷新失败");
+                        false
+                    }
+                }
+            }
+            _ = expiry_tick.tick() => cache.expire(Instant::now()),
+        };
+        if changed {
+            updates.send_replace(cache.snapshot());
+        }
+    }
+}
+
+fn browse_mdns_events(
+    events: tokio::sync::mpsc::UnboundedSender<ContinuousMdnsEvent>,
+    cancelled: &AtomicBool,
+) -> Result<()> {
+    let daemon = ServiceDaemon::new().context("failed to start continuous mDNS daemon")?;
+    let receiver = daemon
+        .browse(MDNS_SERVICE_TYPE)
+        .context("failed to start continuous mDNS browsing")?;
+
+    while !cancelled.load(Ordering::Relaxed) && !events.is_closed() {
+        match receiver.recv_timeout(MDNS_CANCEL_POLL_INTERVAL) {
+            Ok(ServiceEvent::ServiceResolved(info)) => {
+                if let Some(peer) = discovered_peer_from_mdns(&info)
+                    && events.send(ContinuousMdnsEvent::Resolved(peer)).is_err()
+                {
+                    break;
+                }
+            }
+            Ok(ServiceEvent::ServiceRemoved(_, fullname)) => {
+                if events.send(ContinuousMdnsEvent::Removed(fullname)).is_err() {
+                    break;
+                }
+            }
+            Ok(_) => {}
+            Err(_) if receiver.is_disconnected() => break,
+            Err(_) => {}
+        }
+    }
+
+    let _ = daemon.shutdown();
+    Ok(())
 }
 
 struct BrowseCancellation(Arc<AtomicBool>);
@@ -245,13 +465,13 @@ fn combine_browse_results(
         Ok(lnd_peers) => match mdns_result {
             Ok(mdns_peers) => Ok(merge_peers(mdns_peers, lnd_peers)),
             Err(err) => {
-                eprintln!("mDNS 搜索失败, 本次使用 LND 结果: {err:#}");
+                tracing::warn!(error = %err, "mDNS 搜索失败, 本次使用 LND 结果");
                 Ok(merge_peers(Vec::new(), lnd_peers))
             }
         },
         Err(lnd_err) => match mdns_result {
             Ok(mdns_peers) => {
-                eprintln!("LND 搜索失败, 本次使用 mDNS 结果: {lnd_err:#}");
+                tracing::warn!(error = %lnd_err, "LND 搜索失败, 本次使用 mDNS 结果");
                 Ok(merge_peers(mdns_peers, Vec::new()))
             }
             Err(mdns_err) => {
@@ -370,6 +590,10 @@ fn advertisement_metadata(advertisement: &Advertisement) -> BTreeMap<String, Str
         (
             "device_name".to_string(),
             advertisement.device.device_name.clone(),
+        ),
+        (
+            "protocol_version".to_string(),
+            advertisement.protocol_version.to_string(),
         ),
         (
             "fs_mode".to_string(),
@@ -528,6 +752,10 @@ fn discovered_peer_from_mdns(info: &mdns_sd::ResolvedService) -> Option<Discover
         .filter(|value| !value.is_empty())
         .map(ToString::to_string);
     let device_id = info.get_property_val_str("device_id")?.to_string();
+    let protocol_version = info
+        .get_property_val_str("protocol_version")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_default();
     let addresses = info.get_addresses_v4().into_iter().collect::<Vec<_>>();
     if addresses.is_empty() {
         return None;
@@ -538,6 +766,7 @@ fn discovered_peer_from_mdns(info: &mdns_sd::ResolvedService) -> Option<Discover
         device_name,
         instance_name,
         device_id,
+        protocol_version,
         file_sync_mode,
         clipboard_mode,
         audio_mode,
@@ -562,6 +791,10 @@ fn discovered_peer_from_lnd(node: &DiscoveredNode) -> Option<DiscoveredPeer> {
     if device_name.is_empty() {
         return None;
     }
+    let protocol_version = metadata
+        .get("protocol_version")
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_default();
     let file_sync_mode = metadata
         .get("fs_mode")
         .and_then(|value| FileSyncMode::from_wire(value))?;
@@ -599,6 +832,7 @@ fn discovered_peer_from_lnd(node: &DiscoveredNode) -> Option<DiscoveredPeer> {
         device_name,
         instance_name,
         device_id,
+        protocol_version,
         file_sync_mode,
         clipboard_mode,
         audio_mode,
@@ -727,7 +961,8 @@ pub fn format_display_name(instance_name: Option<&str>, device_name: &str) -> St
 #[cfg(test)]
 mod tests {
     use super::{
-        Advertisement, BrowseCancellation, DiscoverySource, LND_SERVICE_TYPE, LocalIpv4Interface,
+        Advertisement, BrowseCancellation, DiscoveryCache, DiscoverySource, LND_SERVICE_TYPE,
+        LND_STALE_AFTER, LocalIpv4Interface,
         build_lnd_announce_spec, combine_browse_results, discovered_peer_from_lnd,
         group_peer_addresses_for_interfaces, merge_peers, normalize_lnd_config,
     };
@@ -758,6 +993,27 @@ mod tests {
         assert_eq!(peers[0].fullname, "mdns");
         assert_eq!(peers[0].addresses.len(), 2);
         assert_eq!(peers[0].source, DiscoverySource::MdnsAndLnd);
+    }
+
+    #[test]
+    fn continuous_cache_merges_sources_and_expires_stale_lnd() {
+        let now = std::time::Instant::now();
+        let mut cache = DiscoveryCache::default();
+        let mdns = sample_peer(DiscoverySource::Mdns);
+        let mut lnd = sample_peer(DiscoverySource::Lnd);
+        lnd.addresses = vec![Ipv4Addr::new(10, 0, 0, 8)];
+
+        cache.upsert_mdns(mdns, now);
+        cache.update_lnd(vec![lnd], now);
+        let merged = cache.snapshot();
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].source, DiscoverySource::MdnsAndLnd);
+        assert_eq!(merged[0].addresses.len(), 2);
+
+        assert!(cache.expire(now + LND_STALE_AFTER + std::time::Duration::from_secs(1)));
+        let remaining = cache.snapshot();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].source, DiscoverySource::Mdns);
     }
 
     #[test]
@@ -922,6 +1178,7 @@ mod tests {
 
     fn sample_advertisement() -> Advertisement {
         Advertisement {
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
             port: 8080,
             device: DeviceConfig {
                 device_id: Uuid::new_v4(),
@@ -943,6 +1200,7 @@ mod tests {
             device_name: "demo-device".to_string(),
             instance_name: Some("worker-a".to_string()),
             device_id: Uuid::nil().to_string(),
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
             file_sync_mode: FileSyncMode::Both,
             clipboard_mode: ClipboardMode::Off,
             audio_mode: AudioMode::Off,

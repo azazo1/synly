@@ -17,6 +17,10 @@ struct ResolvedOpusLib {
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=ui/app.slint");
+    println!("cargo:rerun-if-changed=assets/windows/synly.manifest");
+    println!("cargo:rerun-if-changed=assets/windows/synly-input-agent.manifest");
+    slint_build::compile("ui/app.slint").expect("failed to compile Slint UI");
     for key in [
         "OPUS_DIR",
         "OPUS_LIB_DIR",
@@ -30,10 +34,35 @@ fn main() {
     }
 
     let target = env::var("TARGET").unwrap_or_default();
+    embed_windows_manifests(&target);
     link_opus(&target, opus_link_preference());
 
     if target.contains("apple-darwin") {
         build_macos_native();
+    }
+}
+
+fn embed_windows_manifests(target: &str) {
+    if !target.contains("windows-msvc") {
+        return;
+    }
+
+    for (binary, manifest) in [
+        ("synly", "assets/windows/synly.manifest"),
+        (
+            "synly-input-agent",
+            "assets/windows/synly-input-agent.manifest",
+        ),
+    ] {
+        let manifest = Path::new(manifest)
+            .canonicalize()
+            .expect("failed to locate Windows application manifest");
+        println!("cargo:rustc-link-arg-bin={binary}=/MANIFEST:EMBED");
+        println!("cargo:rustc-link-arg-bin={binary}=/MANIFESTUAC:NO");
+        println!(
+            "cargo:rustc-link-arg-bin={binary}=/MANIFESTINPUT:{}",
+            manifest.display()
+        );
     }
 }
 

@@ -43,5 +43,5 @@ fn main() -> Result<()> {
 
 #[cfg(not(target_os = "macos"))]
 fn main() {
-    eprintln!("input-macos-mock 只支持 macOS");
+    tracing::error!("input-macos-mock 只支持 macOS");
 }

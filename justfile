@@ -1,8 +1,29 @@
-alias r := run
+[private]
+default:
+    @just --list
 
-run *args:
-    cargo run -- {{ args }}
+# 启动 Slint GUI.
+run:
+    cargo run --
 
+# just headless --host --fs off --trusted-only
+# 使用显式参数启动无界面模式.
+headless *args:
+    cargo run -- --headless {{ args }}
+
+# 运行全部测试.
+test:
+    cargo test
+
+# 运行全部 target 和 feature 的 clippy.
+clippy:
+    cargo clippy --all-targets --all-features
+
+# 构建 release 产物.
+build:
+    cargo build --release
+
+# 安装当前工作树中的 Synly.
 install:
     cargo install --path .
 
@@ -10,27 +31,3 @@ install:
 # 使用 GUI mock 验证 macOS 输入捕获和虚拟屏幕切换.
 input-macos-mock *args:
     cargo run --features input-macos-mock --bin input-macos-mock -- {{ args }}
-
-down:
-    docker compose down
-
-up:
-    docker compose up -d
-
-cross-build:
-    cargo zigbuild --target {{ arch() }}-unknown-linux-musl --release
-    cd target && ln -sf {{ arch() }}-unknown-linux-musl/release/synly synly-cross
-
-vhs-join:
-    sleep 0.5s
-    PATH={{ join(justfile_directory(), "tapes", "join") }}:$PATH vhs tapes/join/join.tape
-
-vhs-host:
-    PATH={{ join(justfile_directory(), "tapes", "host") }}:$PATH vhs tapes/host/host.tape
-
-[parallel]
-vhs: vhs-join vhs-host
-
-alias rec := record
-
-record: cross-build down up vhs

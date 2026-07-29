@@ -1,5 +1,7 @@
 use crate::sync::{ManifestSnapshot, WorkspaceSummary};
 use crate::input::InputChannelOffer;
+use crate::input::InputMode;
+use crate::settings::{AudioMode, ClipboardMode};
 use anyhow::{Context, Result, bail};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -16,7 +18,20 @@ const DEFAULT_MAX_FRAME_DATA_LEN: usize = 128 * 1024 * 1024;
 const DEFAULT_MAX_CLIPBOARD_BINARY_LEN: usize = 100 * 1024 * 1024;
 const CLIPBOARD_STREAM_CHUNK_SIZE: usize = 1024 * 1024;
 
-pub const PROTOCOL_VERSION: u16 = 16;
+pub const PROTOCOL_VERSION: u16 = 17;
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeCapabilities {
+    pub clipboard_mode: ClipboardMode,
+    pub audio_mode: AudioMode,
+    pub input_mode: InputMode,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CapabilityEpoch {
+    pub host_generation: u64,
+    pub client_generation: u64,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TransferLimits {
@@ -118,10 +133,22 @@ pub enum ControlMessage {
         proof: String,
         trust_established: bool,
     },
+    CapabilitiesUpdate {
+        generation: u64,
+        capabilities: RuntimeCapabilities,
+    },
+    CapabilitiesAck {
+        generation: u64,
+    },
     AudioUdpReady {
+        epoch: CapabilityEpoch,
         port: u16,
     },
-    InputChannelOffer(InputChannelOffer),
+    InputChannelOffer {
+        epoch: CapabilityEpoch,
+        offer: InputChannelOffer,
+    },
+    SnapshotRescanRequest,
     SnapshotAdvert {
         revision: u64,
         snapshot: ManifestSnapshot,

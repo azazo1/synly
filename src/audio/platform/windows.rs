@@ -682,6 +682,7 @@ fn prime_render_buffer(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn playback_loop(
     audio_client: *mut IAudioClient,
     render_client: *mut IAudioRenderClient,
@@ -1120,7 +1121,7 @@ fn wait_for_multiple_objects_timeout(handles: &[Handle], timeout_ms: u32) -> Res
     if result == WAIT_FAILED {
         return Err(last_os_error("WaitForMultipleObjects"));
     }
-    if result < WAIT_OBJECT_0 || result >= WAIT_OBJECT_0 + handles.len() as u32 {
+    if result >= WAIT_OBJECT_0 + handles.len() as u32 {
         return Err(Error::Backend(format!(
             "WaitForMultipleObjects returned unexpected value 0x{result:08X}"
         )));

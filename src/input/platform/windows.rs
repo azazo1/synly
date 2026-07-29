@@ -284,11 +284,15 @@ struct WindowsBackend {
     state: Arc<WindowsState>,
 }
 
-pub fn ensure_permissions(_mode: InputMode) -> Result<()> {
-    Ok(())
+pub fn ensure_permissions(mode: InputMode) -> Result<()> {
+    crate::input::windows_agent::ensure_ready(mode)
 }
 
 pub fn start(context: CaptureContext) -> Result<Arc<dyn InputBackend>> {
+    crate::input::windows_agent::start_client(context)
+}
+
+pub(in crate::input) fn start_native(context: CaptureContext) -> Result<Arc<dyn InputBackend>> {
     let state = Arc::new(WindowsState {
         context,
         physical_pressed: Mutex::new(BTreeSet::new()),
@@ -444,7 +448,7 @@ fn create_cursor_hider(thread_id: u32) -> Result<CursorHider> {
 fn create_blank_cursor(instance: HInstance) -> Result<HCursor> {
     let width = unsafe { GetSystemMetrics(SM_CXCURSOR) }.max(1);
     let height = unsafe { GetSystemMetrics(SM_CYCURSOR) }.max(1);
-    let row_bytes = ((width as usize + 31) / 32) * 4;
+    let row_bytes = (width as usize).div_ceil(32) * 4;
     let plane_size = row_bytes.saturating_mul(height as usize);
     let and_plane = vec![0xffu8; plane_size];
     let xor_plane = vec![0u8; plane_size];
@@ -626,13 +630,11 @@ unsafe extern "system" fn mouse_callback(code: i32, w_param: WParam, l_param: LP
                 });
             }
         }
-        WM_MOUSEHWHEEL => {
-            if active {
-                context.context.emit_reliable(NativeEvent::Wheel {
-                    x: (event.mouse_data >> 16) as i16 as i32 / WHEEL_DELTA,
-                    y: 0,
-                });
-            }
+        WM_MOUSEHWHEEL if active => {
+            context.context.emit_reliable(NativeEvent::Wheel {
+                x: (event.mouse_data >> 16) as i16 as i32 / WHEEL_DELTA,
+                y: 0,
+            });
         }
         _ => {}
     }
@@ -1062,9 +1064,9 @@ fn vk_to_hid(vk: u16) -> u16 {
         0x26 => 0x52,
         0x27 => 0x4f,
         0x28 => 0x51,
-        0x70..=0x7b => 0x3a + u16::from(vk - 0x70),
-        0x30..=0x39 => if vk == 0x30 { 0x27 } else { 0x1e + u16::from(vk - 0x31) },
-        0x41..=0x5a => 0x04 + u16::from(vk - 0x41),
+        0x70..=0x7b => 0x3a + (vk - 0x70),
+        0x30..=0x39 => if vk == 0x30 { 0x27 } else { 0x1e + (vk - 0x31) },
+        0x41..=0x5a => 0x04 + (vk - 0x41),
         0xa2 => 0xe0,
         0xa0 => 0xe1,
         0xa4 => 0xe2,

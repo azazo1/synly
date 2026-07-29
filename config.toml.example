@@ -17,6 +17,36 @@ max_clipboard_bytes = 104857600
 [notifications]
 enabled = true
 
+[ui]
+log_level = "info"
+first_run_completed = false
+start_hidden = false
+close_to_tray = true
+launch_at_login = false
+resume_last_session = false
+window_width = 1080
+window_height = 720
+
+[runtime]
+connection = "host"
+instance_name = ""
+peer_query = ""
+file_sync_mode = "off"
+paths = []
+sync_delete = false
+clipboard_mode = "off"
+audio_mode = "off"
+input_mode = "off"
+input_edge = "right"
+input_hotkey = "ctrl+alt+shift+esc"
+interval_secs = 3
+accept = false
+trust_device = false
+trusted_only = false
+
+[discovery]
+mdns_enabled = true
+
 # 可选. 取消以下注释以启用 LND 聚合发现.
 # server_url 是服务根 URL, 不包含 /v1.
 # [discovery.lnd]

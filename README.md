@@ -1,822 +1,191 @@
 # Synly
 
-Synly 是一个面向局域网的跨平台 Rust CLI，用来发现附近设备、通过最小明文 bootstrap + PIN + PAKE 建立临时 mTLS，或在已信任设备之间直接使用长期 mTLS，并持续同步指定文件、文件夹和可选的多格式剪贴板。
+Synly 是一个面向局域网的跨平台同步应用. 默认启动 Slint GUI, 可在系统托盘后台运行, 并在当前连接中动态调整剪贴板, 音频和输入方向. 文件工作区或角色等会影响会话边界的设置会自动安全断开并重连.
 
-| Host Mode | Join Mode |
-|-----------|-----------|
-| [![Host Mode Demo](assets/host.gif)](assets/host.gif) | [![Join Mode Demo](assets/join.gif)](assets/join.gif) |
+Synly 支持 Windows, macOS 和 Linux. 文件与剪贴板同步可在三大平台使用. 音频运行时目前支持 Windows 和 macOS. 输入同步目前支持 Windows 和 macOS.
 
-当前版本已经实现：
+## 主要功能
 
-- 默认通过 mDNS 自动发现设备, 配置 LND 后会并行使用中心注册表并聚合结果
-- 文件同步支持关闭 / 发送 / 接收 / 双向 / 自动协商五种模式
-- 未信任设备先只交换一次性 bootstrap 公钥，服务端显示客户端 bootstrap 指纹 ASCII 图和该会话专属 PIN
-- 客户端输入 PIN 后，双方先完成基于 PIN 的 SPAKE2 PAKE，再派生临时 mTLS，在加密信道内传输设备身份、请求模式和同步摘要
-- 服务端在看见加密后的客户端摘要后再交互确认是否放行
-- host 会对未信任设备的失败配对做超时、指数退避和冷却限制，降低暴力猜 PIN 风险
-- 支持在成功输入一次 PIN 后为设备对建立可信设备公钥和根证书绑定，后续连接会优先走 mTLS 并免 PIN
-- 建立加密连接后用 `notify` 监听目录变化，并保留周期性重扫兜底
-- 支持为当前运行中的 Synly 进程单独指定一个临时名称，便于同机多进程时在发现和配对阶段区分与匹配
-- 可选地同步剪贴板中的文本、RTF、HTML、图片，以及限制大小内的文件；剪贴板方向由独立的 `--clipboard off|send|receive|both` 控制，默认关闭，默认允许最多 100 MB 的剪贴板二进制内容
-- 可选地单向同步系统音频；音频方向由独立的 `--audio off|send|receive` 控制，默认关闭，只有一端 `send`、另一端 `receive` 时才会建立音频通道
-- 可选地在 macOS 和 Windows 之间单向同步鼠标键盘; 输入方向由 `--input off|send|receive` 控制, 默认关闭
-- 输入控制使用同一监听端口上的独立 TLS 辅助通道, 不会被大文件或大剪贴板传输阻塞
-- 文件和大剪贴板内容使用分段流式传输，线上 payload 使用二进制编码而不是 JSON
-- 连接意外断开后会自动重连；如果只是某个内容超过大小限制，会跳过那次发送，不会直接退出整个程序
-- 已认证连接建立和断开时发送桌面系统提醒, 支持配置文件和本次运行参数开关
-- 收到 Ctrl-C 后关闭当前连接, 停止 mDNS 和 LND 续租任务, 完成清理后退出
-- 支持用 `.synlyignore` 排除不想参与同步的路径，语法兼容 gitignore
-- 默认通过启动 TUI 补全参数，也支持通过命令行显式指定模式、目标设备、PIN、自动接受和可信设备策略
+- Slint 主窗口和原生系统托盘.
+- 状态, 设备, 同步, 安全, 设置, 日志和 About 页面.
+- mDNS 与 LND 设备发现聚合.
+- 未信任设备使用 bootstrap 指纹, SPAKE2 PIN 和临时 mTLS 完成配对.
+- 可信设备使用身份公钥和长期 mTLS 免 PIN 重连.
+- 文件同步支持 off, send, receive, both 和 auto.
+- 剪贴板同步支持文本, RTF, HTML, 图片和受大小限制的文件.
+- 音频支持单向 send 和 receive.
+- 输入支持单向 send 和 receive, 包含边缘切换和紧急收回热键.
+- 剪贴板, 音频和输入模式使用 protocol 17 capability generation 热协商.
+- 文件扫描间隔和删除策略可在当前会话中更新.
+- 角色, 对侧, 工作区和监听端口变化会自动重建会话.
+- 单实例运行. 重复启动会激活已有窗口.
+- 支持关闭到托盘, 启动隐藏, 恢复上次会话和登录启动.
+- 隐藏窗口收到配对请求时显示不含 PIN 的系统通知, 点击后恢复对应 modal.
+- 窗口尺寸会持久化并在下次启动时恢复.
+- tracing 同时输出到终端, 每日滚动日志文件和 GUI 环形日志缓冲区, 日志级别可实时调整.
 
-## 设计目标
+## 安全顺序
 
-- 尽量少配置，第一次运行就能开始同步
-- 尽量使用成熟库，而不是重复造轮子
-- 命令行提示直白，适合直接在终端中操作
-- 支持 macOS / Linux / Windows 这类常见桌面环境
+未信任设备在 PIN 之前只交换一次性 bootstrap 公钥. 双方核对 bootstrap 指纹和会话 randomart 后, 使用 PIN 完成 SPAKE2. 设备身份, 工作区摘要和能力信息只在临时 mTLS 建立后传输.
 
-## 当前状态
+固定 PIN 只保存在当前进程内存中. PIN, 密钥, PAKE 数据和剪贴板内容不会写入 tracing 日志.
 
-这是一个可编译、可运行的原型版本，核心配对和同步流程已经打通，但还不是生产级同步工具。
+可信设备可保存对侧身份公钥和 TLS 根证书. 撤销当前对侧信任会立即断开连接, 后续可信重连会被拒绝.
 
-它更适合：
+## 构建
 
-- 两台在同一局域网里的机器临时建立同步关系
-- 在终端中手动确认一次同步连接
-- 同步中小规模目录，或显式指定的一组文件/目录
+Rust 版本需要满足 Slint 1.17.1 的要求. 当前开发基线使用 Rust 1.97.1.
 
-如果你需要下面这些能力，目前还没有：
-
-- 断点续传
-- 历史版本 / 冲突合并策略
-- 可信设备公钥轮换 / 撤销 / 证书链管理
-- 后台守护进程 / 系统服务集成
-- 图形界面
-
-输入同步不实现 Deskflow 线协议兼容, 不能直接连接 Deskflow 客户端或服务端.
-
-## 编译环境准备
-
-Synly 本体可以在 macOS / Linux / Windows 上编译；“音频同步”依赖 Opus，并且当前的原生音频后端支持情况是：
-
-- Windows：已实现发送和接收
-- macOS：已实现发送和接收，采集走系统音频 tap，当前要求 macOS 14.0+，且暂不支持手动选择采集设备
-- Linux：音频后端暂未实现；如果只使用文件 / 剪贴板同步，不受影响
-
-也就是说：
-
-- 不开音频同步时，三大桌面平台都可以正常编译和使用文件 / 剪贴板同步
-- 开启音频同步相关编译时，三大平台都需要准备 Opus 开发库
-- 真正运行音频发送 / 接收时，目前建议按 Windows 或 macOS 环境准备
-
-### Windows
-
-推荐使用 MSVC 工具链。
-
-1. 安装 Rust：
-
-```powershell
-rustup default stable-x86_64-pc-windows-msvc
-```
-
-2. 安装 Visual Studio 2022 Build Tools，至少勾选：
-
-- `Desktop development with C++`
-- Windows 10/11 SDK
-
-3. 安装 `vcpkg`，并安装 Opus：
-
-```powershell
-vcpkg install opus:x64-windows-static
-```
-
-4. 设置 `VCPKG_ROOT` 指向你的 `vcpkg` 根目录；如果以前手动设置过 `OPUS_LIB_DIR` / `OPUS_DIR`，建议确认它们没有指向已经失效的旧路径。
-
-```powershell
-$env:VCPKG_ROOT="C:\path\to\vcpkg"
-```
-
-如果你使用的是持久化环境变量，也可以把 `VCPKG_ROOT` 写入系统环境变量。
-
-### macOS
-
-需要 Rust、Xcode Command Line Tools、`pkg-config` 和 `opus`：
-
-```bash
-xcode-select --install
-brew install pkg-config opus
-rustup default stable
-```
-
-说明：
-
-- `build.rs` 会优先通过 `pkg-config` 查找 Opus
-- `build.rs` 还会用 `clang` 编译 `native/macos_audio.m`，并链接 `Foundation`、`AudioToolbox`、`CoreAudio` 等系统 framework
-- 运行音频采集需要 macOS 14.0 或更高版本
-- 当前 macOS 采集固定使用系统音频 tap，暂不支持手动选择采集设备
-
-### Linux
-
-需要 Rust、C 编译器、`pkg-config` 和 Opus 开发包。
-
-Debian / Ubuntu：
-
-```bash
-sudo apt update
-sudo apt install -y build-essential pkg-config libopus-dev
-rustup default stable
-```
-
-Fedora：
-
-```bash
-sudo dnf install -y gcc gcc-c++ make pkgconf-pkg-config opus-devel
-rustup default stable
-```
-
-说明：
-
-- `build.rs` 会通过 `pkg-config` 解析 Opus 的头文件 / 链接参数
-- 当前 Linux 音频后端还没有实现；如果只使用文件 / 剪贴板同步，不受影响
-
-## 安装
-
-准备好上面的编译环境后，执行：
-
-```bash
+```shell
 cargo build --release
 ```
 
-生成的可执行文件位于：
+开发运行:
 
-```text
-target/release/synly
-```
-
-也可以直接用开发模式运行：
-
-```bash
+```shell
 cargo run --
 ```
 
-## 快速开始
+发布产物位于 `target/release/synly`.
 
-### 方式一：启动 TUI
+### Windows
 
-在任意一台机器上运行：
+推荐使用 MSVC 工具链和 Windows 10/11 SDK. 音频依赖 Opus.
 
-```bash
+```powershell
+rustup default stable-x86_64-pc-windows-msvc
+vcpkg install opus:x64-windows-static
+$env:VCPKG_ROOT="C:\path\to\vcpkg"
+cargo build --release
+```
+
+Windows 主 GUI 使用 `asInvoker` manifest 以普通权限运行. `synly-input-agent.exe` 使用 `requireAdministrator` manifest, 输入控制开启前通过 `ShellExecuteW("runas")` 按需请求 UAC. 登录启动且窗口隐藏时不会主动弹出 UAC, 需要用户从托盘或设置页确认授权.
+
+GUI 和代理通过随机命名管道与随机 token 通信. 管道 DACL 只允许当前用户和 SYSTEM, 双方校验 IPC 版本, PID, session ID, 映像路径和安装目录. release 构建要求 GUI 与代理通过 Authenticode 校验, debug 构建会记录签名校验警告但允许本地未签名产物. 管道断开, 心跳超时, 代理退出或进入非 `Default` 输入桌面时会立即释放输入状态.
+
+### macOS
+
+macOS 音频采集要求 macOS 14.0 或更高版本.
+
+```shell
+xcode-select --install
+brew install pkg-config opus
+rustup default stable
+cargo build --release
+```
+
+### Linux
+
+Debian 或 Ubuntu:
+
+```shell
+sudo apt update
+sudo apt install -y build-essential pkg-config libopus-dev
+rustup default stable
+cargo build --release
+```
+
+Fedora:
+
+```shell
+sudo dnf install -y gcc gcc-c++ make pkgconf-pkg-config opus-devel
+rustup default stable
+cargo build --release
+```
+
+Linux 音频和输入运行时目前不可用, 但文件与剪贴板同步不受影响.
+
+## GUI 使用
+
+直接运行 `synly` 启动 GUI.
+
+```shell
 synly
 ```
 
-如果启动参数还不完整，程序会直接进入启动 TUI，你可以在里面选择：
+首次启动总是显示主窗口. 关闭窗口默认隐藏到托盘. 托盘菜单可以打开窗口, 连接或断开, 快速切换剪贴板, 音频和输入, 以及退出应用.
 
-1. 文件同步模式：`--fs <send|receive|both|auto|off>`，默认是 `off`
-2. 连接方式：`--host` 或 `--join`
-3. 共享目录或接收目录（`off` 模式不需要）
-4. 剪贴板同步方向：`off` / `send` / `receive` / `both`
-5. 其他可选项，例如当前实例名、删除同步、音频模式等
+安全页可以设置仅在当前进程内有效的固定 PIN. 留空时 host 为每次未信任配对生成随机 PIN. 固定 PIN 不写入配置, 状态快照或日志.
 
-如果你已经通过命令行把连接方式等必要参数传完整，程序就会直接启动，不再额外弹出启动询问；不传 `--fs` 时默认按 `off` 处理。
+设备页持续显示发现结果, 协议版本, 来源, 信任状态, 地址和广播能力. protocol version 不兼容的设备无法连接.
 
-### 方式二：显式指定模式
+剪贴板, 音频和输入开关会立即发送 capability update. 开启新能力时, 本机等待对侧 ack 后再启动任务. 关闭能力时, 本地任务会立即停止. ack 超过 5 秒未返回时, 当前会话会受控重连.
 
-把当前目录作为发送源，并等待别人连接：
+文件模式, 路径, 初始来源和最大目录深度需要重建文件会话. GUI 会保留进程和托盘, 只重连当前对侧.
 
-```bash
-synly --fs send . --host
-```
+设置页可以调整设备名, mDNS/LND, 剪贴板载荷限制, 缓存目录, 传输帧限制和后台行为. capability 变化会重新发布发现元数据. 设备名, 发现后端或传输限制变化使用受控重连, 剪贴板限制从下一项载荷开始生效.
 
-把远端内容接收到 `./backup`：
+启用删除同步前会显示确认对话框. 确认后更新当前策略, 并请求对侧强制发布一次文件快照.
 
-```bash
-synly --fs receive ./backup --join
-```
+## Headless
 
-双向同步当前目录，并等待别人连接：
+只有显式传入 `--headless` 才会进入无界面模式. Headless 不进行任何终端询问. 参数不足时直接失败.
 
-```bash
-synly --fs both . --host
-```
-
-把兜底重扫间隔改成 5 秒：
-
-```bash
-synly --fs both . --host --interval-secs 5
-```
-
-只同步共享目录下两层以内的内容：
-
-```bash
-synly --fs both . --host --max-folder-depth 2
-```
-
-监听时使用自动协商模式：
-
-```bash
-synly --fs auto . --host
-```
-
-同时开启文件和剪贴板双向同步：
-
-```bash
-synly --fs both . --host --clipboard both
-```
-
-给当前运行中的 Synly 进程指定一个临时名称，方便对端通过名称匹配：
-
-```bash
-synly --name worker-a --fs both . --host
-```
-
-只同步剪贴板，不同步文件：
-
-```bash
-synly --fs off --host --clipboard both
-```
-
-把本机系统音频发送给对端：
-
-```bash
-synly --fs off --host --audio send
-```
-
-接收对端系统音频并在本机播放：
-
-```bash
-synly --fs off --join --audio receive
-```
-
-把本机鼠标键盘发送到对端, 从右侧屏幕边缘切换:
-
-```bash
-synly --fs off --host --input send --input-edge right --input-hotkey ctrl+alt+shift+esc
-```
-
-在本机接收对端鼠标键盘:
-
-```bash
-synly --fs off --join --input receive --peer workstation
-```
-
-输入模式只在一端为 `send` 且另一端为 `receive` 时建立. `--input-edge` 只对发送端有效. 热键使用 `+` 分隔, 必须包含至少一个修饰键和一个主键, 支持 `ctrl`, `alt`, `shift`, `meta/cmd/win` 以及命名按键.
-
-如果你明确不想进入启动交互，可以加上 `--no-interact`。这时如果启动参数不完整，程序会直接报错，并列出当前还缺哪些参数，例如：
-
-```bash
-synly --fs receive --no-interact
-```
-
-### 方式三：第一次全参数建立可信设备
-
-接收端先启动，并固定本次 PIN、自动接受、允许建立可信设备绑定：
-
-```bash
-synly --fs auto . --host --pin 123456 --accept --trust-device
-```
-
-连接端指定目标设备，并直接使用同一个 PIN：
-
-```bash
-synly --name laptop-sync --fs auto . --join --peer workstation --pin 123456 --trust-device
-```
-
-如果这次 PIN 认证成功，并且服务端在确认时选择 `T`、客户端也同意信任服务端，那么双方都会保存对端的身份公钥和 TLS 根证书。
-
-### 方式四：后续免 PIN 自动运行
-
-接收端：
-
-```bash
-synly --fs auto . --host --trusted-only
-```
-
-连接端：
-
-```bash
-synly --fs auto . --join --peer workstation --trusted-only
-```
-
-这时如果双方之前已经互相建立过可信设备绑定，就不会再询问 PIN，而是直接走长期 mTLS；服务端也会默认自动接受这次同步。
-
-## 使用流程
-
-### 服务端（被连接方）
-
-运行：
-
-```bash
-synly --fs auto . --host
-```
-
-随后 Synly 会：
-
-1. 在局域网中通过 mDNS 广播当前设备
-2. 打印当前设备模式、端口，并开始等待请求
-3. 如果连接方已经被信任，就直接通过长期 mTLS + 身份签名完成认证，并默认自动接受本次同步
-4. 如果连接方尚未被信任，先只接收一个最小 bootstrap 请求，并显示客户端 bootstrap 指纹 ASCII 图、本次会话核对图和该请求专属的 6 位 PIN
-5. 客户端输入 PIN 后，双方先完成 SPAKE2 PAKE，再切换到临时 mTLS；只有这之后，服务端才会看到对端设备身份、请求模式和同步摘要
-6. 对未受信任设备，如果没有传 `--accept`，再询问你是否接受本次同步；输入 `T` 表示接受并信任该客户端，`Y` 表示只接受本次，`n` 表示拒绝
-
-### 客户端（连接方）
-
-运行：
-
-```bash
-synly --fs both . --join
-```
-
-随后 Synly 会：
-
-1. 在局域网中搜索可连接的 Synly 设备
-2. 如果没有传 `--peer`，列出发现到的设备供你选择；传了 `--peer` 时会按实例名、设备名、设备 ID 前缀或 IPv4 地址自动匹配
-3. 如果双方已有可信设备绑定，就直接通过长期 mTLS + 身份签名免 PIN 建立认证，服务端会默认自动接受这次同步
-4. 否则客户端先生成一次性 bootstrap 指纹 ASCII 图并发起最小请求，服务端随后显示相同的客户端 bootstrap 图、本次会话核对图以及该会话专属的 6 位 PIN
-5. 客户端核对图形后输入 PIN，双方完成 SPAKE2 PAKE，验证彼此的 key confirmation，再派生临时 mTLS，并只在这条信道里发送设备身份和同步摘要
-6. 如果服务端选择了信任客户端，而本机还没保存该服务端，客户端会再询问是否也信任服务端；传了 `--trust-device` 时会自动同意
-7. 完成确认后建立同步
-
-## 命令概览
-
-```text
-synly [OPTIONS] [PATH ...]
-
-Options:
-  --no-interact
-  --notifications
-  --no-notifications
-  --fs <MODE>
-  --name <NAME>
-  --host
-  --join
-  --sync-delete
-  --no-sync-delete
-  --clipboard <MODE>
-  --audio <MODE>
-  --input <MODE>
-  --input-edge <left|right|top|bottom>
-  --input-hotkey <COMBINATION>
-  --interval-secs <SECONDS>
-  --max-folder-depth <DEPTH>
-  --peer <QUERY>
-  --port <PORT>
-  --pin <PIN>
-  --accept
-  --trust-device
-  --trusted-only
-  --discovery-secs <SECONDS>
-```
-
-其中：
-
-- `PATH` 是文件同步路径；`--fs send` 可以传多个路径，`--fs receive` / `--fs both` / `--fs auto` 只能传一个目录，`--fs off` 不需要路径
-- 不传 `--fs` 时默认就是 `off`
-- `--name` 是当前 Synly 实例的临时名称，只作用于本次运行，不会写回配置；`--peer` 可以按这个名称匹配
-- 剪贴板和音频方向仍然分别通过 `--clipboard <MODE>`、`--audio <MODE>` 独立指定
-- 输入方向通过 `--input <off|send|receive>` 指定, 发送端可以用 `--input-edge` 选择切换边缘
-- `--notifications` 和 `--no-notifications` 会覆盖配置文件中的提醒默认值, 两个参数不能同时使用
-
-### `--fs auto`
-
-本机使用同一个目录同时支持发送和接收，特别适合 `--host` 监听场景。
-
-```bash
-synly --fs auto . --host
-synly --fs auto ./workspace --join
-```
-
-说明：
-
-- `--fs auto` 会把同一个目录同时作为发送目录和接收目录
-- 监听连接时，它会根据客户端请求方向自动协商
-- 如果双方都支持双向同步，也会协商成双向
-
-### `--fs send`
-
-本机作为发送方，只把本地内容同步给对端。
-
-```bash
-synly --fs send ./docs --host
-synly --fs send ./a ./b ./c --join
-```
-
-说明：
-
-- 如果只传入一个目录，会同步这个目录的内容
-- 如果传入多个路径，会把这些路径作为“选定条目”同步
-- 多个路径不能有重名的顶层文件名
-
-### `--fs receive`
-
-本机作为接收方，只接收对端内容。
-
-```bash
-synly --fs receive ./incoming --host
-synly --fs receive ./incoming --join
-```
-
-### `--fs both`
-
-本机既能发送，也能接收。
-
-```bash
-synly --fs both . --host
-synly --fs both . --join
-```
-
-### `--fs off`
-
-关闭文件同步；适合只运行剪贴板同步、只运行音频，或者单纯先完成配对。
-
-```bash
-synly --fs off --host
-synly --fs off --join --clipboard both
-```
-
-说明：
-
-- `off` 模式不需要传目录路径
-- 文件同步会完全关闭
-- 剪贴板和音频仍然可以单独开启
-
-## 同步语义
-
-当前同步逻辑是“文件系统事件监听 + 清单比对 + 传输差异文件”，并保留周期性重扫作为兜底。
-
-具体行为如下：
-
-- 默认使用 `notify` 监听本地目录变化
-- 默认每 3 秒做一次全量重扫，避免错过底层文件系统事件
-- 文件内容通过 SHA-256 比较
-- 文件修改时间和可执行位变化也会触发重新同步
-- 目录会在传输前自动创建
-- 临时文件使用 `.synly.part` 后缀，完成后原子替换目标文件
-- 接收目录下的 `.synly/` 会被保留给 Synly 自己使用，并且永远不会参与同步
-- `.DS_Store` 和 `desktop.ini` 会被自动忽略，不参与同步
-- 符号链接会被忽略
-- `.git` 目录会被忽略
-- 任意层级的 `.synlyignore` 都会生效，使用 gitignore 兼容语法；被忽略的路径不会参与发送、接收或删除同步
-
-### 剪贴板同步
-
-Synly 可以可选地同步剪贴板，默认关闭。通过 `--clipboard <off|send|receive|both>` 独立指定方向：
-
-```bash
-synly --fs both . --host --clipboard both
-synly --fs receive ./incoming --join --clipboard receive
-synly --fs send ./docs --host --clipboard send
-synly --fs off --host --clipboard both
-```
-
-说明：
-
-- 当前会尽量同步纯文本、RTF、HTML、图片，以及普通文件剪贴板；富文本最终能否完整落到目标应用，还取决于目标操作系统和应用对对应格式的支持
-- 剪贴板方向和文件同步方向已经解耦；是否同步文件由 `--fs <send|receive|both|auto|off>` 决定，是否同步剪贴板由 `--clipboard` 单独决定
-- 剪贴板同步只有在双方方向能对上时才会生效；例如一端 `send` 需要另一端至少 `receive`
-- 不传 `--clipboard` 时默认是 `off`
-- 如果你只想同步剪贴板，可以使用 `synly --fs off --clipboard ...`
-- 连接建立后会先尝试同步一次当前剪贴板，之后继续监听新的剪贴板变化
-- 剪贴板文件只同步普通文件，不同步目录、符号链接或其他非常规条目；被跳过的条目会打印原因
-- 剪贴板文件会先落地到本机配置里的缓存目录下，再挂到系统剪贴板，便于跨机器粘贴；默认目录是配置目录下的 `clipboard-cache/`
-- 单个剪贴板文件会受配置项 `clipboard.max_file_bytes` 限制；超过上限的文件不会同步，并会输出原因
-- 如果设置了 `clipboard.max_cache_bytes`，剪贴板缓存总占用超过上限后，会按最早出现的顺序清理较旧批次，并尽量保留最新一次缓存
-- 双向模式下如果两边几乎同时复制了不同内容，最终结果取决于最后到达的一次更新
-
-### 音频同步
-
-Synly 可以可选地同步系统音频，默认关闭。通过 `--audio <off|send|receive>` 独立指定方向：
-
-```bash
-synly --fs off --host --audio send
-synly --fs off --join --audio receive
-synly --fs both . --host --audio receive
-synly --fs auto . --join --audio send
-```
-
-说明：
-
-- 音频方向和文件同步方向、剪贴板方向都已经解耦；是否同步音频完全由 `--audio` 决定
-- 音频只有单向模式，没有 `both`；只有一端 `send`、另一端 `receive` 时才会建立音频通道
-- 如果双方都选 `send`、双方都选 `receive`，或者任意一端是 `off`，连接仍然可以建立，但不会开始音频传输
-- 不传 `--audio` 时默认是 `off`
-- 如果你只想同步音频，可以使用 `synly --fs off --audio ...`
-- 当前发送端采集本机系统音频，接收端把收到的音频播放到本机默认输出设备
-- 音频数据在配对和控制信道建立完成后，会单独走一条加密的 UDP 通道，目标是降低播放延迟
-- 当前 CLI 只暴露立体声系统音频同步；暂不支持手动选择输入 / 输出设备
-- Windows 和 macOS 已实现发送与接收；Linux 音频后端暂未实现
-- macOS 当前依赖系统音频 tap 采集，要求 macOS 14.0 或更高版本
-- 音频同步更偏向低延迟播放而不是高缓冲保真；弱网、系统调度抖动或设备切换时，仍可能出现短暂杂音或中断
-
-### `.synlyignore`
-
-在共享目录里放置 `.synlyignore`，即可排除指定路径。它使用和 `.gitignore` 基本一致的语法，例如：
-
-```gitignore
-node_modules/
-*.log
-dist/
-!important.log
-```
-
-说明：
-
-- 规则会在对应目录及其子目录中生效
-- 双向或接收场景下，本地 `.synlyignore` 也会阻止这些路径被拉取或被删除
-- `synly --fs send ./docs ./notes ./todo.txt` 这类多路径发送时，目录条目会继续读取各自目录树内的 `.synlyignore`；显式传入的单个文件仍按显式选择处理
-
-### 删除行为
-
-如果当前设备会接收文件，Synly 会额外确认是否同步对端删除，默认是不删除。
-也可以显式指定：
-
-```bash
-synly --fs receive ./incoming --join --sync-delete
-synly --fs both . --host --sync-delete
-synly --fs both . --host --no-sync-delete
-```
-
-单向同步时：
-
-- 只有在当前接收端明确开启“删除同步”后，如果远端删除了某个共享文件，本地才会处理对应删除
-- 这里的“删除”不会直接抹掉文件，而是移动到接收目录下的 `.synly/deleted/`
-- `.synly/deleted/` 会按删除批次分桶保存，避免同名文件互相覆盖
-
-双向同步时：
-
-- 默认仍不自动传播删除；只有当前设备开启“删除同步”后，才会应用对端删除
-- 如果希望双方的删除都能互相传播，需要两边都开启删除同步
-- 这里的“删除”同样不会直接抹掉文件，而是移动到接收目录下的 `.synly/deleted/`
-
-自动协商模式时：
-
-- 它使用单个共享目录同时承担发送和接收
-- 实际同步方向由双方握手结果决定
-
-### 多路径发送
-
-当你使用：
-
-```bash
-synly --fs send ./docs ./notes ./todo.txt
-```
-
-远端会收到三个顶层条目：
-
-```text
-docs/
-notes/
-todo.txt
-```
-
-这时删除同步只会影响这些被共享的顶层条目，不会扩散到接收目录里其他不相关内容。
-
-### 示例 4：同时同步目录和多格式剪贴板
-
-两边都执行并开启剪贴板同步：
-
-```bash
-synly --fs both . --clipboard both
-```
-
-如果只有一边开启，或者双方方向对不上，文件仍会正常同步，但剪贴板不会生效。
-
-### 示例 5：仅同步剪贴板
-
-两边都执行：
-
-```bash
-synly --fs off --clipboard both
-```
-
-这时不会同步任何文件，只会按照 `--clipboard` 指定的方向同步剪贴板。
-
-### 示例 6：把一台机器的系统音频转到另一台机器播放
-
-发送端：
-
-```bash
-synly --fs off --host --audio send
-```
-
-接收端：
-
-```bash
-synly --fs off --join --audio receive
-```
-
-如果两边音频方向没有对上，例如双方都写了 `--audio send`，连接仍会成功，但不会建立音频通道。
-
-## 安全模型
-
-Synly 当前的安全连接模型是：
-
-1. 如果双方之前已经互相保存过对端身份公钥和根证书，就直接建立长期 mTLS
-2. 在长期 mTLS 之上，客户端和服务端都会再用 TLS exporter + 长期身份私钥签名，把应用层身份绑定到这一次会话
-3. 每台设备本地都会生成一对长期身份密钥，并从它派生稳定的设备根证书
-4. 如果还没有可信公钥绑定，客户端先生成一次性 `X25519` bootstrap 密钥，只把 bootstrap 公钥发给服务端，不发送设备身份、请求模式和同步摘要
-5. 服务端显示客户端 bootstrap 指纹 ASCII 图、本次会话核对图，以及该 bootstrap 会话专属的 6 位 PIN，或者使用 `--pin` 指定的固定 PIN
-6. 客户端核对图形后输入 PIN，双方先用 `SPAKE2` 完成基于 PIN 的 PAKE，并做一次显式 key confirmation
-7. 双方再用 `X25519 shared secret + PAKE key + request_id + 双方 bootstrap 公钥` 派生一次性临时 mTLS 根证书和双端叶子证书
-8. 只有在临时 mTLS 建好以后，客户端才会发送本机身份、请求模式和同步摘要
-9. host 会对未信任设备的失败尝试做超时、退避、失败次数限制和冷却，降低在线猜 PIN 风险
-10. 如果这次 PIN 认证成功，并且服务端在确认时选择信任客户端，客户端随后也同意信任服务端，双方就会保存彼此的长期身份公钥和设备根证书；后续会话必须同时通过长期 mTLS 和对应私钥签名，才会被当作可信设备
-11. 服务端确认请求后，才开始同步
-
-这意味着：
-
-- PIN 不会以明文在网络中传输
-- 未信任设备在 PIN 前不会暴露设备身份、同步模式或工作区摘要
-- 仅知道局域网地址还不够，必须同时拿到 PIN，并通过 PAKE 和 bootstrap 图核对，才能安全完成首次配对
-- 已建立可信设备后，后续会话仍然会把签名绑定到这一次 mTLS 会话，不能直接重放旧报文
-- 攻击者即使试图在后续连接里双端终止 TLS，也无法通过 mTLS 冒充已受信设备并读取同步明文
-- 未信任设备路径带有配对超时、退避和冷却窗口，固定 PIN 场景也更难被持续在线爆破
-- 服务端可以看到请求方身份、模式和同步摘要后再决定是否放行
-
-但你也需要知道当前版本的边界：
-
-- 首次用 PIN 建立信任时，仍然建议人工核对双方显示的 bootstrap 图和会话图；如果完全不核对，第一次信任依然属于 TOFU
-- PAKE 能显著降低主动中间人风险，但它不能替代“确认你连的是你想连的那台设备”这件事；如果用户选错设备或信错屏幕，仍然可能把首次信任授给错误对象
-- 当前的失败限制是按来源 IP 做的，在 NAT 或多人共享出口地址的环境里可能会互相影响
-- 可信设备材料目前是按“设备对”保存的，不带轮换和吊销机制
-- 根证书是设备自签发身份根，不依赖外部 CA 或硬件信任根
-- 更适合在可信局域网和人工确认场景下使用
-
-### 鼠标键盘同步
-
-输入同步默认关闭. 开启后, 发送端光标在配置的真实外边缘继续向外移动时切换到对端, 接收端从相反外边缘继续向外移动时返回. 控制期间发送端隐藏并消费本地键鼠事件, 紧急热键在两端始终由本地消费.
-
-输入事件使用 USB HID usage 和相对移动传输, 接收端使用自己的键盘布局. 主连接断开, 辅助通道断开, 心跳超时, 权限丢失, 注入失败或可靠事件队列溢出时都会释放远端按键和鼠标按钮, 并恢复本地光标.
-
-平台边界:
-
-- macOS 需要在系统设置中授予 Synly 辅助功能和输入监控权限. Quartz event tap 被系统禁用或超时会立即停止控制. Secure Input 启用时会拒绝启动或立即停止控制, 更高权限桌面不承诺可注入.
-- Windows 使用低级键鼠钩子和 `SendInput`. UAC 安全桌面, 更高完整性进程和权限隔离可能拒绝注入, 检测到失败会停止控制.
-- Linux 和其他平台暂不支持输入同步. 在这些平台使用 `--input off` 不影响文件, 剪贴板和音频的已有功能.
-
-输入通道只接受已经通过 Synly PIN 临时配对或可信设备 mTLS 的主会话, 并用主 TLS exporter, 辅助 TLS exporter, 会话 ID 和双方角色做双向 HMAC 证明. 仅知道会话 ID 或复制辅助证书不能接入.
-
-## 设备发现
-
-Synly 始终尝试使用 mDNS 广播和发现设备, 服务类型为:
-
-```text
-_synly._tcp.local.
-```
-
-当前实现优先使用非回环 IPv4 地址.
-
-配置 `[discovery.lnd]` 后, Synly 还会作为 client 连接外部 `lnd-server`. host 会同时注册 mDNS 服务和 LND 租约, join 会并行查询两个后端, 再按设备 ID, 实例名和端口去重并合并地址. 任一后端可用时程序会继续运行并报告另一个后端的错误, 只有两个后端都失败时发现操作才会失败.
-
-发现结果会标记来源为 `mDNS`, `LND` 或 `mDNS+LND`. 交互选择和 `--peer` 自动匹配都会在连接前显示该信息.
-
-一个设备广播多个 IPv4 地址时, Synly 会根据本机网卡掩码分组, 优先并发尝试同子网地址并使用第一个成功建立的 TCP 连接. 同子网地址均失败时再并发尝试其余地址, 每个地址的超时为 3 秒, 因此 LND 返回的虚拟网卡地址不会串行阻塞整个连接流程.
-
-Synly 不会内嵌或自动启动 `lnd-server`. server base URL 应指向服务根路径或反向代理前缀, 不要追加 `/v1`. 例如:
+Host 示例:
 
 ```shell
-lnd-server --listen-addr 0.0.0.0:8765 --bearer-token dev-token
+synly --headless --host --fs auto --initial this --pin 123456 --accept --trust-device .
 ```
 
-如果局域网里搜不到设备，优先检查：
+Join 示例:
 
-- 两台机器是否在同一个子网
-- 本机防火墙是否拦截 mDNS 或 TCP 监听端口
-- 网络环境是否禁用了局域网广播
-
-## 配置文件
-
-首次运行时, Synly 会为当前设备生成一个本地配置文件, 保存设备信息, 提醒开关, 发现后端, 剪贴板策略和传输大小限制.
-
-所有平台统一使用:
-
-- `~/.config/synly/config.toml`
-
-剪贴板缓存使用由 `dirs::cache_dir()` 确定的平台专用缓存目录. 默认位置是 macOS 的 `~/Library/Caches/synly/clipboard-cache`, Linux 的 `${XDG_CACHE_HOME:-~/.cache}/synly/clipboard-cache` 或 Windows 的 `%LOCALAPPDATA%/synly/clipboard-cache`. 相对 `clipboard.cache_dir` 也以该目录为基准.
-
-可直接编辑的示例见 [`config.toml.example`](config.toml.example). 程序补全设备身份后的配置结构如下:
-
-```toml
-[device]
-device_id = "2d0d69d8-0f7f-40e4-8fd3-fd0a29a2ed84"
-device_name = "workstation"
-identity_private_key = "MC4CAQAwBQYDK2VwBCIEIOt5..."
-identity_public_key = "0i0s2v8kP4q2Tf8s0QylhKf5q7H7YBfQGfJY8y1zPM0"
-
-[clipboard]
-max_file_bytes = 104857600
-max_cache_bytes = 536870912
-cache_dir = "clipboard-cache-custom"
-
-[transfer]
-max_meta_bytes = 20971520
-max_frame_data_bytes = 134217728
-max_clipboard_bytes = 104857600
-
-[notifications]
-enabled = true
-
-[discovery.lnd]
-server_url = "http://127.0.0.1:8765"
-bearer_token = "dev-token"
-discovery_domain = "office-a"
-
-[[trusted_devices]]
-device_id = "6fce44a6-2a07-4f72-9192-a4ec4a1e6df0"
-device_name = "laptop"
-public_key = "wV4Vj7a7VQxgq9b2oS9Q6I72gq8sSdlx6a1aB6V8n3A"
-tls_root_certificate = "MIIB...base64-no-pad..."
-trusted_at_ms = 1763651605123
-last_seen_ms = 1763651888123
-successful_sessions = 3
+```shell
+synly --headless --join --peer workstation --fs auto --initial other --pin 123456 --trust-device .
 ```
 
-其中：
+后续仅允许可信设备:
 
-- `clipboard.max_file_bytes` 是单个剪贴板文件的大小上限，单位为字节
-- `clipboard.max_cache_bytes` 可选；是剪贴板缓存目录总占用上限，单位为字节；超过后会按最早出现顺序清理旧缓存
-- `clipboard.cache_dir` 可选; 可以写绝对路径, 也可以写相对于 `dirs::cache_dir()/synly` 的路径
-- 未设置 `clipboard.cache_dir` 时, 剪贴板文件缓存默认保存在 `dirs::cache_dir()/synly/clipboard-cache`
-- `transfer.max_meta_bytes` 是单帧元数据上限，单位为字节
-- `transfer.max_frame_data_bytes` 是单个二进制帧的数据上限，单位为字节
-- `transfer.max_clipboard_bytes` 是单次剪贴板二进制总载荷上限，单位为字节
-- `notifications.enabled` 默认是 `true`, 可由 `--notifications` 或 `--no-notifications` 为本次运行覆盖
-- 缺少 `[discovery.lnd]` 时只使用 mDNS; 添加该配置节后启用 LND 聚合发现
-- `discovery.lnd.server_url` 不能包含 `/v1`; `bearer_token` 可以留空, `discovery_domain` 可以省略
-- `bearer_token` 会以明文保存在配置文件中, 不会写入运行日志或系统提醒
-- `device.identity_private_key` / `device.identity_public_key` 是当前设备的长期身份密钥
-- `trusted_devices` 可选；只有在一次 PIN 认证成功后，本机明确同意信任对端时，这里才会出现记录；以后会用这里保存的公钥和根证书建立 mTLS，并校验对端签名
-
-设备名称来源优先级大致为：
-
-1. `SYNLY_DEVICE_NAME`
-2. `HOSTNAME` / `COMPUTERNAME`
-3. 当前用户名 + 随机后缀
-
-如果你在启动时传了 `--name`，那只是覆盖“本次运行中的实例名称”，用于发现列表和 `--peer` 匹配；它不会改写这里的设备名配置。
-
-## 示例
-
-### 示例 1：把一台机器的当前目录同步到另一台机器
-
-接收端：
-
-```bash
-synly --fs receive . --host
+```shell
+synly --headless --host --fs auto --initial this --trusted-only .
+synly --headless --join --peer workstation --fs auto --initial other --trusted-only .
 ```
 
-发送端：
+只同步剪贴板:
 
-```bash
-synly --fs send . --join
+```shell
+synly --headless --host --fs off --clipboard both --pin 123456 --accept
+synly --headless --join --peer workstation --fs off --clipboard both --pin 123456
 ```
 
-### 示例 2：两台机器共享同名工作目录
+音频发送和接收:
 
-两边都进入各自项目目录后执行：
-
-```bash
-synly --fs auto .
+```shell
+synly --headless --host --fs off --audio send --pin 123456 --accept
+synly --headless --join --peer workstation --fs off --audio receive --pin 123456
 ```
 
-一边选择“等待别人连接”，另一边选择“连接局域网中的设备”。
+输入发送和接收:
 
-### 示例 3：同步几个离散路径
-
-```bash
-synly --fs send ./docs ./scripts ./README.md --host
+```shell
+synly --headless --host --fs off --input send --input-edge right --input-hotkey ctrl+alt+shift+esc --pin 123456 --accept
+synly --headless --join --peer workstation --fs off --input receive --pin 123456
 ```
 
-## 开发
+## 配置生效方式
 
-常用命令：
+| 配置 | 生效方式 |
+|---|---|
+| 通知, 日志级别, GUI 和启动行为 | 本地立即生效 |
+| 剪贴板, 音频, 输入方向 | 当前会话内 capability 热协商 |
+| 输入边缘和紧急热键 | 推进 capability generation 并重建输入辅助通道 |
+| 剪贴板大小和缓存限制 | 下一项剪贴板载荷应用 |
+| 扫描间隔 | 当前文件任务立即更新 |
+| 删除同步 | 确认后更新策略并请求一次远端快照 |
+| 文件模式, 路径, 初始来源, 最大目录深度 | 自动断开并重连 |
+| 角色, 对侧, 监听端口, 传输限制 | 重建监听器或会话 |
+| capability 广播内容 | 保持当前会话并重新发布发现信息 |
+| 设备名, 实例名, mDNS 或 LND 设置 | 重新启动发现服务并受控重连当前会话 |
+| 撤销当前对侧信任 | 立即断开 |
 
-```bash
-cargo fmt
-env -u RUSTC_WRAPPER cargo check
-env -u RUSTC_WRAPPER cargo test --quiet
-env -u RUSTC_WRAPPER cargo clippy --all-targets --all-features -- -D warnings
+## 验证
+
+```shell
+cargo test
+cargo clippy --all-targets --all-features
 ```
 
-## 已知限制
+协议热协商测试覆盖 generation 并发更新, stale epoch, ack 和 capability 开关状态. Windows 原生构建应运行 `cargo clippy --all-targets --all-features`, `cargo test` 和 `cargo build --bins`. 输入代理仍需要在普通应用, 管理员应用, UAC 拒绝, 代理崩溃, 签名发布包和安全桌面切换场景中进行真机验证.
 
-- 只做文件覆盖，不做三方合并
-- 双向模式下如果两边同时修改同一个文件，最后结果取决于后到达的一次同步
-- 剪贴板虽然支持文本、富文本、图片和普通文件，但不同操作系统与应用对富文本 / HTML / 图片格式的支持仍可能不完全一致
-- 音频同步当前只有单向 `send/receive`，还不支持双向同时传输，也暂不支持手动选择输入 / 输出设备
-- 目前只支持 `.synlyignore`，还没有全局忽略规则或更细粒度策略
-- 大目录初次同步会比较慢，因为需要计算完整清单和哈希
-- 目前没有带宽限制或并发传输调优
+## 协议兼容
 
-## 后续方向
-
-比较值得继续补的能力有：
-
-- 更丰富的忽略规则来源和全局配置
-- 冲突检测与提示
-- 设备长期信任和证书固定
-- 更稳定的断线恢复
-- 图形界面或 TUI
-
-## 许可证
-
-暂未添加许可证文件；如果你准备公开分发，建议在仓库中补充明确的 License。
+当前协议版本为 `17`. 本版本不提供旧协议兼容层. 发现结果会携带协议版本, GUI 在连接前禁用不兼容设备.

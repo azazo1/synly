@@ -10,4 +10,6 @@ mod receiver;
 mod runtime;
 mod sender;
 
-pub use runtime::{AudioChannelDirection, bind_and_spawn_receiver, spawn_sender};
+pub use runtime::{
+    AudioChannelDirection, AudioTaskHandle, bind_and_spawn_receiver, spawn_sender,
+};

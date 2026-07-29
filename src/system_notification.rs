@@ -19,36 +19,78 @@ pub trait SessionNotifier {
     fn notify(&self, event: ConnectionEvent, peer: &NotificationPeer);
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct SystemNotifier {
-    enabled: bool,
+    tuning: tokio::sync::watch::Receiver<crate::runtime_control::RuntimeTuning>,
 }
 
 impl SystemNotifier {
-    pub fn new(enabled: bool) -> Self {
-        Self { enabled }
+    pub fn new(
+        tuning: tokio::sync::watch::Receiver<crate::runtime_control::RuntimeTuning>,
+    ) -> Self {
+        Self { tuning }
+    }
+}
+
+pub fn notify_interaction(
+    enabled: bool,
+    title: String,
+    body: String,
+    on_open: impl Fn() + Send + Sync + 'static,
+) {
+    if !enabled {
+        return;
+    }
+    if let Err(error) = std::thread::Builder::new()
+        .name("synly-interaction-notification".to_string())
+        .spawn(move || {
+            let mut notification = Notification::new();
+            notification
+                .appname("Synly")
+                .summary(&title)
+                .body(&body)
+                .action("open", "打开 Synly");
+            match notification.show() {
+                Ok(handle) => handle.wait_for_action(move |action| {
+                    if matches!(action, "open" | "default") {
+                        on_open();
+                    }
+                }),
+                Err(err) if !NOTIFICATION_ERROR_REPORTED.swap(true, Ordering::Relaxed) => {
+                    tracing::warn!(error = %err, "无法发送系统提醒, 后续错误将不再重复显示");
+                }
+                Err(_) => {}
+            }
+        })
+    {
+        tracing::warn!(error = %error, "无法启动配对提醒线程");
     }
 }
 
 impl SessionNotifier for SystemNotifier {
     fn notify(&self, event: ConnectionEvent, peer: &NotificationPeer) {
-        if !self.enabled {
+        if !self.tuning.borrow().notifications_enabled {
             return;
         }
 
         let (title, body) = notification_text(event, peer);
-        tokio::task::spawn_blocking(move || {
-            let result = Notification::new()
-                .appname("Synly")
-                .summary(title)
-                .body(&body)
-                .show();
-            if let Err(err) = result
-                && !NOTIFICATION_ERROR_REPORTED.swap(true, Ordering::Relaxed)
-            {
-                eprintln!("无法发送系统提醒, 后续提醒错误将不再重复显示: {err}");
+        if let Err(error) = std::thread::Builder::new()
+            .name("synly-session-notification".to_string())
+            .spawn(move || {
+                let result = Notification::new()
+                    .appname("Synly")
+                    .summary(title)
+                    .body(&body)
+                    .show();
+                if let Err(err) = result
+                    && !NOTIFICATION_ERROR_REPORTED.swap(true, Ordering::Relaxed)
+                {
+                    tracing::warn!(error = %err, "无法发送系统提醒, 后续错误将不再重复显示");
+                }
             }
-        });
+        ) {
+            tracing::warn!(error = %error, "无法启动会话提醒线程");
+        }
     }
 }
 

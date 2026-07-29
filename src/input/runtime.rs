@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio::sync::Mutex;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::{self, Instant, MissedTickBehavior};
 use tokio_rustls::TlsStream;
@@ -23,17 +24,34 @@ const RECONNECT_MIN: Duration = Duration::from_secs(2);
 const RECONNECT_MAX: Duration = Duration::from_secs(20);
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InputRuntimeOptions {
     pub mode: InputMode,
     pub edge: ScreenEdge,
     pub hotkey: Hotkey,
 }
 
+#[derive(Clone)]
+pub struct InputSocketInbox {
+    sockets: Arc<Mutex<mpsc::Receiver<TcpStream>>>,
+}
+
+impl InputSocketInbox {
+    pub fn new(sockets: mpsc::Receiver<TcpStream>) -> Self {
+        Self {
+            sockets: Arc::new(Mutex::new(sockets)),
+        }
+    }
+
+    async fn recv(&self) -> Option<TcpStream> {
+        self.sockets.lock().await.recv().await
+    }
+}
+
 pub enum InputSessionContext {
     Host {
         channel: InputHostChannel,
-        sockets: mpsc::Receiver<TcpStream>,
+        sockets: InputSocketInbox,
     },
     Client {
         offer: InputChannelOffer,
@@ -42,7 +60,7 @@ pub enum InputSessionContext {
 }
 
 impl InputSessionContext {
-    pub fn host(channel: InputHostChannel, sockets: mpsc::Receiver<TcpStream>) -> Self {
+    pub fn host(channel: InputHostChannel, sockets: InputSocketInbox) -> Self {
         Self::Host { channel, sockets }
     }
 
@@ -62,7 +80,7 @@ pub async fn run_input_session(
     match context {
         InputSessionContext::Host {
             channel,
-            mut sockets,
+            sockets,
         } => {
             loop {
                 let socket = sockets

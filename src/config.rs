@@ -1,5 +1,9 @@
 use crate::path_expand::{expand_config_path_string, home_dir};
 use crate::protocol::TransferLimits;
+use crate::input::{InputMode, ScreenEdge};
+use crate::settings::{
+    AudioMode, ClipboardMode, ConnectionPreference, FileSyncMode, InitialSyncMode, LogLevel,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
@@ -29,7 +33,71 @@ pub struct SynlyConfig {
     #[serde(default)]
     pub discovery: DiscoveryConfig,
     #[serde(default)]
+    pub ui: UiConfig,
+    #[serde(default)]
+    pub runtime: RuntimeConfig,
+    #[serde(default)]
     pub trusted_devices: Vec<TrustedDeviceConfig>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UiConfig {
+    #[serde(default)]
+    pub first_run_completed: bool,
+    #[serde(default)]
+    pub start_hidden: bool,
+    #[serde(default = "default_true")]
+    pub close_to_tray: bool,
+    #[serde(default)]
+    pub launch_at_login: bool,
+    #[serde(default)]
+    pub resume_last_session: bool,
+    #[serde(default)]
+    pub log_level: LogLevel,
+    #[serde(default = "default_window_width")]
+    pub window_width: u32,
+    #[serde(default = "default_window_height")]
+    pub window_height: u32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RuntimeConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection: Option<ConnectionPreference>,
+    #[serde(default)]
+    pub instance_name: String,
+    #[serde(default)]
+    pub peer_query: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default = "default_file_sync_mode")]
+    pub file_sync_mode: FileSyncMode,
+    #[serde(default)]
+    pub paths: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial: Option<InitialSyncMode>,
+    #[serde(default)]
+    pub sync_delete: bool,
+    #[serde(default)]
+    pub clipboard_mode: ClipboardMode,
+    #[serde(default)]
+    pub audio_mode: AudioMode,
+    #[serde(default)]
+    pub input_mode: InputMode,
+    #[serde(default = "default_input_edge")]
+    pub input_edge: ScreenEdge,
+    #[serde(default = "default_input_hotkey")]
+    pub input_hotkey: String,
+    #[serde(default = "default_interval_secs")]
+    pub interval_secs: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_folder_depth: Option<usize>,
+    #[serde(default)]
+    pub accept: bool,
+    #[serde(default)]
+    pub trust_device: bool,
+    #[serde(default)]
+    pub trusted_only: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -68,8 +136,10 @@ pub struct NotificationConfig {
     pub enabled: bool,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DiscoveryConfig {
+    #[serde(default = "default_true")]
+    pub mdns_enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lnd: Option<LndDiscoveryConfig>,
 }
@@ -133,6 +203,55 @@ impl Default for TransferConfig {
 impl Default for NotificationConfig {
     fn default() -> Self {
         Self { enabled: true }
+    }
+}
+
+impl Default for DiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            mdns_enabled: true,
+            lnd: None,
+        }
+    }
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            first_run_completed: false,
+            start_hidden: false,
+            close_to_tray: true,
+            launch_at_login: false,
+            resume_last_session: false,
+            log_level: LogLevel::Info,
+            window_width: default_window_width(),
+            window_height: default_window_height(),
+        }
+    }
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            connection: None,
+            instance_name: String::new(),
+            peer_query: String::new(),
+            port: None,
+            file_sync_mode: FileSyncMode::Off,
+            paths: Vec::new(),
+            initial: None,
+            sync_delete: false,
+            clipboard_mode: ClipboardMode::Off,
+            audio_mode: AudioMode::Off,
+            input_mode: InputMode::Off,
+            input_edge: ScreenEdge::Right,
+            input_hotkey: default_input_hotkey(),
+            interval_secs: default_interval_secs(),
+            max_folder_depth: None,
+            accept: false,
+            trust_device: false,
+            trusted_only: false,
+        }
     }
 }
 
@@ -207,6 +326,13 @@ impl SynlyConfig {
         }
     }
 
+    pub fn revoke_trusted_device(&mut self, device_id: Uuid) -> bool {
+        let previous_len = self.trusted_devices.len();
+        self.trusted_devices
+            .retain(|device| device.device_id != device_id);
+        self.trusted_devices.len() != previous_len
+    }
+
     fn load_or_create_in_dir(dir: &Path) -> Result<Self> {
         let path = config_path_in(dir);
         if path.exists() {
@@ -220,6 +346,8 @@ impl SynlyConfig {
                 transfer: TransferConfig::default(),
                 notifications: NotificationConfig::default(),
                 discovery: DiscoveryConfig::default(),
+                ui: UiConfig::default(),
+                runtime: RuntimeConfig::default(),
                 trusted_devices: Vec::new(),
             }
         } else {
@@ -247,6 +375,8 @@ impl SynlyConfig {
             transfer: TransferConfig::default(),
             notifications: NotificationConfig::default(),
             discovery: DiscoveryConfig::default(),
+            ui: UiConfig::default(),
+            runtime: RuntimeConfig::default(),
             trusted_devices: Vec::new(),
         }
     }
@@ -389,6 +519,30 @@ fn default_clipboard_max_file_bytes() -> u64 {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_window_width() -> u32 {
+    1080
+}
+
+fn default_window_height() -> u32 {
+    720
+}
+
+fn default_file_sync_mode() -> FileSyncMode {
+    FileSyncMode::Off
+}
+
+fn default_input_edge() -> ScreenEdge {
+    ScreenEdge::Right
+}
+
+fn default_input_hotkey() -> String {
+    crate::input::Hotkey::DEFAULT.to_string()
+}
+
+fn default_interval_secs() -> u64 {
+    3
 }
 
 fn default_transfer_max_meta_bytes() -> u64 {
