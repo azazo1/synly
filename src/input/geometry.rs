@@ -81,37 +81,39 @@ impl DesktopLayout {
         Ok(Self { displays })
     }
 
-    pub fn is_outer_edge_point(&self, edge: ScreenEdge, point: Point, tolerance: i32) -> bool {
-        self.displays.iter().any(|display| {
+    pub fn is_jump_zone_point(&self, edge: ScreenEdge, point: Point, zone_size: i32) -> bool {
+        if zone_size <= 0 {
+            return false;
+        }
+        self.outer_edge_segments(edge).into_iter().any(|segment| {
             let on_span = match edge {
                 ScreenEdge::Left | ScreenEdge::Right => {
-                    point.y >= display.y && point.y < display.bottom()
+                    point.y >= segment.start && point.y < segment.end
                 }
                 ScreenEdge::Top | ScreenEdge::Bottom => {
-                    point.x >= display.x && point.x < display.right()
+                    point.x >= segment.start && point.x < segment.end
                 }
             };
-            if !on_span {
-                return false;
-            }
-            let coordinate_matches = match edge {
-                ScreenEdge::Left => (point.x - display.x).abs() <= tolerance,
-                ScreenEdge::Right => (point.x - (display.right() - 1)).abs() <= tolerance,
-                ScreenEdge::Top => (point.y - display.y).abs() <= tolerance,
-                ScreenEdge::Bottom => (point.y - (display.bottom() - 1)).abs() <= tolerance,
-            };
-            coordinate_matches && self.edge_is_exposed(*display, edge, point)
+            on_span
+                && match edge {
+                    ScreenEdge::Left => {
+                        point.x >= segment.boundary
+                            && point.x < segment.boundary.saturating_add(zone_size)
+                    }
+                    ScreenEdge::Right => {
+                        point.x < segment.boundary
+                            && point.x >= segment.boundary.saturating_sub(zone_size)
+                    }
+                    ScreenEdge::Top => {
+                        point.y >= segment.boundary
+                            && point.y < segment.boundary.saturating_add(zone_size)
+                    }
+                    ScreenEdge::Bottom => {
+                        point.y < segment.boundary
+                            && point.y >= segment.boundary.saturating_sub(zone_size)
+                    }
+                }
         })
-    }
-
-    fn edge_is_exposed(&self, display: DisplayRect, edge: ScreenEdge, point: Point) -> bool {
-        let outside = match edge {
-            ScreenEdge::Left => Point { x: display.x - 1, y: point.y },
-            ScreenEdge::Right => Point { x: display.right(), y: point.y },
-            ScreenEdge::Top => Point { x: point.x, y: display.y - 1 },
-            ScreenEdge::Bottom => Point { x: point.x, y: display.bottom() },
-        };
-        !self.displays.iter().any(|candidate| candidate.contains(outside))
     }
 
     pub fn normalized_edge_position(&self, edge: ScreenEdge, point: Point) -> f32 {
@@ -182,14 +184,84 @@ impl DesktopLayout {
         }
     }
 
-    pub fn movement_crosses_edge(&self, edge: ScreenEdge, point: Point, dx: i32, dy: i32) -> bool {
-        self.is_outer_edge_point(edge, point, 2)
-            && match edge {
-                ScreenEdge::Left => dx < 0,
-                ScreenEdge::Right => dx > 0,
-                ScreenEdge::Top => dy < 0,
-                ScreenEdge::Bottom => dy > 0,
+    pub fn crossed_outer_edge_position(
+        &self,
+        edge: ScreenEdge,
+        point: Point,
+        dx: i32,
+        dy: i32,
+    ) -> Option<f32> {
+        let target = Point {
+            x: point.x.saturating_add(dx),
+            y: point.y.saturating_add(dy),
+        };
+        for segment in self.outer_edge_segments(edge) {
+            let boundary_point = match edge {
+                ScreenEdge::Left
+                    if dx < 0 && point.x >= segment.boundary && target.x < segment.boundary =>
+                {
+                    Point {
+                        x: segment.boundary,
+                        y: crossing_coordinate(point.y, dy, point.x, dx, segment.boundary),
+                    }
+                }
+                ScreenEdge::Right
+                    if dx > 0 && point.x < segment.boundary && target.x >= segment.boundary =>
+                {
+                    Point {
+                        x: segment.boundary - 1,
+                        y: crossing_coordinate(point.y, dy, point.x, dx, segment.boundary),
+                    }
+                }
+                ScreenEdge::Top
+                    if dy < 0 && point.y >= segment.boundary && target.y < segment.boundary =>
+                {
+                    Point {
+                        x: crossing_coordinate(point.x, dx, point.y, dy, segment.boundary),
+                        y: segment.boundary,
+                    }
+                }
+                ScreenEdge::Bottom
+                    if dy > 0 && point.y < segment.boundary && target.y >= segment.boundary =>
+                {
+                    Point {
+                        x: crossing_coordinate(point.x, dx, point.y, dy, segment.boundary),
+                        y: segment.boundary - 1,
+                    }
+                }
+                _ => continue,
+            };
+            let coordinate = match edge {
+                ScreenEdge::Left | ScreenEdge::Right => boundary_point.y,
+                ScreenEdge::Top | ScreenEdge::Bottom => boundary_point.x,
+            };
+            if coordinate >= segment.start && coordinate < segment.end {
+                return Some(self.normalized_edge_position(edge, boundary_point));
             }
+        }
+        None
+    }
+
+    pub fn move_within_layout(&self, point: Point, dx: i32, dy: i32) -> Point {
+        let target = Point {
+            x: point.x.saturating_add(dx),
+            y: point.y.saturating_add(dy),
+        };
+        if self.displays.iter().any(|display| display.contains(target)) {
+            return target;
+        }
+        self.displays
+            .iter()
+            .map(|display| Point {
+                x: target.x.clamp(display.x, display.right() - 1),
+                y: target.y.clamp(display.y, display.bottom() - 1),
+            })
+            .min_by_key(|candidate| {
+                let dx = i64::from(candidate.x) - i64::from(target.x);
+                let dy = i64::from(candidate.y) - i64::from(target.y);
+                dx.saturating_mul(dx).saturating_add(dy.saturating_mul(dy))
+            })
+            .unwrap_or(point)
     }
 
     fn outer_edge_segments(&self, edge: ScreenEdge) -> Vec<EdgeSegment> {
@@ -256,6 +328,20 @@ impl DesktopLayout {
     }
 }
 
+fn crossing_coordinate(
+    coordinate: i32,
+    coordinate_delta: i32,
+    axis: i32,
+    axis_delta: i32,
+    boundary: i32,
+) -> i32 {
+    if axis_delta == 0 {
+        return coordinate;
+    }
+    let progress = f64::from(boundary - axis) / f64::from(axis_delta);
+    (f64::from(coordinate) + f64::from(coordinate_delta) * progress).round() as i32
+}
+
 #[derive(Clone, Copy)]
 struct EdgeSegment {
     start: i32,
@@ -285,11 +371,23 @@ mod tests {
     }
 
     #[test]
-    fn internal_monitor_edges_do_not_trigger() {
+    fn jump_zone_uses_the_outermost_pixel_without_an_outward_delta() {
         let layout = layout();
-        assert!(!layout.is_outer_edge_point(ScreenEdge::Right, Point { x: 1919, y: 500 }, 2));
-        assert!(layout.is_outer_edge_point(ScreenEdge::Right, Point { x: 3199, y: 500 }, 2));
-        assert!(layout.is_outer_edge_point(ScreenEdge::Right, Point { x: 1919, y: 100 }, 2));
+        assert!(layout.is_jump_zone_point(
+            ScreenEdge::Right,
+            Point { x: 3199, y: 500 },
+            1,
+        ));
+        assert!(!layout.is_jump_zone_point(
+            ScreenEdge::Right,
+            Point { x: 3198, y: 500 },
+            1,
+        ));
+        assert!(!layout.is_jump_zone_point(
+            ScreenEdge::Right,
+            Point { x: 1919, y: 500 },
+            1,
+        ));
     }
 
     #[test]
@@ -322,6 +420,56 @@ mod tests {
         assert_eq!(
             layout.normalized_edge_position(ScreenEdge::Right, Point { x: 299, y: 50 }),
             0.75
+        );
+        assert_eq!(
+            layout.crossed_outer_edge_position(
+                ScreenEdge::Right,
+                Point { x: 291, y: 50 },
+                4,
+                0,
+            ),
+            None,
+        );
+        assert_eq!(
+            layout.crossed_outer_edge_position(
+                ScreenEdge::Right,
+                Point { x: 291, y: 50 },
+                12,
+                0,
+            ),
+            Some(0.75),
+        );
+    }
+
+    #[test]
+    fn receiver_motion_accumulates_until_it_crosses_the_return_edge() {
+        let layout = DesktopLayout::new(vec![DisplayRect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        }])
+        .unwrap();
+        let mut point = Point { x: 8, y: 50 };
+        point = layout.move_within_layout(point, 30, 4);
+        point = layout.move_within_layout(point, 40, 3);
+        assert_eq!(point, Point { x: 78, y: 57 });
+        assert_eq!(
+            layout.crossed_outer_edge_position(ScreenEdge::Left, point, -90, 0),
+            Some(0.57),
+        );
+    }
+
+    #[test]
+    fn receiver_motion_is_clamped_to_real_displays() {
+        let layout = DesktopLayout::new(vec![
+            DisplayRect { x: 0, y: 0, width: 100, height: 100 },
+            DisplayRect { x: 200, y: 0, width: 100, height: 100 },
+        ])
+        .unwrap();
+        assert_eq!(
+            layout.move_within_layout(Point { x: 90, y: 50 }, 40, 0),
+            Point { x: 99, y: 50 },
         );
     }
 }

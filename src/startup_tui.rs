@@ -17,6 +17,7 @@ use crossterm::{
         KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
     },
     execute,
+    terminal::is_raw_mode_enabled,
 };
 use ratatui::{
     DefaultTerminal, Frame,
@@ -348,13 +349,11 @@ impl StartupApp {
     fn run(&mut self) -> Result<RuntimeOptions> {
         let mut terminal = ratatui::try_init().context("failed to initialize startup TUI")?;
         if let Err(err) = execute!(stdout(), EnableMouseCapture) {
-            ratatui::restore();
+            restore_startup_terminal(&mut terminal)?;
             return Err(err).context("failed to enable mouse capture");
         }
         let result = self.run_loop(&mut terminal);
-        let _ = execute!(stdout(), DisableMouseCapture);
-        let _ = terminal.show_cursor();
-        ratatui::restore();
+        restore_startup_terminal(&mut terminal)?;
         result
     }
 
@@ -2344,6 +2343,21 @@ impl StartupApp {
             .find(|(candidate, _, rect)| *candidate == field && rect_contains(*rect, column, row))
             .map(|(_, index, _)| *index)
     }
+}
+
+fn restore_startup_terminal(terminal: &mut DefaultTerminal) -> Result<()> {
+    let mouse_result = execute!(stdout(), DisableMouseCapture)
+        .context("failed to disable startup TUI mouse capture");
+    let cursor_result = terminal
+        .show_cursor()
+        .context("failed to restore startup TUI cursor");
+    ratatui::try_restore().context("failed to restore startup TUI terminal mode")?;
+    if is_raw_mode_enabled().context("failed to inspect startup TUI terminal mode")? {
+        bail!("startup TUI left terminal raw mode enabled");
+    }
+    mouse_result?;
+    cursor_result?;
+    Ok(())
 }
 
 fn single_line_textarea(value: String, placeholder: &str) -> TextArea<'static> {

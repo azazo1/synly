@@ -3155,6 +3155,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "shellexpand",
+ "socket2",
  "spake2",
  "tokio",
  "tokio-rustls",

@@ -29,6 +29,7 @@ use console::style;
 use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use rand::RngExt;
 use sha2::{Digest, Sha256};
+use socket2::{SockRef, TcpKeepalive};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -251,6 +252,7 @@ async fn run_host(config: &mut SynlyConfig, options: RuntimeOptions) -> Result<(
         result = async {
             loop {
                 let (socket, address) = listener.accept().await?;
+                configure_session_socket(&socket)?;
                 match handle_incoming_connection(
                     socket,
                     address,
@@ -326,6 +328,7 @@ async fn run_host_session_with_aux(
             result = &mut session_future => return result,
             accepted = listener.accept() => {
                 let (socket, address) = accepted?;
+                configure_session_socket(&socket)?;
                 let mut first_byte = [0u8; 1];
                 let is_input = matches!(
                     time::timeout(Duration::from_millis(100), socket.peek(&mut first_byte)).await,
@@ -636,12 +639,26 @@ async fn race_peer_addresses(
 
 async fn connect_tcp(address: Ipv4Addr, port: u16) -> Result<TcpStream> {
     match time::timeout(TCP_CONNECT_TIMEOUT, TcpStream::connect((address, port))).await {
-        Ok(result) => result.with_context(|| format!("failed to connect to {address}:{port}")),
+        Ok(result) => {
+            let socket = result.with_context(|| format!("failed to connect to {address}:{port}"))?;
+            configure_session_socket(&socket)?;
+            Ok(socket)
+        }
         Err(_) => bail!(
             "连接 {address}:{port} 超过 {} 秒",
             TCP_CONNECT_TIMEOUT.as_secs()
         ),
     }
+}
+
+fn configure_session_socket(socket: &TcpStream) -> Result<()> {
+    let keepalive = TcpKeepalive::new()
+        .with_time(Duration::from_secs(3))
+        .with_interval(Duration::from_secs(1))
+        .with_retries(3);
+    SockRef::from(socket)
+        .set_tcp_keepalive(&keepalive)
+        .context("无法配置同步会话 TCP keepalive")
 }
 
 async fn handle_trusted_incoming_connection(

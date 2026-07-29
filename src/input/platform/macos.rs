@@ -137,6 +137,7 @@ struct MacState {
     physical_buttons: Mutex<BTreeSet<u8>>,
     injected_pressed: Mutex<BTreeSet<u16>>,
     injected_buttons: Mutex<BTreeSet<u8>>,
+    injected_cursor: Mutex<Option<Point>>,
     tap: Mutex<Option<usize>>,
     run_loop: Mutex<Option<usize>>,
 }
@@ -176,6 +177,7 @@ pub fn start(context: CaptureContext) -> Result<Arc<dyn InputBackend>> {
         physical_buttons: Mutex::new(BTreeSet::new()),
         injected_pressed: Mutex::new(BTreeSet::new()),
         injected_buttons: Mutex::new(BTreeSet::new()),
+        injected_cursor: Mutex::new(None),
         tap: Mutex::new(None),
         run_loop: Mutex::new(None),
     });
@@ -354,6 +356,15 @@ fn update_set<T: Ord + Copy>(set: &Mutex<BTreeSet<T>>, value: T, down: bool) {
     }
 }
 
+fn mac_mouse_button(button: u8) -> u32 {
+    match button {
+        1 => 0,
+        2 => 2,
+        3 => 1,
+        other => u32::from(other.saturating_sub(1)),
+    }
+}
+
 impl InputBackend for MacBackend {
     fn health_check(&self) -> Result<()> {
         let result = if !unsafe { AXIsProcessTrusted() } {
@@ -441,6 +452,7 @@ impl InputBackend for MacBackend {
         if result != 0 {
             bail!("移动 macOS 光标失败, 错误码 {result}");
         }
+        *self.state.injected_cursor.lock().unwrap() = Some(point);
         Ok(())
     }
 
@@ -460,17 +472,19 @@ impl InputBackend for MacBackend {
     }
 
     fn inject_button(&self, button: u8, down: bool) -> Result<()> {
-        let point = self.cursor_position()?;
-        let (mouse_button, event_type) = match (button, down) {
-            (1, true) => (0, EVENT_LEFT_DOWN),
-            (1, false) => (0, EVENT_LEFT_UP),
-            (2, true) => (2, EVENT_OTHER_DOWN),
-            (2, false) => (2, EVENT_OTHER_UP),
-            (3, true) => (1, EVENT_RIGHT_DOWN),
-            (3, false) => (1, EVENT_RIGHT_UP),
-            (other, true) => (u32::from(other.saturating_sub(1)), EVENT_OTHER_DOWN),
-            (other, false) => (u32::from(other.saturating_sub(1)), EVENT_OTHER_UP),
+        let point = match *self.state.injected_cursor.lock().unwrap() {
+            Some(point) => point,
+            None => self.cursor_position()?,
         };
+        let event_type = match (button, down) {
+            (1, true) => EVENT_LEFT_DOWN,
+            (1, false) => EVENT_LEFT_UP,
+            (3, true) => EVENT_RIGHT_DOWN,
+            (3, false) => EVENT_RIGHT_UP,
+            (_, true) => EVENT_OTHER_DOWN,
+            (_, false) => EVENT_OTHER_UP,
+        };
+        let mouse_button = mac_mouse_button(button);
         let event = unsafe {
             CGEventCreateMouseEvent(
                 ptr::null(),
@@ -484,14 +498,50 @@ impl InputBackend for MacBackend {
         Ok(())
     }
 
-    fn inject_motion(&self, dx: i32, dy: i32) -> Result<()> {
-        let point = self.cursor_position()?;
-        let target = CGPoint {
-            x: point.x.saturating_add(dx) as f64,
-            y: point.y.saturating_add(dy) as f64,
+    fn inject_cursor(&self, point: Point) -> Result<()> {
+        let pressed_button = self
+            .state
+            .injected_buttons
+            .lock()
+            .unwrap()
+            .iter()
+            .next()
+            .copied();
+        let (mouse_button, event_type) = match pressed_button {
+            Some(1) => (0, EVENT_LEFT_DRAGGED),
+            Some(3) => (1, EVENT_RIGHT_DRAGGED),
+            Some(button) => (mac_mouse_button(button), EVENT_OTHER_DRAGGED),
+            None => (0, EVENT_MOUSE_MOVED),
         };
-        let event = unsafe { CGEventCreateMouseEvent(ptr::null(), EVENT_MOUSE_MOVED, target, 0) };
-        post_event(event, 0)
+        let event = unsafe {
+            CGEventCreateMouseEvent(
+                ptr::null(),
+                event_type,
+                CGPoint { x: point.x as f64, y: point.y as f64 },
+                mouse_button,
+            )
+        };
+        if event.is_null() {
+            bail!("无法创建 macOS 鼠标移动事件");
+        }
+        if let Some(previous) = *self.state.injected_cursor.lock().unwrap() {
+            unsafe {
+                CGEventSetIntegerValueField(
+                    event,
+                    FIELD_MOUSE_DELTA_X,
+                    i64::from(point.x.saturating_sub(previous.x)),
+                );
+                CGEventSetIntegerValueField(
+                    event,
+                    FIELD_MOUSE_DELTA_Y,
+                    i64::from(point.y.saturating_sub(previous.y)),
+                );
+            }
+        }
+        let modifiers = current_modifiers(&self.state.injected_pressed.lock().unwrap());
+        post_event(event, flags_from_modifiers(modifiers))?;
+        *self.state.injected_cursor.lock().unwrap() = Some(point);
+        Ok(())
     }
 
     fn inject_wheel(&self, x: i32, y: i32) -> Result<()> {
@@ -587,4 +637,17 @@ fn mac_keycode_to_hid(code: u16) -> Option<u16> {
 
 fn hid_to_mac_keycode(usage: u16) -> Option<u16> {
     (0..=127).find(|code| mac_keycode_to_hid(*code) == Some(usage))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mac_mouse_button;
+
+    #[test]
+    fn protocol_buttons_map_to_quartz_button_numbers() {
+        assert_eq!(mac_mouse_button(1), 0);
+        assert_eq!(mac_mouse_button(2), 2);
+        assert_eq!(mac_mouse_button(3), 1);
+        assert_eq!(mac_mouse_button(4), 3);
+    }
 }

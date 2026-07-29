@@ -52,7 +52,7 @@ pub trait InputBackend: Send + Sync {
         repeat: bool,
     ) -> Result<()>;
     fn inject_button(&self, button: u8, down: bool) -> Result<()>;
-    fn inject_motion(&self, dx: i32, dy: i32) -> Result<()>;
+    fn inject_cursor(&self, point: Point) -> Result<()>;
     fn inject_wheel(&self, x: i32, y: i32) -> Result<()>;
     fn release_all(&self) -> Result<()>;
 }

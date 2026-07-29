@@ -17,6 +17,7 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(250);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(1);
 const RETURN_COOLDOWN: Duration = Duration::from_millis(300);
 const EDGE_INSET: i32 = 8;
+const JUMP_ZONE_SIZE: i32 = 1;
 const OVERFLOW_POLL: Duration = Duration::from_millis(50);
 const RECONNECT_MIN: Duration = Duration::from_secs(2);
 const RECONNECT_MAX: Duration = Duration::from_secs(20);
@@ -155,6 +156,7 @@ async fn run_established(
         }
         Result::<()>::Ok(())
     });
+    let _writer_abort = AbortOnDrop(writer_task.abort_handle());
     tx.send(InputMessage::Layout(local_layout.clone())).await?;
     let remote_layout = match read_message(&mut reader).await? {
         InputMessage::Layout(layout) => layout,
@@ -169,6 +171,7 @@ async fn run_established(
 
     // 读取帧必须由单独任务连续完成, 避免 select 取消半包读取后破坏帧边界.
     let (mut incoming, reader_task) = spawn_input_reader(reader);
+    let _reader_abort = AbortOnDrop(reader_task.abort_handle());
 
     let session = match local_role {
         LocalInputRole::Send => run_sender(
@@ -201,6 +204,14 @@ async fn run_established(
         Err(err) => return Err(err.into()),
     }
     session
+}
+
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 fn spawn_input_reader<R>(
@@ -323,7 +334,7 @@ async fn run_sender(
                     enqueue_message(tx, InputMessage::Motion { generation, dx, dy })?;
                 } else if Instant::now() >= cooldown_until {
                     let point = platform.backend.cursor_position()?;
-                    if local_layout.movement_crosses_edge(source_edge, point, dx, dy) {
+                    if local_layout.is_jump_zone_point(source_edge, point, JUMP_ZONE_SIZE) {
                         generation = generation.wrapping_add(1).max(1);
                         let edge_position = local_layout.normalized_edge_position(source_edge, point);
                         let pressed = platform.backend.snapshot();
@@ -433,6 +444,7 @@ async fn run_receiver(
     let mut generation = 0u64;
     let mut active = false;
     let mut return_edge = ScreenEdge::Left;
+    let mut cursor = None;
     let mut last_heartbeat = Instant::now();
     let mut timeout_tick = time::interval(HEARTBEAT_INTERVAL);
     timeout_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -454,13 +466,16 @@ async fn run_receiver(
                         active = true;
                         return_edge = source_edge.opposite();
                         last_heartbeat = Instant::now();
-                        platform.backend.warp_cursor(local_layout.point_inside_edge(return_edge, edge_position, EDGE_INSET))?;
+                        let entry = local_layout.point_inside_edge(return_edge, edge_position, EDGE_INSET);
+                        platform.backend.warp_cursor(entry)?;
+                        cursor = Some(entry);
                         apply_snapshot(&*platform.backend, &pressed)?;
                         tracing::info!(generation, edge = ?return_edge, "开始接受对端控制");
                     }
                     InputMessage::Deactivate { generation: incoming_generation } if incoming_generation == generation => {
                         platform.backend.release_all()?;
                         active = false;
+                        cursor = None;
                     }
                     InputMessage::Heartbeat { generation: incoming_generation } if incoming_generation == generation => {
                         last_heartbeat = Instant::now();
@@ -479,14 +494,18 @@ async fn run_receiver(
                     }
                     InputMessage::Motion { generation: incoming_generation, dx, dy }
                         if active && incoming_generation == generation => {
-                            let point = platform.backend.cursor_position()?;
-                            if local_layout.movement_crosses_edge(return_edge, point, dx, dy) {
-                                let edge_position = local_layout.normalized_edge_position(return_edge, point);
-                                platform.backend.release_all()?;
-                                active = false;
-                                enqueue_message(tx, InputMessage::Return { generation, edge_position })?;
-                            } else {
-                                platform.backend.inject_motion(dx, dy)?;
+                            let point = cursor.context("输入接收端缺少逻辑光标位置")?;
+                            match receiver_motion(&local_layout, return_edge, point, dx, dy) {
+                                ReceiverMotion::Return(edge_position) => {
+                                    platform.backend.release_all()?;
+                                    active = false;
+                                    cursor = None;
+                                    enqueue_message(tx, InputMessage::Return { generation, edge_position })?;
+                                }
+                                ReceiverMotion::Move(target) => {
+                                    platform.backend.inject_cursor(target)?;
+                                    cursor = Some(target);
+                                }
                             }
                     }
                     InputMessage::Proof { .. } => bail!("输入通道收到重复认证消息"),
@@ -499,6 +518,7 @@ async fn run_receiver(
                         if active {
                             platform.backend.release_all()?;
                             active = false;
+                            cursor = None;
                             let _ = tx.try_send(InputMessage::Deactivate { generation });
                             tracing::info!(generation, "接收端紧急热键已停止远程控制");
                         }
@@ -528,6 +548,26 @@ async fn run_receiver(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ReceiverMotion {
+    Move(super::Point),
+    Return(f32),
+}
+
+fn receiver_motion(
+    layout: &super::DesktopLayout,
+    return_edge: ScreenEdge,
+    point: super::Point,
+    dx: i32,
+    dy: i32,
+) -> ReceiverMotion {
+    if let Some(edge_position) = layout.crossed_outer_edge_position(return_edge, point, dx, dy) {
+        ReceiverMotion::Return(edge_position)
+    } else {
+        ReceiverMotion::Move(layout.move_within_layout(point, dx, dy))
+    }
+}
+
 fn apply_snapshot(backend: &dyn platform::InputBackend, snapshot: &KeySnapshot) -> Result<()> {
     for usage in &snapshot.usages {
         backend.inject_key(*usage, snapshot.modifiers, true, false)?;
@@ -540,7 +580,10 @@ fn apply_snapshot(backend: &dyn platform::InputBackend, snapshot: &KeySnapshot) 
 
 #[cfg(test)]
 mod tests {
-    use super::{EDGE_INSET, SenderRecoveryGuard, enqueue_message, spawn_input_reader};
+    use super::{
+        AbortOnDrop, EDGE_INSET, ReceiverMotion, SenderRecoveryGuard, enqueue_message,
+        receiver_motion, spawn_input_reader,
+    };
     use crate::input::platform::InputBackend;
     use crate::input::{DesktopLayout, DisplayRect, KeySnapshot, ModifierMask, Point, ScreenEdge};
     use anyhow::Result;
@@ -585,7 +628,7 @@ mod tests {
             Ok(())
         }
 
-        fn inject_motion(&self, _dx: i32, _dy: i32) -> Result<()> {
+        fn inject_cursor(&self, _point: Point) -> Result<()> {
             Ok(())
         }
 
@@ -658,5 +701,39 @@ mod tests {
         write_task.await.unwrap();
         reader_task.abort();
         let _ = reader_task.await;
+    }
+
+    #[test]
+    fn receiver_uses_logical_cursor_across_consecutive_motion_frames() {
+        let layout = DesktopLayout::new(vec![DisplayRect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        }])
+        .unwrap();
+        let first = receiver_motion(
+            &layout,
+            ScreenEdge::Left,
+            Point { x: 8, y: 40 },
+            30,
+            5,
+        );
+        assert_eq!(first, ReceiverMotion::Move(Point { x: 38, y: 45 }));
+        let ReceiverMotion::Move(point) = first else {
+            panic!("第一次移动不应返回本机");
+        };
+        assert_eq!(
+            receiver_motion(&layout, ScreenEdge::Left, point, 30, 5),
+            ReceiverMotion::Move(Point { x: 68, y: 50 }),
+        );
+    }
+
+    #[tokio::test]
+    async fn input_io_task_is_aborted_when_session_is_dropped() {
+        let task = tokio::spawn(std::future::pending::<()>());
+        let guard = AbortOnDrop(task.abort_handle());
+        drop(guard);
+        assert!(task.await.unwrap_err().is_cancelled());
     }
 }

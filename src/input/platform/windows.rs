@@ -47,6 +47,8 @@ const MOUSEEVENTF_XDOWN: u32 = 0x0080;
 const MOUSEEVENTF_XUP: u32 = 0x0100;
 const MOUSEEVENTF_WHEEL: u32 = 0x0800;
 const MOUSEEVENTF_HWHEEL: u32 = 0x1000;
+const MOUSEEVENTF_VIRTUALDESK: u32 = 0x4000;
+const MOUSEEVENTF_ABSOLUTE: u32 = 0x8000;
 const WHEEL_DELTA: i32 = 120;
 const INPUT_MOUSE: u32 = 0;
 const INPUT_KEYBOARD: u32 = 1;
@@ -305,15 +307,30 @@ unsafe extern "system" fn mouse_callback(code: i32, w_param: WParam, l_param: LP
     }
     let context = unsafe { &*HOOK_STATE.load(Ordering::Acquire) };
     let point = Point { x: event.pt.x, y: event.pt.y };
-    let previous = context.last_point.lock().unwrap().replace(point);
     let active = context.context.capture_active.load(Ordering::Acquire);
     match w_param as u32 {
         WM_MOUSEMOVE => {
-            if let Some(previous) = previous {
-                context.context.motion.add(
-                    point.x.saturating_sub(previous.x),
-                    point.y.saturating_sub(previous.y),
-                );
+            if active {
+                let center = virtual_desktop_center();
+                let dx = point.x.saturating_sub(center.x);
+                let dy = point.y.saturating_sub(center.y);
+                if dx != 0 || dy != 0 {
+                    context.context.motion.add(dx, dy);
+                    if unsafe { SetCursorPos(center.x, center.y) } == 0 {
+                        context.context.emit_reliable(NativeEvent::Failed(
+                            "Windows 捕获期间无法回正本机光标".to_string(),
+                        ));
+                    }
+                }
+                *context.last_point.lock().unwrap() = Some(center);
+            } else {
+                let previous = context.last_point.lock().unwrap().replace(point);
+                if let Some(previous) = previous {
+                    context.context.motion.add(
+                        point.x.saturating_sub(previous.x),
+                        point.y.saturating_sub(previous.y),
+                    );
+                }
             }
         }
         WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN
@@ -398,8 +415,18 @@ impl InputBackend for WindowsBackend {
 
     fn set_capture(&self, active: bool) -> Result<()> {
         let previous = self.state.context.capture_active.swap(active, Ordering::AcqRel);
-        if previous != active {
-            unsafe { ShowCursor(if active { 0 } else { 1 }) };
+        if previous == active {
+            return Ok(());
+        }
+        unsafe { ShowCursor(if active { 0 } else { 1 }) };
+        if active {
+            let center = virtual_desktop_center();
+            if unsafe { SetCursorPos(center.x, center.y) } == 0 {
+                self.state.context.capture_active.store(false, Ordering::Release);
+                unsafe { ShowCursor(1) };
+                bail!("无法在输入捕获开始时回正 Windows 光标");
+            }
+            *self.state.last_point.lock().unwrap() = Some(center);
         }
         Ok(())
     }
@@ -440,8 +467,8 @@ impl InputBackend for WindowsBackend {
         Ok(())
     }
 
-    fn inject_motion(&self, dx: i32, dy: i32) -> Result<()> {
-        send_mouse(dx, dy, 0, MOUSEEVENTF_MOVE)
+    fn inject_cursor(&self, point: Point) -> Result<()> {
+        send_absolute_mouse(point)
     }
 
     fn inject_wheel(&self, x: i32, y: i32) -> Result<()> {
@@ -559,6 +586,45 @@ fn send_mouse(dx: i32, dy: i32, mouse_data: u32, flags: u32) -> Result<()> {
         bail!("Windows SendInput 鼠标注入失败");
     }
     Ok(())
+}
+
+fn virtual_desktop_center() -> Point {
+    let x = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+    let y = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+    let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) }.max(1);
+    let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) }.max(1);
+    Point {
+        x: x.saturating_add(width / 2),
+        y: y.saturating_add(height / 2),
+    }
+}
+
+fn send_absolute_mouse(point: Point) -> Result<()> {
+    let x = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+    let y = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+    let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) }.max(1);
+    let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) }.max(1);
+    send_mouse(
+        normalize_absolute_coordinate(point.x, x, width),
+        normalize_absolute_coordinate(point.y, y, height),
+        0,
+        MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+    )
+}
+
+fn normalize_absolute_coordinate(coordinate: i32, origin: i32, extent: i32) -> i32 {
+    if extent <= 1 {
+        return 0;
+    }
+    let maximum = i64::from(extent - 1);
+    let relative = i64::from(coordinate)
+        .saturating_sub(i64::from(origin))
+        .clamp(0, maximum);
+    relative
+        .saturating_mul(65_535)
+        .saturating_add(maximum / 2)
+        .checked_div(maximum)
+        .unwrap_or(0) as i32
 }
 
 fn windows_scan_to_hid(scan: u16, vk: u16) -> Option<u16> {
