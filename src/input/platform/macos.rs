@@ -279,7 +279,26 @@ unsafe extern "C" fn event_callback(
         EVENT_MOUSE_MOVED | EVENT_LEFT_DRAGGED | EVENT_RIGHT_DRAGGED | EVENT_OTHER_DRAGGED => {
             let dx = unsafe { CGEventGetIntegerValueField(event, FIELD_MOUSE_DELTA_X) } as i32;
             let dy = unsafe { CGEventGetIntegerValueField(event, FIELD_MOUSE_DELTA_Y) } as i32;
-            state.context.motion.add(dx, dy);
+            if !active {
+                let position_event = unsafe { CGEventCreate(ptr::null()) };
+                let position = if !position_event.is_null() {
+                    let position = unsafe { CGEventGetLocation(position_event) };
+                    unsafe { CFRelease(position_event) };
+                    position
+                } else {
+                    unsafe { CGEventGetLocation(event) }
+                };
+                state.context.motion.add_at(
+                    dx,
+                    dy,
+                    Point {
+                        x: position.x.round() as i32,
+                        y: position.y.round() as i32,
+                    },
+                );
+            } else {
+                state.context.motion.add(dx, dy);
+            }
             if active { ptr::null_mut() } else { event }
         }
         EVENT_LEFT_DOWN | EVENT_LEFT_UP | EVENT_RIGHT_DOWN | EVENT_RIGHT_UP | EVENT_OTHER_DOWN
@@ -331,6 +350,22 @@ unsafe extern "C" fn event_callback(
                 }
                 return ptr::null_mut();
             }
+            if active
+                && usage == 0x06
+                && modifiers == ModifierMask::CTRL
+                && matches!(event_type, EVENT_KEY_DOWN | EVENT_KEY_UP)
+            {
+                return event;
+            }
+            if active && event_type == EVENT_FLAGS_CHANGED && usage_is_modifier(usage) {
+                state.context.emit_reliable(NativeEvent::Key {
+                    usage,
+                    modifiers,
+                    down,
+                    repeat,
+                });
+                return event;
+            }
             if active {
                 state.context.emit_reliable(NativeEvent::Key {
                     usage,
@@ -345,6 +380,10 @@ unsafe extern "C" fn event_callback(
         }
         _ => event,
     }
+}
+
+fn usage_is_modifier(usage: u16) -> bool {
+    matches!(usage, 0xe0..=0xe7)
 }
 
 fn update_set<T: Ord + Copy>(set: &Mutex<BTreeSet<T>>, value: T, down: bool) {
@@ -417,11 +456,15 @@ impl InputBackend for MacBackend {
     }
 
     fn snapshot(&self) -> KeySnapshot {
-        KeySnapshot {
-            usages: self.state.physical_pressed.lock().unwrap().iter().copied().collect(),
-            modifiers: current_modifiers(&self.state.physical_pressed.lock().unwrap()),
-            buttons: self.state.physical_buttons.lock().unwrap().iter().copied().collect(),
-        }
+        let (usages, modifiers) = {
+            let pressed = self.state.physical_pressed.lock().unwrap();
+            (
+                pressed.iter().copied().collect(),
+                current_modifiers(&pressed),
+            )
+        };
+        let buttons = self.state.physical_buttons.lock().unwrap().iter().copied().collect();
+        KeySnapshot { usages, modifiers, buttons }
     }
 
     fn set_capture(&self, active: bool) -> Result<()> {
@@ -648,7 +691,14 @@ fn hid_to_mac_keycode(usage: u16) -> Option<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::mac_mouse_button;
+    use super::{CaptureContext, MacBackend, MacState, NativeEvent, mac_mouse_button};
+    use crate::input::platform::{InputBackend, MotionAccumulator};
+    use crate::input::{Hotkey, InputMode, ModifierMask};
+    use std::collections::BTreeSet;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::sync::mpsc;
 
     #[test]
     fn protocol_buttons_map_to_quartz_button_numbers() {
@@ -656,5 +706,39 @@ mod tests {
         assert_eq!(mac_mouse_button(2), 2);
         assert_eq!(mac_mouse_button(3), 1);
         assert_eq!(mac_mouse_button(4), 3);
+    }
+
+    #[test]
+    fn snapshot_releases_pressed_lock_before_reading_modifiers() {
+        let (events, _receiver) = mpsc::channel::<NativeEvent>(1);
+        let state = Arc::new(MacState {
+            context: CaptureContext {
+                mode: InputMode::Send,
+                hotkey: Hotkey::DEFAULT.parse().unwrap(),
+                events,
+                motion: Arc::new(MotionAccumulator::default()),
+                capture_active: Arc::new(AtomicBool::new(false)),
+                overflowed: Arc::new(AtomicBool::new(false)),
+                failed: Arc::new(AtomicBool::new(false)),
+            },
+            physical_pressed: Mutex::new(BTreeSet::from([0xe0])),
+            physical_buttons: Mutex::new(BTreeSet::from([1])),
+            injected_pressed: Mutex::new(BTreeSet::new()),
+            injected_buttons: Mutex::new(BTreeSet::new()),
+            injected_cursor: Mutex::new(None),
+            tap: Mutex::new(None),
+            run_loop: Mutex::new(None),
+        });
+        let backend = MacBackend { state };
+        let (result_tx, result_rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::spawn(move || {
+            result_tx.send(backend.snapshot()).unwrap();
+        });
+        let snapshot = result_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("snapshot 不应因重复锁定 physical_pressed 而阻塞");
+        assert_eq!(snapshot.modifiers, ModifierMask::CTRL);
+        assert_eq!(snapshot.usages, vec![0xe0]);
+        assert_eq!(snapshot.buttons, vec![1]);
     }
 }

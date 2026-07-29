@@ -67,7 +67,7 @@ where
     if bytes.len() > MAX_INPUT_FRAME_LEN {
         bail!("输入消息超过 64 KiB 限制");
     }
-    writer.write_u32(bytes.len() as u32).await?;
+    writer.write_all(&(bytes.len() as u32).to_be_bytes()).await?;
     writer.write_all(&bytes).await?;
     writer.flush().await?;
     Ok(())
@@ -77,9 +77,11 @@ pub async fn read_message<R>(reader: &mut R) -> Result<InputMessage>
 where
     R: AsyncRead + Unpin,
 {
-    let len = reader.read_u32().await? as usize;
+    let mut length_prefix = [0u8; 4];
+    reader.read_exact(&mut length_prefix).await?;
+    let len = u32::from_be_bytes(length_prefix) as usize;
     if len == 0 || len > MAX_INPUT_FRAME_LEN {
-        bail!("输入消息长度无效: {len}");
+        bail!("输入消息长度无效: {len}, 原始长度前缀: {length_prefix:?}");
     }
     let mut bytes = vec![0u8; len];
     reader.read_exact(&mut bytes).await?;
@@ -105,7 +107,10 @@ mod tests {
     #[tokio::test]
     async fn oversized_frame_is_rejected_before_allocation() {
         let (mut writer, mut reader) = duplex(16);
-        writer.write_u32((MAX_INPUT_FRAME_LEN + 1) as u32).await.unwrap();
+        writer
+            .write_all(&((MAX_INPUT_FRAME_LEN + 1) as u32).to_be_bytes())
+            .await
+            .unwrap();
         assert!(read_message(&mut reader).await.is_err());
     }
 }

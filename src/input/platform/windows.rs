@@ -290,6 +290,18 @@ unsafe extern "system" fn keyboard_callback(code: i32, w_param: WParam, l_param:
         }
         return 1;
     }
+    let tracked_modifiers = current_modifiers_from_keys(&context.physical_pressed.lock().unwrap());
+    if context.context.capture_active.load(Ordering::Acquire)
+        && usage == 0x06
+        && tracked_modifiers == ModifierMask::CTRL
+        && matches!(w_param as u32, 0x0100 | 0x0101 | 0x0104 | 0x0105)
+    {
+        return unsafe { CallNextHookEx(0, code, w_param, l_param) };
+    }
+    if context.context.capture_active.load(Ordering::Acquire) && usage_is_modifier(usage) {
+        context.context.emit_reliable(NativeEvent::Key { usage, modifiers, down, repeat });
+        return unsafe { CallNextHookEx(0, code, w_param, l_param) };
+    }
     if context.context.capture_active.load(Ordering::Acquire) {
         context.context.emit_reliable(NativeEvent::Key { usage, modifiers, down, repeat });
         return 1;
@@ -326,9 +338,10 @@ unsafe extern "system" fn mouse_callback(code: i32, w_param: WParam, l_param: LP
             } else {
                 let previous = context.last_point.lock().unwrap().replace(point);
                 if let Some(previous) = previous {
-                    context.context.motion.add(
+                    context.context.motion.add_at(
                         point.x.saturating_sub(previous.x),
                         point.y.saturating_sub(previous.y),
+                        point,
                     );
                 }
             }
@@ -543,6 +556,19 @@ fn current_modifiers() -> ModifierMask {
     if key_down(VK_SHIFT) { bits |= ModifierMask::SHIFT.bits(); }
     if key_down(VK_LWIN) || key_down(VK_RWIN) { bits |= ModifierMask::META.bits(); }
     ModifierMask::from_bits(bits)
+}
+
+fn current_modifiers_from_keys(keys: &BTreeSet<u16>) -> ModifierMask {
+    let mut bits = 0u8;
+    if keys.contains(&0xe0) || keys.contains(&0xe4) { bits |= ModifierMask::CTRL.bits(); }
+    if keys.contains(&0xe1) || keys.contains(&0xe5) { bits |= ModifierMask::SHIFT.bits(); }
+    if keys.contains(&0xe2) || keys.contains(&0xe6) { bits |= ModifierMask::ALT.bits(); }
+    if keys.contains(&0xe3) || keys.contains(&0xe7) { bits |= ModifierMask::META.bits(); }
+    ModifierMask::from_bits(bits)
+}
+
+fn usage_is_modifier(usage: u16) -> bool {
+    matches!(usage, 0xe0..=0xe7)
 }
 
 fn key_down(vk: i32) -> bool {

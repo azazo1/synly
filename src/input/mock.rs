@@ -1,4 +1,5 @@
-use super::platform::{self, NativeEvent};
+use super::platform;
+use super::protocol::InputMessage;
 use super::{DesktopLayout, DisplayRect, Hotkey, InputMode, Point, ScreenEdge};
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeSet;
@@ -6,12 +7,11 @@ use std::ffi::CString;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+use tokio::sync::mpsc;
 use tokio::time::{self, MissedTickBehavior};
 
-const MOTION_INTERVAL: Duration = Duration::from_micros(8_333);
-const HEALTH_INTERVAL: Duration = Duration::from_millis(250);
-const GUI_INTERVAL: Duration = MOTION_INTERVAL;
-const JUMP_ZONE_SIZE: i32 = 1;
+const GUI_INTERVAL: Duration = Duration::from_micros(8_333);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(250);
 const EDGE_INSET: i32 = 8;
 
 #[derive(Clone, Debug)]
@@ -35,6 +35,7 @@ pub fn run_macos_mock(options: MacosMockOptions) -> Result<()> {
     }
 
     let stop = Arc::new(AtomicBool::new(false));
+    spawn_signal_monitor(Arc::clone(&stop))?;
     let worker_stop = Arc::clone(&stop);
     let worker = std::thread::Builder::new()
         .name("synly-input-macos-mock".to_string())
@@ -55,10 +56,40 @@ pub fn run_macos_mock(options: MacosMockOptions) -> Result<()> {
     }
 }
 
+fn spawn_signal_monitor(stop: Arc<AtomicBool>) -> Result<()> {
+    std::thread::Builder::new()
+        .name("synly-input-mock-signal".to_string())
+        .spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    tracing::error!(error = %error, "无法创建 macOS mock 信号运行时");
+                    return;
+                }
+            };
+            match runtime.block_on(tokio::signal::ctrl_c()) {
+                Ok(()) => {
+                    tracing::info!("收到 Ctrl-C, 正在恢复 macOS 光标");
+                    stop.store(true, Ordering::Release);
+                    unsafe { synly_input_mock_gui_stop() };
+                }
+                Err(error) => {
+                    tracing::error!(error = %error, "macOS mock 无法监听 Ctrl-C");
+                }
+            }
+        })
+        .context("无法启动 macOS mock 信号线程")?;
+    Ok(())
+}
+
 async fn run_mock_worker(options: MacosMockOptions, stop: Arc<AtomicBool>) -> Result<()> {
     let mut platform = match platform::start(InputMode::Send, options.hotkey) {
         Ok(platform) => platform,
         Err(error) => {
+            tracing::error!(error = %error, "macOS 输入 mock 启动失败");
             update_gui(&GuiUpdate {
                 active: false,
                 cursor: Point::default(),
@@ -79,12 +110,6 @@ async fn run_mock_worker(options: MacosMockOptions, stop: Arc<AtomicBool>) -> Re
         width: options.width,
         height: options.height,
     }])?;
-    let mut session = MockSession::new(
-        Arc::clone(&platform.backend),
-        local_layout,
-        mock_layout,
-        options.edge,
-    );
     update_gui(&GuiUpdate {
         active: false,
         cursor: Point::default(),
@@ -96,23 +121,50 @@ async fn run_mock_worker(options: MacosMockOptions, stop: Arc<AtomicBool>) -> Re
     });
     tracing::info!(edge = options.edge.as_arg(), "macOS 输入 mock 已启动");
 
-    let result = run_mock_loop(&mut platform, &mut session, &stop).await;
-    session.restore_local();
+    let observed_motion = Arc::clone(&platform.motion);
+    let (incoming_tx, mut incoming_rx) = mpsc::channel(256);
+    let (outgoing_tx, outgoing_rx) = mpsc::channel(256);
+    let sender = super::runtime::run_sender(
+        &mut incoming_rx,
+        &outgoing_tx,
+        &mut platform,
+        local_layout,
+        mock_layout.clone(),
+        options.edge,
+    );
+    tokio::pin!(sender);
+    let peer = run_mock_peer(
+        mock_layout,
+        observed_motion,
+        incoming_tx,
+        outgoing_rx,
+        &stop,
+    );
+    tokio::pin!(peer);
+    let result = tokio::select! {
+        result = &mut sender => result,
+        result = &mut peer => result,
+    };
     unsafe { synly_input_mock_gui_stop() };
     result
 }
 
-async fn run_mock_loop(
-    platform: &mut platform::PlatformHandle,
-    session: &mut MockSession,
+async fn run_mock_peer(
+    mock_layout: DesktopLayout,
+    motion: Arc<platform::MotionAccumulator>,
+    incoming: mpsc::Sender<Result<InputMessage>>,
+    mut outgoing: mpsc::Receiver<InputMessage>,
     stop: &AtomicBool,
 ) -> Result<()> {
-    let mut motion_tick = time::interval(MOTION_INTERVAL);
-    motion_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut health_tick = time::interval(HEALTH_INTERVAL);
-    health_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut gui_tick = time::interval(GUI_INTERVAL);
     gui_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut heartbeat = time::interval(HEARTBEAT_INTERVAL);
+    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut generation = 0u64;
+    let mut active = false;
+    let mut return_edge = ScreenEdge::Left;
+    let mut remote_cursor = Point::default();
+    let mut last_local_position = None;
     let mut last_delta = Point::default();
     let mut keys = BTreeSet::new();
     let mut buttons = BTreeSet::new();
@@ -121,62 +173,138 @@ async fn run_mock_loop(
 
     loop {
         tokio::select! {
-            signal = tokio::signal::ctrl_c() => {
-                signal.context("无法监听 Ctrl-C")?;
-                tracing::info!("收到 Ctrl-C, 正在恢复 macOS 光标");
-                break;
-            }
-            Some(event) = platform.events.recv() => {
-                match event {
-                    NativeEvent::Key { usage, modifiers, down, repeat } => {
+            message = outgoing.recv() => {
+                let message = message.context("正式输入发送端已停止")?;
+                match message {
+                    InputMessage::Activate {
+                        generation: incoming_generation,
+                        source_edge,
+                        edge_position,
+                        pressed,
+                    } => {
+                        generation = incoming_generation;
+                        active = true;
+                        return_edge = source_edge.opposite();
+                        remote_cursor = mock_layout.point_inside_edge(
+                            return_edge,
+                            edge_position,
+                            EDGE_INSET,
+                        );
+                        keys = pressed.usages.into_iter().collect();
+                        buttons = pressed.buttons.into_iter().collect();
+                        last_event = format!(
+                            "正式 sender 已接入 mock, entry={edge_position:.3}, x={}, y={}",
+                            remote_cursor.x,
+                            remote_cursor.y,
+                        );
+                        tracing::info!(
+                            generation,
+                            source_edge = ?source_edge,
+                            edge_position,
+                            cursor = ?remote_cursor,
+                            "mock 收到正式 sender 的 Activate"
+                        );
+                    }
+                    InputMessage::Deactivate { generation: incoming_generation }
+                        if incoming_generation == generation => {
+                        active = false;
+                        keys.clear();
+                        buttons.clear();
+                        last_event = "正式 sender 已恢复本机".to_string();
+                        tracing::info!(generation, "mock 收到正式 sender 的 Deactivate");
+                    }
+                    InputMessage::Motion {
+                        generation: incoming_generation,
+                        dx,
+                        dy,
+                    } if active && incoming_generation == generation => {
+                        last_delta = Point { x: dx, y: dy };
+                        if let Some(edge_position) = mock_layout.crossed_outer_edge_position(
+                            return_edge,
+                            remote_cursor,
+                            dx,
+                            dy,
+                        ) {
+                            active = false;
+                            incoming
+                                .send(Ok(InputMessage::Return { generation, edge_position }))
+                                .await
+                                .context("无法向正式 sender 返回控制")?;
+                            last_event = format!(
+                                "mock 已向正式 sender 返回控制, position={edge_position:.3}"
+                            );
+                            tracing::info!(
+                                generation,
+                                edge_position,
+                                "mock 向正式 sender 返回控制"
+                            );
+                        } else {
+                            remote_cursor = mock_layout.move_within_layout(remote_cursor, dx, dy);
+                        }
+                    }
+                    InputMessage::Key { generation: incoming_generation, usage, modifiers, down, repeat }
+                        if active && incoming_generation == generation => {
                         if down { keys.insert(usage); } else { keys.remove(&usage); }
                         last_event = format!(
                             "按键 hid=0x{usage:04x}, down={down}, repeat={repeat}, modifiers=0x{:02x}",
                             modifiers.bits(),
                         );
                     }
-                    NativeEvent::Button { button, down } => {
+                    InputMessage::Button { generation: incoming_generation, button, down }
+                        if active && incoming_generation == generation => {
                         if down { buttons.insert(button); } else { buttons.remove(&button); }
                         last_event = format!("鼠标按钮 button={button}, down={down}");
                     }
-                    NativeEvent::Wheel { x, y } => {
+                    InputMessage::Wheel { generation: incoming_generation, x, y }
+                        if active && incoming_generation == generation => {
                         wheel.x = wheel.x.saturating_add(x);
                         wheel.y = wheel.y.saturating_add(y);
                         last_event = format!("滚轮 x={x}, y={y}");
                     }
-                    NativeEvent::Emergency => {
-                        last_event = "紧急热键已恢复本机".to_string();
-                        session.restore_local();
-                    }
-                    NativeEvent::ReliableQueueOverflow => bail!("macOS 输入事件队列已满"),
-                    NativeEvent::Failed(message) => bail!("macOS 输入捕获失败: {message}"),
+                    InputMessage::Heartbeat { .. } => {}
+                    InputMessage::Layout(_) | InputMessage::Proof { .. } | InputMessage::Return { .. }
+                    | InputMessage::Deactivate { .. }
+                    | InputMessage::Key { .. } | InputMessage::Button { .. }
+                    | InputMessage::Motion { .. } | InputMessage::Wheel { .. } => {}
                 }
             }
-            _ = motion_tick.tick() => {
-                let (dx, dy) = platform.motion.take();
-                if dx != 0 || dy != 0 {
-                    last_delta = Point { x: dx, y: dy };
-                    if let Some(event) = session.motion(dx, dy)? {
-                        last_event = event;
-                    }
-                }
-            }
-            _ = health_tick.tick() => {
-                platform.backend.health_check()?;
-                if platform.failed.load(Ordering::Acquire) {
-                    bail!("macOS 输入后端已失败")
-                }
-                if platform.overflowed.load(Ordering::Acquire) {
-                    bail!("macOS 输入事件队列已满")
-                }
+            _ = heartbeat.tick() => {
+                incoming
+                    .send(Ok(InputMessage::Heartbeat { generation }))
+                    .await
+                    .context("无法向正式 sender 发送 mock 心跳")?;
             }
             _ = gui_tick.tick() => {
                 if stop.load(Ordering::Acquire) || !unsafe { synly_input_mock_gui_is_running() } {
                     break;
                 }
+                if !active {
+                    let sample = motion.take_observed();
+                    let delta = Point { x: sample.dx, y: sample.dy };
+                    if delta != last_delta || sample.position != last_local_position {
+                        last_delta = delta;
+                        last_local_position = sample.position;
+                        if let Some(point) = sample.position {
+                            last_event = format!(
+                                "本机采样 x={}, y={}, delta={:+}, {:+}",
+                                point.x,
+                                point.y,
+                                sample.dx,
+                                sample.dy,
+                            );
+                            tracing::debug!(
+                                point = ?point,
+                                dx = sample.dx,
+                                dy = sample.dy,
+                                position_updated = sample.position_updated,
+                                "mock 收到本机位置采样"
+                            );
+                        }
+                    }
+                }
                 update_gui(&GuiUpdate {
-                    active: session.active,
-                    cursor: session.remote_cursor,
+                    active,
+                    cursor: remote_cursor,
                     delta: last_delta,
                     key_count: keys.len() as u32,
                     button_mask: button_mask(&buttons),
@@ -192,121 +320,10 @@ async fn run_mock_loop(
 async fn wait_for_shutdown(stop: &AtomicBool) {
     let mut tick = time::interval(GUI_INTERVAL);
     loop {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                unsafe { synly_input_mock_gui_stop() };
-                break;
-            }
-            _ = tick.tick() => {
-                if stop.load(Ordering::Acquire) || !unsafe { synly_input_mock_gui_is_running() } {
-                    break;
-                }
-            }
+        tick.tick().await;
+        if stop.load(Ordering::Acquire) || !unsafe { synly_input_mock_gui_is_running() } {
+            break;
         }
-    }
-}
-
-struct MockSession {
-    backend: Arc<dyn platform::InputBackend>,
-    local_layout: DesktopLayout,
-    mock_layout: DesktopLayout,
-    source_edge: ScreenEdge,
-    active: bool,
-    edge_position: f32,
-    remote_cursor: Point,
-}
-
-impl MockSession {
-    fn new(
-        backend: Arc<dyn platform::InputBackend>,
-        local_layout: DesktopLayout,
-        mock_layout: DesktopLayout,
-        source_edge: ScreenEdge,
-    ) -> Self {
-        Self {
-            backend,
-            local_layout,
-            mock_layout,
-            source_edge,
-            active: false,
-            edge_position: 0.5,
-            remote_cursor: Point::default(),
-        }
-    }
-
-    fn motion(&mut self, dx: i32, dy: i32) -> Result<Option<String>> {
-        if !self.active {
-            let point = self.backend.cursor_position()?;
-            if !self.local_layout.is_jump_zone_point(
-                self.source_edge,
-                point,
-                JUMP_ZONE_SIZE,
-            ) {
-                return Ok(None);
-            }
-            self.edge_position = self
-                .local_layout
-                .normalized_edge_position(self.source_edge, point);
-            self.remote_cursor = self.mock_layout.point_inside_edge(
-                self.source_edge.opposite(),
-                self.edge_position,
-                EDGE_INSET,
-            );
-            self.backend.set_capture(true)?;
-            self.active = true;
-            tracing::info!(
-                edge = self.source_edge.as_arg(),
-                position = self.edge_position,
-                "鼠标已接入 mock 虚拟屏幕"
-            );
-            return Ok(Some(format!(
-                "接入 mock, entry={:.3}, x={}, y={}",
-                self.edge_position, self.remote_cursor.x, self.remote_cursor.y,
-            )));
-        }
-
-        let return_edge = self.source_edge.opposite();
-        if let Some(position) = self.mock_layout.crossed_outer_edge_position(
-            return_edge,
-            self.remote_cursor,
-            dx,
-            dy,
-        ) {
-            self.edge_position = position;
-            self.restore_local();
-            tracing::info!(position, "鼠标已从 mock 返回本机");
-            return Ok(Some(format!("从 mock 返回本机, position={position:.3}")));
-        }
-        self.remote_cursor = self
-            .mock_layout
-            .move_within_layout(self.remote_cursor, dx, dy);
-        Ok(None)
-    }
-
-    fn restore_local(&mut self) {
-        if !self.active {
-            return;
-        }
-        let target = self.local_layout.point_inside_edge(
-            self.source_edge,
-            self.edge_position,
-            EDGE_INSET,
-        );
-        let warp_result = self.backend.warp_cursor(target);
-        let capture_result = self.backend.set_capture(false);
-        if let Err(error) = warp_result {
-            tracing::error!(error = %error, "恢复 macOS 本机光标位置失败");
-        }
-        if let Err(error) = capture_result {
-            tracing::error!(error = %error, "恢复 macOS 本机光标显示失败");
-        }
-        self.active = false;
-    }
-}
-
-impl Drop for MockSession {
-    fn drop(&mut self) {
-        self.restore_local();
     }
 }
 

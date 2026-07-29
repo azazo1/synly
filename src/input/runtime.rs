@@ -242,7 +242,7 @@ where
     (rx, task)
 }
 
-async fn run_sender(
+pub(super) async fn run_sender(
     incoming: &mut mpsc::Receiver<Result<InputMessage>>,
     tx: &mpsc::Sender<InputMessage>,
     platform: &mut platform::PlatformHandle,
@@ -265,6 +265,14 @@ async fn run_sender(
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut overflow_poll = time::interval(OVERFLOW_POLL);
     let mut timeout_tick = time::interval(HEARTBEAT_INTERVAL);
+    let mut motion_logged = false;
+    let mut last_jump_zone_result = None;
+
+    tracing::info!(
+        edge = ?source_edge,
+        displays = ?local_layout.displays,
+        "输入发送端已准备边缘切换"
+    );
 
     loop {
         tokio::select! {
@@ -326,15 +334,56 @@ async fn run_sender(
                 }
             }
             _ = motion_tick.tick() => {
-                let (dx, dy) = platform.motion.take();
-                if dx == 0 && dy == 0 {
-                    continue;
-                }
+                let sample = platform.motion.take();
                 if active {
-                    enqueue_message(tx, InputMessage::Motion { generation, dx, dy })?;
+                    if sample.dx == 0 && sample.dy == 0 {
+                        continue;
+                    }
+                    enqueue_message(tx, InputMessage::Motion {
+                        generation,
+                        dx: sample.dx,
+                        dy: sample.dy,
+                    })?;
                 } else if Instant::now() >= cooldown_until {
-                    let point = platform.backend.cursor_position()?;
-                    if local_layout.is_jump_zone_point(source_edge, point, JUMP_ZONE_SIZE) {
+                    let point = match (sample.position_updated, sample.position) {
+                        (true, Some(point)) => point,
+                        _ if sample.dx != 0 || sample.dy != 0 => {
+                            platform.backend.cursor_position()?
+                        }
+                        _ => continue,
+                    };
+                    let in_jump_zone = local_layout.is_jump_zone_point(source_edge, point, JUMP_ZONE_SIZE);
+                    if last_jump_zone_result != Some(in_jump_zone) {
+                        tracing::info!(
+                            point = ?point,
+                            edge = ?source_edge,
+                            in_jump_zone,
+                            displays = ?local_layout.displays,
+                            "输入发送端边缘判定状态变化"
+                        );
+                        last_jump_zone_result = Some(in_jump_zone);
+                    }
+                    tracing::debug!(
+                        point = ?point,
+                        dx = sample.dx,
+                        dy = sample.dy,
+                        position_updated = sample.position_updated,
+                        edge = ?source_edge,
+                        in_jump_zone,
+                        displays = ?local_layout.displays,
+                        "输入发送端检查本机边缘"
+                    );
+                    if !motion_logged {
+                        tracing::info!(
+                            dx = sample.dx,
+                            dy = sample.dy,
+                            point = ?point,
+                            edge = ?source_edge,
+                            "输入发送端收到首次鼠标运动"
+                        );
+                        motion_logged = true;
+                    }
+                    if in_jump_zone {
                         generation = generation.wrapping_add(1).max(1);
                         let edge_position = local_layout.normalized_edge_position(source_edge, point);
                         let pressed = platform.backend.snapshot();
@@ -342,7 +391,13 @@ async fn run_sender(
                         platform.backend.set_capture(true)?;
                         active = true;
                         recovery.arm(edge_position);
-                        tracing::info!(generation, edge = ?source_edge, "鼠标已进入对端桌面");
+                        tracing::info!(
+                            generation,
+                            edge = ?source_edge,
+                            point = ?point,
+                            edge_position,
+                            "鼠标已进入对端桌面"
+                        );
                     }
                 }
             }
@@ -594,12 +649,15 @@ fn apply_snapshot(backend: &dyn platform::InputBackend, snapshot: &KeySnapshot) 
 mod tests {
     use super::{
         AbortOnDrop, EDGE_INSET, ReceiverMotion, SenderRecoveryGuard, enqueue_message,
-        receiver_motion, spawn_input_reader,
+        receiver_motion, run_sender, spawn_input_reader,
     };
-    use crate::input::platform::InputBackend;
+    use crate::input::platform::{InputBackend, MotionAccumulator, PlatformHandle};
+    use crate::input::protocol::InputMessage;
     use crate::input::{DesktopLayout, DisplayRect, KeySnapshot, ModifierMask, Point, ScreenEdge};
     use anyhow::Result;
+    use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
+    use tokio::sync::mpsc;
     use tokio::io::AsyncWriteExt;
     use tokio::time::{Duration, sleep, timeout};
 
@@ -691,6 +749,52 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn sender_activates_from_a_zero_delta_edge_position_update() {
+        let backend = Arc::new(FakeBackend::default());
+        let layout = backend.layout().unwrap();
+        let motion = Arc::new(MotionAccumulator::default());
+        let (_events_tx, events) = mpsc::channel(1);
+        let mut platform = PlatformHandle {
+            backend: Arc::clone(&backend) as Arc<dyn InputBackend>,
+            events,
+            motion: Arc::clone(&motion),
+            overflowed: Arc::new(AtomicBool::new(false)),
+            failed: Arc::new(AtomicBool::new(false)),
+        };
+        let (_incoming_tx, mut incoming) = mpsc::channel(1);
+        let (outgoing, mut messages) = mpsc::channel(8);
+        motion.add_at(0, 0, Point { x: 0, y: 50 });
+
+        let task = tokio::spawn(async move {
+            run_sender(
+                &mut incoming,
+                &outgoing,
+                &mut platform,
+                layout.clone(),
+                layout,
+                ScreenEdge::Left,
+            )
+            .await
+        });
+        let activation = timeout(Duration::from_secs(1), async {
+            loop {
+                if let InputMessage::Activate { edge_position, .. } =
+                    messages.recv().await.expect("sender 不应提前停止")
+                {
+                    break edge_position;
+                }
+            }
+        })
+        .await
+        .expect("sender 应处理零 delta 的边缘坐标更新");
+
+        assert_eq!(activation, 0.5);
+        assert!(*backend.capture.lock().unwrap());
+        task.abort();
+        let _ = task.await;
     }
 
     #[tokio::test]
