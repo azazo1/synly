@@ -2,13 +2,16 @@ use super::{CaptureContext, InputBackend, NativeEvent};
 use crate::input::{DesktopLayout, DisplayRect, InputMode, KeySnapshot, ModifierMask, Point};
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeSet;
+use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicPtr, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 type HHook = isize;
 type HInstance = isize;
+type HCursor = isize;
+type HWnd = isize;
 type HMonitor = isize;
 type Hdc = isize;
 type LParam = isize;
@@ -20,6 +23,10 @@ const WH_MOUSE_LL: i32 = 14;
 const HC_ACTION: i32 = 0;
 const WM_QUIT: u32 = 0x0012;
 const WM_SYNLY_CAPTURE: u32 = 0x8001;
+const WM_SYNLY_WARP: u32 = 0x8002;
+const WM_SYNLY_LAYOUT: u32 = 0x8003;
+const WM_SYNLY_CURSOR_POSITION: u32 = 0x8004;
+const WM_SYNLY_INJECT_CURSOR: u32 = 0x8005;
 const WM_MOUSEMOVE: u32 = 0x0200;
 const WM_LBUTTONDOWN: u32 = 0x0201;
 const WM_LBUTTONUP: u32 = 0x0202;
@@ -58,11 +65,26 @@ const SM_XVIRTUALSCREEN: i32 = 76;
 const SM_YVIRTUALSCREEN: i32 = 77;
 const SM_CXVIRTUALSCREEN: i32 = 78;
 const SM_CYVIRTUALSCREEN: i32 = 79;
+const SM_CXCURSOR: i32 = 13;
+const SM_CYCURSOR: i32 = 14;
 const VK_CONTROL: i32 = 0x11;
 const VK_SHIFT: i32 = 0x10;
 const VK_MENU: i32 = 0x12;
 const VK_LWIN: i32 = 0x5b;
 const VK_RWIN: i32 = 0x5c;
+const CS_DBLCLKS: u32 = 0x0008;
+const CS_NOCLOSE: u32 = 0x0200;
+const WS_EX_TRANSPARENT: u32 = 0x00000020;
+const WS_EX_TOOLWINDOW: u32 = 0x00000080;
+const WS_POPUP: u32 = 0x80000000;
+const HWND_TOP: HWnd = 0;
+const HWND_BOTTOM: HWnd = 1;
+const SWP_NOSIZE: u32 = 0x0001;
+const SWP_NOMOVE: u32 = 0x0002;
+const SWP_NOACTIVATE: u32 = 0x0010;
+const SWP_SHOWWINDOW: u32 = 0x0040;
+const SWP_HIDEWINDOW: u32 = 0x0080;
+const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -154,6 +176,22 @@ struct Msg {
     private: u32,
 }
 
+#[repr(C)]
+struct WindowClassExW {
+    cb_size: u32,
+    style: u32,
+    window_proc: Option<unsafe extern "system" fn(HWnd, u32, WParam, LParam) -> LResult>,
+    cls_extra: i32,
+    window_extra: i32,
+    instance: HInstance,
+    icon: isize,
+    cursor: HCursor,
+    background: isize,
+    menu_name: *const u16,
+    class_name: *const u16,
+    small_icon: isize,
+}
+
 #[link(name = "user32")]
 unsafe extern "system" {
     fn SetWindowsHookExW(
@@ -168,10 +206,49 @@ unsafe extern "system" {
     fn TranslateMessage(message: *const Msg) -> i32;
     fn DispatchMessageW(message: *const Msg) -> LResult;
     fn PostThreadMessageW(thread_id: u32, message: u32, w_param: WParam, l_param: LParam) -> i32;
+    fn SendMessageW(window: HWnd, message: u32, w_param: WParam, l_param: LParam) -> LResult;
     fn GetCurrentThreadId() -> u32;
     fn GetCursorPos(point: *mut PointRaw) -> i32;
     fn SetCursorPos(x: i32, y: i32) -> i32;
     fn ShowCursor(show: i32) -> i32;
+    fn CreateCursor(
+        instance: HInstance,
+        x_hot_spot: i32,
+        y_hot_spot: i32,
+        width: i32,
+        height: i32,
+        and_plane: *const c_void,
+        xor_plane: *const c_void,
+    ) -> HCursor;
+    fn DestroyCursor(cursor: HCursor) -> i32;
+    fn RegisterClassExW(class: *const WindowClassExW) -> u16;
+    fn UnregisterClassW(class_name: *const u16, instance: HInstance) -> i32;
+    fn CreateWindowExW(
+        extended_style: u32,
+        class_name: *const u16,
+        window_name: *const u16,
+        style: u32,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        parent: HWnd,
+        menu: isize,
+        instance: HInstance,
+        parameter: *const c_void,
+    ) -> HWnd;
+    fn DestroyWindow(window: HWnd) -> i32;
+    fn DefWindowProcW(window: HWnd, message: u32, w_param: WParam, l_param: LParam) -> LResult;
+    fn SetWindowPos(
+        window: HWnd,
+        insert_after: HWnd,
+        x: i32,
+        y: i32,
+        width: i32,
+        height: i32,
+        flags: u32,
+    ) -> i32;
+    fn SetThreadDpiAwarenessContext(context: isize) -> isize;
     fn SendInput(count: u32, inputs: *const InputRaw, size: i32) -> u32;
     fn GetAsyncKeyState(vk: i32) -> i16;
     fn GetSystemMetrics(index: i32) -> i32;
@@ -184,6 +261,11 @@ unsafe extern "system" {
     fn GetMonitorInfoW(monitor: HMonitor, info: *mut MonitorInfo) -> i32;
 }
 
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetModuleHandleW(module_name: *const u16) -> HInstance;
+}
+
 struct WindowsState {
     context: CaptureContext,
     physical_pressed: Mutex<BTreeSet<u16>>,
@@ -192,6 +274,7 @@ struct WindowsState {
     injected_buttons: Mutex<BTreeSet<u8>>,
     last_point: Mutex<Option<Point>>,
     thread_id: AtomicU32,
+    hider_window: AtomicIsize,
     cursor_hidden: AtomicBool,
     stop: AtomicBool,
     hooks: Mutex<(HHook, HHook)>,
@@ -214,6 +297,7 @@ pub fn start(context: CaptureContext) -> Result<Arc<dyn InputBackend>> {
         injected_buttons: Mutex::new(BTreeSet::new()),
         last_point: Mutex::new(None),
         thread_id: AtomicU32::new(0),
+        hider_window: AtomicIsize::new(0),
         cursor_hidden: AtomicBool::new(false),
         stop: AtomicBool::new(false),
         hooks: Mutex::new((0, 0)),
@@ -232,8 +316,25 @@ pub fn start(context: CaptureContext) -> Result<Arc<dyn InputBackend>> {
 }
 
 fn run_message_loop(state: Arc<WindowsState>, ready: std::sync::mpsc::SyncSender<Result<()>>) {
+    let previous_dpi_context = unsafe {
+        SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+    };
+    if previous_dpi_context == 0 {
+        tracing::warn!("Windows 输入线程无法启用 per-monitor DPI awareness");
+    }
     let thread_id = unsafe { GetCurrentThreadId() };
     state.thread_id.store(thread_id, Ordering::Release);
+    let hider = match create_cursor_hider(thread_id) {
+        Ok(hider) => hider,
+        Err(error) => {
+            if previous_dpi_context != 0 {
+                unsafe { SetThreadDpiAwarenessContext(previous_dpi_context) };
+            }
+            let _ = ready.send(Err(error));
+            return;
+        }
+    };
+    state.hider_window.store(hider.window, Ordering::Release);
     let keyboard = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_callback), 0, 0) };
     let mouse = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_callback), 0, 0) };
     if keyboard == 0 || mouse == 0 {
@@ -242,6 +343,11 @@ fn run_message_loop(state: Arc<WindowsState>, ready: std::sync::mpsc::SyncSender
         }
         if mouse != 0 {
             unsafe { UnhookWindowsHookEx(mouse) };
+        }
+        state.hider_window.store(0, Ordering::Release);
+        destroy_cursor_hider(hider);
+        if previous_dpi_context != 0 {
+            unsafe { SetThreadDpiAwarenessContext(previous_dpi_context) };
         }
         let _ = ready.send(Err(anyhow::anyhow!(
             "无法安装 Windows 全局输入钩子, 请检查当前进程完整性级别"
@@ -256,21 +362,162 @@ fn run_message_loop(state: Arc<WindowsState>, ready: std::sync::mpsc::SyncSender
         if result <= 0 {
             break;
         }
-        if message.message == WM_SYNLY_CAPTURE {
-            sync_cursor_visibility(&state, message.w_param != 0);
-            continue;
-        }
         unsafe {
             TranslateMessage(&message);
             DispatchMessageW(&message);
         }
     }
-    sync_cursor_visibility(&state, false);
+    sync_cursor_capture(&state, false);
     unsafe {
         UnhookWindowsHookEx(keyboard);
         UnhookWindowsHookEx(mouse);
     }
     *state.hooks.lock().unwrap() = (0, 0);
+    state.hider_window.store(0, Ordering::Release);
+    destroy_cursor_hider(hider);
+    if previous_dpi_context != 0 {
+        unsafe { SetThreadDpiAwarenessContext(previous_dpi_context) };
+    }
+}
+
+struct CursorHider {
+    window: HWnd,
+    cursor: HCursor,
+    instance: HInstance,
+    class_name: Vec<u16>,
+}
+
+fn create_cursor_hider(thread_id: u32) -> Result<CursorHider> {
+    let instance = unsafe { GetModuleHandleW(ptr::null()) };
+    if instance == 0 {
+        bail!("无法读取 Windows 进程模块句柄");
+    }
+    let cursor = create_blank_cursor(instance)?;
+    let class_name = format!("SynlyInputCapture-{thread_id}\0")
+        .encode_utf16()
+        .collect::<Vec<_>>();
+    let class = WindowClassExW {
+        cb_size: size_of::<WindowClassExW>() as u32,
+        style: CS_DBLCLKS | CS_NOCLOSE,
+        window_proc: Some(cursor_hider_window_proc),
+        cls_extra: 0,
+        window_extra: 0,
+        instance,
+        icon: 0,
+        cursor,
+        background: 0,
+        menu_name: ptr::null(),
+        class_name: class_name.as_ptr(),
+        small_icon: 0,
+    };
+    if unsafe { RegisterClassExW(&class) } == 0 {
+        unsafe { DestroyCursor(cursor) };
+        bail!("无法注册 Windows 光标隐藏窗口类");
+    }
+    let window_name = "SynlyInputCapture\0".encode_utf16().collect::<Vec<_>>();
+    let window = unsafe {
+        CreateWindowExW(
+            WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW,
+            class_name.as_ptr(),
+            window_name.as_ptr(),
+            WS_POPUP,
+            0,
+            0,
+            1,
+            1,
+            0,
+            0,
+            instance,
+            ptr::null(),
+        )
+    };
+    if window == 0 {
+        unsafe {
+            UnregisterClassW(class_name.as_ptr(), instance);
+            DestroyCursor(cursor);
+        }
+        bail!("无法创建 Windows 光标隐藏窗口");
+    }
+    Ok(CursorHider { window, cursor, instance, class_name })
+}
+
+fn create_blank_cursor(instance: HInstance) -> Result<HCursor> {
+    let width = unsafe { GetSystemMetrics(SM_CXCURSOR) }.max(1);
+    let height = unsafe { GetSystemMetrics(SM_CYCURSOR) }.max(1);
+    let row_bytes = ((width as usize + 31) / 32) * 4;
+    let plane_size = row_bytes.saturating_mul(height as usize);
+    let and_plane = vec![0xffu8; plane_size];
+    let xor_plane = vec![0u8; plane_size];
+    let cursor = unsafe {
+        CreateCursor(
+            instance,
+            0,
+            0,
+            width,
+            height,
+            and_plane.as_ptr().cast(),
+            xor_plane.as_ptr().cast(),
+        )
+    };
+    if cursor == 0 {
+        bail!("无法创建 Windows 透明光标");
+    }
+    Ok(cursor)
+}
+
+fn destroy_cursor_hider(hider: CursorHider) {
+    unsafe {
+        DestroyWindow(hider.window);
+        UnregisterClassW(hider.class_name.as_ptr(), hider.instance);
+        DestroyCursor(hider.cursor);
+    }
+}
+
+unsafe extern "system" fn cursor_hider_window_proc(
+    window: HWnd,
+    message: u32,
+    w_param: WParam,
+    l_param: LParam,
+) -> LResult {
+    if message == WM_SYNLY_CAPTURE {
+        let state = HOOK_STATE.load(Ordering::Acquire);
+        if state.is_null() {
+            return 0;
+        }
+        return isize::from(sync_cursor_capture(unsafe { &*state }, w_param != 0));
+    }
+    if message == WM_SYNLY_WARP {
+        let state = HOOK_STATE.load(Ordering::Acquire);
+        if state.is_null() {
+            return 0;
+        }
+        let point = Point { x: w_param as i32, y: l_param as i32 };
+        if unsafe { SetCursorPos(point.x, point.y) } == 0 {
+            return 0;
+        }
+        *unsafe { &*state }.last_point.lock().unwrap() = Some(point);
+        return 1;
+    }
+    if message == WM_SYNLY_LAYOUT {
+        let displays = w_param as *mut Vec<DisplayRect>;
+        if displays.is_null() {
+            return 0;
+        }
+        unsafe { *displays = collect_display_rects() };
+        return isize::from(!unsafe { &*displays }.is_empty());
+    }
+    if message == WM_SYNLY_CURSOR_POSITION {
+        let point = w_param as *mut PointRaw;
+        if point.is_null() {
+            return 0;
+        }
+        return unsafe { GetCursorPos(point) } as isize;
+    }
+    if message == WM_SYNLY_INJECT_CURSOR {
+        let point = Point { x: w_param as i32, y: l_param as i32 };
+        return isize::from(send_absolute_mouse(point).is_ok());
+    }
+    unsafe { DefWindowProcW(window, message, w_param, l_param) }
 }
 
 unsafe extern "system" fn keyboard_callback(code: i32, w_param: WParam, l_param: LParam) -> LResult {
@@ -284,8 +531,6 @@ unsafe extern "system" fn keyboard_callback(code: i32, w_param: WParam, l_param:
         return unsafe { CallNextHookEx(0, code, w_param, l_param) };
     }
     let context = unsafe { &*HOOK_STATE.load(Ordering::Acquire) };
-    let active = context.context.capture_active.load(Ordering::Acquire);
-    sync_cursor_visibility(context, active);
     let usage = windows_scan_to_hid(state.scan_code as u16, state.vk_code as u16);
     let Some(usage) = usage else {
         return unsafe { CallNextHookEx(0, code, w_param, l_param) };
@@ -330,7 +575,6 @@ unsafe extern "system" fn mouse_callback(code: i32, w_param: WParam, l_param: LP
     let context = unsafe { &*HOOK_STATE.load(Ordering::Acquire) };
     let point = Point { x: event.pt.x, y: event.pt.y };
     let active = context.context.capture_active.load(Ordering::Acquire);
-    sync_cursor_visibility(context, active);
     match w_param as u32 {
         WM_MOUSEMOVE => {
             if active {
@@ -409,21 +653,35 @@ fn update_set<T: Ord + Copy>(set: &Mutex<BTreeSet<T>>, value: T, down: bool) {
 impl InputBackend for WindowsBackend {
     fn layout(&self) -> Result<DesktopLayout> {
         let mut displays = Vec::new();
-        let data = &mut displays as *mut Vec<DisplayRect> as isize;
-        let ok = unsafe { EnumDisplayMonitors(0, ptr::null(), Some(monitor_callback), data) };
-        if ok == 0 || displays.is_empty() {
-            let x = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
-            let y = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
-            let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
-            let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
-            return DesktopLayout::new(vec![DisplayRect { x, y, width, height }]);
+        let window = self.state.hider_window.load(Ordering::Acquire);
+        if window == 0
+            || unsafe {
+                SendMessageW(
+                    window,
+                    WM_SYNLY_LAYOUT,
+                    (&mut displays as *mut Vec<DisplayRect>) as usize,
+                    0,
+                )
+            } == 0
+        {
+            bail!("无法从 Windows 输入线程读取显示器布局");
         }
         DesktopLayout::new(displays)
     }
 
     fn cursor_position(&self) -> Result<Point> {
         let mut point = PointRaw::default();
-        if unsafe { GetCursorPos(&mut point) } == 0 {
+        let window = self.state.hider_window.load(Ordering::Acquire);
+        if window == 0
+            || unsafe {
+                SendMessageW(
+                    window,
+                    WM_SYNLY_CURSOR_POSITION,
+                    (&mut point as *mut PointRaw) as usize,
+                    0,
+                )
+            } == 0
+        {
             bail!("无法读取 Windows 光标位置");
         }
         Ok(Point { x: point.x, y: point.y })
@@ -442,32 +700,35 @@ impl InputBackend for WindowsBackend {
         if previous == active {
             return Ok(());
         }
-        let thread_id = self.state.thread_id.load(Ordering::Acquire);
-        if thread_id == 0
-            || unsafe {
-                PostThreadMessageW(thread_id, WM_SYNLY_CAPTURE, usize::from(active), 0)
-            } == 0
+        let window = self.state.hider_window.load(Ordering::Acquire);
+        if window == 0
+            || unsafe { SendMessageW(window, WM_SYNLY_CAPTURE, usize::from(active), 0) } == 0
         {
             self.state.context.capture_active.store(previous, Ordering::Release);
-            bail!("无法向 Windows 输入钩子线程发送光标捕获状态")
-        }
-        if active {
-            let center = virtual_desktop_center();
-            if unsafe { SetCursorPos(center.x, center.y) } == 0 {
-                self.state.context.capture_active.store(false, Ordering::Release);
-                let _ = unsafe { PostThreadMessageW(thread_id, WM_SYNLY_CAPTURE, 0, 0) };
-                bail!("无法在输入捕获开始时回正 Windows 光标");
+            if window != 0 {
+                let _ = unsafe {
+                    SendMessageW(window, WM_SYNLY_CAPTURE, usize::from(previous), 0)
+                };
             }
-            *self.state.last_point.lock().unwrap() = Some(center);
+            bail!("无法切换 Windows 光标捕获状态")
         }
         Ok(())
     }
 
     fn warp_cursor(&self, point: Point) -> Result<()> {
-        if unsafe { SetCursorPos(point.x, point.y) } == 0 {
+        let window = self.state.hider_window.load(Ordering::Acquire);
+        if window == 0
+            || unsafe {
+                SendMessageW(
+                    window,
+                    WM_SYNLY_WARP,
+                    point.x as isize as usize,
+                    point.y as isize,
+                )
+            } == 0
+        {
             bail!("无法移动 Windows 光标");
         }
-        *self.state.last_point.lock().unwrap() = Some(point);
         Ok(())
     }
 
@@ -500,7 +761,20 @@ impl InputBackend for WindowsBackend {
     }
 
     fn inject_cursor(&self, point: Point) -> Result<()> {
-        send_absolute_mouse(point)
+        let window = self.state.hider_window.load(Ordering::Acquire);
+        if window == 0
+            || unsafe {
+                SendMessageW(
+                    window,
+                    WM_SYNLY_INJECT_CURSOR,
+                    point.x as isize as usize,
+                    point.y as isize,
+                )
+            } == 0
+        {
+            bail!("Windows SendInput 鼠标移动注入失败");
+        }
+        Ok(())
     }
 
     fn inject_wheel(&self, x: i32, y: i32) -> Result<()> {
@@ -536,23 +810,78 @@ impl InputBackend for WindowsBackend {
     }
 }
 
-fn sync_cursor_visibility(state: &WindowsState, active: bool) {
+fn sync_cursor_capture(state: &WindowsState, active: bool) -> bool {
     let hidden = state.cursor_hidden.load(Ordering::Acquire);
     if hidden == active {
-        return;
+        return true;
     }
-    if set_cursor_visibility(!active) {
-        state.cursor_hidden.store(active, Ordering::Release);
+    let window = state.hider_window.load(Ordering::Acquire);
+    if window == 0 {
+        return false;
+    }
+    let succeeded = if active {
+        let center = virtual_desktop_center();
+        let visibility_ok = set_cursor_visibility(false);
+        let window_ok = visibility_ok
+            && unsafe {
+                SetWindowPos(
+                    window,
+                    HWND_TOP,
+                    center.x,
+                    center.y,
+                    1,
+                    1,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                )
+            } != 0;
+        let position_ok = window_ok && unsafe { SetCursorPos(center.x, center.y) } != 0;
+        if position_ok {
+            *state.last_point.lock().unwrap() = Some(center);
+            true
+        } else {
+            unsafe {
+                SetWindowPos(
+                    window,
+                    HWND_BOTTOM,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_HIDEWINDOW,
+                );
+            }
+            let _ = set_cursor_visibility(true);
+            false
+        }
     } else {
+        let visibility_ok = set_cursor_visibility(true);
+        let window_ok = unsafe {
+            SetWindowPos(
+                window,
+                HWND_BOTTOM,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_HIDEWINDOW,
+            )
+        } != 0;
+        visibility_ok && window_ok
+    };
+    if succeeded {
+        state.cursor_hidden.store(active, Ordering::Release);
+        tracing::debug!(active, "Windows 光标捕获状态已切换");
+    } else {
+        let message = if active {
+            "Windows 无法隐藏并固定本机光标"
+        } else {
+            "Windows 无法恢复本机光标"
+        };
         state.context.failed.store(true, Ordering::Release);
-        state.context.emit_reliable(NativeEvent::Failed(
-            if active {
-                "Windows 无法隐藏本机光标".to_string()
-            } else {
-                "Windows 无法恢复本机光标".to_string()
-            },
-        ));
+        state.context.emit_reliable(NativeEvent::Failed(message.to_string()));
+        tracing::error!(active, "{message}");
     }
+    succeeded
 }
 
 fn set_cursor_visibility(visible: bool) -> bool {
@@ -567,6 +896,7 @@ fn set_cursor_visibility(visible: bool) -> bool {
 
 impl Drop for WindowsBackend {
     fn drop(&mut self) {
+        let _ = self.set_capture(false);
         let _ = self.release_all();
         self.state.stop.store(true, Ordering::Release);
         let thread_id = self.state.thread_id.load(Ordering::Acquire);
@@ -595,6 +925,20 @@ unsafe extern "system" fn monitor_callback(
         });
     }
     1
+}
+
+fn collect_display_rects() -> Vec<DisplayRect> {
+    let mut displays = Vec::new();
+    let data = &mut displays as *mut Vec<DisplayRect> as isize;
+    let ok = unsafe { EnumDisplayMonitors(0, ptr::null(), Some(monitor_callback), data) };
+    if ok == 0 || displays.is_empty() {
+        let x = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+        let y = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+        let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
+        let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
+        displays.push(DisplayRect { x, y, width, height });
+    }
+    displays
 }
 
 fn current_modifiers() -> ModifierMask {

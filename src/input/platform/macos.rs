@@ -13,6 +13,7 @@ type CFMachPortRef = *mut c_void;
 type CFRunLoopSourceRef = *mut c_void;
 type CFRunLoopRef = *mut c_void;
 type CFStringRef = *const c_void;
+type CFTypeRef = *const c_void;
 type CGDirectDisplayID = u32;
 type CGEventType = u32;
 type CGEventFlags = u64;
@@ -110,11 +111,24 @@ unsafe extern "C" {
     fn CGWarpMouseCursorPosition(position: CGPoint) -> i32;
     fn CGAssociateMouseAndMouseCursorPosition(connected: bool) -> i32;
     fn CGSetLocalEventsSuppressionInterval(interval: c_double);
+    fn CGSSetConnectionProperty(
+        connection: i32,
+        target_connection: i32,
+        key: CFStringRef,
+        value: CFTypeRef,
+    ) -> i32;
+    fn _CGSDefaultConnection() -> i32;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     static kCFRunLoopCommonModes: CFStringRef;
+    static kCFBooleanTrue: CFTypeRef;
+    fn CFStringCreateWithCString(
+        allocator: *const c_void,
+        value: *const i8,
+        encoding: u32,
+    ) -> CFStringRef;
     fn CFMachPortCreateRunLoopSource(
         allocator: *const c_void,
         port: CFMachPortRef,
@@ -405,6 +419,33 @@ fn mac_mouse_button(button: u8) -> u32 {
     }
 }
 
+fn enable_background_cursor_updates() {
+    const PROPERTY: &[u8] = b"SetsCursorInBackground\0";
+    const CF_STRING_ENCODING_MAC_ROMAN: u32 = 0;
+
+    let property = unsafe {
+        CFStringCreateWithCString(
+            ptr::null(),
+            PROPERTY.as_ptr().cast(),
+            CF_STRING_ENCODING_MAC_ROMAN,
+        )
+    };
+    if property.is_null() {
+        tracing::warn!("无法创建 macOS 后台光标属性名, 光标隐藏可能不稳定");
+        return;
+    }
+    let connection = unsafe { _CGSDefaultConnection() };
+    let result = unsafe {
+        CGSSetConnectionProperty(connection, connection, property, kCFBooleanTrue)
+    };
+    unsafe { CFRelease(property) };
+    if result != 0 {
+        tracing::warn!(error_code = result, "设置 macOS 后台光标属性失败, 光标隐藏可能不稳定");
+    } else {
+        tracing::debug!("已设置 macOS 后台光标属性");
+    }
+}
+
 impl InputBackend for MacBackend {
     fn health_check(&self) -> Result<()> {
         let result = if !unsafe { AXIsProcessTrusted() } {
@@ -474,6 +515,7 @@ impl InputBackend for MacBackend {
             return Ok(());
         }
         let display = unsafe { CGMainDisplayID() };
+        enable_background_cursor_updates();
         let visibility_result = if active {
             unsafe { CGDisplayHideCursor(display) }
         } else {
