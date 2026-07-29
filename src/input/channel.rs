@@ -120,6 +120,9 @@ pub async fn connect(
     offer: &InputChannelOffer,
     master_secret: &[u8; 32],
 ) -> Result<TlsStream<TcpStream>> {
+    if offer.certificate_der.is_empty() || offer.certificate_der.len() > 64 * 1024 {
+        bail!("输入辅助证书长度无效");
+    }
     let mut socket = TcpStream::connect(address)
         .await
         .with_context(|| format!("无法连接输入辅助通道 {address}"))?;

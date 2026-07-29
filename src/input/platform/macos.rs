@@ -126,6 +126,11 @@ unsafe extern "C" {
     fn CFRelease(value: *const c_void);
 }
 
+#[link(name = "Carbon", kind = "framework")]
+unsafe extern "C" {
+    fn IsSecureEventInputEnabled() -> bool;
+}
+
 struct MacState {
     context: CaptureContext,
     physical_pressed: Mutex<BTreeSet<u16>>,
@@ -154,11 +159,13 @@ impl Drop for MacBackend {
 }
 
 pub fn ensure_permissions(_mode: InputMode) -> Result<()> {
-    if unsafe { AXIsProcessTrusted() } {
-        Ok(())
-    } else {
+    if !unsafe { AXIsProcessTrusted() } {
         bail!("鼠标键盘同步需要在系统设置中授予 Synly 辅助功能权限")
     }
+    if unsafe { IsSecureEventInputEnabled() } {
+        bail!("macOS Secure Input 已启用, 无法安全启动鼠标键盘同步")
+    }
+    Ok(())
 }
 
 pub fn start(context: CaptureContext) -> Result<Arc<dyn InputBackend>> {
@@ -215,6 +222,11 @@ fn run_event_tap(state: Arc<MacState>, ready: std::sync::mpsc::SyncSender<Result
     *state.tap.lock().unwrap() = Some(tap as usize);
     let source = unsafe { CFMachPortCreateRunLoopSource(ptr::null(), tap, 0) };
     if source.is_null() {
+        unsafe {
+            CGEventTapEnable(tap, false);
+            CFRelease(tap);
+            drop(Arc::from_raw(context.cast::<MacState>()));
+        }
         let _ = ready.send(Err(anyhow::anyhow!("无法创建 Quartz event tap run loop source")));
         return;
     }
@@ -225,6 +237,13 @@ fn run_event_tap(state: Arc<MacState>, ready: std::sync::mpsc::SyncSender<Result
     }
     let _ = ready.send(Ok(()));
     unsafe { CFRunLoopRun() };
+    *state.tap.lock().unwrap() = None;
+    *state.run_loop.lock().unwrap() = None;
+    unsafe {
+        CFRelease(source);
+        CFRelease(tap);
+        drop(Arc::from_raw(context.cast::<MacState>()));
+    }
 }
 
 unsafe extern "C" fn event_callback(
@@ -336,6 +355,20 @@ fn update_set<T: Ord + Copy>(set: &Mutex<BTreeSet<T>>, value: T, down: bool) {
 }
 
 impl InputBackend for MacBackend {
+    fn health_check(&self) -> Result<()> {
+        let result = if !unsafe { AXIsProcessTrusted() } {
+            Err(anyhow::anyhow!("macOS 辅助功能权限已撤销"))
+        } else if unsafe { IsSecureEventInputEnabled() } {
+            Err(anyhow::anyhow!("macOS Secure Input 已启用"))
+        } else {
+            Ok(())
+        };
+        if result.is_err() {
+            self.state.context.failed.store(true, Ordering::Release);
+        }
+        result
+    }
+
     fn layout(&self) -> Result<DesktopLayout> {
         let mut count = 0u32;
         let result = unsafe { CGGetActiveDisplayList(0, ptr::null_mut(), &mut count) };
@@ -453,7 +486,10 @@ impl InputBackend for MacBackend {
 
     fn inject_motion(&self, dx: i32, dy: i32) -> Result<()> {
         let point = self.cursor_position()?;
-        let target = CGPoint { x: (point.x + dx) as f64, y: (point.y + dy) as f64 };
+        let target = CGPoint {
+            x: point.x.saturating_add(dx) as f64,
+            y: point.y.saturating_add(dy) as f64,
+        };
         let event = unsafe { CGEventCreateMouseEvent(ptr::null(), EVENT_MOUSE_MOVED, target, 0) };
         post_event(event, 0)
     }

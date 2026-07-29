@@ -126,17 +126,17 @@ impl DesktopLayout {
             .sum::<i32>()
             .max(1);
         let mut offset = 0i32;
-        for segment in segments {
-            if coordinate < segment.start {
-                break;
-            }
-            if coordinate < segment.end {
-                offset += coordinate - segment.start;
-                break;
+        for segment in &segments {
+            if coordinate >= segment.start
+                && coordinate < segment.end
+                && point_matches_boundary(edge, point, segment.boundary)
+            {
+                return ((offset + coordinate - segment.start) as f32 / total as f32)
+                    .clamp(0.0, 1.0);
             }
             offset += segment.end - segment.start;
         }
-        (offset as f32 / total as f32).clamp(0.0, 1.0)
+        0.0
     }
 
     pub fn point_inside_edge(&self, edge: ScreenEdge, position: f32, inset: i32) -> Point {
@@ -263,6 +263,15 @@ struct EdgeSegment {
     boundary: i32,
 }
 
+fn point_matches_boundary(edge: ScreenEdge, point: Point, boundary: i32) -> bool {
+    match edge {
+        ScreenEdge::Left => (point.x - boundary).abs() <= 2,
+        ScreenEdge::Right => (point.x - (boundary - 1)).abs() <= 2,
+        ScreenEdge::Top => (point.y - boundary).abs() <= 2,
+        ScreenEdge::Bottom => (point.y - (boundary - 1)).abs() <= 2,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{DesktopLayout, DisplayRect, Point, ScreenEdge};
@@ -300,6 +309,19 @@ mod tests {
         assert_eq!(
             layout.point_inside_edge(ScreenEdge::Right, 0.75, 8),
             Point { x: 291, y: 100 }
+        );
+    }
+
+    #[test]
+    fn edge_normalization_distinguishes_parallel_exposed_segments() {
+        let layout = DesktopLayout::new(vec![
+            DisplayRect { x: 0, y: 0, width: 100, height: 100 },
+            DisplayRect { x: 200, y: 0, width: 100, height: 100 },
+        ])
+        .unwrap();
+        assert_eq!(
+            layout.normalized_edge_position(ScreenEdge::Right, Point { x: 299, y: 50 }),
+            0.75
         );
     }
 }

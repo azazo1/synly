@@ -67,13 +67,13 @@ pub struct Cli {
     #[arg(
         long = "input",
         value_enum,
-        help = "鼠标键盘同步方向；默认关闭，可选 off / send / receive"
+        help = "鼠标键盘同步方向; 默认关闭, 可选 off / send / receive"
     )]
     pub input_mode: Option<InputMode>,
     #[arg(
         long,
         value_enum,
-        help = "发送鼠标键盘时跨入对端的屏幕边缘；默认 right"
+        help = "发送鼠标键盘时跨入对端的屏幕边缘; 默认 right"
     )]
     pub input_edge: Option<ScreenEdge>,
     #[arg(

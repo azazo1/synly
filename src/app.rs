@@ -1668,6 +1668,7 @@ async fn run_sync_session(
     let input_master_secret = session.input_master_secret;
     let input_host_channel = options.input_host_channel;
     let has_input_host_channel = input_host_channel.is_some();
+    let mut input_started = has_input_host_channel && input_role.is_some();
     let input_sockets = options.input_sockets;
 
     println!(
@@ -1837,6 +1838,10 @@ async fn run_sync_session(
                 if has_input_host_channel {
                     bail!("host 输入会话收到重复的输入辅助通道 offer");
                 }
+                if input_started {
+                    bail!("输入辅助通道 offer 重复");
+                }
+                input_started = true;
                 let input_options = options.input_options.clone();
                 let task = tokio::spawn(async move {
                     if let Err(err) = input::run_input_session(
@@ -3389,7 +3394,7 @@ fn discovered_peer_mode_mismatch_message(
     }
 
     Some(format!(
-        "找到设备 {}，但同步模式不匹配: 对端广播为 文件:{} / 剪贴板:{} / 音频:{} / 输入:{}; 本机为 文件:{} / 剪贴板:{} / 音频:{} / 输入:{}。当前没有任何可用同步方向。",
+        "找到设备 {}, 但同步模式不匹配: 对端广播为 文件:{} / 剪贴板:{} / 音频:{} / 输入:{}; 本机为 文件:{} / 剪贴板:{} / 音频:{} / 输入:{}. 当前没有任何可用同步方向.",
         peer.display_name(),
         peer.file_sync_mode.label(),
         peer.clipboard_mode.label(),

@@ -35,6 +35,10 @@ pub enum NativeEvent {
 }
 
 pub trait InputBackend: Send + Sync {
+    fn health_check(&self) -> Result<()> {
+        Ok(())
+    }
+
     fn layout(&self) -> Result<DesktopLayout>;
     fn cursor_position(&self) -> Result<Point>;
     fn snapshot(&self) -> KeySnapshot;
@@ -78,6 +82,7 @@ pub struct PlatformHandle {
     pub events: mpsc::Receiver<NativeEvent>,
     pub motion: Arc<MotionAccumulator>,
     pub overflowed: Arc<AtomicBool>,
+    pub failed: Arc<AtomicBool>,
 }
 
 pub struct CaptureContext {
@@ -87,12 +92,15 @@ pub struct CaptureContext {
     pub motion: Arc<MotionAccumulator>,
     pub capture_active: Arc<AtomicBool>,
     pub overflowed: Arc<AtomicBool>,
+    pub failed: Arc<AtomicBool>,
 }
 
 impl CaptureContext {
     pub fn emit_reliable(&self, event: NativeEvent) {
+        if matches!(&event, NativeEvent::Failed(_)) {
+            self.failed.store(true, Ordering::Release);
+        }
         if self.events.try_send(event).is_err() {
-            self.capture_active.store(false, Ordering::Release);
             self.overflowed.store(true, Ordering::Release);
             let _ = self.events.try_send(NativeEvent::ReliableQueueOverflow);
         }
@@ -104,6 +112,7 @@ pub fn start(mode: InputMode, hotkey: Hotkey) -> Result<PlatformHandle> {
     let motion = Arc::new(MotionAccumulator::default());
     let capture_active = Arc::new(AtomicBool::new(false));
     let overflowed = Arc::new(AtomicBool::new(false));
+    let failed = Arc::new(AtomicBool::new(false));
     let context = CaptureContext {
         mode,
         hotkey,
@@ -111,6 +120,7 @@ pub fn start(mode: InputMode, hotkey: Hotkey) -> Result<PlatformHandle> {
         motion: Arc::clone(&motion),
         capture_active,
         overflowed: Arc::clone(&overflowed),
+        failed: Arc::clone(&failed),
     };
     #[cfg(target_os = "macos")]
     let backend = macos::start(context)?;
@@ -123,6 +133,7 @@ pub fn start(mode: InputMode, hotkey: Hotkey) -> Result<PlatformHandle> {
         events: events_rx,
         motion,
         overflowed,
+        failed,
     })
 }
 

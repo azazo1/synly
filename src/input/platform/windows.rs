@@ -148,6 +148,7 @@ struct Msg {
     l_param: isize,
     time: u32,
     point: PointRaw,
+    private: u32,
 }
 
 #[link(name = "user32")]
@@ -309,7 +310,10 @@ unsafe extern "system" fn mouse_callback(code: i32, w_param: WParam, l_param: LP
     match w_param as u32 {
         WM_MOUSEMOVE => {
             if let Some(previous) = previous {
-                context.context.motion.add(point.x - previous.x, point.y - previous.y);
+                context.context.motion.add(
+                    point.x.saturating_sub(previous.x),
+                    point.y.saturating_sub(previous.y),
+                );
             }
         }
         WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN
@@ -404,6 +408,7 @@ impl InputBackend for WindowsBackend {
         if unsafe { SetCursorPos(point.x, point.y) } == 0 {
             bail!("无法移动 Windows 光标");
         }
+        *self.state.last_point.lock().unwrap() = Some(point);
         Ok(())
     }
 
@@ -441,10 +446,20 @@ impl InputBackend for WindowsBackend {
 
     fn inject_wheel(&self, x: i32, y: i32) -> Result<()> {
         if y != 0 {
-            send_mouse(0, 0, (y * WHEEL_DELTA) as u32, MOUSEEVENTF_WHEEL)?;
+            send_mouse(
+                0,
+                0,
+                y.saturating_mul(WHEEL_DELTA) as u32,
+                MOUSEEVENTF_WHEEL,
+            )?;
         }
         if x != 0 {
-            send_mouse(0, 0, (x * WHEEL_DELTA) as u32, MOUSEEVENTF_HWHEEL)?;
+            send_mouse(
+                0,
+                0,
+                x.saturating_mul(WHEEL_DELTA) as u32,
+                MOUSEEVENTF_HWHEEL,
+            )?;
         }
         Ok(())
     }
@@ -504,7 +519,7 @@ fn current_modifiers() -> ModifierMask {
 }
 
 fn key_down(vk: i32) -> bool {
-    unsafe { GetAsyncKeyState(vk) } < 0
+    (unsafe { GetAsyncKeyState(vk) }) < 0
 }
 
 fn send_keyboard(scan: u16, flags: u32) -> Result<()> {

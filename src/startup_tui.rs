@@ -596,7 +596,7 @@ impl StartupApp {
                     );
                     self.clamp_focus_current_tab();
                     self.push_log(format!(
-                        "鼠标键盘同步已切换为{}。",
+                        "鼠标键盘同步已切换为{}.",
                         self.flow.input_mode.label()
                     ));
                 }

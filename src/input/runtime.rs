@@ -4,9 +4,11 @@ use super::protocol::{InputMessage, read_message, write_message};
 use super::{Hotkey, InputMode, KeySnapshot, LocalInputRole, ScreenEdge};
 use anyhow::{Context, Result, bail};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::{self, Instant, MissedTickBehavior};
 use tokio_rustls::TlsStream;
 
@@ -77,6 +79,9 @@ pub async fn run_input_session(
                         .await
                         {
                             cleanup_platform(&platform);
+                            if platform_is_terminal(&platform) {
+                                return Err(err);
+                            }
                             tracing::warn!(error = %err, "输入辅助连接已断开, 等待重连");
                         }
                     }
@@ -109,6 +114,9 @@ pub async fn run_input_session(
                 };
                 cleanup_platform(&platform);
                 if let Err(err) = established {
+                    if platform_is_terminal(&platform) {
+                        return Err(err);
+                    }
                     tracing::warn!(error = %err, retry_secs = delay.as_secs(), "输入辅助连接将在退避后重连");
                     time::sleep(delay).await;
                     delay = Duration::from_secs(
@@ -123,6 +131,13 @@ pub async fn run_input_session(
 fn cleanup_platform(platform: &platform::PlatformHandle) {
     let _ = platform.backend.set_capture(false);
     let _ = platform.backend.release_all();
+}
+
+fn platform_is_terminal(platform: &platform::PlatformHandle) -> bool {
+    platform.failed.load(std::sync::atomic::Ordering::Acquire)
+        || platform
+            .overflowed
+            .load(std::sync::atomic::Ordering::Acquire)
 }
 
 async fn run_established(
@@ -191,6 +206,11 @@ where
 {
     let mut generation = 0u64;
     let mut active = false;
+    let mut recovery = SenderRecoveryGuard::new(
+        Arc::clone(&platform.backend),
+        local_layout.clone(),
+        source_edge,
+    );
     let mut cooldown_until = Instant::now();
     let mut last_heartbeat = Instant::now();
     let mut motion_tick = time::interval(MOTION_INTERVAL);
@@ -208,16 +228,18 @@ where
                         if active && remote_generation == generation => {
                             deactivate_sender(platform, &local_layout, source_edge, edge_position)?;
                             active = false;
+                            recovery.disarm();
                             cooldown_until = Instant::now() + RETURN_COOLDOWN;
                             tracing::info!(generation, "控制已从对端返回本机");
                         }
                     InputMessage::Deactivate { generation: remote_generation }
                         if active && remote_generation == generation => {
-                            platform.backend.set_capture(false)?;
+                            recovery.recover();
                             active = false;
                             cooldown_until = Instant::now() + RETURN_COOLDOWN;
                         }
-                    InputMessage::Heartbeat { .. } => {
+                    InputMessage::Heartbeat { generation: remote_generation }
+                        if !active || remote_generation == generation => {
                         last_heartbeat = Instant::now();
                     }
                     InputMessage::Layout(_) => {}
@@ -229,26 +251,26 @@ where
                 match event {
                     NativeEvent::Emergency => {
                         if active {
-                            tx.send(InputMessage::Deactivate { generation }).await?;
-                            platform.backend.set_capture(false)?;
+                            recovery.recover();
                             active = false;
                             cooldown_until = Instant::now() + RETURN_COOLDOWN;
+                            let _ = tx.try_send(InputMessage::Deactivate { generation });
                             tracing::info!(generation, "紧急热键已收回本机控制");
                         }
                     }
                     NativeEvent::Key { usage, modifiers, down, repeat } if active => {
-                        tx.send(InputMessage::Key { generation, usage, modifiers, down, repeat }).await?;
+                        enqueue_message(tx, InputMessage::Key { generation, usage, modifiers, down, repeat })?;
                     }
                     NativeEvent::Button { button, down } if active => {
-                        tx.send(InputMessage::Button { generation, button, down }).await?;
+                        enqueue_message(tx, InputMessage::Button { generation, button, down })?;
                     }
                     NativeEvent::Wheel { x, y } if active => {
-                        tx.send(InputMessage::Wheel { generation, x, y }).await?;
+                        enqueue_message(tx, InputMessage::Wheel { generation, x, y })?;
                     }
                     NativeEvent::ReliableQueueOverflow => {
                         if active {
-                            let _ = tx.send(InputMessage::Deactivate { generation }).await;
-                            platform.backend.set_capture(false)?;
+                            recovery.recover();
+                            let _ = tx.try_send(InputMessage::Deactivate { generation });
                         }
                         bail!("本机输入可靠事件队列已满, 已停止远程控制");
                     }
@@ -262,28 +284,30 @@ where
                     continue;
                 }
                 if active {
-                    tx.send(InputMessage::Motion { generation, dx, dy }).await?;
+                    enqueue_message(tx, InputMessage::Motion { generation, dx, dy })?;
                 } else if Instant::now() >= cooldown_until {
                     let point = platform.backend.cursor_position()?;
                     if local_layout.movement_crosses_edge(source_edge, point, dx, dy) {
                         generation = generation.wrapping_add(1).max(1);
                         let edge_position = local_layout.normalized_edge_position(source_edge, point);
                         let pressed = platform.backend.snapshot();
-                        tx.send(InputMessage::Activate { generation, source_edge, edge_position, pressed }).await?;
+                        enqueue_message(tx, InputMessage::Activate { generation, source_edge, edge_position, pressed })?;
                         platform.backend.set_capture(true)?;
                         active = true;
+                        recovery.arm(edge_position);
                         tracing::info!(generation, edge = ?source_edge, "鼠标已进入对端桌面");
                     }
                 }
             }
             _ = heartbeat.tick() => {
-                tx.send(InputMessage::Heartbeat { generation }).await?;
+                enqueue_message(tx, InputMessage::Heartbeat { generation })?;
             }
             _ = overflow_poll.tick() => {
+                platform.backend.health_check()?;
                 if platform.overflowed.load(std::sync::atomic::Ordering::Acquire) {
                     if active {
-                        let _ = tx.send(InputMessage::Deactivate { generation }).await;
-                        let _ = platform.backend.set_capture(false);
+                        recovery.recover();
+                        let _ = tx.try_send(InputMessage::Deactivate { generation });
                     }
                     bail!("本机输入可靠事件队列已满, 已停止远程控制");
                 }
@@ -298,6 +322,53 @@ where
     }
 }
 
+struct SenderRecoveryGuard {
+    backend: Arc<dyn platform::InputBackend>,
+    layout: super::DesktopLayout,
+    edge: ScreenEdge,
+    edge_position: Option<f32>,
+}
+
+impl SenderRecoveryGuard {
+    fn new(
+        backend: Arc<dyn platform::InputBackend>,
+        layout: super::DesktopLayout,
+        edge: ScreenEdge,
+    ) -> Self {
+        Self {
+            backend,
+            layout,
+            edge,
+            edge_position: None,
+        }
+    }
+
+    fn arm(&mut self, edge_position: f32) {
+        self.edge_position = Some(edge_position);
+    }
+
+    fn disarm(&mut self) {
+        self.edge_position = None;
+    }
+
+    fn recover(&mut self) {
+        let Some(edge_position) = self.edge_position.take() else {
+            return;
+        };
+        let _ = self.backend.set_capture(false);
+        let _ = self.backend.warp_cursor(
+            self.layout
+                .point_inside_edge(self.edge, edge_position, EDGE_INSET),
+        );
+    }
+}
+
+impl Drop for SenderRecoveryGuard {
+    fn drop(&mut self) {
+        self.recover();
+    }
+}
+
 fn deactivate_sender(
     platform: &platform::PlatformHandle,
     layout: &super::DesktopLayout,
@@ -308,6 +379,13 @@ fn deactivate_sender(
     platform
         .backend
         .warp_cursor(layout.point_inside_edge(edge, edge_position, EDGE_INSET))
+}
+
+fn enqueue_message(tx: &mpsc::Sender<InputMessage>, message: InputMessage) -> Result<()> {
+    tx.try_send(message).map_err(|err| match err {
+        TrySendError::Full(_) => anyhow::anyhow!("输入辅助发送队列已满"),
+        TrySendError::Closed(_) => anyhow::anyhow!("输入辅助发送队列已关闭"),
+    })
 }
 
 async fn run_receiver<R>(
@@ -372,7 +450,7 @@ where
                                 let edge_position = local_layout.normalized_edge_position(return_edge, point);
                                 platform.backend.release_all()?;
                                 active = false;
-                                tx.send(InputMessage::Return { generation, edge_position }).await?;
+                                enqueue_message(tx, InputMessage::Return { generation, edge_position })?;
                             } else {
                                 platform.backend.inject_motion(dx, dy)?;
                             }
@@ -387,7 +465,7 @@ where
                         if active {
                             platform.backend.release_all()?;
                             active = false;
-                            tx.send(InputMessage::Deactivate { generation }).await?;
+                            let _ = tx.try_send(InputMessage::Deactivate { generation });
                             tracing::info!(generation, "接收端紧急热键已停止远程控制");
                         }
                     }
@@ -403,13 +481,14 @@ where
                 }
             }
             _ = overflow_poll.tick() => {
+                platform.backend.health_check()?;
                 if platform.overflowed.load(std::sync::atomic::Ordering::Acquire) {
                     let _ = platform.backend.release_all();
                     bail!("本机输入可靠事件队列已满, 已停止远程控制");
                 }
             }
             _ = heartbeat.tick() => {
-                tx.send(InputMessage::Heartbeat { generation }).await?;
+                enqueue_message(tx, InputMessage::Heartbeat { generation })?;
             }
         }
     }
@@ -423,4 +502,96 @@ fn apply_snapshot(backend: &dyn platform::InputBackend, snapshot: &KeySnapshot) 
         backend.inject_button(*button, true)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EDGE_INSET, SenderRecoveryGuard, enqueue_message};
+    use crate::input::platform::InputBackend;
+    use crate::input::{DesktopLayout, DisplayRect, KeySnapshot, ModifierMask, Point, ScreenEdge};
+    use anyhow::Result;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct FakeBackend {
+        capture: Mutex<bool>,
+        warped: Mutex<Option<Point>>,
+    }
+
+    impl InputBackend for FakeBackend {
+        fn layout(&self) -> Result<DesktopLayout> {
+            DesktopLayout::new(vec![DisplayRect { x: 0, y: 0, width: 100, height: 100 }])
+        }
+
+        fn cursor_position(&self) -> Result<Point> {
+            Ok(Point { x: 99, y: 50 })
+        }
+
+        fn snapshot(&self) -> KeySnapshot {
+            KeySnapshot { usages: Vec::new(), modifiers: ModifierMask::default(), buttons: Vec::new() }
+        }
+
+        fn set_capture(&self, active: bool) -> Result<()> {
+            *self.capture.lock().unwrap() = active;
+            Ok(())
+        }
+
+        fn warp_cursor(&self, point: Point) -> Result<()> {
+            *self.warped.lock().unwrap() = Some(point);
+            Ok(())
+        }
+
+        fn inject_key(&self, _usage: u16, _modifiers: ModifierMask, _down: bool, _repeat: bool) -> Result<()> {
+            Ok(())
+        }
+
+        fn inject_button(&self, _button: u8, _down: bool) -> Result<()> {
+            Ok(())
+        }
+
+        fn inject_motion(&self, _dx: i32, _dy: i32) -> Result<()> {
+            Ok(())
+        }
+
+        fn inject_wheel(&self, _x: i32, _y: i32) -> Result<()> {
+            Ok(())
+        }
+
+        fn release_all(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn sender_recovery_guard_restores_cursor_on_drop() {
+        let backend = Arc::new(FakeBackend::default());
+        *backend.capture.lock().unwrap() = true;
+        let layout = backend.layout().unwrap();
+        let mut guard = SenderRecoveryGuard::new(
+            Arc::clone(&backend) as Arc<dyn InputBackend>,
+            layout,
+            ScreenEdge::Right,
+        );
+        guard.arm(0.5);
+        drop(guard);
+        assert!(!*backend.capture.lock().unwrap());
+        assert_eq!(
+            *backend.warped.lock().unwrap(),
+            Some(Point { x: 100 - EDGE_INSET - 1, y: 50 })
+        );
+    }
+
+    #[tokio::test]
+    async fn input_writer_queue_rejects_overflow_without_waiting() {
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        enqueue_message(&tx, crate::input::protocol::InputMessage::Heartbeat { generation: 1 })
+            .unwrap();
+        assert!(
+            enqueue_message(
+                &tx,
+                crate::input::protocol::InputMessage::Heartbeat { generation: 1 },
+            )
+            .is_err()
+        );
+    }
 }
