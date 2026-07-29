@@ -167,9 +167,12 @@ async fn run_established(
         "输入通道布局交换完成"
     );
 
+    // 读取帧必须由单独任务连续完成, 避免 select 取消半包读取后破坏帧边界.
+    let (mut incoming, reader_task) = spawn_input_reader(reader);
+
     let session = match local_role {
         LocalInputRole::Send => run_sender(
-            &mut reader,
+            &mut incoming,
             &tx,
             platform,
             local_layout,
@@ -178,10 +181,17 @@ async fn run_established(
         )
         .await,
         LocalInputRole::Receive => {
-            run_receiver(&mut reader, &tx, platform, local_layout).await
+            run_receiver(&mut incoming, &tx, platform, local_layout).await
         }
     };
+    reader_task.abort();
+    let _ = reader_task.await;
     drop(tx);
+    if session.is_err() {
+        writer_task.abort();
+        let _ = writer_task.await;
+        return session;
+    }
     match writer_task.await {
         Ok(Ok(())) => {}
         Ok(Err(err)) if session.is_err() => {
@@ -193,17 +203,42 @@ async fn run_established(
     session
 }
 
-async fn run_sender<R>(
-    reader: &mut R,
+fn spawn_input_reader<R>(
+    mut reader: R,
+) -> (
+    mpsc::Receiver<Result<InputMessage>>,
+    tokio::task::JoinHandle<()>,
+)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel(256);
+    let task = tokio::spawn(async move {
+        loop {
+            match read_message(&mut reader).await {
+                Ok(message) => {
+                    if tx.send(Ok(message)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    let _ = tx.send(Err(err)).await;
+                    break;
+                }
+            }
+        }
+    });
+    (rx, task)
+}
+
+async fn run_sender(
+    incoming: &mut mpsc::Receiver<Result<InputMessage>>,
     tx: &mpsc::Sender<InputMessage>,
     platform: &mut platform::PlatformHandle,
     local_layout: super::DesktopLayout,
     _remote_layout: super::DesktopLayout,
     source_edge: ScreenEdge,
-) -> Result<()>
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
+) -> Result<()> {
     let mut generation = 0u64;
     let mut active = false;
     let mut recovery = SenderRecoveryGuard::new(
@@ -222,8 +257,9 @@ where
 
     loop {
         tokio::select! {
-            incoming = read_message(reader) => {
-                match incoming? {
+            message = incoming.recv() => {
+                let message = message.context("输入辅助读取任务已停止")??;
+                match message {
                     InputMessage::Return { generation: remote_generation, edge_position }
                         if active && remote_generation == generation => {
                             deactivate_sender(platform, &local_layout, source_edge, edge_position)?;
@@ -388,15 +424,12 @@ fn enqueue_message(tx: &mpsc::Sender<InputMessage>, message: InputMessage) -> Re
     })
 }
 
-async fn run_receiver<R>(
-    reader: &mut R,
+async fn run_receiver(
+    incoming: &mut mpsc::Receiver<Result<InputMessage>>,
     tx: &mpsc::Sender<InputMessage>,
     platform: &mut platform::PlatformHandle,
     local_layout: super::DesktopLayout,
-) -> Result<()>
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
+) -> Result<()> {
     let mut generation = 0u64;
     let mut active = false;
     let mut return_edge = ScreenEdge::Left;
@@ -409,8 +442,9 @@ where
 
     loop {
         tokio::select! {
-            incoming = read_message(reader) => {
-                match incoming? {
+            message = incoming.recv() => {
+                let message = message.context("输入辅助读取任务已停止")??;
+                match message {
                     InputMessage::Activate { generation: incoming_generation, source_edge, edge_position, pressed } => {
                         if incoming_generation <= generation {
                             continue;
@@ -506,11 +540,13 @@ fn apply_snapshot(backend: &dyn platform::InputBackend, snapshot: &KeySnapshot) 
 
 #[cfg(test)]
 mod tests {
-    use super::{EDGE_INSET, SenderRecoveryGuard, enqueue_message};
+    use super::{EDGE_INSET, SenderRecoveryGuard, enqueue_message, spawn_input_reader};
     use crate::input::platform::InputBackend;
     use crate::input::{DesktopLayout, DisplayRect, KeySnapshot, ModifierMask, Point, ScreenEdge};
     use anyhow::Result;
     use std::sync::{Arc, Mutex};
+    use tokio::io::AsyncWriteExt;
+    use tokio::time::{Duration, sleep, timeout};
 
     #[derive(Default)]
     struct FakeBackend {
@@ -593,5 +629,34 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn input_reader_keeps_frame_alignment_across_select_cancellation() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let (mut incoming, reader_task) = spawn_input_reader(reader);
+        let expected = crate::input::protocol::InputMessage::Heartbeat { generation: 9 };
+        let bytes = bincode::serialize(&expected).unwrap();
+        let write_task = tokio::spawn(async move {
+            writer.write_u32(bytes.len() as u32).await.unwrap();
+            writer.write_all(&bytes[..1]).await.unwrap();
+            sleep(Duration::from_millis(20)).await;
+            writer.write_all(&bytes[1..]).await.unwrap();
+        });
+
+        tokio::select! {
+            _ = sleep(Duration::from_millis(1)) => {}
+            _ = incoming.recv() => panic!("分片帧不应提前完成"),
+        }
+        let actual = timeout(Duration::from_secs(1), incoming.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(actual, expected);
+
+        write_task.await.unwrap();
+        reader_task.abort();
+        let _ = reader_task.await;
     }
 }
