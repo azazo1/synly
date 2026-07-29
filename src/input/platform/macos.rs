@@ -1,4 +1,4 @@
-use super::{CaptureContext, InputBackend, NativeEvent, is_local_interrupt};
+use super::{CaptureContext, InputBackend, NativeEvent};
 use crate::input::{DesktopLayout, DisplayRect, InputMode, KeySnapshot, ModifierMask, Point};
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeSet;
@@ -323,9 +323,6 @@ unsafe extern "C" fn event_callback(
             let repeat = event_type == EVENT_KEY_DOWN
                 && unsafe { CGEventGetIntegerValueField(event, FIELD_KEY_AUTOREPEAT) } != 0;
             update_set(&state.physical_pressed, usage, down);
-            if is_local_interrupt(usage, modifiers) {
-                return event;
-            }
             if state.context.hotkey.matches(usage, modifiers) {
                 if down && !repeat {
                     state.context.emit_reliable(NativeEvent::Emergency);

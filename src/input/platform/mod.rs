@@ -95,10 +95,6 @@ pub struct CaptureContext {
     pub failed: Arc<AtomicBool>,
 }
 
-pub fn is_local_interrupt(usage: u16, modifiers: ModifierMask) -> bool {
-    usage == 0x06 && modifiers == ModifierMask::CTRL
-}
-
 impl CaptureContext {
     pub fn emit_reliable(&self, event: NativeEvent) {
         if matches!(&event, NativeEvent::Failed(_)) {
@@ -155,20 +151,4 @@ pub fn ensure_permissions(mode: InputMode) -> Result<()> {
     return windows::ensure_permissions(mode);
     #[cfg(not(any(target_os = "macos", windows)))]
     return unsupported::ensure_permissions(mode);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::is_local_interrupt;
-    use crate::input::ModifierMask;
-
-    #[test]
-    fn ctrl_c_is_reserved_for_local_shutdown() {
-        assert!(is_local_interrupt(0x06, ModifierMask::CTRL));
-        assert!(!is_local_interrupt(0x06, ModifierMask::SHIFT));
-        assert!(!is_local_interrupt(
-            0x06,
-            ModifierMask::from_bits(ModifierMask::CTRL.bits() | ModifierMask::SHIFT.bits()),
-        ));
-    }
 }
