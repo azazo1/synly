@@ -155,6 +155,7 @@ async fn run_established(
         }
         Result::<()>::Ok(())
     });
+    let _writer_abort = AbortOnDrop(writer_task.abort_handle());
     tx.send(InputMessage::Layout(local_layout.clone())).await?;
     let remote_layout = match read_message(&mut reader).await? {
         InputMessage::Layout(layout) => layout,
@@ -169,6 +170,7 @@ async fn run_established(
 
     // 读取帧必须由单独任务连续完成, 避免 select 取消半包读取后破坏帧边界.
     let (mut incoming, reader_task) = spawn_input_reader(reader);
+    let _reader_abort = AbortOnDrop(reader_task.abort_handle());
 
     let session = match local_role {
         LocalInputRole::Send => run_sender(
@@ -201,6 +203,14 @@ async fn run_established(
         Err(err) => return Err(err.into()),
     }
     session
+}
+
+struct AbortOnDrop(tokio::task::AbortHandle);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 fn spawn_input_reader<R>(
@@ -540,7 +550,7 @@ fn apply_snapshot(backend: &dyn platform::InputBackend, snapshot: &KeySnapshot) 
 
 #[cfg(test)]
 mod tests {
-    use super::{EDGE_INSET, SenderRecoveryGuard, enqueue_message, spawn_input_reader};
+    use super::{AbortOnDrop, EDGE_INSET, SenderRecoveryGuard, enqueue_message, spawn_input_reader};
     use crate::input::platform::InputBackend;
     use crate::input::{DesktopLayout, DisplayRect, KeySnapshot, ModifierMask, Point, ScreenEdge};
     use anyhow::Result;
@@ -658,5 +668,13 @@ mod tests {
         write_task.await.unwrap();
         reader_task.abort();
         let _ = reader_task.await;
+    }
+
+    #[tokio::test]
+    async fn input_io_task_is_aborted_when_session_is_dropped() {
+        let task = tokio::spawn(std::future::pending::<()>());
+        let guard = AbortOnDrop(task.abort_handle());
+        drop(guard);
+        assert!(task.await.unwrap_err().is_cancelled());
     }
 }

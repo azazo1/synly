@@ -1,4 +1,4 @@
-use super::{CaptureContext, InputBackend, NativeEvent};
+use super::{CaptureContext, InputBackend, NativeEvent, is_local_interrupt};
 use crate::input::{DesktopLayout, DisplayRect, InputMode, KeySnapshot, ModifierMask, Point};
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeSet;
@@ -282,6 +282,9 @@ unsafe extern "system" fn keyboard_callback(code: i32, w_param: WParam, l_param:
     let down = matches!(w_param as u32, 0x0100 | 0x0104);
     let repeat = down && context.physical_pressed.lock().unwrap().contains(&usage);
     update_set(&context.physical_pressed, usage, down);
+    if is_local_interrupt(usage, modifiers) {
+        return unsafe { CallNextHookEx(0, code, w_param, l_param) };
+    }
     if context.context.hotkey.matches(usage, modifiers) {
         if down && !repeat {
             context.context.emit_reliable(NativeEvent::Emergency);
