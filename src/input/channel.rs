@@ -2,7 +2,7 @@ use super::protocol::{InputMessage, read_message, write_message};
 use anyhow::{Context, Result, bail};
 use hmac::{Hmac, Mac};
 use rcgen::generate_simple_self_signed;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -136,7 +136,7 @@ pub async fn connect(
     config.alpn_protocols = vec![INPUT_ALPN.to_vec()];
     let connector = TlsConnector::from(Arc::new(config));
     let stream = connector
-        .connect(crate::crypto::server_name()?, socket)
+        .connect(input_server_name()?, socket)
         .await?;
     let exporter = export_client(&stream, offer.session_id)?;
     let mut stream: TlsStream<TcpStream> = stream.into();
@@ -168,6 +168,10 @@ pub async fn connect(
         &proof,
     )?;
     Ok(stream)
+}
+
+fn input_server_name() -> Result<ServerName<'static>> {
+    Ok(ServerName::try_from("synly.local")?.to_owned())
 }
 
 pub async fn write_preamble<W>(socket: &mut W, session_id: Uuid) -> Result<()>

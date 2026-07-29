@@ -1,6 +1,8 @@
 mod channel;
 mod geometry;
 mod hotkey;
+#[cfg(target_os = "macos")]
+pub mod mock;
 mod platform;
 mod protocol;
 mod runtime;

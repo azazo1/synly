@@ -402,10 +402,11 @@ impl SenderRecoveryGuard {
         let Some(edge_position) = self.edge_position.take() else {
             return;
         };
-        let _ = self.backend.set_capture(false);
-        let _ = self.backend.warp_cursor(
-            self.layout
-                .point_inside_edge(self.edge, edge_position, EDGE_INSET),
+        let _ = restore_sender(
+            &*self.backend,
+            &self.layout,
+            self.edge,
+            edge_position,
         );
     }
 }
@@ -422,10 +423,21 @@ fn deactivate_sender(
     edge: ScreenEdge,
     edge_position: f32,
 ) -> Result<()> {
-    platform.backend.set_capture(false)?;
-    platform
-        .backend
-        .warp_cursor(layout.point_inside_edge(edge, edge_position, EDGE_INSET))
+    restore_sender(&*platform.backend, layout, edge, edge_position)
+}
+
+fn restore_sender(
+    backend: &dyn platform::InputBackend,
+    layout: &super::DesktopLayout,
+    edge: ScreenEdge,
+    edge_position: f32,
+) -> Result<()> {
+    let warp_result = backend.warp_cursor(
+        layout.point_inside_edge(edge, edge_position, EDGE_INSET),
+    );
+    let capture_result = backend.set_capture(false);
+    capture_result?;
+    warp_result
 }
 
 fn enqueue_message(tx: &mpsc::Sender<InputMessage>, message: InputMessage) -> Result<()> {
@@ -595,6 +607,7 @@ mod tests {
     struct FakeBackend {
         capture: Mutex<bool>,
         warped: Mutex<Option<Point>>,
+        recovery_actions: Mutex<Vec<&'static str>>,
     }
 
     impl InputBackend for FakeBackend {
@@ -612,11 +625,13 @@ mod tests {
 
         fn set_capture(&self, active: bool) -> Result<()> {
             *self.capture.lock().unwrap() = active;
+            self.recovery_actions.lock().unwrap().push("capture");
             Ok(())
         }
 
         fn warp_cursor(&self, point: Point) -> Result<()> {
             *self.warped.lock().unwrap() = Some(point);
+            self.recovery_actions.lock().unwrap().push("warp");
             Ok(())
         }
 
@@ -657,6 +672,10 @@ mod tests {
         assert_eq!(
             *backend.warped.lock().unwrap(),
             Some(Point { x: 100 - EDGE_INSET - 1, y: 50 })
+        );
+        assert_eq!(
+            *backend.recovery_actions.lock().unwrap(),
+            vec!["warp", "capture"],
         );
     }
 

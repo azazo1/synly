@@ -2,6 +2,16 @@
 name = "synly"
 version = "0.1.0"
 edition = "2024"
+default-run = "synly"
+
+[features]
+default = []
+input-macos-mock = []
+
+[[bin]]
+name = "input-macos-mock"
+path = "src/bin/input-macos-mock.rs"
+required-features = ["input-macos-mock"]
 
 [dependencies]
 anyhow = "1.0.102"

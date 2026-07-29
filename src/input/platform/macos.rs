@@ -430,19 +430,26 @@ impl InputBackend for MacBackend {
             return Ok(());
         }
         let display = unsafe { CGMainDisplayID() };
-        let result = if active {
-            unsafe {
-                CGAssociateMouseAndMouseCursorPosition(false);
-                CGDisplayHideCursor(display)
-            }
+        let visibility_result = if active {
+            unsafe { CGDisplayHideCursor(display) }
         } else {
-            unsafe {
-                CGAssociateMouseAndMouseCursorPosition(true);
-                CGDisplayShowCursor(display)
-            }
+            unsafe { CGDisplayShowCursor(display) }
         };
-        if result != 0 {
-            bail!("切换 macOS 光标捕获状态失败, 错误码 {result}");
+        let association_result = unsafe { CGAssociateMouseAndMouseCursorPosition(!active) };
+        if visibility_result != 0 || association_result != 0 {
+            if active {
+                unsafe {
+                    CGAssociateMouseAndMouseCursorPosition(true);
+                    CGDisplayShowCursor(display);
+                }
+                self.state
+                    .context
+                    .capture_active
+                    .store(false, Ordering::Release);
+            }
+            bail!(
+                "切换 macOS 光标捕获状态失败, visibility={visibility_result}, association={association_result}"
+            );
         }
         Ok(())
     }

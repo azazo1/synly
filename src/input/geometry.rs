@@ -97,20 +97,16 @@ impl DesktopLayout {
             on_span
                 && match edge {
                     ScreenEdge::Left => {
-                        point.x >= segment.boundary
-                            && point.x < segment.boundary.saturating_add(zone_size)
+                        point.x < segment.boundary.saturating_add(zone_size)
                     }
                     ScreenEdge::Right => {
-                        point.x < segment.boundary
-                            && point.x >= segment.boundary.saturating_sub(zone_size)
+                        point.x >= segment.boundary.saturating_sub(zone_size)
                     }
                     ScreenEdge::Top => {
-                        point.y >= segment.boundary
-                            && point.y < segment.boundary.saturating_add(zone_size)
+                        point.y < segment.boundary.saturating_add(zone_size)
                     }
                     ScreenEdge::Bottom => {
-                        point.y < segment.boundary
-                            && point.y >= segment.boundary.saturating_sub(zone_size)
+                        point.y >= segment.boundary.saturating_sub(zone_size)
                     }
                 }
         })
@@ -381,6 +377,11 @@ mod tests {
         assert!(!layout.is_jump_zone_point(
             ScreenEdge::Right,
             Point { x: 3198, y: 500 },
+            1,
+        ));
+        assert!(layout.is_jump_zone_point(
+            ScreenEdge::Right,
+            Point { x: 3200, y: 500 },
             1,
         ));
         assert!(!layout.is_jump_zone_point(

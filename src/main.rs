@@ -5,7 +5,6 @@ mod clipboard;
 mod config;
 mod crypto;
 mod discovery;
-mod input;
 mod path_expand;
 mod protocol;
 mod startup_tui;
@@ -16,6 +15,7 @@ mod sync;
 use anyhow::Result;
 use clap::Parser;
 use console::style;
+use synly::input;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {

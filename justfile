@@ -6,6 +6,11 @@ run *args:
 install:
     cargo install --path .
 
+# just input-macos-mock --edge right
+# 使用 GUI mock 验证 macOS 输入捕获和虚拟屏幕切换.
+input-macos-mock *args:
+    cargo run --features input-macos-mock --bin input-macos-mock -- {{ args }}
+
 down:
     docker compose down
 
