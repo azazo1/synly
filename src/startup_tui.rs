@@ -6,6 +6,7 @@ use crate::cli::{
     resolve_notifications_enabled,
 };
 use crate::config::{DiscoveryConfig, SynlyConfig};
+use crate::input::{Hotkey, InputMode, InputRuntimeOptions, ScreenEdge};
 use crate::path_expand::expand_path_string;
 use crate::protocol::TransferLimits;
 use crate::sync::WorkspaceSpec;
@@ -35,7 +36,7 @@ const DEFAULT_DISCOVERY_SECS: u64 = 3;
 const LOG_LIMIT: usize = 48;
 const TICK_RATE: Duration = Duration::from_millis(180);
 const MIN_WIDTH: u16 = 96;
-const MIN_HEIGHT: u16 = 30;
+const MIN_HEIGHT: u16 = 36;
 
 pub fn collect_runtime_options_tui(cli: Cli, config: &SynlyConfig) -> Result<RuntimeOptions> {
     let context = StartupContext::from_config(config)?;
@@ -98,6 +99,9 @@ struct FlowDraft {
     sync_delete: bool,
     clipboard_mode: ClipboardMode,
     audio_mode: AudioMode,
+    input_mode: InputMode,
+    input_edge: ScreenEdge,
+    input_hotkey: TextArea<'static>,
     notifications_enabled: bool,
 }
 
@@ -161,6 +165,9 @@ enum FieldId {
     SyncDelete,
     ClipboardMode,
     AudioMode,
+    InputMode,
+    InputEdge,
+    InputHotkey,
     Notifications,
     WorkspacePath,
     MaxFolderDepth,
@@ -279,6 +286,12 @@ impl StartupApp {
                 sync_delete: cli.sync_delete,
                 clipboard_mode: cli.clipboard.unwrap_or(ClipboardMode::Off),
                 audio_mode: cli.audio.unwrap_or(AudioMode::Off),
+                input_mode: cli.input_mode.unwrap_or(InputMode::Off),
+                input_edge: cli.input_edge.unwrap_or(ScreenEdge::Right),
+                input_hotkey: single_line_textarea(
+                    cli.input_hotkey,
+                    Hotkey::DEFAULT,
+                ),
                 notifications_enabled,
             },
             workspace: WorkspaceDraft {
@@ -572,6 +585,36 @@ impl StartupApp {
                     ));
                 }
             }
+            FieldId::InputMode => {
+                if matches!(
+                    key.code,
+                    KeyCode::Left | KeyCode::Right | KeyCode::Enter | KeyCode::Char(' ')
+                ) {
+                    self.flow.input_mode = cycle_input_mode(
+                        self.flow.input_mode,
+                        matches!(key.code, KeyCode::Left),
+                    );
+                    self.clamp_focus_current_tab();
+                    self.push_log(format!(
+                        "鼠标键盘同步已切换为{}。",
+                        self.flow.input_mode.label()
+                    ));
+                }
+            }
+            FieldId::InputEdge => {
+                if matches!(
+                    key.code,
+                    KeyCode::Left | KeyCode::Right | KeyCode::Enter | KeyCode::Char(' ')
+                ) {
+                    self.flow.input_edge = cycle_input_edge(
+                        self.flow.input_edge,
+                        matches!(key.code, KeyCode::Left),
+                    );
+                }
+            }
+            FieldId::InputHotkey => {
+                let _ = key;
+            }
             FieldId::Notifications => {
                 if matches!(
                     key.code,
@@ -780,6 +823,26 @@ impl StartupApp {
                     ));
                 }
             }
+            FieldId::InputMode => {
+                if let Some(index) = self.selector_choice_at(field, column, row) {
+                    self.flow.input_mode = match index {
+                        0 => InputMode::Off,
+                        1 => InputMode::Send,
+                        _ => InputMode::Receive,
+                    };
+                    self.clamp_focus_current_tab();
+                }
+            }
+            FieldId::InputEdge => {
+                if let Some(index) = self.selector_choice_at(field, column, row) {
+                    self.flow.input_edge = match index {
+                        0 => ScreenEdge::Left,
+                        1 => ScreenEdge::Right,
+                        2 => ScreenEdge::Top,
+                        _ => ScreenEdge::Bottom,
+                    };
+                }
+            }
             FieldId::Notifications => {
                 self.flow.notifications_enabled = !self.flow.notifications_enabled;
                 self.push_log(format!(
@@ -961,6 +1024,12 @@ impl StartupApp {
             Span::raw(" "),
             chip(
                 self.flow.audio_mode.label(),
+                colors.text,
+                colors.primary_soft,
+            ),
+            Span::raw(" "),
+            chip(
+                self.flow.input_mode.label(),
                 colors.text,
                 colors.primary_soft,
             ),
@@ -1150,6 +1219,48 @@ impl StartupApp {
                 focused,
                 colors,
             ),
+            FieldId::InputMode => self.render_selector_field(
+                frame,
+                area,
+                field,
+                "鼠标键盘同步",
+                &["关闭", "发送", "接收"],
+                match self.flow.input_mode {
+                    InputMode::Off => 0,
+                    InputMode::Send => 1,
+                    InputMode::Receive => 2,
+                },
+                true,
+                focused,
+                colors,
+            ),
+            FieldId::InputEdge => self.render_selector_field(
+                frame,
+                area,
+                field,
+                "对端屏幕位置",
+                &["左", "右", "上", "下"],
+                match self.flow.input_edge {
+                    ScreenEdge::Left => 0,
+                    ScreenEdge::Right => 1,
+                    ScreenEdge::Top => 2,
+                    ScreenEdge::Bottom => 3,
+                },
+                self.flow.input_mode == InputMode::Send,
+                focused,
+                colors,
+            ),
+            FieldId::InputHotkey => {
+                apply_textarea_theme(
+                    &mut self.flow.input_hotkey,
+                    "紧急收回热键",
+                    Hotkey::DEFAULT,
+                    focused,
+                    editing,
+                    colors,
+                );
+                frame.render_widget(&self.flow.input_hotkey, area);
+            }
             FieldId::Notifications => self.render_toggle_field(
                 frame,
                 area,
@@ -1586,10 +1697,15 @@ impl StartupApp {
             format!("文件同步模式: {}", self.flow.file_sync_mode.label()),
             format!("剪贴板同步: {}", self.flow.clipboard_mode.label()),
             format!("音频同步: {}", self.flow.audio_mode.label()),
+            format!("鼠标键盘同步: {}", self.flow.input_mode.label()),
             format!("系统连接提醒: {}", bool_label(self.flow.notifications_enabled)),
         ];
         let mut notes = Vec::new();
         let mut errors = Vec::new();
+
+        if let Err(err) = trimmed_text(&self.flow.input_hotkey).parse::<Hotkey>() {
+            errors.push(format!("紧急收回热键无效: {err:#}"));
+        }
 
         match self.parsed_initial_sync() {
             Ok(Some(initial_sync)) => {
@@ -1755,6 +1871,23 @@ impl StartupApp {
             "--audio",
             audio_mode_arg(self.flow.audio_mode).to_string(),
         );
+        push_flag_value(
+            &mut args,
+            "--input",
+            self.flow.input_mode.as_wire().to_string(),
+        );
+        if self.flow.input_mode == InputMode::Send {
+            push_flag_value(
+                &mut args,
+                "--input-edge",
+                self.flow.input_edge.as_arg().to_string(),
+            );
+        }
+        push_flag_value(
+            &mut args,
+            "--input-hotkey",
+            trimmed_text(&self.flow.input_hotkey),
+        );
         args.push(if self.flow.notifications_enabled {
             "--notifications".to_string()
         } else {
@@ -1894,6 +2027,7 @@ impl StartupApp {
         let port = self.parsed_port()?;
         let pin = self.parsed_pin()?;
         let initial_sync = self.parsed_initial_sync()?;
+        let hotkey = trimmed_text(&self.flow.input_hotkey).parse::<Hotkey>()?;
         let workspace = match self.flow.file_sync_mode {
             FileSyncMode::Off => WorkspaceSpec::for_off(),
             FileSyncMode::Send => WorkspaceSpec::for_send(parse_send_paths(
@@ -1939,6 +2073,12 @@ impl StartupApp {
             },
             clipboard_mode: self.flow.clipboard_mode,
             audio_mode: self.flow.audio_mode,
+            input_mode: self.flow.input_mode,
+            input: InputRuntimeOptions {
+                mode: self.flow.input_mode,
+                edge: self.flow.input_edge,
+                hotkey,
+            },
             notifications_enabled: self.flow.notifications_enabled,
             discovery: self.context.discovery.clone(),
             workspace,
@@ -2031,6 +2171,9 @@ impl StartupApp {
                 FieldId::SyncDelete,
                 FieldId::ClipboardMode,
                 FieldId::AudioMode,
+                FieldId::InputMode,
+                FieldId::InputEdge,
+                FieldId::InputHotkey,
                 FieldId::Notifications,
             ],
             StartupTab::Workspace => &[
@@ -2065,6 +2208,7 @@ impl StartupApp {
             FieldId::WorkspacePath
                 | FieldId::MaxFolderDepth
                 | FieldId::IntervalSecs
+                | FieldId::InputHotkey
                 | FieldId::InstanceName
                 | FieldId::PeerQuery
                 | FieldId::Port
@@ -2082,6 +2226,7 @@ impl StartupApp {
                 )
             }
             FieldId::SyncDelete => self.flow.file_sync_mode.can_receive(),
+            FieldId::InputEdge => self.flow.input_mode == InputMode::Send,
             _ => true,
         }
     }
@@ -2156,6 +2301,7 @@ impl StartupApp {
             FieldId::WorkspacePath => Some(&mut self.workspace.path),
             FieldId::MaxFolderDepth => Some(&mut self.workspace.max_folder_depth),
             FieldId::IntervalSecs => Some(&mut self.workspace.interval_secs),
+            FieldId::InputHotkey => Some(&mut self.flow.input_hotkey),
             FieldId::InstanceName => Some(&mut self.pairing.instance_name),
             FieldId::PeerQuery => Some(&mut self.pairing.peer_query),
             FieldId::Port => Some(&mut self.pairing.port),
@@ -2317,6 +2463,28 @@ fn cycle_audio_mode(mode: AudioMode, reverse: bool) -> AudioMode {
         (current + 1) % modes.len()
     };
     modes[next]
+}
+
+fn cycle_input_mode(mode: InputMode, reverse: bool) -> InputMode {
+    let modes = [InputMode::Off, InputMode::Send, InputMode::Receive];
+    let current = modes.iter().position(|candidate| *candidate == mode).unwrap_or(0);
+    let next = if reverse {
+        (current + modes.len() - 1) % modes.len()
+    } else {
+        (current + 1) % modes.len()
+    };
+    modes[next]
+}
+
+fn cycle_input_edge(edge: ScreenEdge, reverse: bool) -> ScreenEdge {
+    let edges = [ScreenEdge::Left, ScreenEdge::Right, ScreenEdge::Top, ScreenEdge::Bottom];
+    let current = edges.iter().position(|candidate| *candidate == edge).unwrap_or(1);
+    let next = if reverse {
+        (current + edges.len() - 1) % edges.len()
+    } else {
+        (current + 1) % edges.len()
+    };
+    edges[next]
 }
 
 fn connection_label(connection: ConnectionPreference) -> &'static str {
@@ -2605,6 +2773,23 @@ fn equivalent_command_from_options(options: &RuntimeOptions, cwd: &Path) -> Stri
         "--audio",
         audio_mode_arg(options.audio_mode).to_string(),
     );
+    push_flag_value(
+        &mut args,
+        "--input",
+        options.input_mode.as_wire().to_string(),
+    );
+    if options.input_mode == InputMode::Send {
+        push_flag_value(
+            &mut args,
+            "--input-edge",
+            options.input.edge.as_arg().to_string(),
+        );
+    }
+    push_flag_value(
+        &mut args,
+        "--input-hotkey",
+        options.input.hotkey.to_string(),
+    );
     args.push(if options.notifications_enabled {
         "--notifications".to_string()
     } else {
@@ -2883,6 +3068,12 @@ mod tests {
             sync_delete: false,
             clipboard_mode: ClipboardMode::Receive,
             audio_mode: AudioMode::Send,
+            input_mode: InputMode::Off,
+            input: InputRuntimeOptions {
+                mode: InputMode::Off,
+                edge: ScreenEdge::Right,
+                hotkey: Hotkey::DEFAULT.parse().unwrap(),
+            },
             notifications_enabled: false,
             discovery: DiscoveryConfig::default(),
             clipboard: ClipboardRuntimeOptions {
@@ -2911,7 +3102,7 @@ mod tests {
         let command = equivalent_command_from_options(&options, Path::new("/tmp"));
         assert_eq!(
             command,
-            "synly --name worker-a --fs both --initial other ./demo --join --no-sync-delete --clipboard receive --audio send --no-notifications --interval-secs 5 --max-folder-depth 2 --peer 'studio display' --discovery-secs 9 --pin 123456 --accept --trusted-only"
+            "synly --name worker-a --fs both --initial other ./demo --join --no-sync-delete --clipboard receive --audio send --input off --input-hotkey 'ctrl+alt+shift+esc' --no-notifications --interval-secs 5 --max-folder-depth 2 --peer 'studio display' --discovery-secs 9 --pin 123456 --accept --trusted-only"
         );
     }
 

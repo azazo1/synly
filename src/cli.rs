@@ -1,4 +1,5 @@
 use crate::config::{DiscoveryConfig, SynlyConfig};
+use crate::input::{Hotkey, InputMode, InputRuntimeOptions, ScreenEdge};
 use crate::path_expand::expand_path_string;
 use crate::protocol::TransferLimits;
 use crate::sync::WorkspaceSpec;
@@ -63,6 +64,24 @@ pub struct Cli {
         help = "音频同步模式；默认关闭，可选 off / send / receive"
     )]
     pub audio: Option<AudioMode>,
+    #[arg(
+        long = "input",
+        value_enum,
+        help = "鼠标键盘同步方向；默认关闭，可选 off / send / receive"
+    )]
+    pub input_mode: Option<InputMode>,
+    #[arg(
+        long,
+        value_enum,
+        help = "发送鼠标键盘时跨入对端的屏幕边缘；默认 right"
+    )]
+    pub input_edge: Option<ScreenEdge>,
+    #[arg(
+        long,
+        default_value = Hotkey::DEFAULT,
+        help = "紧急收回控制的全局热键"
+    )]
+    pub input_hotkey: String,
     #[arg(
         long,
         value_enum,
@@ -305,6 +324,8 @@ pub struct RuntimeOptions {
     pub sync_delete: bool,
     pub clipboard_mode: ClipboardMode,
     pub audio_mode: AudioMode,
+    pub input_mode: InputMode,
+    pub input: InputRuntimeOptions,
     pub notifications_enabled: bool,
     pub discovery: DiscoveryConfig,
     pub clipboard: ClipboardRuntimeOptions,
@@ -375,6 +396,15 @@ fn collect_runtime_options_from_cli(cli: Cli, config: &SynlyConfig) -> Result<Ru
     let pin = cli.pin.as_deref().map(normalize_pin).transpose()?;
     let clipboard_mode = cli.clipboard.unwrap_or(ClipboardMode::Off);
     let audio_mode = cli.audio.unwrap_or(AudioMode::Off);
+    let input_mode = cli.input_mode.unwrap_or(InputMode::Off);
+    if input_mode != InputMode::Send && cli.input_edge.is_some() {
+        bail!("`--input-edge` 只能和 `--input send` 一起使用");
+    }
+    let input = InputRuntimeOptions {
+        mode: input_mode,
+        edge: cli.input_edge.unwrap_or(ScreenEdge::Right),
+        hotkey: cli.input_hotkey.parse()?,
+    };
     Ok(RuntimeOptions {
         file_sync_mode,
         connection,
@@ -383,6 +413,8 @@ fn collect_runtime_options_from_cli(cli: Cli, config: &SynlyConfig) -> Result<Ru
         sync_delete,
         clipboard_mode,
         audio_mode,
+        input_mode,
+        input,
         notifications_enabled,
         discovery: config.discovery.clone(),
         clipboard: ClipboardRuntimeOptions {
@@ -828,7 +860,7 @@ mod tests {
         assert_eq!(
             options
                 .workspace
-                .workspace_summary(ClipboardMode::Off, AudioMode::Off)
+                .session_summary(ClipboardMode::Off, AudioMode::Off, InputMode::Off)
                 .max_folder_depth,
             None
         );
@@ -858,14 +890,14 @@ mod tests {
         assert_eq!(
             options
                 .workspace
-                .workspace_summary(ClipboardMode::Send, AudioMode::Off)
+                .session_summary(ClipboardMode::Send, AudioMode::Off, InputMode::Off)
                 .max_folder_depth,
             Some(4)
         );
         assert_eq!(
             options
                 .workspace
-                .workspace_summary(ClipboardMode::Send, AudioMode::Off)
+                .session_summary(ClipboardMode::Send, AudioMode::Off, InputMode::Off)
                 .initial_sync,
             Some(InitialSyncMode::This)
         );
@@ -941,6 +973,43 @@ mod tests {
         .unwrap();
         let explicit_options = collect_runtime_options(explicit_cli, &test_config()).unwrap();
         assert_eq!(explicit_options.audio_mode, AudioMode::Receive);
+    }
+
+    #[test]
+    fn collect_runtime_options_parses_input_controls() {
+        let cli = Cli::try_parse_from([
+            "synly",
+            "--host",
+            "--fs",
+            "off",
+            "--input",
+            "send",
+            "--input-edge",
+            "left",
+            "--input-hotkey",
+            "ctrl+shift+f12",
+        ])
+        .unwrap();
+        let options = collect_runtime_options(cli, &test_config()).unwrap();
+        assert_eq!(options.input_mode, InputMode::Send);
+        assert_eq!(options.input.edge, ScreenEdge::Left);
+        assert_eq!(options.input.hotkey.to_string(), "ctrl+shift+f12");
+    }
+
+    #[test]
+    fn input_edge_requires_send_mode() {
+        let cli = Cli::try_parse_from([
+            "synly",
+            "--host",
+            "--fs",
+            "off",
+            "--input",
+            "receive",
+            "--input-edge",
+            "left",
+        ])
+        .unwrap();
+        assert!(collect_runtime_options(cli, &test_config()).is_err());
     }
 
     #[test]

@@ -19,6 +19,8 @@ Synly 是一个面向局域网的跨平台 Rust CLI，用来发现附近设备�
 - 支持为当前运行中的 Synly 进程单独指定一个临时名称，便于同机多进程时在发现和配对阶段区分与匹配
 - 可选地同步剪贴板中的文本、RTF、HTML、图片，以及限制大小内的文件；剪贴板方向由独立的 `--clipboard off|send|receive|both` 控制，默认关闭，默认允许最多 100 MB 的剪贴板二进制内容
 - 可选地单向同步系统音频；音频方向由独立的 `--audio off|send|receive` 控制，默认关闭，只有一端 `send`、另一端 `receive` 时才会建立音频通道
+- 可选地在 macOS 和 Windows 之间单向同步鼠标键盘；输入方向由 `--input off|send|receive` 控制，默认关闭
+- 输入控制使用同一监听端口上的独立 TLS 辅助通道, 不会被大文件或大剪贴板传输阻塞
 - 文件和大剪贴板内容使用分段流式传输，线上 payload 使用二进制编码而不是 JSON
 - 连接意外断开后会自动重连；如果只是某个内容超过大小限制，会跳过那次发送，不会直接退出整个程序
 - 已认证连接建立和断开时发送桌面系统提醒, 支持配置文件和本次运行参数开关
@@ -50,6 +52,8 @@ Synly 是一个面向局域网的跨平台 Rust CLI，用来发现附近设备�
 - 可信设备公钥轮换 / 撤销 / 证书链管理
 - 后台守护进程 / 系统服务集成
 - 图形界面
+
+输入同步不实现 Deskflow 线协议兼容, 不能直接连接 Deskflow 客户端或服务端.
 
 ## 编译环境准备
 
@@ -243,6 +247,20 @@ synly --fs off --host --audio send
 synly --fs off --join --audio receive
 ```
 
+把本机鼠标键盘发送到对端, 从右侧屏幕边缘切换:
+
+```bash
+synly --fs off --host --input send --input-edge right --input-hotkey ctrl+alt+shift+esc
+```
+
+在本机接收对端鼠标键盘:
+
+```bash
+synly --fs off --join --input receive --peer workstation
+```
+
+输入模式只在一端为 `send` 且另一端为 `receive` 时建立. `--input-edge` 只对发送端有效. 热键使用 `+` 分隔, 必须包含至少一个修饰键和一个主键, 支持 `ctrl`, `alt`, `shift`, `meta/cmd/win` 以及命名按键.
+
 如果你明确不想进入启动交互，可以加上 `--no-interact`。这时如果启动参数不完整，程序会直接报错，并列出当前还缺哪些参数，例如：
 
 ```bash
@@ -335,6 +353,9 @@ Options:
   --no-sync-delete
   --clipboard <MODE>
   --audio <MODE>
+  --input <MODE>
+  --input-edge <left|right|top|bottom>
+  --input-hotkey <COMBINATION>
   --interval-secs <SECONDS>
   --max-folder-depth <DEPTH>
   --peer <QUERY>
@@ -352,6 +373,7 @@ Options:
 - 不传 `--fs` 时默认就是 `off`
 - `--name` 是当前 Synly 实例的临时名称，只作用于本次运行，不会写回配置；`--peer` 可以按这个名称匹配
 - 剪贴板和音频方向仍然分别通过 `--clipboard <MODE>`、`--audio <MODE>` 独立指定
+- 输入方向通过 `--input <off|send|receive>` 指定, 发送端可以用 `--input-edge` 选择切换边缘
 - `--notifications` 和 `--no-notifications` 会覆盖配置文件中的提醒默认值, 两个参数不能同时使用
 
 ### `--fs auto`
@@ -618,6 +640,20 @@ Synly 当前的安全连接模型是：
 - 可信设备材料目前是按“设备对”保存的，不带轮换和吊销机制
 - 根证书是设备自签发身份根，不依赖外部 CA 或硬件信任根
 - 更适合在可信局域网和人工确认场景下使用
+
+### 鼠标键盘同步
+
+输入同步默认关闭. 开启后, 发送端光标在配置的真实外边缘继续向外移动时切换到对端, 接收端从相反外边缘继续向外移动时返回. 控制期间发送端隐藏并消费本地键鼠事件, 紧急热键在两端始终由本地消费.
+
+输入事件使用 USB HID usage 和相对移动传输, 接收端使用自己的键盘布局. 主连接断开, 辅助通道断开, 心跳超时, 权限丢失, 注入失败或可靠事件队列溢出时都会释放远端按键和鼠标按钮, 并恢复本地光标.
+
+平台边界:
+
+- macOS 需要在系统设置中授予 Synly 辅助功能和输入监控权限. Quartz event tap 被系统禁用或超时会立即停止控制. Secure Input 和更高权限桌面不承诺可注入.
+- Windows 使用低级键鼠钩子和 `SendInput`. UAC 安全桌面, 更高完整性进程和权限隔离可能拒绝注入, 检测到失败会停止控制.
+- Linux 和其他平台暂不支持输入同步. 在这些平台使用 `--input off` 不影响文件, 剪贴板和音频的已有功能.
+
+输入通道只接受已经通过 Synly PIN 临时配对或可信设备 mTLS 的主会话, 并用主 TLS exporter, 辅助 TLS exporter, 会话 ID 和双方角色做双向 HMAC 证明. 仅知道会话 ID 或复制辅助证书不能接入.
 
 ## 设备发现
 

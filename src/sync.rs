@@ -1,4 +1,5 @@
 use crate::cli::{AudioMode, ClipboardMode, FileSyncMode, InitialSyncMode};
+use crate::input::InputMode;
 use anyhow::{Context, Result, bail};
 use filetime::{FileTime, set_file_mtime};
 use ignore::gitignore::Gitignore;
@@ -53,6 +54,7 @@ pub struct WorkspaceSummary {
     pub max_folder_depth: Option<usize>,
     pub clipboard_mode: ClipboardMode,
     pub audio_mode: AudioMode,
+    pub input_mode: InputMode,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -224,10 +226,11 @@ impl WorkspaceSpec {
         self
     }
 
-    pub fn workspace_summary(
+    pub fn session_summary(
         &self,
         clipboard_mode: ClipboardMode,
         audio_mode: AudioMode,
+        input_mode: InputMode,
     ) -> WorkspaceSummary {
         let (send_description, send_layout, send_items, max_folder_depth) = match &self.outgoing {
             Some(OutgoingSpec::RootContents {
@@ -264,6 +267,7 @@ impl WorkspaceSpec {
             max_folder_depth,
             clipboard_mode,
             audio_mode,
+            input_mode,
         }
     }
 
@@ -279,10 +283,11 @@ impl WorkspaceSpec {
         self.can_send_files() || self.can_receive_files()
     }
 
-    pub fn local_summary_lines(
+    pub fn local_summary_lines_with_input(
         &self,
         clipboard_mode: ClipboardMode,
         audio_mode: AudioMode,
+        input_mode: InputMode,
     ) -> Vec<String> {
         let mut lines = vec![format!("文件同步模式: {}", self.file_sync_mode.label())];
 
@@ -322,6 +327,7 @@ impl WorkspaceSpec {
         }
         lines.push(format!("剪贴板同步: {}", clipboard_mode.label()));
         lines.push(format!("音频同步: {}", audio_mode.label()));
+        lines.push(format!("鼠标键盘同步: {}", input_mode.label()));
 
         lines
     }
@@ -364,6 +370,7 @@ impl WorkspaceSummary {
         }
         lines.push(format!("剪贴板同步: {}", self.clipboard_mode.label()));
         lines.push(format!("音频同步: {}", self.audio_mode.label()));
+        lines.push(format!("鼠标键盘同步: {}", self.input_mode.label()));
 
         lines
     }
@@ -1449,10 +1456,18 @@ mod tests {
         assert!(!workspace.can_send_files());
         assert!(!workspace.can_receive_files());
 
-        let lines = workspace.local_summary_lines(ClipboardMode::Both, AudioMode::Off);
+        let lines = workspace.local_summary_lines_with_input(
+            ClipboardMode::Both,
+            AudioMode::Off,
+            InputMode::Off,
+        );
         assert!(lines.iter().any(|line| line.contains("文件同步: 关闭")));
 
-        let summary = workspace.workspace_summary(ClipboardMode::Both, AudioMode::Off);
+        let summary = workspace.session_summary(
+            ClipboardMode::Both,
+            AudioMode::Off,
+            InputMode::Off,
+        );
         assert!(!summary.file_sync_enabled());
         let remote_lines = summary.summary_lines();
         assert!(

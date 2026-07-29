@@ -1,0 +1,426 @@
+use super::channel::{InputChannelOffer, InputHostChannel};
+use super::platform::{self, NativeEvent};
+use super::protocol::{InputMessage, read_message, write_message};
+use super::{Hotkey, InputMode, KeySnapshot, LocalInputRole, ScreenEdge};
+use anyhow::{Context, Result, bail};
+use std::net::SocketAddr;
+use std::time::Duration;
+use tokio::net::TcpStream;
+use tokio::sync::mpsc;
+use tokio::time::{self, Instant, MissedTickBehavior};
+use tokio_rustls::TlsStream;
+
+const MOTION_INTERVAL: Duration = Duration::from_micros(8_333);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(250);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(1);
+const RETURN_COOLDOWN: Duration = Duration::from_millis(300);
+const EDGE_INSET: i32 = 8;
+const OVERFLOW_POLL: Duration = Duration::from_millis(50);
+const RECONNECT_MIN: Duration = Duration::from_secs(2);
+const RECONNECT_MAX: Duration = Duration::from_secs(20);
+const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Debug)]
+pub struct InputRuntimeOptions {
+    pub mode: InputMode,
+    pub edge: ScreenEdge,
+    pub hotkey: Hotkey,
+}
+
+pub enum InputSessionContext {
+    Host {
+        channel: InputHostChannel,
+        sockets: mpsc::Receiver<TcpStream>,
+    },
+    Client {
+        offer: InputChannelOffer,
+        remote_addr: SocketAddr,
+    },
+}
+
+impl InputSessionContext {
+    pub fn host(channel: InputHostChannel, sockets: mpsc::Receiver<TcpStream>) -> Self {
+        Self::Host { channel, sockets }
+    }
+
+    pub fn client(offer: InputChannelOffer, remote_addr: SocketAddr) -> Self {
+        Self::Client { offer, remote_addr }
+    }
+}
+
+pub async fn run_input_session(
+    context: InputSessionContext,
+    master_secret: [u8; 32],
+    local_role: LocalInputRole,
+    options: InputRuntimeOptions,
+) -> Result<()> {
+    let mut platform = platform::start(options.mode, options.hotkey)?;
+    tracing::info!(role = ?local_role, "输入同步运行时已启动");
+    match context {
+        InputSessionContext::Host {
+            channel,
+            mut sockets,
+        } => {
+            loop {
+                let socket = sockets
+                    .recv()
+                    .await
+                    .context("输入辅助连接等待期间主会话已结束")?;
+                match time::timeout(AUTH_TIMEOUT, channel.accept(socket, &master_secret)).await {
+                    Ok(Ok(stream)) => {
+                        if let Err(err) = run_established(
+                            stream,
+                            local_role,
+                            options.edge,
+                            &mut platform,
+                        )
+                        .await
+                        {
+                            cleanup_platform(&platform);
+                            tracing::warn!(error = %err, "输入辅助连接已断开, 等待重连");
+                        }
+                    }
+                    Ok(Err(err)) => {
+                        cleanup_platform(&platform);
+                        tracing::warn!(error = %err, "输入辅助连接认证失败");
+                    }
+                    Err(_) => {
+                        cleanup_platform(&platform);
+                        tracing::warn!("输入辅助连接认证超时");
+                    }
+                }
+            }
+        }
+        InputSessionContext::Client { offer, remote_addr } => {
+            let mut delay = RECONNECT_MIN;
+            loop {
+                let established = match time::timeout(
+                    AUTH_TIMEOUT,
+                    super::channel::connect(remote_addr, &offer, &master_secret),
+                )
+                .await
+                {
+                    Ok(Ok(stream)) => {
+                        delay = RECONNECT_MIN;
+                        run_established(stream, local_role, options.edge, &mut platform).await
+                    }
+                    Ok(Err(err)) => Err(err),
+                    Err(_) => Err(anyhow::anyhow!("输入辅助连接认证超时")),
+                };
+                cleanup_platform(&platform);
+                if let Err(err) = established {
+                    tracing::warn!(error = %err, retry_secs = delay.as_secs(), "输入辅助连接将在退避后重连");
+                    time::sleep(delay).await;
+                    delay = Duration::from_secs(
+                        delay.as_secs().saturating_mul(2).min(RECONNECT_MAX.as_secs()),
+                    );
+                }
+            }
+        }
+    }
+}
+
+fn cleanup_platform(platform: &platform::PlatformHandle) {
+    let _ = platform.backend.set_capture(false);
+    let _ = platform.backend.release_all();
+}
+
+async fn run_established(
+    stream: TlsStream<TcpStream>,
+    local_role: LocalInputRole,
+    source_edge: ScreenEdge,
+    platform: &mut platform::PlatformHandle,
+) -> Result<()> {
+    let local_layout = platform.backend.layout()?;
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    let (tx, mut rx) = mpsc::channel::<InputMessage>(256);
+    let writer_task = tokio::spawn(async move {
+        while let Some(message) = rx.recv().await {
+            write_message(&mut writer, &message).await?;
+        }
+        Result::<()>::Ok(())
+    });
+    tx.send(InputMessage::Layout(local_layout.clone())).await?;
+    let remote_layout = match read_message(&mut reader).await? {
+        InputMessage::Layout(layout) => layout,
+        InputMessage::Proof { .. } => bail!("输入通道认证完成后收到了重复证明"),
+        _ => bail!("输入通道在布局交换前收到了事件"),
+    };
+    tracing::info!(
+        local_displays = local_layout.displays.len(),
+        remote_displays = remote_layout.displays.len(),
+        "输入通道布局交换完成"
+    );
+
+    let session = match local_role {
+        LocalInputRole::Send => run_sender(
+            &mut reader,
+            &tx,
+            platform,
+            local_layout,
+            remote_layout,
+            source_edge,
+        )
+        .await,
+        LocalInputRole::Receive => {
+            run_receiver(&mut reader, &tx, platform, local_layout).await
+        }
+    };
+    drop(tx);
+    match writer_task.await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) if session.is_err() => {
+            tracing::debug!(error = %err, "输入通道写入任务随会话错误结束");
+        }
+        Ok(Err(err)) => return Err(err),
+        Err(err) => return Err(err.into()),
+    }
+    session
+}
+
+async fn run_sender<R>(
+    reader: &mut R,
+    tx: &mpsc::Sender<InputMessage>,
+    platform: &mut platform::PlatformHandle,
+    local_layout: super::DesktopLayout,
+    _remote_layout: super::DesktopLayout,
+    source_edge: ScreenEdge,
+) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut generation = 0u64;
+    let mut active = false;
+    let mut cooldown_until = Instant::now();
+    let mut last_heartbeat = Instant::now();
+    let mut motion_tick = time::interval(MOTION_INTERVAL);
+    motion_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut heartbeat = time::interval(HEARTBEAT_INTERVAL);
+    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut overflow_poll = time::interval(OVERFLOW_POLL);
+    let mut timeout_tick = time::interval(HEARTBEAT_INTERVAL);
+
+    loop {
+        tokio::select! {
+            incoming = read_message(reader) => {
+                match incoming? {
+                    InputMessage::Return { generation: remote_generation, edge_position }
+                        if active && remote_generation == generation => {
+                            deactivate_sender(platform, &local_layout, source_edge, edge_position)?;
+                            active = false;
+                            cooldown_until = Instant::now() + RETURN_COOLDOWN;
+                            tracing::info!(generation, "控制已从对端返回本机");
+                        }
+                    InputMessage::Deactivate { generation: remote_generation }
+                        if active && remote_generation == generation => {
+                            platform.backend.set_capture(false)?;
+                            active = false;
+                            cooldown_until = Instant::now() + RETURN_COOLDOWN;
+                        }
+                    InputMessage::Heartbeat { .. } => {
+                        last_heartbeat = Instant::now();
+                    }
+                    InputMessage::Layout(_) => {}
+                    InputMessage::Proof { .. } => bail!("输入通道收到重复认证消息"),
+                    _ => {}
+                }
+            }
+            Some(event) = platform.events.recv() => {
+                match event {
+                    NativeEvent::Emergency => {
+                        if active {
+                            tx.send(InputMessage::Deactivate { generation }).await?;
+                            platform.backend.set_capture(false)?;
+                            active = false;
+                            cooldown_until = Instant::now() + RETURN_COOLDOWN;
+                            tracing::info!(generation, "紧急热键已收回本机控制");
+                        }
+                    }
+                    NativeEvent::Key { usage, modifiers, down, repeat } if active => {
+                        tx.send(InputMessage::Key { generation, usage, modifiers, down, repeat }).await?;
+                    }
+                    NativeEvent::Button { button, down } if active => {
+                        tx.send(InputMessage::Button { generation, button, down }).await?;
+                    }
+                    NativeEvent::Wheel { x, y } if active => {
+                        tx.send(InputMessage::Wheel { generation, x, y }).await?;
+                    }
+                    NativeEvent::ReliableQueueOverflow => {
+                        if active {
+                            let _ = tx.send(InputMessage::Deactivate { generation }).await;
+                            platform.backend.set_capture(false)?;
+                        }
+                        bail!("本机输入可靠事件队列已满, 已停止远程控制");
+                    }
+                    NativeEvent::Failed(message) => bail!("本机输入捕获失败: {message}"),
+                    _ => {}
+                }
+            }
+            _ = motion_tick.tick() => {
+                let (dx, dy) = platform.motion.take();
+                if dx == 0 && dy == 0 {
+                    continue;
+                }
+                if active {
+                    tx.send(InputMessage::Motion { generation, dx, dy }).await?;
+                } else if Instant::now() >= cooldown_until {
+                    let point = platform.backend.cursor_position()?;
+                    if local_layout.movement_crosses_edge(source_edge, point, dx, dy) {
+                        generation = generation.wrapping_add(1).max(1);
+                        let edge_position = local_layout.normalized_edge_position(source_edge, point);
+                        let pressed = platform.backend.snapshot();
+                        tx.send(InputMessage::Activate { generation, source_edge, edge_position, pressed }).await?;
+                        platform.backend.set_capture(true)?;
+                        active = true;
+                        tracing::info!(generation, edge = ?source_edge, "鼠标已进入对端桌面");
+                    }
+                }
+            }
+            _ = heartbeat.tick() => {
+                tx.send(InputMessage::Heartbeat { generation }).await?;
+            }
+            _ = overflow_poll.tick() => {
+                if platform.overflowed.load(std::sync::atomic::Ordering::Acquire) {
+                    if active {
+                        let _ = tx.send(InputMessage::Deactivate { generation }).await;
+                        let _ = platform.backend.set_capture(false);
+                    }
+                    bail!("本机输入可靠事件队列已满, 已停止远程控制");
+                }
+            }
+            _ = timeout_tick.tick() => {
+                if active && Instant::now().duration_since(last_heartbeat) >= HEARTBEAT_TIMEOUT {
+                    let _ = platform.backend.set_capture(false);
+                    bail!("输入辅助通道心跳超时");
+                }
+            }
+        }
+    }
+}
+
+fn deactivate_sender(
+    platform: &platform::PlatformHandle,
+    layout: &super::DesktopLayout,
+    edge: ScreenEdge,
+    edge_position: f32,
+) -> Result<()> {
+    platform.backend.set_capture(false)?;
+    platform
+        .backend
+        .warp_cursor(layout.point_inside_edge(edge, edge_position, EDGE_INSET))
+}
+
+async fn run_receiver<R>(
+    reader: &mut R,
+    tx: &mpsc::Sender<InputMessage>,
+    platform: &mut platform::PlatformHandle,
+    local_layout: super::DesktopLayout,
+) -> Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    let mut generation = 0u64;
+    let mut active = false;
+    let mut return_edge = ScreenEdge::Left;
+    let mut last_heartbeat = Instant::now();
+    let mut timeout_tick = time::interval(HEARTBEAT_INTERVAL);
+    timeout_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut overflow_poll = time::interval(OVERFLOW_POLL);
+    let mut heartbeat = time::interval(HEARTBEAT_INTERVAL);
+    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            incoming = read_message(reader) => {
+                match incoming? {
+                    InputMessage::Activate { generation: incoming_generation, source_edge, edge_position, pressed } => {
+                        if incoming_generation <= generation {
+                            continue;
+                        }
+                        platform.backend.release_all()?;
+                        generation = incoming_generation;
+                        active = true;
+                        return_edge = source_edge.opposite();
+                        last_heartbeat = Instant::now();
+                        platform.backend.warp_cursor(local_layout.point_inside_edge(return_edge, edge_position, EDGE_INSET))?;
+                        apply_snapshot(&*platform.backend, &pressed)?;
+                        tracing::info!(generation, edge = ?return_edge, "开始接受对端控制");
+                    }
+                    InputMessage::Deactivate { generation: incoming_generation } if incoming_generation == generation => {
+                        platform.backend.release_all()?;
+                        active = false;
+                    }
+                    InputMessage::Heartbeat { generation: incoming_generation } if incoming_generation == generation => {
+                        last_heartbeat = Instant::now();
+                    }
+                    InputMessage::Key { generation: incoming_generation, usage, modifiers, down, repeat }
+                        if active && incoming_generation == generation => {
+                            platform.backend.inject_key(usage, modifiers, down, repeat)?;
+                    }
+                    InputMessage::Button { generation: incoming_generation, button, down }
+                        if active && incoming_generation == generation => {
+                            platform.backend.inject_button(button, down)?;
+                    }
+                    InputMessage::Wheel { generation: incoming_generation, x, y }
+                        if active && incoming_generation == generation => {
+                            platform.backend.inject_wheel(x, y)?;
+                    }
+                    InputMessage::Motion { generation: incoming_generation, dx, dy }
+                        if active && incoming_generation == generation => {
+                            let point = platform.backend.cursor_position()?;
+                            if local_layout.movement_crosses_edge(return_edge, point, dx, dy) {
+                                let edge_position = local_layout.normalized_edge_position(return_edge, point);
+                                platform.backend.release_all()?;
+                                active = false;
+                                tx.send(InputMessage::Return { generation, edge_position }).await?;
+                            } else {
+                                platform.backend.inject_motion(dx, dy)?;
+                            }
+                    }
+                    InputMessage::Proof { .. } => bail!("输入通道收到重复认证消息"),
+                    _ => {}
+                }
+            }
+            Some(event) = platform.events.recv() => {
+                match event {
+                    NativeEvent::Emergency => {
+                        if active {
+                            platform.backend.release_all()?;
+                            active = false;
+                            tx.send(InputMessage::Deactivate { generation }).await?;
+                            tracing::info!(generation, "接收端紧急热键已停止远程控制");
+                        }
+                    }
+                    NativeEvent::ReliableQueueOverflow => bail!("本机紧急热键事件队列已满"),
+                    NativeEvent::Failed(message) => bail!("本机输入注入后端失败: {message}"),
+                    _ => {}
+                }
+            }
+            _ = timeout_tick.tick() => {
+                if active && Instant::now().duration_since(last_heartbeat) >= HEARTBEAT_TIMEOUT {
+                    platform.backend.release_all()?;
+                    bail!("输入辅助通道心跳超时");
+                }
+            }
+            _ = overflow_poll.tick() => {
+                if platform.overflowed.load(std::sync::atomic::Ordering::Acquire) {
+                    let _ = platform.backend.release_all();
+                    bail!("本机输入可靠事件队列已满, 已停止远程控制");
+                }
+            }
+            _ = heartbeat.tick() => {
+                tx.send(InputMessage::Heartbeat { generation }).await?;
+            }
+        }
+    }
+}
+
+fn apply_snapshot(backend: &dyn platform::InputBackend, snapshot: &KeySnapshot) -> Result<()> {
+    for usage in &snapshot.usages {
+        backend.inject_key(*usage, snapshot.modifiers, true, false)?;
+    }
+    for button in &snapshot.buttons {
+        backend.inject_button(*button, true)?;
+    }
+    Ok(())
+}

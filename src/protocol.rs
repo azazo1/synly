@@ -1,4 +1,5 @@
 use crate::sync::{ManifestSnapshot, WorkspaceSummary};
+use crate::input::InputChannelOffer;
 use anyhow::{Context, Result, bail};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -15,7 +16,7 @@ const DEFAULT_MAX_FRAME_DATA_LEN: usize = 128 * 1024 * 1024;
 const DEFAULT_MAX_CLIPBOARD_BINARY_LEN: usize = 100 * 1024 * 1024;
 const CLIPBOARD_STREAM_CHUNK_SIZE: usize = 1024 * 1024;
 
-pub const PROTOCOL_VERSION: u16 = 15;
+pub const PROTOCOL_VERSION: u16 = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TransferLimits {
@@ -120,6 +121,7 @@ pub enum ControlMessage {
     AudioUdpReady {
         port: u16,
     },
+    InputChannelOffer(InputChannelOffer),
     SnapshotAdvert {
         revision: u64,
         snapshot: ManifestSnapshot,
@@ -677,6 +679,7 @@ mod tests {
                 max_folder_depth: Some(2),
                 clipboard_mode: ClipboardMode::Both,
                 audio_mode: AudioMode::Receive,
+                input_mode: crate::input::InputMode::Off,
             },
             agreement: SessionAgreement {
                 host_to_client: true,
@@ -799,7 +802,8 @@ mod tests {
                 "initial_sync": "this",
                 "max_folder_depth": 2,
                 "clipboard_mode": "both",
-                "audio_mode": "receive"
+                "audio_mode": "receive",
+                "input_mode": "off"
             }
         }))
         .unwrap_err()
@@ -830,7 +834,8 @@ mod tests {
                     "initial_sync": "this",
                     "max_folder_depth": 2,
                     "clipboard_mode": "both",
-                    "audio_mode": "receive"
+                    "audio_mode": "receive",
+                    "input_mode": "off"
                 },
                 "agreement": {
                     "host_to_client": true,

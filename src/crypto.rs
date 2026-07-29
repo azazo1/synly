@@ -359,6 +359,19 @@ pub fn export_audio_master_secret_from_client<T>(
     Ok(output)
 }
 
+pub fn export_input_master_secret_from_client<T>(
+    stream: &tokio_rustls::client::TlsStream<T>,
+    binding_id: &str,
+) -> Result<[u8; 32]> {
+    let mut output = [0u8; 32];
+    stream.get_ref().1.export_keying_material(
+        &mut output,
+        b"synly/input/v1",
+        Some(binding_id.as_bytes()),
+    )?;
+    Ok(output)
+}
+
 pub fn export_keying_material_from_server<T>(
     stream: &tokio_rustls::server::TlsStream<T>,
     binding_id: &str,
@@ -380,6 +393,19 @@ pub fn export_audio_master_secret_from_server<T>(
     stream.get_ref().1.export_keying_material(
         &mut output,
         b"synly-audio-master",
+        Some(binding_id.as_bytes()),
+    )?;
+    Ok(output)
+}
+
+pub fn export_input_master_secret_from_server<T>(
+    stream: &tokio_rustls::server::TlsStream<T>,
+    binding_id: &str,
+) -> Result<[u8; 32]> {
+    let mut output = [0u8; 32];
+    stream.get_ref().1.export_keying_material(
+        &mut output,
+        b"synly/input/v1",
         Some(binding_id.as_bytes()),
     )?;
     Ok(output)
@@ -1254,6 +1280,7 @@ mod tests {
                 max_folder_depth: None,
                 clipboard_mode: ClipboardMode::Off,
                 audio_mode: AudioMode::Off,
+                input_mode: crate::input::InputMode::Off,
             },
             request_trust: false,
         };
@@ -1286,6 +1313,7 @@ mod tests {
                 max_folder_depth: None,
                 clipboard_mode: ClipboardMode::Off,
                 audio_mode: AudioMode::Off,
+                input_mode: crate::input::InputMode::Off,
             },
             request_trust: true,
         };
@@ -1327,6 +1355,7 @@ mod tests {
             max_folder_depth: None,
             clipboard_mode: ClipboardMode::Off,
             audio_mode: AudioMode::Off,
+            input_mode: crate::input::InputMode::Off,
         };
         let proof = sign_pair_decision(
             &exporter,
@@ -1400,6 +1429,7 @@ mod tests {
             max_folder_depth: None,
             clipboard_mode: ClipboardMode::Both,
             audio_mode: AudioMode::Off,
+            input_mode: crate::input::InputMode::Off,
         };
         let proof = sign_trusted_pair_decision(
             &private_key,

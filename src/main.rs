@@ -5,6 +5,7 @@ mod clipboard;
 mod config;
 mod crypto;
 mod discovery;
+mod input;
 mod path_expand;
 mod protocol;
 mod startup_tui;
@@ -21,6 +22,7 @@ async fn main() -> Result<()> {
     let cli = cli::Cli::parse();
     let mut config = config::SynlyConfig::load_or_create()?;
     let options = cli::collect_runtime_options(cli, &config)?;
+    input::ensure_platform_supported(options.input_mode)?;
     tracing_utils::init_tracing();
     println!();
     println!("{}", style("本次同步确认").bold());
@@ -29,7 +31,11 @@ async fn main() -> Result<()> {
     }
     for line in options
         .workspace
-        .local_summary_lines(options.clipboard_mode, options.audio_mode)
+        .local_summary_lines_with_input(
+            options.clipboard_mode,
+            options.audio_mode,
+            options.input_mode,
+        )
     {
         println!("{line}");
     }

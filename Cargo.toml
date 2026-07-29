@@ -33,12 +33,23 @@ tokio = { version = "1.49.0", features = ["fs", "io-util", "macros", "net", "rt-
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring"] }
 toml = "0.9.8"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
+tracing = "0.1.41"
 tui-textarea = { version = "0.7.0", features = ["crossterm"] }
 url = "2.5.7"
 uuid = { version = "1.22.0", features = ["serde", "v4"] }
 walkdir = "2.5.0"
 x509-parser = "0.18.1"
 spake2 = "0.4.0"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 [dev-dependencies]
 axum = "0.8.1"

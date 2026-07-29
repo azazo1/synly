@@ -1,4 +1,5 @@
 use crate::cli::{AudioMode, ClipboardMode, FileSyncMode};
+use crate::input::InputMode;
 use crate::config::{DeviceConfig, DiscoveryConfig, LndDiscoveryConfig};
 use anyhow::{Context, Result, anyhow, bail};
 use if_addrs::{IfAddr, get_if_addrs};
@@ -24,6 +25,7 @@ pub struct Advertisement {
     pub file_sync_mode: FileSyncMode,
     pub clipboard_mode: ClipboardMode,
     pub audio_mode: AudioMode,
+    pub input_mode: InputMode,
     pub instance_name: Option<String>,
 }
 
@@ -90,6 +92,7 @@ pub struct DiscoveredPeer {
     pub file_sync_mode: FileSyncMode,
     pub clipboard_mode: ClipboardMode,
     pub audio_mode: AudioMode,
+    pub input_mode: InputMode,
     pub source: DiscoverySource,
     pub port: u16,
     pub addresses: Vec<Ipv4Addr>,
@@ -108,12 +111,13 @@ impl DiscoveredPeer {
             .collect::<Vec<_>>()
             .join(", ");
         format!(
-            "{} ({})  文件:{}  剪贴板:{}  音频:{}  来源:{}  {}",
+            "{} ({})  文件:{}  剪贴板:{}  音频:{}  输入:{}  来源:{}  {}",
             self.display_name(),
             &self.device_id[..8.min(self.device_id.len())],
             self.file_sync_mode.label(),
             self.clipboard_mode.label(),
             self.audio_mode.label(),
+            self.input_mode.label(),
             self.source.label(),
             addresses
         )
@@ -379,6 +383,10 @@ fn advertisement_metadata(advertisement: &Advertisement) -> BTreeMap<String, Str
             "audio_mode".to_string(),
             advertisement.audio_mode.as_wire().to_string(),
         ),
+        (
+            "input_mode".to_string(),
+            advertisement.input_mode.as_wire().to_string(),
+        ),
         ("protocol".to_string(), "1".to_string()),
     ]);
     if let Some(instance_name) = advertisement
@@ -510,6 +518,9 @@ fn discovered_peer_from_mdns(info: &mdns_sd::ResolvedService) -> Option<Discover
     let audio_mode = info
         .get_property_val_str("audio_mode")
         .and_then(AudioMode::from_wire)?;
+    let input_mode = info
+        .get_property_val_str("input_mode")
+        .and_then(InputMode::from_wire)?;
     let device_name = info.get_property_val_str("device_name")?.to_string();
     let instance_name = info
         .get_property_val_str("instance_name")
@@ -530,6 +541,7 @@ fn discovered_peer_from_mdns(info: &mdns_sd::ResolvedService) -> Option<Discover
         file_sync_mode,
         clipboard_mode,
         audio_mode,
+        input_mode,
         source: DiscoverySource::Mdns,
         port: info.get_port(),
         addresses,
@@ -559,6 +571,9 @@ fn discovered_peer_from_lnd(node: &DiscoveredNode) -> Option<DiscoveredPeer> {
     let audio_mode = metadata
         .get("audio_mode")
         .and_then(|value| AudioMode::from_wire(value))?;
+    let input_mode = metadata
+        .get("input_mode")
+        .and_then(|value| InputMode::from_wire(value))?;
     let instance_name = metadata
         .get("instance_name")
         .map(String::as_str)
@@ -587,6 +602,7 @@ fn discovered_peer_from_lnd(node: &DiscoveredNode) -> Option<DiscoveredPeer> {
         file_sync_mode,
         clipboard_mode,
         audio_mode,
+        input_mode,
         source: DiscoverySource::Lnd,
         port: node.port,
         addresses,
@@ -717,6 +733,7 @@ mod tests {
     };
     use crate::cli::{AudioMode, ClipboardMode, FileSyncMode};
     use crate::config::{DeviceConfig, LndDiscoveryConfig};
+    use crate::input::InputMode;
     use lnd::{
         DiscoveredNode, DiscoveryFilter, InMemoryRegistry, LeaseInfo, LndClient, ServerConfig,
         build_router,
@@ -895,6 +912,7 @@ mod tests {
         assert_eq!(peer.file_sync_mode, FileSyncMode::Both);
         assert_eq!(peer.clipboard_mode, ClipboardMode::Receive);
         assert_eq!(peer.audio_mode, AudioMode::Send);
+        assert_eq!(peer.input_mode, InputMode::Receive);
         assert_eq!(peer.source, DiscoverySource::Lnd);
         assert_eq!(peer.addresses, vec![Ipv4Addr::LOCALHOST]);
 
@@ -914,6 +932,7 @@ mod tests {
             file_sync_mode: FileSyncMode::Both,
             clipboard_mode: ClipboardMode::Receive,
             audio_mode: AudioMode::Send,
+            input_mode: InputMode::Receive,
             instance_name: Some("worker-a".to_string()),
         }
     }
@@ -927,6 +946,7 @@ mod tests {
             file_sync_mode: FileSyncMode::Both,
             clipboard_mode: ClipboardMode::Off,
             audio_mode: AudioMode::Off,
+            input_mode: InputMode::Off,
             source,
             port: 8080,
             addresses: vec![Ipv4Addr::new(192, 168, 1, 20)],

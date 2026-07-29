@@ -3159,11 +3159,13 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "toml",
+ "tracing",
  "tracing-subscriber",
  "tui-textarea",
  "url",
  "uuid",
  "walkdir",
+ "windows-sys 0.61.2",
  "x509-parser",
 ]
 
