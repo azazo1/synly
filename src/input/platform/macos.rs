@@ -109,6 +109,7 @@ unsafe extern "C" {
     fn CGDisplayShowCursor(display: CGDirectDisplayID) -> i32;
     fn CGWarpMouseCursorPosition(position: CGPoint) -> i32;
     fn CGAssociateMouseAndMouseCursorPosition(connected: bool) -> i32;
+    fn CGSetLocalEventsSuppressionInterval(interval: c_double);
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -478,11 +479,20 @@ impl InputBackend for MacBackend {
         } else {
             unsafe { CGDisplayShowCursor(display) }
         };
-        let association_result = unsafe { CGAssociateMouseAndMouseCursorPosition(!active) };
+        let association_result = if active {
+            let recouple_result = unsafe { CGAssociateMouseAndMouseCursorPosition(true) };
+            unsafe { CGSetLocalEventsSuppressionInterval(0.0001) };
+            let decouple_result = unsafe { CGAssociateMouseAndMouseCursorPosition(false) };
+            if recouple_result != 0 { recouple_result } else { decouple_result }
+        } else {
+            unsafe { CGSetLocalEventsSuppressionInterval(0.0) };
+            unsafe { CGAssociateMouseAndMouseCursorPosition(true) }
+        };
         if visibility_result != 0 || association_result != 0 {
             if active {
                 unsafe {
                     CGAssociateMouseAndMouseCursorPosition(true);
+                    CGSetLocalEventsSuppressionInterval(0.0);
                     CGDisplayShowCursor(display);
                 }
                 self.state

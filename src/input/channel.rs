@@ -77,6 +77,7 @@ impl InputHostChannel {
         mut socket: TcpStream,
         master_secret: &[u8; 32],
     ) -> Result<TlsStream<TcpStream>> {
+        socket.set_nodelay(true)?;
         let session_id = read_preamble(&mut socket).await?;
         if session_id != self.offer.session_id {
             bail!("输入辅助连接 session_id 不匹配");
@@ -126,6 +127,7 @@ pub async fn connect(
     let mut socket = TcpStream::connect(address)
         .await
         .with_context(|| format!("无法连接输入辅助通道 {address}"))?;
+    socket.set_nodelay(true)?;
     write_preamble(&mut socket, offer.session_id).await?;
 
     let mut roots = RootCertStore::empty();

@@ -19,6 +19,7 @@ const WH_KEYBOARD_LL: i32 = 13;
 const WH_MOUSE_LL: i32 = 14;
 const HC_ACTION: i32 = 0;
 const WM_QUIT: u32 = 0x0012;
+const WM_SYNLY_CAPTURE: u32 = 0x8001;
 const WM_MOUSEMOVE: u32 = 0x0200;
 const WM_LBUTTONDOWN: u32 = 0x0201;
 const WM_LBUTTONUP: u32 = 0x0202;
@@ -191,6 +192,7 @@ struct WindowsState {
     injected_buttons: Mutex<BTreeSet<u8>>,
     last_point: Mutex<Option<Point>>,
     thread_id: AtomicU32,
+    cursor_hidden: AtomicBool,
     stop: AtomicBool,
     hooks: Mutex<(HHook, HHook)>,
 }
@@ -212,6 +214,7 @@ pub fn start(context: CaptureContext) -> Result<Arc<dyn InputBackend>> {
         injected_buttons: Mutex::new(BTreeSet::new()),
         last_point: Mutex::new(None),
         thread_id: AtomicU32::new(0),
+        cursor_hidden: AtomicBool::new(false),
         stop: AtomicBool::new(false),
         hooks: Mutex::new((0, 0)),
     });
@@ -253,11 +256,16 @@ fn run_message_loop(state: Arc<WindowsState>, ready: std::sync::mpsc::SyncSender
         if result <= 0 {
             break;
         }
+        if message.message == WM_SYNLY_CAPTURE {
+            sync_cursor_visibility(&state, message.w_param != 0);
+            continue;
+        }
         unsafe {
             TranslateMessage(&message);
             DispatchMessageW(&message);
         }
     }
+    sync_cursor_visibility(&state, false);
     unsafe {
         UnhookWindowsHookEx(keyboard);
         UnhookWindowsHookEx(mouse);
@@ -276,6 +284,8 @@ unsafe extern "system" fn keyboard_callback(code: i32, w_param: WParam, l_param:
         return unsafe { CallNextHookEx(0, code, w_param, l_param) };
     }
     let context = unsafe { &*HOOK_STATE.load(Ordering::Acquire) };
+    let active = context.context.capture_active.load(Ordering::Acquire);
+    sync_cursor_visibility(context, active);
     let usage = windows_scan_to_hid(state.scan_code as u16, state.vk_code as u16);
     let Some(usage) = usage else {
         return unsafe { CallNextHookEx(0, code, w_param, l_param) };
@@ -320,6 +330,7 @@ unsafe extern "system" fn mouse_callback(code: i32, w_param: WParam, l_param: LP
     let context = unsafe { &*HOOK_STATE.load(Ordering::Acquire) };
     let point = Point { x: event.pt.x, y: event.pt.y };
     let active = context.context.capture_active.load(Ordering::Acquire);
+    sync_cursor_visibility(context, active);
     match w_param as u32 {
         WM_MOUSEMOVE => {
             if active {
@@ -431,12 +442,20 @@ impl InputBackend for WindowsBackend {
         if previous == active {
             return Ok(());
         }
-        unsafe { ShowCursor(if active { 0 } else { 1 }) };
+        let thread_id = self.state.thread_id.load(Ordering::Acquire);
+        if thread_id == 0
+            || unsafe {
+                PostThreadMessageW(thread_id, WM_SYNLY_CAPTURE, usize::from(active), 0)
+            } == 0
+        {
+            self.state.context.capture_active.store(previous, Ordering::Release);
+            bail!("无法向 Windows 输入钩子线程发送光标捕获状态")
+        }
         if active {
             let center = virtual_desktop_center();
             if unsafe { SetCursorPos(center.x, center.y) } == 0 {
                 self.state.context.capture_active.store(false, Ordering::Release);
-                unsafe { ShowCursor(1) };
+                let _ = unsafe { PostThreadMessageW(thread_id, WM_SYNLY_CAPTURE, 0, 0) };
                 bail!("无法在输入捕获开始时回正 Windows 光标");
             }
             *self.state.last_point.lock().unwrap() = Some(center);
@@ -515,6 +534,35 @@ impl InputBackend for WindowsBackend {
         }
         Ok(())
     }
+}
+
+fn sync_cursor_visibility(state: &WindowsState, active: bool) {
+    let hidden = state.cursor_hidden.load(Ordering::Acquire);
+    if hidden == active {
+        return;
+    }
+    if set_cursor_visibility(!active) {
+        state.cursor_hidden.store(active, Ordering::Release);
+    } else {
+        state.context.failed.store(true, Ordering::Release);
+        state.context.emit_reliable(NativeEvent::Failed(
+            if active {
+                "Windows 无法隐藏本机光标".to_string()
+            } else {
+                "Windows 无法恢复本机光标".to_string()
+            },
+        ));
+    }
+}
+
+fn set_cursor_visibility(visible: bool) -> bool {
+    for _ in 0..10 {
+        let counter = unsafe { ShowCursor(if visible { 1 } else { 0 }) };
+        if (visible && counter >= 0) || (!visible && counter < 0) {
+            return true;
+        }
+    }
+    false
 }
 
 impl Drop for WindowsBackend {
