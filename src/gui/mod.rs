@@ -44,6 +44,7 @@ pub fn run(config: SynlyConfig) -> Result<()> {
     runtime.spawn(supervisor.run());
 
     let window = AppWindow::new().context("failed to create Slint main window")?;
+    window.set_monospace_font_family(system_monospace_font_family().into());
     window.window().set_size(restored_window_size(&config.ui));
     let _single_instance_guard =
         single_instance::SingleInstanceGuard::start(listener, window.as_weak())?;
@@ -78,6 +79,21 @@ pub fn run(config: SynlyConfig) -> Result<()> {
     let _ = handle.commands().try_send(AppCommand::Shutdown);
     runtime.shutdown_timeout(std::time::Duration::from_secs(5));
     Ok(())
+}
+
+fn system_monospace_font_family() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "Menlo"
+    }
+    #[cfg(target_os = "windows")]
+    {
+        "Consolas"
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        "DejaVu Sans Mono"
+    }
 }
 
 fn spawn_ctrl_c_handler(
@@ -463,15 +479,8 @@ fn apply_snapshot(
     let active = snapshot.applied.is_some();
     let peer_label = snapshot
         .current_peer
-        .as_deref()
-        .and_then(|device_id| {
-            snapshot
-                .discovered_peers
-                .iter()
-                .find(|peer| peer.device_id == device_id)
-                .map(|peer| peer.display_name.as_str())
-        })
-        .or(snapshot.current_peer.as_deref())
+        .as_ref()
+        .map(|peer| peer.display_name.as_str())
         .unwrap_or("未连接");
     window.set_lifecycle_text(snapshot.lifecycle.label().into());
     window.set_session_active(active);

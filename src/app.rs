@@ -646,6 +646,19 @@ fn notification_peer(identity: &DeviceIdentity) -> NotificationPeer {
     }
 }
 
+fn bootstrap_peer_label(device_name: &str, remote_addr: SocketAddr) -> String {
+    let device_name = device_name.trim();
+    if device_name.is_empty() {
+        remote_addr.to_string()
+    } else {
+        format!("{device_name} ({remote_addr})")
+    }
+}
+
+fn bootstrap_device_name_matches(declared: &str, authenticated: &str) -> bool {
+    declared.trim() == authenticated.trim()
+}
+
 async fn run_with_session_notifications<N, F, T>(
     notifier: &N,
     peer: NotificationPeer,
@@ -1036,7 +1049,7 @@ async fn handle_bootstrap_incoming_connection(
     options: &RuntimeOptions,
 ) -> Result<Option<AuthenticatedSession>> {
     let transfer_limits = options.transfer_limits;
-    let remote_label = remote_addr.to_string();
+    let remote_addr_text = remote_addr.to_string();
     let remote_peer_key = remote_addr.ip().to_string();
     if options.pairing.trusted_only {
         write_frame(
@@ -1077,7 +1090,8 @@ async fn handle_bootstrap_incoming_connection(
         Frame::Control(ControlMessage::BootstrapHello {
             protocol_version,
             client_bootstrap_public_key,
-        }) => (protocol_version, client_bootstrap_public_key),
+            device_name,
+        }) => (protocol_version, client_bootstrap_public_key, device_name),
         _ => {
             write_frame(
                 &mut socket,
@@ -1090,7 +1104,7 @@ async fn handle_bootstrap_incoming_connection(
             return Ok(None);
         }
     };
-    let (protocol_version, client_bootstrap_public_key) = bootstrap_hello;
+    let (protocol_version, client_bootstrap_public_key, client_device_name) = bootstrap_hello;
     if protocol_version != PROTOCOL_VERSION {
         write_frame(
             &mut socket,
@@ -1104,6 +1118,7 @@ async fn handle_bootstrap_incoming_connection(
     }
 
     let client_display = crypto::bootstrap_public_key_display(&client_bootstrap_public_key)?;
+    let remote_label = bootstrap_peer_label(&client_device_name, remote_addr);
     let request_id = Uuid::new_v4().to_string();
     let server_bootstrap_key = crypto::generate_bootstrap_key_material()?;
     let server_bootstrap_public_key = server_bootstrap_key.public_key_encoded();
@@ -1331,7 +1346,18 @@ async fn handle_bootstrap_incoming_connection(
         negotiate_clipboard(options.clipboard_mode, payload.workspace.clipboard_mode);
     let audio_compatible = audio_modes_compatible(options.audio_mode, payload.workspace.audio_mode);
     let input_compatible = negotiate_input(options.input_mode, payload.workspace.input_mode).is_some();
-    print_pair_request_overview(&payload, options, &agreement, &remote_label)?;
+    if !bootstrap_device_name_matches(&client_device_name, &payload.client.device_name) {
+        write_frame(
+            &mut server_stream,
+            transfer_limits,
+            Frame::Control(ControlMessage::Error {
+                message: "bootstrap 设备名与认证身份不一致".to_string(),
+            }),
+        )
+        .await?;
+        return Ok(None);
+    }
+    print_pair_request_overview(&payload, options, &agreement, &remote_addr_text)?;
     if !agreement.any_direction() && !clipboard_agreement.any_direction() && !audio_compatible && !input_compatible {
         write_frame(
             &mut server_stream,
@@ -1617,6 +1643,7 @@ async fn connect_to_untrusted_peer(
         Frame::Control(ControlMessage::BootstrapHello {
             protocol_version: PROTOCOL_VERSION,
             client_bootstrap_public_key: client_bootstrap_public_key.clone(),
+            device_name: device.device_name.clone(),
         }),
     )
     .await?;
@@ -4597,7 +4624,8 @@ mod tests {
     use super::{
         FILE_STREAM_CHUNK_SIZE, InitialSnapshotPolicy, SessionRole, SessionTaskAbortGuard,
         SnapshotEchoSuppressions, SnapshotPathExpectation, accept_policy_label,
-        build_remote_echo_expectations, choose_peer, delete_policy, handle_file_chunk,
+        bootstrap_device_name_matches, bootstrap_peer_label, build_remote_echo_expectations,
+        choose_peer, delete_policy, handle_file_chunk,
         identity_display_name, input_task_restart_required, is_connection_shutdown_error,
         next_reconnect_delay,
         parse_direct_peer_addr, peer_matches_query, preferred_peer_query, race_peer_addresses,
@@ -4625,7 +4653,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashMap};
     use std::env;
     use std::fs;
-    use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
     use std::path::PathBuf;
     use std::sync::Mutex;
     use std::time::Duration;
@@ -5319,6 +5347,26 @@ mod tests {
         };
 
         assert_eq!(identity_display_name(&identity), "worker-a @ demo-device");
+    }
+
+    #[test]
+    fn bootstrap_peer_label_prefers_device_name_and_keeps_address() {
+        let address = SocketAddr::from(([127, 0, 0, 1], 8080));
+
+        assert_eq!(
+            bootstrap_peer_label("  demo-device  ", address),
+            "demo-device (127.0.0.1:8080)"
+        );
+        assert_eq!(bootstrap_peer_label(" ", address), "127.0.0.1:8080");
+    }
+
+    #[test]
+    fn bootstrap_device_name_must_match_authenticated_identity() {
+        assert!(bootstrap_device_name_matches(" demo-device ", "demo-device"));
+        assert!(!bootstrap_device_name_matches(
+            "displayed-device",
+            "authenticated-device"
+        ));
     }
 
     #[test]

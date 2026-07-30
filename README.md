@@ -26,7 +26,7 @@ Synly 支持 Windows, macOS 和 Linux. 文件与剪贴板同步可在三大平�
 
 ## 安全顺序
 
-未信任设备在 PIN 之前只交换一次性 bootstrap 公钥. 双方核对 bootstrap 指纹和会话 randomart 后, 使用 PIN 完成 SPAKE2. 设备身份, 工作区摘要和能力信息只在临时 mTLS 建立后传输.
+未信任设备在 PIN 之前交换一次性 bootstrap 公钥和主动方声明的 device_name. 双方核对 bootstrap 指纹和会话 randomart 后, 使用 PIN 完成 SPAKE2. 设备身份, 工作区摘要和能力信息只在临时 mTLS 建立后传输, bootstrap 阶段的名称仅用于提示并会在认证后重新校验.
 
 固定 PIN 只保存在当前进程内存中. PIN, 密钥, PAKE 数据和剪贴板内容不会写入 tracing 日志.
 

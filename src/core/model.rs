@@ -2,7 +2,7 @@ use crate::config::{
     ClipboardConfig, DiscoveryConfig, RuntimeConfig, SynlyConfig, TransferConfig,
     TrustedDeviceConfig, UiConfig,
 };
-use crate::runtime_control::InteractionRequest;
+use crate::runtime_control::{InteractionRequest, RuntimePeerSummary};
 use crate::protocol::{CapabilityEpoch, RuntimeCapabilities};
 use crate::settings::{AudioMode, ClipboardMode};
 use crate::input::InputMode;
@@ -89,7 +89,7 @@ pub struct AppSnapshot {
     pub pending: Option<RuntimeConfig>,
     pub applied: Option<RuntimeConfig>,
     pub settings: AppSettings,
-    pub current_peer: Option<String>,
+    pub current_peer: Option<RuntimePeerSummary>,
     pub discovered_peers: Vec<DiscoveredPeerView>,
     pub trusted_devices: Vec<TrustedDeviceConfig>,
     pub interaction: Option<PendingInteraction>,

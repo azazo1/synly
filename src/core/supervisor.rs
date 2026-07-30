@@ -315,7 +315,12 @@ impl AppSupervisor {
                 if self.config.revoke_trusted_device(device_id) {
                     self.save_trusted_devices();
                     self.snapshot.trusted_devices = self.config.trusted_devices.clone();
-                    if self.snapshot.current_peer.as_deref() == Some(&device_id.to_string()) {
+                    if self
+                        .snapshot
+                        .current_peer
+                        .as_ref()
+                        .is_some_and(|peer| peer.device_id == device_id)
+                    {
                         self.stop_session().await;
                     }
                     self.publish();
@@ -427,7 +432,7 @@ impl AppSupervisor {
             }
             RuntimeEvent::Connected(peer) => {
                 self.snapshot.lifecycle = AppLifecycle::Connected;
-                self.snapshot.current_peer = Some(peer.device_id.to_string());
+                self.snapshot.current_peer = Some(peer);
             }
             RuntimeEvent::Disconnected => {
                 self.snapshot.lifecycle = AppLifecycle::Idle;
@@ -874,6 +879,19 @@ mod tests {
             ClipboardMode::Both
         );
         assert!(supervisor.snapshot.capabilities_acknowledged);
+    }
+
+    #[test]
+    fn connected_event_preserves_peer_display_name_without_discovery_match() {
+        let (mut supervisor, _) = AppSupervisor::new(test_config());
+        let peer = crate::runtime_control::RuntimePeerSummary {
+            device_id: Uuid::new_v4(),
+            display_name: "direct-peer".to_string(),
+        };
+
+        supervisor.handle_runtime_event(RuntimeEvent::Connected(peer.clone()));
+
+        assert_eq!(supervisor.snapshot.current_peer, Some(peer));
     }
 
     #[test]

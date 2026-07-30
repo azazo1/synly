@@ -140,6 +140,7 @@ export component AppWindow inherits Window {
     in property <string> interaction-detail;
     in property <string> interaction-art;
     in property <string> interaction-pin;
+    in property <string> monospace-font-family: "monospace";
     in property <int> interaction-kind: 0;
     in-out property <string> entered-pin;
     in-out property <bool> interaction-trust: false;
@@ -604,7 +605,7 @@ export component AppWindow inherits Window {
                 spacing: 8px;
                 Text { text: root.interaction-title; font-size: 20px; font-weight: 650; color: #202523; }
                 Text { text: root.interaction-detail; wrap: word-wrap; color: #555b58; }
-                TextEdit { text: root.interaction-art; read-only: true; vertical-stretch: 1; font-family: "monospace"; font-size: 10px; }
+                TextEdit { text: root.interaction-art; read-only: true; vertical-stretch: 1; font-family: root.monospace-font-family; font-size: 10px; wrap: no-wrap; }
                 if root.interaction-pin != "": Text { text: "PIN: " + root.interaction-pin; font-size: 24px; font-weight: 700; color: #2e7d5b; horizontal-alignment: center; }
                 if root.interaction-kind == 1: LineEdit { text <=> root.entered-pin; placeholder-text: "输入 6 位 PIN"; input-type: password; }
                 if root.interaction-kind == 2: CheckBox { text: "建立长期信任"; checked <=> root.interaction-trust; }

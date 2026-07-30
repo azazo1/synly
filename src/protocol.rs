@@ -18,7 +18,7 @@ const DEFAULT_MAX_FRAME_DATA_LEN: usize = 128 * 1024 * 1024;
 const DEFAULT_MAX_CLIPBOARD_BINARY_LEN: usize = 100 * 1024 * 1024;
 const CLIPBOARD_STREAM_CHUNK_SIZE: usize = 1024 * 1024;
 
-pub const PROTOCOL_VERSION: u16 = 18;
+pub const PROTOCOL_VERSION: u16 = 19;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeCapabilities {
@@ -93,6 +93,7 @@ pub enum ControlMessage {
     BootstrapHello {
         protocol_version: u16,
         client_bootstrap_public_key: String,
+        device_name: String,
     },
     BootstrapChallenge {
         request_id: String,
@@ -736,6 +737,26 @@ mod tests {
                 assert!(trust_established);
             }
             other => panic!("expected pair decision, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bootstrap_hello_roundtrip_preserves_device_name() {
+        let message = ControlMessage::BootstrapHello {
+            protocol_version: PROTOCOL_VERSION,
+            client_bootstrap_public_key: "bootstrap-key".to_string(),
+            device_name: "client-device".to_string(),
+        };
+
+        let encoded = encode_payload(&message).unwrap();
+        let decoded: ControlMessage =
+            decode_payload(&encoded, "failed to decode bootstrap hello").unwrap();
+
+        match decoded {
+            ControlMessage::BootstrapHello { device_name, .. } => {
+                assert_eq!(device_name, "client-device");
+            }
+            other => panic!("expected bootstrap hello, got {other:?}"),
         }
     }
 
