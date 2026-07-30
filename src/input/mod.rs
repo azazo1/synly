@@ -4,6 +4,8 @@ mod hotkey;
 mod mapping;
 #[cfg(target_os = "macos")]
 pub mod mock;
+#[cfg(all(target_os = "macos", feature = "input-macos-trackpad-debug"))]
+pub mod trackpad_debug;
 #[cfg(feature = "input-receiver-mock")]
 pub mod receiver_mock;
 mod platform;

@@ -55,6 +55,8 @@ const EVENT_OTHER_DOWN: CGEventType = 25;
 const EVENT_OTHER_UP: CGEventType = 26;
 const EVENT_OTHER_DRAGGED: CGEventType = 27;
 const EVENT_GESTURE: CGEventType = 29;
+const EVENT_DOCK_SWIPE: CGEventType = 30;
+const EVENT_NAVIGATION_SWIPE: CGEventType = 31;
 const EVENT_TAP_DISABLED_TIMEOUT: CGEventType = u32::MAX - 1;
 const EVENT_TAP_DISABLED_USER_INPUT: CGEventType = u32::MAX;
 const FIELD_MOUSE_BUTTON: u32 = 3;
@@ -227,6 +229,8 @@ fn run_event_tap(state: Arc<MacState>, ready: std::sync::mpsc::SyncSender<Result
         EVENT_OTHER_UP,
         EVENT_OTHER_DRAGGED,
         EVENT_GESTURE,
+        EVENT_DOCK_SWIPE,
+        EVENT_NAVIGATION_SWIPE,
     ]
     .into_iter()
     .fold(0u64, |mask, event| mask | (1u64 << event));
@@ -350,7 +354,7 @@ unsafe extern "C" fn event_callback(
                 event
             }
         }
-        EVENT_GESTURE => {
+        EVENT_GESTURE | EVENT_DOCK_SWIPE | EVENT_NAVIGATION_SWIPE => {
             if suppress_local_gesture(event_type, active) { ptr::null_mut() } else { event }
         }
         EVENT_KEY_DOWN | EVENT_KEY_UP | EVENT_FLAGS_CHANGED => {
@@ -400,7 +404,11 @@ unsafe extern "C" fn event_callback(
 }
 
 fn suppress_local_gesture(event_type: CGEventType, capture_active: bool) -> bool {
-    capture_active && event_type == EVENT_GESTURE
+    capture_active
+        && matches!(
+            event_type,
+            EVENT_GESTURE | EVENT_DOCK_SWIPE | EVENT_NAVIGATION_SWIPE
+        )
 }
 
 fn scroll_source(is_continuous: i64) -> ScrollSource {
@@ -758,8 +766,8 @@ fn hid_to_mac_keycode(usage: u16) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::{
-        CaptureContext, EVENT_GESTURE, EVENT_SCROLL, MacBackend, MacState, NativeEvent,
-        mac_mouse_button, scroll_source, suppress_local_gesture,
+        CaptureContext, EVENT_DOCK_SWIPE, EVENT_GESTURE, EVENT_NAVIGATION_SWIPE, EVENT_SCROLL,
+        MacBackend, MacState, NativeEvent, mac_mouse_button, scroll_source, suppress_local_gesture,
     };
     use crate::input::platform::{InputBackend, MotionAccumulator, ScrollSource};
     use crate::input::{Hotkey, InputMode, ModifierMask};
@@ -780,7 +788,11 @@ mod tests {
     #[test]
     fn active_capture_suppresses_gestures_but_not_scroll_events() {
         assert!(suppress_local_gesture(EVENT_GESTURE, true));
+        assert!(suppress_local_gesture(EVENT_DOCK_SWIPE, true));
+        assert!(suppress_local_gesture(EVENT_NAVIGATION_SWIPE, true));
         assert!(!suppress_local_gesture(EVENT_GESTURE, false));
+        assert!(!suppress_local_gesture(EVENT_DOCK_SWIPE, false));
+        assert!(!suppress_local_gesture(EVENT_NAVIGATION_SWIPE, false));
         assert!(!suppress_local_gesture(EVENT_SCROLL, true));
     }
 

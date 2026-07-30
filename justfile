@@ -32,6 +32,10 @@ install:
 input-macos-mock *args:
     cargo run --features input-macos-mock --bin input-macos-mock -- {{ args }}
 
+# 完全捕获 macOS trackpad 事件并输出诊断日志, 按任意键退出.
+input-macos-trackpad-debug:
+    cargo run --features input-macos-trackpad-debug --bin input-macos-trackpad-debug
+
 # just input-receiver-mock receive --listen 0.0.0.0:59679
 # 使用真实被控端和 mock 控制端验证系统输入注入.
 input-receiver-mock *args:
