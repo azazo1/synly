@@ -372,6 +372,7 @@ async fn run_continuous_browse(
     let mut mdns_open = discovery.mdns_enabled;
     let mut lnd_tick = tokio::time::interval(CONTINUOUS_LND_INTERVAL);
     lnd_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut lnd_failures = 0u32;
     let mut expiry_tick = tokio::time::interval(Duration::from_secs(1));
     expiry_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -400,11 +401,23 @@ async fn run_continuous_browse(
                 let config = discovery.lnd.as_ref().expect("LND config checked");
                 match browse_lnd(config, CONTINUOUS_LND_TIMEOUT).await {
                     Ok(peers) => {
+                        if lnd_failures > 0 {
+                            tracing::info!(failed_attempts = lnd_failures, "持续 LND 发现已恢复");
+                        }
+                        lnd_failures = 0;
                         cache.update_lnd(peers, Instant::now());
                         true
                     }
                     Err(error) => {
-                        tracing::warn!(error = %error, "持续 LND 发现刷新失败");
+                        lnd_failures = lnd_failures.saturating_add(1);
+                        if should_report_lnd_failure(lnd_failures) {
+                            tracing::warn!(
+                                error = %format_args!("{error:#}"),
+                                server_url = %config.server_url,
+                                failed_attempts = lnd_failures,
+                                "持续 LND 发现刷新失败"
+                            );
+                        }
                         false
                     }
                 }
@@ -415,6 +428,10 @@ async fn run_continuous_browse(
             updates.send_replace(cache.snapshot());
         }
     }
+}
+
+fn should_report_lnd_failure(failures: u32) -> bool {
+    failures == 1 || failures.is_multiple_of(12)
 }
 
 fn browse_mdns_events(
@@ -988,7 +1005,7 @@ mod tests {
         LND_STALE_AFTER, LocalIpv4Interface,
         build_lnd_announce_spec, combine_browse_results, discovered_peer_from_lnd,
         discovered_peers_from_lnd, group_peer_addresses_for_interfaces, merge_peers,
-        normalize_lnd_config,
+        normalize_lnd_config, should_report_lnd_failure,
     };
     use crate::cli::{AudioMode, ClipboardMode, FileSyncMode};
     use crate::config::{DeviceConfig, LndDiscoveryConfig};
@@ -1038,6 +1055,16 @@ mod tests {
         let remaining = cache.snapshot();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].source, DiscoverySource::Mdns);
+    }
+
+    #[test]
+    fn continuous_lnd_failure_reporting_is_rate_limited() {
+        assert!(should_report_lnd_failure(1));
+        assert!(!should_report_lnd_failure(2));
+        assert!(!should_report_lnd_failure(11));
+        assert!(should_report_lnd_failure(12));
+        assert!(!should_report_lnd_failure(13));
+        assert!(should_report_lnd_failure(24));
     }
 
     #[test]

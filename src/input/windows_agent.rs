@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeServer, ServerOptions};
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc, watch};
 use tokio::time::{self, Instant, MissedTickBehavior};
 use uuid::Uuid;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LocalFree};
@@ -46,6 +46,7 @@ const DISPATCH_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 const CLIENT_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
 const AGENT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
+const IPC_SLOW_OPERATION_TRACE_AFTER: Duration = Duration::from_millis(250);
 
 static AGENT: OnceLock<Mutex<Option<Arc<AgentClient>>>> = OnceLock::new();
 
@@ -97,6 +98,10 @@ impl AgentRequest {
                 | Self::WarpCursor(_)
                 | Self::ReleaseAll
         )
+    }
+
+    fn requires_cursor_ordering(&self) -> bool {
+        matches!(self, Self::InjectButton { .. } | Self::InjectWheel { .. })
     }
 }
 
@@ -166,6 +171,12 @@ struct ClientCommand {
     response: Option<std::sync::mpsc::SyncSender<Result<AgentResponse, String>>>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct CursorUpdate {
+    point: Point,
+    queued_at: Instant,
+}
+
 type PendingResponses = Arc<Mutex<HashMap<
     u64,
     std::sync::mpsc::SyncSender<Result<AgentResponse, String>>,
@@ -173,6 +184,7 @@ type PendingResponses = Arc<Mutex<HashMap<
 
 struct AgentClient {
     commands: mpsc::Sender<ClientCommand>,
+    latest_cursor: watch::Sender<Option<CursorUpdate>>,
     context: Arc<Mutex<Option<CaptureContext>>>,
     alive: Arc<AtomicBool>,
     lifecycle: Mutex<()>,
@@ -193,6 +205,13 @@ struct NativeAgentRuntime {
 
 struct AgentHeartbeat {
     last_seen: Instant,
+}
+
+#[derive(Clone, Copy)]
+struct ActiveAgentRequest {
+    id: u64,
+    request: &'static str,
+    started: Instant,
 }
 
 impl AgentHeartbeat {
@@ -473,6 +492,19 @@ impl AgentClient {
             tracing::trace!(request = request.name(), "Windows 输入代理通知因连接关闭被丢弃"); // to remove
             return;
         }
+        let request = match request {
+            AgentRequest::InjectCursor(point) => {
+                if let Err(error) = self.latest_cursor.send(Some(CursorUpdate {
+                    point,
+                    queued_at: Instant::now(),
+                })) {
+                    tracing::trace!(error = %error, "Windows 输入代理最新光标通知发送失败"); // to remove
+                    mark_agent_unavailable(&self.alive, "InjectCursor", "cursor-channel-closed");
+                }
+                return;
+            }
+            request => request,
+        };
         let request_name = request.name();
         if let Err(error) = self.commands.try_send(ClientCommand {
             request,
@@ -780,10 +812,12 @@ async fn connect_agent(
     }
 
     let (commands, command_rx) = mpsc::channel(64);
+    let (latest_cursor, cursor_rx) = watch::channel(None);
     let context = Arc::new(Mutex::new(None));
     let alive = Arc::new(AtomicBool::new(true));
     let client = Arc::new(AgentClient {
         commands,
+        latest_cursor,
         context: Arc::clone(&context),
         alive: Arc::clone(&alive),
         lifecycle: Mutex::new(()),
@@ -795,7 +829,7 @@ async fn connect_agent(
         .map_err(|_| anyhow!("Windows input agent readiness receiver closed"))?;
     tracing::trace!(agent_pid, parent_pid, "Windows 输入代理 GUI 端 client 已发布为 ready"); // to remove
     let heartbeat_task = spawn_client_heartbeat(client.commands.clone(), Arc::clone(&alive));
-    let result = client_loop(server, command_rx, context, alive).await;
+    let result = client_loop(server, command_rx, cursor_rx, context, alive).await;
     tracing::trace!(agent_pid, parent_pid, result = ?result.as_ref().err(), "Windows 输入代理 GUI 端 client loop 已返回"); // to remove
     heartbeat_task.abort();
     let _ = heartbeat_task.await;
@@ -830,22 +864,29 @@ fn spawn_client_heartbeat(
 async fn client_loop(
     server: NamedPipeServer,
     commands: mpsc::Receiver<ClientCommand>,
+    latest_cursor: watch::Receiver<Option<CursorUpdate>>,
     context: Arc<Mutex<Option<CaptureContext>>>,
     alive: Arc<AtomicBool>,
 ) -> Result<()> {
     tracing::trace!("Windows 输入代理 GUI client loop 开始"); // to remove
     let (reader, writer) = tokio::io::split(server);
-    let (mut packets, reader_task) = spawn_packet_reader(reader);
+    let (mut packets, reader_task) = spawn_packet_reader(reader, "gui-response");
     let pending = Arc::new(Mutex::new(HashMap::new()));
     let heartbeat_probe = Arc::new(AtomicU64::new(0));
+    let cursor_probe = Arc::new(AtomicU64::new(0));
+    let cursor_ready = Arc::new(Notify::new());
     let mut writer_task = tokio::spawn(command_writer_loop(
         writer,
         commands,
+        latest_cursor,
         Arc::clone(&pending),
         Arc::clone(&heartbeat_probe),
+        Arc::clone(&cursor_probe),
+        Arc::clone(&cursor_ready),
     ));
     let mut writer_finished = false;
     let mut unmatched_response = 0usize;
+    let mut acknowledged_cursor = 0usize;
     let result: Result<()> = async {
         loop {
             tokio::select! {
@@ -865,14 +906,22 @@ async fn client_loop(
                         let heartbeat_response = heartbeat_probe
                             .compare_exchange(id, 0, Ordering::AcqRel, Ordering::Acquire)
                             .is_ok();
-                        if heartbeat_response {
-                            let roundtrip = id;
-                            if roundtrip == 1 || roundtrip % 10 == 0 {
-                                tracing::debug!(
-                                    target: "synly_input_agent",
-                                    request_id = id,
-                                    "Windows 输入代理保活往返已确认"
-                                );
+                        let cursor_response = cursor_probe
+                            .compare_exchange(id, 0, Ordering::AcqRel, Ordering::Acquire)
+                            .is_ok();
+                        if cursor_response {
+                            cursor_ready.notify_one();
+                            acknowledged_cursor = acknowledged_cursor.saturating_add(1);
+                            if let AgentResponse::Error(message) = &response
+                                && let Ok(context) = context.lock()
+                                && let Some(context) = context.as_ref()
+                            {
+                                context.emit_reliable(NativeEvent::Failed(format!(
+                                    "Windows input agent cursor injection failed: {message}"
+                                )));
+                            }
+                            if acknowledged_cursor == 1 || acknowledged_cursor % 500 == 0 {
+                                tracing::trace!(count = acknowledged_cursor, request_id = id, response = response_name, "Windows 输入代理 GUI 光标请求确认汇总"); // to remove
                             }
                         }
                         let sender = pending
@@ -882,11 +931,9 @@ async fn client_loop(
                         if let Some(sender) = sender {
                             tracing::trace!(request_id = id, response = response_name, "Windows 输入代理 GUI response id 已匹配 pending"); // to remove
                             let _ = sender.try_send(Ok(response));
-                        } else {
+                        } else if !heartbeat_response && !cursor_response {
                             unmatched_response = unmatched_response.saturating_add(1);
-                            if !heartbeat_response
-                                && (unmatched_response == 1 || unmatched_response % 500 == 0)
-                            {
+                            if unmatched_response == 1 || unmatched_response % 500 == 0 {
                                 tracing::trace!(count = unmatched_response, request_id = id, response = response_name, "Windows 输入代理 GUI 收到无 waiter response 汇总"); // to remove
                             }
                         }
@@ -963,7 +1010,7 @@ async fn client_loop(
         }
     }
     .await;
-    tracing::trace!(writer_finished, unmatched_response, result = ?result.as_ref().err(), "Windows 输入代理 GUI client loop 准备清理"); // to remove
+    tracing::trace!(writer_finished, unmatched_response, acknowledged_cursor, result = ?result.as_ref().err(), "Windows 输入代理 GUI client loop 准备清理"); // to remove
     if !writer_finished {
         writer_task.abort();
         let _ = writer_task.await;
@@ -1021,103 +1068,218 @@ fn agent_completion_packet(
 async fn command_writer_loop<W>(
     mut writer: W,
     mut commands: mpsc::Receiver<ClientCommand>,
+    mut latest_cursor: watch::Receiver<Option<CursorUpdate>>,
     pending: PendingResponses,
     heartbeat_probe: Arc<AtomicU64>,
+    cursor_probe: Arc<AtomicU64>,
+    cursor_ready: Arc<Notify>,
 ) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
     let mut next_id = 1u64;
     let mut written_inject_cursor = 0usize;
+    let mut commands_open = true;
+    let mut cursor_open = true;
     tracing::trace!("Windows 输入代理 GUI command writer 开始"); // to remove
-    while let Some(command) = commands.recv().await {
-        let ClientCommand {
-            request,
-            queued_at,
-            dispatched,
-            response,
-        } = command;
-        let id = next_id;
-        next_id = next_id.saturating_add(1);
-        let request_name = request.name();
-        let report_diagnostic = request.reports_diagnostic();
-        let is_inject_cursor = matches!(&request, AgentRequest::InjectCursor(_));
-        let is_heartbeat_probe = matches!(&request, AgentRequest::Health)
-            && response.is_none()
-            && heartbeat_probe.load(Ordering::Acquire) == 0;
-        let expects_response = response.is_some() || is_heartbeat_probe;
-        if let Some(response) = response {
-            pending
-                .lock()
-                .map_err(|_| anyhow!("Windows input agent pending response state poisoned"))?
-                .insert(id, response);
-            tracing::trace!(request = request_name, request_id = id, "Windows 输入代理 GUI 已登记 pending response"); // to remove
-        }
-        if !is_inject_cursor && !matches!(&request, AgentRequest::Health) {
-            tracing::trace!(request = request_name, request_id = id, queue_ms = queued_at.elapsed().as_millis(), "Windows 输入代理 GUI 开始写入 IPC request"); // to remove
-        }
-        if let Err(error) = write_packet(
-            &mut writer,
-            &AgentPacket::Request {
-                id,
-                expects_response,
-                request,
-            },
-        )
-        .await
-        {
-            tracing::trace!(request = request_name, request_id = id, error = %error, "Windows 输入代理 GUI 写入 IPC request 失败"); // to remove
-            if let Some(response) = pending
-                .lock()
-                .map_err(|_| anyhow!("Windows input agent pending response state poisoned"))?
-                .remove(&id)
-            {
-                let _ = response.try_send(Err(format!("{error:#}")));
+    while commands_open || cursor_open {
+        tokio::select! {
+            biased;
+            command = commands.recv(), if commands_open => {
+                let Some(command) = command else {
+                    commands_open = false;
+                    continue;
+                };
+                if cursor_open && command.request.requires_cursor_ordering() {
+                    match latest_cursor.has_changed() {
+                        Ok(true) => {
+                            let update = { *latest_cursor.borrow_and_update() };
+                            if let Some(update) = update {
+                                let acknowledge_cursor =
+                                    cursor_probe.load(Ordering::Acquire) == 0;
+                                write_client_command(
+                                    &mut writer,
+                                    ClientCommand {
+                                        request: AgentRequest::InjectCursor(update.point),
+                                        queued_at: update.queued_at,
+                                        dispatched: None,
+                                        response: None,
+                                    },
+                                    &pending,
+                                    &heartbeat_probe,
+                                    &cursor_probe,
+                                    acknowledge_cursor,
+                                    &mut next_id,
+                                    &mut written_inject_cursor,
+                                )
+                                .await?;
+                            }
+                        }
+                        Ok(false) => {}
+                        Err(_) => cursor_open = false,
+                    }
+                }
+                write_client_command(
+                    &mut writer,
+                    command,
+                    &pending,
+                    &heartbeat_probe,
+                    &cursor_probe,
+                    false,
+                    &mut next_id,
+                    &mut written_inject_cursor,
+                )
+                .await?;
             }
-            return Err(error);
-        }
-        if is_inject_cursor {
-            written_inject_cursor = written_inject_cursor.saturating_add(1);
-            if written_inject_cursor == 1 || written_inject_cursor % 500 == 0 {
-                tracing::trace!(count = written_inject_cursor, request_id = id, "Windows 输入代理 GUI 已写入 InjectCursor 汇总"); // to remove
+            changed = latest_cursor.changed(), if cursor_open && cursor_probe.load(Ordering::Acquire) == 0 => {
+                if changed.is_err() {
+                    cursor_open = false;
+                    continue;
+                }
+                let update = { *latest_cursor.borrow_and_update() };
+                if let Some(update) = update {
+                    write_client_command(
+                        &mut writer,
+                        ClientCommand {
+                            request: AgentRequest::InjectCursor(update.point),
+                            queued_at: update.queued_at,
+                            dispatched: None,
+                            response: None,
+                        },
+                        &pending,
+                        &heartbeat_probe,
+                        &cursor_probe,
+                        true,
+                        &mut next_id,
+                        &mut written_inject_cursor,
+                    )
+                    .await?;
+                }
             }
-        } else if request_name != "Health" {
-            tracing::trace!(request = request_name, request_id = id, "Windows 输入代理 GUI IPC request 写入完成"); // to remove
-        }
-        if let Some(dispatched) = dispatched {
-            let _ = dispatched.send(());
-            tracing::trace!(request = request_name, request_id = id, "Windows 输入代理 GUI 已通知同步调用方 request 完成派发"); // to remove
-        }
-        if is_heartbeat_probe
-            && heartbeat_probe
-                .compare_exchange(0, id, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            && (id == 1 || id % 10 == 0)
-        {
-            tracing::debug!(
-                target: "synly_input_agent",
-                request_id = id,
-                "Windows 输入代理保活请求已写入"
-            );
-        }
-        if report_diagnostic {
-            tracing::debug!(
-                target: "synly_input_agent",
-                request = request_name,
-                request_id = id,
-                queue_ms = queued_at.elapsed().as_millis(),
-                "Windows 输入代理 IPC 请求已写入"
-            );
+            _ = cursor_ready.notified(), if cursor_open && cursor_probe.load(Ordering::Acquire) != 0 => {}
         }
     }
     tracing::trace!(inject_cursor_count = written_inject_cursor, "Windows 输入代理 GUI command writer 收到关闭信号"); // to remove
     Ok(())
 }
 
+async fn write_client_command<W>(
+    writer: &mut W,
+    command: ClientCommand,
+    pending: &PendingResponses,
+    heartbeat_probe: &AtomicU64,
+    cursor_probe: &AtomicU64,
+    acknowledge_cursor: bool,
+    next_id: &mut u64,
+    written_inject_cursor: &mut usize,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let ClientCommand {
+        request,
+        queued_at,
+        dispatched,
+        response,
+    } = command;
+    let id = *next_id;
+    *next_id = (*next_id).saturating_add(1);
+    let request_name = request.name();
+    let report_diagnostic = request.reports_diagnostic();
+    let is_inject_cursor = matches!(&request, AgentRequest::InjectCursor(_));
+    let is_heartbeat_probe = matches!(&request, AgentRequest::Health)
+        && response.is_none()
+        && heartbeat_probe
+            .compare_exchange(0, id, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+    if matches!(&request, AgentRequest::Health)
+        && response.is_none()
+        && !is_heartbeat_probe
+    {
+        return Ok(());
+    }
+    let is_cursor_probe = is_inject_cursor
+        && acknowledge_cursor
+        && cursor_probe
+            .compare_exchange(0, id, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+    let expects_response = response.is_some() || is_heartbeat_probe || is_cursor_probe;
+    if let Some(response) = response {
+        pending
+            .lock()
+            .map_err(|_| anyhow!("Windows input agent pending response state poisoned"))?
+            .insert(id, response);
+        tracing::trace!(request = request_name, request_id = id, "Windows 输入代理 GUI 已登记 pending response"); // to remove
+    }
+    if !is_inject_cursor && !matches!(&request, AgentRequest::Health) {
+        tracing::trace!(request = request_name, request_id = id, queue_ms = queued_at.elapsed().as_millis(), "Windows 输入代理 GUI 开始写入 IPC request"); // to remove
+    }
+    if let Err(error) = write_packet(
+        writer,
+        &AgentPacket::Request {
+            id,
+            expects_response,
+            request,
+        },
+    )
+    .await
+    {
+        tracing::trace!(request = request_name, request_id = id, error = %error, "Windows 输入代理 GUI 写入 IPC request 失败"); // to remove
+        if let Some(response) = pending
+            .lock()
+            .map_err(|_| anyhow!("Windows input agent pending response state poisoned"))?
+            .remove(&id)
+        {
+            let _ = response.try_send(Err(format!("{error:#}")));
+        }
+        if is_heartbeat_probe {
+            let _ = heartbeat_probe.compare_exchange(
+                id,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+        if is_cursor_probe {
+            let _ = cursor_probe.compare_exchange(
+                id,
+                0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+        }
+        return Err(error);
+    }
+    if is_inject_cursor {
+        *written_inject_cursor = (*written_inject_cursor).saturating_add(1);
+        if *written_inject_cursor == 1 || *written_inject_cursor % 500 == 0 {
+            tracing::trace!(count = *written_inject_cursor, request_id = id, "Windows 输入代理 GUI 已写入 InjectCursor 汇总"); // to remove
+        }
+    } else if request_name != "Health" {
+        tracing::trace!(request = request_name, request_id = id, "Windows 输入代理 GUI IPC request 写入完成"); // to remove
+    }
+    if let Some(dispatched) = dispatched {
+        let _ = dispatched.send(());
+        tracing::trace!(request = request_name, request_id = id, "Windows 输入代理 GUI 已通知同步调用方 request 完成派发"); // to remove
+    }
+    if report_diagnostic {
+        tracing::debug!(
+            target: "synly_input_agent",
+            request = request_name,
+            request_id = id,
+            queue_ms = queued_at.elapsed().as_millis(),
+            "Windows 输入代理 IPC 请求已写入"
+        );
+    }
+    Ok(())
+}
+
 async fn run_agent_loop(client: tokio::net::windows::named_pipe::NamedPipeClient) -> Result<()> {
     let (reader, mut writer) = tokio::io::split(client);
-    let (mut packets, reader_task) = spawn_packet_reader(reader);
+    let (mut packets, reader_task) = spawn_packet_reader(reader, "agent-request");
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<AgentPacket>(256);
+    let active_request = Arc::new(Mutex::new(None));
+    let request_watchdog = spawn_agent_request_watchdog(Arc::clone(&active_request));
     let mut runtime = None;
     let mut heartbeat = AgentHeartbeat::new(Instant::now());
     let mut paused = false;
@@ -1140,7 +1302,8 @@ async fn run_agent_loop(client: tokio::net::windows::named_pipe::NamedPipeClient
                         bail!("Windows input agent received an unexpected packet");
                     };
                     heartbeat.observe(Instant::now());
-                    let request_name = request.name().to_string();
+                    let request_kind = request.name();
+                    let request_name = request_kind.to_string();
                     let report_diagnostic = request.reports_diagnostic();
                     let is_inject_cursor = matches!(&request, AgentRequest::InjectCursor(_));
                     if is_inject_cursor {
@@ -1164,7 +1327,19 @@ async fn run_agent_loop(client: tokio::net::windows::named_pipe::NamedPipeClient
                         .await?;
                     }
                     let started = Instant::now();
+                    if let Ok(mut active) = active_request.lock() {
+                        *active = Some(ActiveAgentRequest {
+                            id,
+                            request: request_kind,
+                            started,
+                        });
+                    }
                     let response = handle_agent_request(request, &mut runtime, outgoing_tx.clone()).await;
+                    if let Ok(mut active) = active_request.lock()
+                        && active.as_ref().is_some_and(|active| active.id == id)
+                    {
+                        *active = None;
+                    }
                     if !is_inject_cursor && request_name != "Health" {
                         tracing::trace!(target: "synly_input_agent", request = %request_name, request_id = id, elapsed_ms = started.elapsed().as_millis(), result = ?response.as_ref().err(), "Windows 输入代理进程 backend 调用结束"); // to remove
                     }
@@ -1249,12 +1424,48 @@ async fn run_agent_loop(client: tokio::net::windows::named_pipe::NamedPipeClient
     }
     .await;
     tracing::trace!(target: "synly_input_agent", inject_cursor_count = processed_inject_cursor, outgoing_motion_count = outgoing_motion, result = ?result.as_ref().err(), "Windows 输入代理进程 request loop 已返回"); // to remove
+    request_watchdog.abort();
+    let _ = request_watchdog.await;
     reader_task.abort();
     let _ = reader_task.await;
     if let Some(runtime) = runtime {
         runtime.stop().await;
     }
     result
+}
+
+fn spawn_agent_request_watchdog(
+    active_request: Arc<Mutex<Option<ActiveAgentRequest>>>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut tick = time::interval(IPC_SLOW_OPERATION_TRACE_AFTER);
+        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut reported_id = 0u64;
+        loop {
+            tick.tick().await;
+            let active = active_request
+                .lock()
+                .ok()
+                .and_then(|active| *active);
+            match active {
+                Some(active)
+                    if active.started.elapsed() >= IPC_SLOW_OPERATION_TRACE_AFTER
+                        && reported_id != active.id =>
+                {
+                    reported_id = active.id;
+                    tracing::trace!(
+                        target: "synly_input_agent",
+                        request = active.request,
+                        request_id = active.id,
+                        elapsed_ms = active.started.elapsed().as_millis(),
+                        "Windows 输入代理 backend 请求仍在执行"
+                    ); // to remove
+                }
+                None => reported_id = 0,
+                _ => {}
+            }
+        }
+    })
 }
 
 async fn handle_agent_request(
@@ -1713,15 +1924,11 @@ where
         tracing::trace!(target: "synly_input_agent", packet = packet_name, length = bytes.len(), "Windows 输入代理 IPC packet 长度校验失败"); // to remove
         bail!("Windows input agent packet length is invalid");
     }
-    writer
-        .write_all(&(bytes.len() as u32).to_be_bytes())
-        .await
-        .map_err(|error| {
-            tracing::trace!(target: "synly_input_agent", packet = packet_name, error = %error, "Windows 输入代理 IPC packet 长度写入失败"); // to remove
-            error
-        })?;
-    writer.write_all(&bytes).await.map_err(|error| {
-        tracing::trace!(target: "synly_input_agent", packet = packet_name, error = %error, "Windows 输入代理 IPC packet body 写入失败"); // to remove
+    let mut frame = Vec::with_capacity(4 + bytes.len());
+    frame.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&bytes);
+    write_packet_frame(writer, &frame, packet).await.map_err(|error| {
+        tracing::trace!(target: "synly_input_agent", packet = packet_name, error = %error, "Windows 输入代理 IPC packet frame 写入失败"); // to remove
         error
     })?;
     writer.flush().await.map_err(|error| {
@@ -1729,6 +1936,47 @@ where
         error
     })?;
     Ok(())
+}
+
+async fn write_packet_frame<W>(
+    writer: &mut W,
+    frame: &[u8],
+    packet: &AgentPacket,
+) -> std::io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let packet_name = agent_packet_name(packet);
+    let (request_id, request) = agent_packet_request_context(packet);
+    let started = Instant::now();
+    let write = writer.write_all(frame);
+    tokio::pin!(write);
+    tokio::select! {
+        result = &mut write => result,
+        _ = time::sleep(IPC_SLOW_OPERATION_TRACE_AFTER) => {
+            tracing::trace!(
+                target: "synly_input_agent",
+                packet = packet_name,
+                ?request_id,
+                ?request,
+                frame_length = frame.len(),
+                elapsed_ms = started.elapsed().as_millis(),
+                "Windows 输入代理 IPC packet frame 写入仍在等待"
+            ); // to remove
+            let result = write.await;
+            tracing::trace!(
+                target: "synly_input_agent",
+                packet = packet_name,
+                ?request_id,
+                ?request,
+                frame_length = frame.len(),
+                elapsed_ms = started.elapsed().as_millis(),
+                result = ?result.as_ref().err(),
+                "Windows 输入代理 IPC packet frame 延迟写入已返回"
+            ); // to remove
+            result
+        }
+    }
 }
 
 async fn read_packet<R>(reader: &mut R) -> Result<AgentPacket>
@@ -1770,8 +2018,19 @@ fn agent_packet_name(packet: &AgentPacket) -> &'static str {
     }
 }
 
+fn agent_packet_request_context(
+    packet: &AgentPacket,
+) -> (Option<u64>, Option<&'static str>) {
+    match packet {
+        AgentPacket::Request { id, request, .. } => (Some(*id), Some(request.name())),
+        AgentPacket::Response { id, .. } => (Some(*id), None),
+        _ => (None, None),
+    }
+}
+
 fn spawn_packet_reader<R>(
     mut reader: R,
+    reader_name: &'static str,
 ) -> (
     mpsc::Receiver<Result<AgentPacket>>,
     tokio::task::JoinHandle<()>,
@@ -1784,9 +2043,33 @@ where
         loop {
             match read_packet(&mut reader).await {
                 Ok(packet) => {
+                    let packet_name = agent_packet_name(&packet);
+                    let (request_id, request) = agent_packet_request_context(&packet);
+                    let queued_at = Instant::now();
+                    if packets.capacity() == 0 {
+                        tracing::trace!(
+                            target: "synly_input_agent",
+                            %reader_name,
+                            packet = packet_name,
+                            ?request_id,
+                            ?request,
+                            "Windows 输入代理 IPC packet reader 下游队列已满"
+                        ); // to remove
+                    }
                     if packets.send(Ok(packet)).await.is_err() {
                         tracing::trace!(target: "synly_input_agent", "Windows 输入代理 IPC packet reader 下游已关闭"); // to remove
                         break;
+                    }
+                    if queued_at.elapsed() >= IPC_SLOW_OPERATION_TRACE_AFTER {
+                        tracing::trace!(
+                            target: "synly_input_agent",
+                            %reader_name,
+                            packet = packet_name,
+                            ?request_id,
+                            ?request,
+                            queue_ms = queued_at.elapsed().as_millis(),
+                            "Windows 输入代理 IPC packet reader 下游派发延迟"
+                        ); // to remove
                     }
                 }
                 Err(error) => {
@@ -1824,9 +2107,11 @@ mod tests {
     fn closed_command_queue_marks_agent_unavailable() {
         let (commands, receiver) = mpsc::channel(1);
         drop(receiver);
+        let (latest_cursor, _latest_cursor_rx) = watch::channel(None);
         let alive = Arc::new(AtomicBool::new(true));
         let client = AgentClient {
             commands,
+            latest_cursor,
             context: Arc::new(Mutex::new(None)),
             alive: Arc::clone(&alive),
             lifecycle: Mutex::new(()),
@@ -1841,8 +2126,10 @@ mod tests {
     #[test]
     fn stale_backend_drop_does_not_stop_current_lease() {
         let (commands, mut receiver) = mpsc::channel(4);
+        let (latest_cursor, _latest_cursor_rx) = watch::channel(None);
         let client = Arc::new(AgentClient {
             commands,
+            latest_cursor,
             context: Arc::new(Mutex::new(None)),
             alive: Arc::new(AtomicBool::new(true)),
             lifecycle: Mutex::new(()),
@@ -1862,8 +2149,10 @@ mod tests {
     #[test]
     fn current_backend_drop_stops_runtime_without_closing_reusable_agent() {
         let (commands, mut receiver) = mpsc::channel(4);
+        let (latest_cursor, _latest_cursor_rx) = watch::channel(None);
         let client = Arc::new(AgentClient {
             commands,
+            latest_cursor,
             context: Arc::new(Mutex::new(None)),
             alive: Arc::new(AtomicBool::new(true)),
             lifecycle: Mutex::new(()),
@@ -1887,9 +2176,11 @@ mod tests {
     #[test]
     fn backend_layout_and_health_use_local_state_without_queueing_requests() {
         let (commands, mut receiver) = mpsc::channel(1);
+        let (latest_cursor, _latest_cursor_rx) = watch::channel(None);
         let alive = Arc::new(AtomicBool::new(true));
         let client = Arc::new(AgentClient {
             commands,
+            latest_cursor,
             context: Arc::new(Mutex::new(None)),
             alive: Arc::clone(&alive),
             lifecycle: Mutex::new(()),
@@ -1927,6 +2218,153 @@ mod tests {
         alive.store(false, Ordering::Release);
         heartbeat_task.abort();
         let _ = heartbeat_task.await;
+    }
+
+    #[test]
+    fn cursor_notifications_do_not_fill_the_reliable_command_queue() {
+        let (commands, mut command_rx) = mpsc::channel(1);
+        let (latest_cursor, mut latest_cursor_rx) = watch::channel(None);
+        let client = AgentClient {
+            commands,
+            latest_cursor,
+            context: Arc::new(Mutex::new(None)),
+            alive: Arc::new(AtomicBool::new(true)),
+            lifecycle: Mutex::new(()),
+            next_lease: AtomicU64::new(1),
+            active_lease: AtomicU64::new(0),
+        };
+
+        for x in 0..1024 {
+            client.notify(AgentRequest::InjectCursor(Point { x, y: 10 }));
+        }
+        client.notify(AgentRequest::Stop);
+
+        let command = command_rx.try_recv().unwrap();
+        assert!(matches!(command.request, AgentRequest::Stop));
+        assert!(command_rx.try_recv().is_err());
+        let update = (*latest_cursor_rx.borrow_and_update()).unwrap();
+        assert_eq!(update.point, Point { x: 1023, y: 10 });
+    }
+
+    #[tokio::test]
+    async fn reliable_command_follows_latest_cursor_without_motion_backlog() {
+        let (writer, mut reader) = tokio::io::duplex(4096);
+        let (commands, command_rx) = mpsc::channel(1);
+        let (latest_cursor, latest_cursor_rx) = watch::channel(None);
+        for x in 0..1024 {
+            latest_cursor
+                .send(Some(CursorUpdate {
+                    point: Point { x, y: 20 },
+                    queued_at: Instant::now(),
+                }))
+                .unwrap();
+        }
+        let (dispatch_tx, dispatch_rx) = std::sync::mpsc::sync_channel(1);
+        let (response_tx, _response_rx) = std::sync::mpsc::sync_channel(1);
+        assert!(
+            commands
+                .try_send(ClientCommand {
+                    request: AgentRequest::InjectButton {
+                        button: 1,
+                        down: true,
+                    },
+                    queued_at: Instant::now(),
+                    dispatched: Some(dispatch_tx),
+                    response: Some(response_tx),
+                })
+                .is_ok()
+        );
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let heartbeat_probe = Arc::new(AtomicU64::new(0));
+        let cursor_probe = Arc::new(AtomicU64::new(0));
+        let cursor_ready = Arc::new(Notify::new());
+        let writer_pending = Arc::clone(&pending);
+        let writer_heartbeat = Arc::clone(&heartbeat_probe);
+        let writer_cursor_probe = Arc::clone(&cursor_probe);
+        let writer_cursor_ready = Arc::clone(&cursor_ready);
+        let writer_task = tokio::spawn(command_writer_loop(
+            writer,
+            command_rx,
+            latest_cursor_rx,
+            writer_pending,
+            writer_heartbeat,
+            writer_cursor_probe,
+            writer_cursor_ready,
+        ));
+
+        let cursor_packet = time::timeout(Duration::from_secs(1), read_packet(&mut reader))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            cursor_packet,
+            AgentPacket::Request {
+                id: 1,
+                expects_response: true,
+                request: AgentRequest::InjectCursor(Point { x: 1023, y: 20 }),
+            }
+        ));
+        let button_packet = time::timeout(Duration::from_secs(1), read_packet(&mut reader))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            button_packet,
+            AgentPacket::Request {
+                id: 2,
+                expects_response: true,
+                request: AgentRequest::InjectButton {
+                    button: 1,
+                    down: true,
+                },
+            }
+        ));
+        assert!(dispatch_rx.try_recv().is_ok());
+        assert!(pending.lock().unwrap().contains_key(&2));
+        assert_eq!(cursor_probe.load(Ordering::Acquire), 1);
+
+        for x in 1024..2048 {
+            latest_cursor
+                .send(Some(CursorUpdate {
+                    point: Point { x, y: 30 },
+                    queued_at: Instant::now(),
+                }))
+                .unwrap();
+        }
+        assert!(
+            cursor_probe
+                .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        );
+        cursor_ready.notify_one();
+        let next_cursor_packet =
+            time::timeout(Duration::from_secs(1), read_packet(&mut reader))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(matches!(
+            next_cursor_packet,
+            AgentPacket::Request {
+                id: 3,
+                expects_response: true,
+                request: AgentRequest::InjectCursor(Point { x: 2047, y: 30 }),
+            }
+        ));
+        assert_eq!(cursor_probe.load(Ordering::Acquire), 3);
+        assert!(
+            cursor_probe
+                .compare_exchange(3, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        );
+        cursor_ready.notify_one();
+
+        drop(commands);
+        drop(latest_cursor);
+        time::timeout(Duration::from_secs(1), writer_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 
     #[test]
@@ -2001,7 +2439,7 @@ mod tests {
                 }
             }
         });
-        let (mut packets, reader_task) = spawn_packet_reader(reader);
+        let (mut packets, reader_task) = spawn_packet_reader(reader, "test");
 
         assert!(matches!(
             packets.recv().await.unwrap().unwrap(),

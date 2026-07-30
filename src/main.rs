@@ -65,7 +65,9 @@ fn run_internal_command(command: &cli::InternalCommand) -> Result<()> {
                         anyhow::anyhow!("failed to initialize input agent tracing: {error}")
                     })?;
                 tracing::trace!(%pipe, parent_pid, "Windows 输入代理内部子进程入口已启动"); // to remove
-                let runtime = tokio::runtime::Builder::new_current_thread()
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .thread_name("synly-input-agent")
                     .enable_all()
                     .build()?;
                 return runtime.block_on(input::run_agent(

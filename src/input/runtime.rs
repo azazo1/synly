@@ -339,7 +339,7 @@ where
     let motion = Arc::new(IncomingMotion::default());
     let reader_motion = Arc::clone(&motion);
     let task = tokio::spawn(async move {
-        let mut reported_heartbeat_generation = None;
+        // let mut reported_heartbeat_generation = None;
         let mut received_motion = 0usize;
         loop {
             match read_message(&mut reader).await {
@@ -351,36 +351,36 @@ where
                     reader_motion.push(generation, dx, dy);
                 }
                 Ok(message) => {
-                    match &message {
-                        InputMessage::Activate { generation, .. } => {
-                            tracing::trace!(generation, "输入通道 Activate 已读取"); // to remove
-                        }
-                        InputMessage::Heartbeat { generation }
-                            if reported_heartbeat_generation != Some(*generation) =>
-                        {
-                            reported_heartbeat_generation = Some(*generation);
-                            tracing::trace!(generation, "输入通道当前 generation 首个心跳已读取"); // to remove
-                        }
-                        InputMessage::Layout(_) => {
-                            tracing::trace!("输入辅助 reader 已读取 Layout"); // to remove
-                        }
-                        InputMessage::Deactivate { generation } => {
-                            tracing::trace!(generation, "输入辅助 reader 已读取 Deactivate"); // to remove
-                        }
-                        InputMessage::Return { generation, edge_position } => {
-                            tracing::trace!(generation, edge_position, "输入辅助 reader 已读取 Return"); // to remove
-                        }
-                        InputMessage::Key { generation, usage, down, repeat, .. } => {
-                            tracing::trace!(generation, usage, down, repeat, "输入辅助 reader 已读取 Key"); // to remove
-                        }
-                        InputMessage::Button { generation, button, down } => {
-                            tracing::trace!(generation, button, down, "输入辅助 reader 已读取 Button"); // to remove
-                        }
-                        InputMessage::Wheel { generation, x, y } => {
-                            tracing::trace!(generation, x, y, "输入辅助 reader 已读取 Wheel"); // to remove
-                        }
-                        _ => {}
-                    }
+                    // match &message {
+                    //     InputMessage::Activate { generation, .. } => {
+                    //         tracing::trace!(generation, "输入通道 Activate 已读取"); // to remove
+                    //     }
+                    //     InputMessage::Heartbeat { generation }
+                    //         if reported_heartbeat_generation != Some(*generation) =>
+                    //     {
+                    //         reported_heartbeat_generation = Some(*generation);
+                    //         tracing::trace!(generation, "输入通道当前 generation 首个心跳已读取"); // to remove
+                    //     }
+                    //     InputMessage::Layout(_) => {
+                    //         tracing::trace!("输入辅助 reader 已读取 Layout"); // to remove
+                    //     }
+                    //     InputMessage::Deactivate { generation } => {
+                    //         tracing::trace!(generation, "输入辅助 reader 已读取 Deactivate"); // to remove
+                    //     }
+                    //     InputMessage::Return { generation, edge_position } => {
+                    //         tracing::trace!(generation, edge_position, "输入辅助 reader 已读取 Return"); // to remove
+                    //     }
+                    //     InputMessage::Key { generation, usage, down, repeat, .. } => {
+                    //         tracing::trace!(generation, usage, down, repeat, "输入辅助 reader 已读取 Key"); // to remove
+                    //     }
+                    //     InputMessage::Button { generation, button, down } => {
+                    //         tracing::trace!(generation, button, down, "输入辅助 reader 已读取 Button"); // to remove
+                    //     }
+                    //     InputMessage::Wheel { generation, x, y } => {
+                    //         tracing::trace!(generation, x, y, "输入辅助 reader 已读取 Wheel"); // to remove
+                    //     }
+                    //     _ => {}
+                    // }
                     if !matches!(message, InputMessage::Heartbeat { .. })
                         && let Some(motion) = reader_motion.take()
                         && tx
@@ -604,16 +604,16 @@ pub(super) async fn run_sender(
                         );
                         last_activation_ready = Some(activation_ready);
                     }
-                    tracing::debug!(
-                        point = ?point,
-                        dx = sample.dx,
-                        dy = sample.dy,
-                        position_updated = sample.position_updated,
-                        edge = ?source_edge,
-                        activation_ready,
-                        displays = ?local_layout.displays,
-                        "输入发送端检查本机边缘"
-                    );
+                    // tracing::debug!(
+                    //     point = ?point,
+                    //     dx = sample.dx,
+                    //     dy = sample.dy,
+                    //     position_updated = sample.position_updated,
+                    //     edge = ?source_edge,
+                    //     activation_ready,
+                    //     displays = ?local_layout.displays,
+                    //     "输入发送端检查本机边缘"
+                    // );
                     if !motion_logged {
                         tracing::info!(
                             dx = sample.dx,
@@ -650,9 +650,6 @@ pub(super) async fn run_sender(
             }
             _ = heartbeat.tick() => {
                 enqueue_message(tx, InputMessage::Heartbeat { generation })?;
-                if generation > 0 {
-                    tracing::trace!(generation, "输入发送端 heartbeat 已入队"); // to remove
-                }
             }
             _ = overflow_poll.tick() => {
                 platform.backend.health_check()?;
@@ -830,7 +827,6 @@ pub(super) async fn run_receiver(
             biased;
             _ = heartbeat.tick() => {
                 enqueue_message(tx, InputMessage::Heartbeat { generation })?;
-                tracing::trace!(generation, "输入接收端 heartbeat 已入队"); // to remove
             }
             _ = timeout_tick.tick() => {
                 if active && Instant::now().duration_since(last_heartbeat) >= HEARTBEAT_TIMEOUT {
@@ -881,7 +877,6 @@ pub(super) async fn run_receiver(
                     }
                     InputMessage::Heartbeat { generation: incoming_generation } if incoming_generation == generation => {
                         last_heartbeat = Instant::now();
-                        tracing::trace!(generation, "输入接收端收到匹配 heartbeat"); // to remove
                     }
                     InputMessage::Heartbeat { generation: incoming_generation } => {
                         tracing::trace!(generation, incoming_generation, "输入接收端忽略不匹配 heartbeat"); // to remove

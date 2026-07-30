@@ -28,7 +28,9 @@ fn main() -> Result<()> {
         .try_init()
         .map_err(|error| anyhow::anyhow!("failed to initialize input agent tracing: {error}"))?;
     let cli = AgentCli::parse();
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("synly-input-agent")
         .enable_all()
         .build()
         .context("failed to create input agent runtime")?;
