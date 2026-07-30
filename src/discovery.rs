@@ -133,8 +133,6 @@ impl DiscoveredPeer {
 #[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 struct PeerKey {
     device_id: String,
-    instance_name: Option<String>,
-    port: u16,
 }
 
 #[derive(Clone)]
@@ -151,6 +149,9 @@ struct DiscoveryCache {
 
 impl DiscoveryCache {
     fn upsert_mdns(&mut self, peer: DiscoveredPeer, now: Instant) {
+        self.mdns.retain(|fullname, seen| {
+            fullname == &peer.fullname || seen.peer.device_id != peer.device_id
+        });
         self.mdns.insert(
             peer.fullname.clone(),
             SeenPeer {
@@ -165,13 +166,12 @@ impl DiscoveryCache {
     }
 
     fn update_lnd(&mut self, peers: Vec<DiscoveredPeer>, now: Instant) {
+        let mut next = BTreeMap::new();
         for peer in peers {
             let key = PeerKey {
                 device_id: peer.device_id.clone(),
-                instance_name: peer.instance_name.clone(),
-                port: peer.port,
             };
-            self.lnd.insert(
+            next.insert(
                 key,
                 SeenPeer {
                     peer,
@@ -179,6 +179,7 @@ impl DiscoveryCache {
                 },
             );
         }
+        self.lnd = next;
     }
 
     fn expire(&mut self, now: Instant) -> bool {
@@ -563,7 +564,7 @@ fn build_lnd_announce_spec(
     config: &LndDiscoveryConfig,
 ) -> Result<AnnounceSpec> {
     let normalized = normalize_lnd_config(config)?;
-    let node_id = format!("{}:{}", advertisement.device.device_id, advertisement.port);
+    let node_id = advertisement.device.device_id.to_string();
     let display_name = format_display_name(
         advertisement.instance_name.as_deref(),
         &advertisement.device.device_name,
@@ -679,10 +680,7 @@ async fn browse_lnd(config: &LndDiscoveryConfig, timeout: Duration) -> Result<Ve
         filter = filter.with_reachability_scopes(scopes);
     }
     let nodes = client.list(filter).await.context("LND list request failed")?;
-    Ok(nodes
-        .into_iter()
-        .filter_map(|node| discovered_peer_from_lnd(&node))
-        .collect())
+    Ok(discovered_peers_from_lnd(nodes))
 }
 
 fn build_lnd_client(
@@ -843,6 +841,31 @@ fn discovered_peer_from_lnd(node: &DiscoveredNode) -> Option<DiscoveredPeer> {
     })
 }
 
+fn discovered_peers_from_lnd(nodes: Vec<DiscoveredNode>) -> Vec<DiscoveredPeer> {
+    let mut latest = BTreeMap::<String, (DiscoveredPeer, (u64, u64, u64))>::new();
+    for node in nodes {
+        let Some(peer) = discovered_peer_from_lnd(&node) else {
+            continue;
+        };
+        let rank = (
+            node.lease.last_seen_unix_ms,
+            node.lease.expires_at_unix_ms,
+            node.lease.revision,
+        );
+        match latest.get_mut(&peer.device_id) {
+            Some((current, current_rank)) if rank > *current_rank => {
+                *current = peer;
+                *current_rank = rank;
+            }
+            None => {
+                latest.insert(peer.device_id.clone(), (peer, rank));
+            }
+            _ => {}
+        }
+    }
+    latest.into_values().map(|(peer, _)| peer).collect()
+}
+
 fn merge_peers(
     mdns_peers: Vec<DiscoveredPeer>,
     lnd_peers: Vec<DiscoveredPeer>,
@@ -851,14 +874,14 @@ fn merge_peers(
     for peer in mdns_peers.into_iter().chain(lnd_peers) {
         let key = PeerKey {
             device_id: peer.device_id.clone(),
-            instance_name: peer.instance_name.clone(),
-            port: peer.port,
         };
         match merged.get_mut(&key) {
             Some(existing) => {
-                existing.addresses.extend(peer.addresses);
-                existing.addresses.sort();
-                existing.addresses.dedup();
+                if existing.port == peer.port {
+                    existing.addresses.extend(peer.addresses);
+                    existing.addresses.sort();
+                    existing.addresses.dedup();
+                }
                 existing.source = existing.source.merge(peer.source);
             }
             None => {
@@ -964,7 +987,8 @@ mod tests {
         Advertisement, BrowseCancellation, DiscoveryCache, DiscoverySource, LND_SERVICE_TYPE,
         LND_STALE_AFTER, LocalIpv4Interface,
         build_lnd_announce_spec, combine_browse_results, discovered_peer_from_lnd,
-        group_peer_addresses_for_interfaces, merge_peers, normalize_lnd_config,
+        discovered_peers_from_lnd, group_peer_addresses_for_interfaces, merge_peers,
+        normalize_lnd_config,
     };
     use crate::cli::{AudioMode, ClipboardMode, FileSyncMode};
     use crate::config::{DeviceConfig, LndDiscoveryConfig};
@@ -1014,6 +1038,28 @@ mod tests {
         let remaining = cache.snapshot();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].source, DiscoverySource::Mdns);
+    }
+
+    #[test]
+    fn lnd_discovery_keeps_latest_registration_for_each_device() {
+        let mut stale = sample_lnd_node();
+        stale.port = 49100;
+        stale.lan_addrs[0].set_port(stale.port);
+        stale.lease.revision = 10;
+        stale.lease.last_seen_unix_ms = 10_000;
+        stale.lease.expires_at_unix_ms = 40_000;
+        let mut current = stale.clone();
+        current.node_id = format!("{}:49200", current.metadata["device_id"]);
+        current.port = 49200;
+        current.lan_addrs[0].set_port(current.port);
+        current.lease.revision = 11;
+        current.lease.last_seen_unix_ms = 11_000;
+        current.lease.expires_at_unix_ms = 41_000;
+
+        let peers = discovered_peers_from_lnd(vec![current, stale]);
+
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].port, 49200);
     }
 
     #[test]
@@ -1148,6 +1194,7 @@ mod tests {
             .build()
             .unwrap();
         let spec = build_lnd_announce_spec(&advertisement, &config).unwrap();
+        assert_eq!(spec.node_id, advertisement.device.device_id.to_string());
         let lan_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), advertisement.port);
         let mut announcement = spec.into_announcement(vec![lan_addr]);
         announcement.reachability_scopes = Vec::new();
@@ -1215,10 +1262,7 @@ mod tests {
         let advertisement = sample_advertisement();
         DiscoveredNode {
             discovery_domain: Some("test-domain".to_string()),
-            node_id: format!(
-                "{}:{}",
-                advertisement.device.device_id, advertisement.port
-            ),
+            node_id: advertisement.device.device_id.to_string(),
             service: LND_SERVICE_TYPE.to_string(),
             display_name: "worker-a @ demo-device".to_string(),
             port: advertisement.port,

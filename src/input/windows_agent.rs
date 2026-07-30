@@ -39,7 +39,7 @@ use windows_sys::Win32::System::Threading::{
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
-const IPC_VERSION: u16 = 2;
+const IPC_VERSION: u16 = 3;
 const IPC_MAX_FRAME: usize = 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
@@ -53,7 +53,6 @@ enum AgentRequest {
     Start { mode: InputMode, hotkey: Hotkey },
     Stop,
     Health,
-    Layout,
     CursorPosition,
     Snapshot,
     SetCapture(bool),
@@ -77,7 +76,6 @@ impl AgentRequest {
             Self::Start { .. } => "Start",
             Self::Stop => "Stop",
             Self::Health => "Health",
-            Self::Layout => "Layout",
             Self::CursorPosition => "CursorPosition",
             Self::Snapshot => "Snapshot",
             Self::SetCapture(_) => "SetCapture",
@@ -96,7 +94,6 @@ impl AgentRequest {
             self,
             Self::Start { .. }
                 | Self::Stop
-                | Self::Layout
                 | Self::SetCapture(_)
                 | Self::WarpCursor(_)
                 | Self::ReleaseAll
@@ -108,7 +105,7 @@ impl AgentRequest {
 enum AgentResponse {
     Ok,
     Pong,
-    Layout(DesktopLayout),
+    Started { layout: DesktopLayout },
     Point(Point),
     Snapshot(KeySnapshot),
     Error(String),
@@ -175,6 +172,7 @@ struct AgentClient {
 struct AgentBackend {
     client: Arc<AgentClient>,
     lease: u64,
+    layout: DesktopLayout,
 }
 
 struct NativeAgentRuntime {
@@ -309,10 +307,13 @@ pub(in crate::input) fn start_client(context: CaptureContext) -> Result<Arc<dyn 
         .lifecycle
         .lock()
         .map_err(|_| anyhow!("Windows input agent lifecycle poisoned"))?;
-    client.request(AgentRequest::Start {
+    let layout = match client.request(AgentRequest::Start {
         mode: context.mode,
         hotkey: context.hotkey,
-    })?;
+    })? {
+        AgentResponse::Started { layout } => layout,
+        _ => bail!("Windows input agent returned an invalid Start response"),
+    };
     let lease = client.next_lease.fetch_add(1, Ordering::AcqRel);
     client.active_lease.store(lease, Ordering::Release);
     *client
@@ -320,7 +321,11 @@ pub(in crate::input) fn start_client(context: CaptureContext) -> Result<Arc<dyn 
         .lock()
         .map_err(|_| anyhow!("Windows input agent context poisoned"))? = Some(context);
     drop(lifecycle);
-    Ok(Arc::new(AgentBackend { client, lease }))
+    Ok(Arc::new(AgentBackend {
+        client,
+        lease,
+        layout,
+    }))
 }
 
 pub async fn run_agent(pipe_name: String, token: String, parent_pid: u32) -> Result<()> {
@@ -408,15 +413,17 @@ impl AgentClient {
 
 impl InputBackend for AgentBackend {
     fn health_check(&self) -> Result<()> {
-        self.request(AgentRequest::Health)?;
+        if !self.is_current() {
+            bail!("Windows input agent backend was superseded by a newer session");
+        }
+        if !self.client.alive.load(Ordering::Acquire) {
+            bail!("Windows input agent connection is closed");
+        }
         Ok(())
     }
 
     fn layout(&self) -> Result<DesktopLayout> {
-        match self.request(AgentRequest::Layout)? {
-            AgentResponse::Layout(layout) => Ok(layout),
-            _ => bail!("Windows input agent returned an invalid layout response"),
-        }
+        Ok(self.layout.clone())
     }
 
     fn cursor_position(&self) -> Result<Point> {
@@ -847,7 +854,8 @@ async fn handle_agent_request(
                 previous.stop().await;
             }
             *runtime = Some(start_native_runtime(mode, hotkey, outgoing)?);
-            Ok(AgentResponse::Ok)
+            let layout = agent_backend(runtime)?.layout()?;
+            Ok(AgentResponse::Started { layout })
         }
         AgentRequest::Stop => {
             if let Some(previous) = runtime.take() {
@@ -856,7 +864,6 @@ async fn handle_agent_request(
             Ok(AgentResponse::Ok)
         }
         AgentRequest::Health | AgentRequest::Ping => Ok(AgentResponse::Pong),
-        AgentRequest::Layout => Ok(AgentResponse::Layout(agent_backend(runtime)?.layout()?)),
         AgentRequest::CursorPosition => {
             Ok(AgentResponse::Point(agent_backend(runtime)?.cursor_position()?))
         }
@@ -902,6 +909,7 @@ fn start_native_runtime(
     hotkey: Hotkey,
     outgoing: mpsc::Sender<AgentPacket>,
 ) -> Result<NativeAgentRuntime> {
+    let send_motion = mode == InputMode::Send;
     let (events_tx, mut events_rx) = mpsc::channel(256);
     let motion = Arc::new(MotionAccumulator::default());
     let context = CaptureContext {
@@ -925,7 +933,7 @@ fn start_native_runtime(
                         break;
                     }
                 }
-                _ = motion_tick.tick() => {
+                _ = motion_tick.tick(), if send_motion => {
                     let sample = motion.take_observed();
                     if (sample.dx != 0 || sample.dy != 0 || sample.position_updated)
                         && outgoing
@@ -1319,6 +1327,17 @@ fn wide(value: &str) -> Vec<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input::DisplayRect;
+
+    fn test_layout() -> DesktopLayout {
+        DesktopLayout::new(vec![DisplayRect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        }])
+        .unwrap()
+    }
 
     #[test]
     fn closed_command_queue_marks_agent_unavailable() {
@@ -1352,6 +1371,7 @@ mod tests {
         drop(AgentBackend {
             client: Arc::clone(&client),
             lease: 1,
+            layout: test_layout(),
         });
 
         assert_eq!(client.active_lease.load(Ordering::Acquire), 2);
@@ -1372,12 +1392,39 @@ mod tests {
         drop(AgentBackend {
             client: Arc::clone(&client),
             lease: 1,
+            layout: test_layout(),
         });
 
         let command = receiver.try_recv().unwrap();
         assert!(matches!(command.request, AgentRequest::Stop));
         assert!(command.response.is_none());
         assert_eq!(client.active_lease.load(Ordering::Acquire), 0);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn backend_layout_and_health_use_local_state_without_queueing_requests() {
+        let (commands, mut receiver) = mpsc::channel(1);
+        let alive = Arc::new(AtomicBool::new(true));
+        let client = Arc::new(AgentClient {
+            commands,
+            context: Arc::new(Mutex::new(None)),
+            alive: Arc::clone(&alive),
+            lifecycle: Mutex::new(()),
+            next_lease: AtomicU64::new(2),
+            active_lease: AtomicU64::new(1),
+        });
+        let backend = AgentBackend {
+            client,
+            lease: 1,
+            layout: test_layout(),
+        };
+
+        assert!(backend.health_check().is_ok());
+        assert_eq!(backend.layout().unwrap(), test_layout());
+        assert!(receiver.try_recv().is_err());
+        alive.store(false, Ordering::Release);
+        assert!(backend.health_check().is_err());
         assert!(receiver.try_recv().is_err());
     }
 

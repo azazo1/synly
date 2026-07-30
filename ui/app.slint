@@ -145,9 +145,11 @@ export component AppWindow inherits Window {
     in-out property <bool> interaction-trust: false;
 
     callback start-hosting();
+    callback refresh-discovery();
     callback connect-peer(string);
     callback connect-query();
     callback disconnect();
+    callback quit-application();
     callback apply-settings();
     callback choose-path();
     callback set-clipboard-mode(int);
@@ -203,6 +205,7 @@ export component AppWindow inherits Window {
                     font-size: 11px;
                     height: 38px;
                 }
+                Button { text: "退出应用"; clicked => { root.quit-application(); } }
             }
         }
 
@@ -334,7 +337,13 @@ export component AppWindow inherits Window {
             if root.selected-page == 1: VerticalLayout {
                 padding: 18px;
                 spacing: 10px;
-                Text { text: "设备"; font-size: 22px; font-weight: 680; color: #202523; height: 34px; }
+                HorizontalLayout {
+                    height: 34px;
+                    Text { text: "设备"; font-size: 22px; font-weight: 680; color: #202523; vertical-alignment: center; }
+                    Rectangle { horizontal-stretch: 1; }
+                    Button { text: "刷新"; clicked => { root.refresh-discovery(); } }
+                    Button { text: "断开"; enabled: root.session-active; clicked => { root.disconnect(); } }
+                }
                 HorizontalLayout {
                     height: 34px;
                     spacing: 6px;

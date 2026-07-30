@@ -3902,14 +3902,37 @@ fn parse_direct_peer_addr(query: &str) -> Option<SocketAddrV4> {
 }
 
 fn select_peer_from_query(peers: &[DiscoveredPeer], query: &str) -> Result<DiscoveredPeer> {
-    let mut matches = peers
+    let mut logical_matches = BTreeMap::<String, DiscoveredPeer>::new();
+    for peer in peers
         .iter()
         .filter(|peer| peer_matches_query(peer, query))
         .cloned()
-        .collect::<Vec<_>>();
+    {
+        match logical_matches.get_mut(&peer.device_id) {
+            Some(current) if current.port == peer.port => {
+                current.addresses.extend(peer.addresses);
+                current.addresses.sort();
+                current.addresses.dedup();
+                if discovery_source_priority(peer.source)
+                    > discovery_source_priority(current.source)
+                {
+                    current.source = peer.source;
+                }
+            }
+            Some(current)
+                if discovery_source_priority(peer.source)
+                    > discovery_source_priority(current.source) =>
+            {
+                *current = peer;
+            }
+            Some(_) => {}
+            None => {
+                logical_matches.insert(peer.device_id.clone(), peer);
+            }
+        }
+    }
+    let matches = logical_matches.into_values().collect::<Vec<_>>();
 
-    matches.sort();
-    matches.dedup();
     match matches.len() {
         0 => bail!("没有找到匹配 `{query}` 的设备"),
         1 => Ok(matches[0].clone()),
@@ -3923,6 +3946,14 @@ fn select_peer_from_query(peers: &[DiscoveredPeer], query: &str) -> Result<Disco
                 "`{query}` 匹配到多个设备，请改用更精确的实例名、设备名、设备 ID 前缀或 IPv4 地址:\n{labels}"
             )
         }
+    }
+}
+
+fn discovery_source_priority(source: discovery::DiscoverySource) -> u8 {
+    match source {
+        discovery::DiscoverySource::Lnd => 0,
+        discovery::DiscoverySource::Mdns => 1,
+        discovery::DiscoverySource::MdnsAndLnd => 2,
     }
 }
 
@@ -4957,6 +4988,22 @@ mod tests {
             addresses: vec![Ipv4Addr::new(192, 168, 1, 21)],
         };
         assert!(select_peer_from_query(&[peer, duplicate], "demo-device").is_err());
+    }
+
+    #[test]
+    fn select_peer_from_query_collapses_stale_ports_for_the_same_device() {
+        let mut current = sample_peer();
+        current.source = crate::discovery::DiscoverySource::Mdns;
+        current.port = 49200;
+        let mut stale = current.clone();
+        stale.fullname = "stale-lnd".to_string();
+        stale.source = crate::discovery::DiscoverySource::Lnd;
+        stale.port = 49100;
+
+        let selected = select_peer_from_query(&[stale, current], "demo-device").unwrap();
+
+        assert_eq!(selected.port, 49200);
+        assert_eq!(selected.source, crate::discovery::DiscoverySource::Mdns);
     }
 
     #[test]

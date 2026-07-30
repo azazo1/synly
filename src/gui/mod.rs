@@ -98,6 +98,11 @@ fn wire_window_callbacks(
     window.on_start_hosting(move || send_command(&commands, AppCommand::StartHosting));
 
     let commands = handle.commands();
+    window.on_refresh_discovery(move || {
+        send_command(&commands, AppCommand::RefreshDiscovery)
+    });
+
+    let commands = handle.commands();
     window.on_connect_peer(move |peer| {
         send_command(&commands, AppCommand::ConnectPeer(peer.to_string()))
     });
@@ -115,6 +120,16 @@ fn wire_window_callbacks(
 
     let commands = handle.commands();
     window.on_disconnect(move || send_command(&commands, AppCommand::Disconnect));
+
+    let commands = handle.commands();
+    let weak = window.as_weak();
+    window.on_quit_application(move || {
+        if let Some(window) = weak.upgrade() {
+            save_window_state(&window, &commands);
+        }
+        send_command(&commands, AppCommand::Shutdown);
+        let _ = slint::quit_event_loop();
+    });
 
     let commands = handle.commands();
     let snapshots = handle.snapshots();

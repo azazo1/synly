@@ -132,6 +132,7 @@ pub enum AppCommand {
     },
     Start,
     StartHosting,
+    RefreshDiscovery,
     ConnectPeer(String),
     SetClipboardMode(ClipboardMode),
     SetAudioMode(AudioMode),

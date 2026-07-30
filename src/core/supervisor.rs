@@ -238,6 +238,10 @@ impl AppSupervisor {
                 self.save_config();
                 self.restart_session().await;
             }
+            AppCommand::RefreshDiscovery => {
+                tracing::info!("用户请求刷新设备发现");
+                self.spawn_discovery_loop();
+            }
             AppCommand::ConnectPeer(peer) => {
                 self.snapshot.desired.connection = Some(ConnectionPreference::Join);
                 self.snapshot.desired.peer_query = peer;
