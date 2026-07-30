@@ -38,7 +38,6 @@ use windows_sys::Win32::System::Threading::{
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
-const IPC_VERSION: u16 = 7;
 const IPC_MAX_FRAME: usize = 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const DISPATCH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -106,7 +105,6 @@ enum AgentResponse {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 enum GuiToAgentPacket {
     HelloAck {
-        version: u16,
         session_id: u32,
     },
     Request {
@@ -118,7 +116,6 @@ enum GuiToAgentPacket {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 enum AgentToGuiPacket {
     Hello {
-        version: u16,
         token: String,
         agent_pid: u32,
         parent_pid: u32,
@@ -536,19 +533,10 @@ fn agent_command_owner(
     validate_pipe_server(&pipe, parent_pid)?;
     let ack: GuiToAgentPacket = read_packet(&mut pipe, CONNECT_TIMEOUT)?;
     let startup_result = (|| -> Result<()> {
-        let GuiToAgentPacket::HelloAck {
-            version,
-            session_id,
-        } = ack
+        let GuiToAgentPacket::HelloAck { session_id } = ack
         else {
             bail!("Windows input agent received an invalid handshake response");
         };
-        if version != IPC_VERSION {
-            bail!(
-                "Windows input agent handshake version mismatch: agent={}, GUI={version}",
-                IPC_VERSION
-            );
-        }
         let expected_session_id = process_session_id(parent_pid)?;
         if session_id != expected_session_id {
             bail!(
@@ -601,7 +589,6 @@ fn agent_event_owner(
     write_packet(
         &mut pipe,
         &AgentToGuiPacket::Hello {
-            version: IPC_VERSION,
             token,
             agent_pid: unsafe { GetCurrentProcessId() },
             parent_pid,
@@ -1070,10 +1057,7 @@ fn gui_command_owner(
     let session_id = process_session_id(parent_pid)?;
     write_packet(
         &mut pipe,
-        &GuiToAgentPacket::HelloAck {
-            version: IPC_VERSION,
-            session_id,
-        },
+        &GuiToAgentPacket::HelloAck { session_id },
         REQUEST_DELIVERY_TIMEOUT,
     )?;
     command_writer_loop(pipe, commands, cursor, pending, alive)
@@ -1110,7 +1094,6 @@ fn gui_event_owner(
     pipe.connect_server(CONNECT_TIMEOUT)?;
     let hello: AgentToGuiPacket = read_packet(&mut pipe, CONNECT_TIMEOUT)?;
     let AgentToGuiPacket::Hello {
-        version,
         token: incoming_token,
         agent_pid,
         parent_pid: incoming_parent,
@@ -1119,12 +1102,6 @@ fn gui_event_owner(
     else {
         bail!("Windows input agent sent an invalid handshake");
     };
-    if version != IPC_VERSION {
-        bail!(
-            "Windows input agent handshake version mismatch: agent={version}, GUI={}",
-            IPC_VERSION
-        );
-    }
     if incoming_token != token || incoming_parent != parent_pid {
         bail!("Windows input agent handshake token or parent mismatch");
     }
