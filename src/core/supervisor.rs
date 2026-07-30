@@ -616,7 +616,6 @@ impl AppSupervisor {
             return;
         }
         self.input_backend_generation = self.input_backend_generation.saturating_add(1);
-        tracing::trace!(generation = self.input_backend_generation, elevated = self.snapshot.input_elevation_ready, "Windows 输入 backend generation 已更新"); // to remove
         self.update_tuning();
     }
 

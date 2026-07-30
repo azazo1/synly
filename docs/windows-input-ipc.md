@@ -7,7 +7,7 @@ Windows 输入代理原先在 Tokio named pipe 上进行持续双向读写. 在�
 ## 核心修复
 
 - command pipe 仅负责 `GUI -> agent` 请求.
-- event pipe 仅负责 `agent -> GUI` 响应, 事件和诊断.
+- event pipe 仅负责 `agent -> GUI` 响应和输入事件.
 - 两条 pipe 均由固定的专用线程独占. 创建, 连接, 读写, 取消和关闭都在 owner 线程内完成.
 - 传输直接使用 `CreateNamedPipeW`, `CreateFileW`, `ReadFile` 和 `WriteFile`.
 - 阻塞 I/O 使用 OVERLAPPED event 等待, 超时和关闭使用 `CancelIoEx`.
@@ -21,7 +21,7 @@ Windows 输入代理原先在 Tokio named pipe 上进行持续双向读写. 在�
 - 未申请提权时仍可使用普通权限基础输入控制.
 - 已启用提权 receiver 后发生 IPC 故障会直接报告失败, 不会在当前会话中静默降级到普通权限.
 - pipe DACL, token, PID, session 和二进制路径校验继续保留.
-- agent trace 独立写入本机滚动文件, 不经过 event pipe. 日志目录为 `%LOCALAPPDATA%\synly\logs\input-agent`.
+- agent 日志独立写入本机滚动文件, 不经过 event pipe. 日志目录为 `%LOCALAPPDATA%\synly\logs\input-agent`.
 
 ## 验证
 

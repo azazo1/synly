@@ -55,7 +55,6 @@ fn run_internal_command(command: &cli::InternalCommand) -> Result<()> {
             #[cfg(windows)]
             {
                 let _tracing_guard = input::init_windows_agent_tracing()?;
-                tracing::trace!(%command_pipe, %event_pipe, parent_pid, "Windows 输入代理内部子进程入口已启动"); // to remove
                 let runtime = tokio::runtime::Builder::new_multi_thread()
                     .worker_threads(2)
                     .thread_name("synly-input-agent")

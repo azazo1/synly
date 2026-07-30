@@ -66,7 +66,6 @@ impl InputHostChannel {
             },
             acceptor: TlsAcceptor::from(Arc::new(config)),
         };
-        tracing::trace!(session_id = %channel.offer.session_id, "输入辅助 host channel 已创建"); // to remove
         Ok(channel)
     }
 
@@ -79,10 +78,8 @@ impl InputHostChannel {
         mut socket: TcpStream,
         master_secret: &[u8; 32],
     ) -> Result<TlsStream<TcpStream>> {
-        tracing::trace!(session_id = %self.offer.session_id, "输入辅助 host 开始读取 TCP 前导"); // to remove
         socket.set_nodelay(true)?;
         let session_id = read_preamble(&mut socket).await?;
-        tracing::trace!(session_id = %session_id, expected_session_id = %self.offer.session_id, "输入辅助 host 已读取 TCP 前导"); // to remove
         self.accept_after_preamble(socket, session_id, master_secret)
             .await
     }
@@ -95,36 +92,25 @@ impl InputHostChannel {
     ) -> Result<TlsStream<TcpStream>> {
         socket.set_nodelay(true)?;
         if session_id != self.offer.session_id {
-            tracing::trace!(session_id = %session_id, expected_session_id = %self.offer.session_id, "输入辅助 host session id 校验失败"); // to remove
             bail!("输入辅助连接 session_id 不匹配");
         }
-        tracing::trace!(session_id = %session_id, "输入辅助 host 开始 TLS 握手"); // to remove
         let stream = self.acceptor.accept(socket).await?;
-        tracing::trace!(session_id = %session_id, "输入辅助 host TLS 握手完成"); // to remove
         let exporter = export_server(&stream, self.offer.session_id)?;
-        tracing::trace!(session_id = %session_id, "输入辅助 host 已导出 TLS channel binding"); // to remove
         let mut stream: TlsStream<TcpStream> = stream.into();
         let message = read_message(&mut stream).await?;
         let InputMessage::Proof { role, proof } = message else {
-            tracing::trace!(session_id = %session_id, "输入辅助 host 收到非 proof 首帧"); // to remove
             bail!("输入辅助连接缺少客户端证明");
         };
-        tracing::trace!(session_id = %session_id, role = ?role, "输入辅助 host 已读取客户端 proof"); // to remove
         if role != InputChannelRole::Client {
-            tracing::trace!(session_id = %session_id, role = ?role, "输入辅助 host 客户端 proof role 校验失败"); // to remove
             bail!("输入辅助连接角色不正确");
         }
-        if let Err(error) = verify_proof(
+        verify_proof(
             master_secret,
             self.offer.session_id,
             role,
             &exporter,
             &proof,
-        ) {
-            tracing::trace!(session_id = %session_id, error = %error, "输入辅助 host 客户端 proof 校验失败"); // to remove
-            return Err(error);
-        }
-        tracing::trace!(session_id = %session_id, "输入辅助 host 客户端 proof 校验通过"); // to remove
+        )?;
         write_message(
             &mut stream,
             &InputMessage::Proof {
@@ -138,7 +124,6 @@ impl InputHostChannel {
             },
         )
         .await?;
-        tracing::trace!(session_id = %session_id, "输入辅助 host 已写入服务端 proof"); // to remove
         Ok(stream)
     }
 }
@@ -148,9 +133,7 @@ pub async fn connect(
     offer: &InputChannelOffer,
     master_secret: &[u8; 32],
 ) -> Result<TlsStream<TcpStream>> {
-    tracing::trace!(%address, session_id = %offer.session_id, "输入辅助 client 开始 TCP 连接"); // to remove
     if offer.certificate_der.is_empty() || offer.certificate_der.len() > 64 * 1024 {
-        tracing::trace!(session_id = %offer.session_id, certificate_len = offer.certificate_der.len(), "输入辅助 client 证书长度校验失败"); // to remove
         bail!("输入辅助证书长度无效");
     }
     let mut socket = TcpStream::connect(address)
@@ -158,7 +141,6 @@ pub async fn connect(
         .with_context(|| format!("无法连接输入辅助通道 {address}"))?;
     socket.set_nodelay(true)?;
     write_preamble(&mut socket, offer.session_id).await?;
-    tracing::trace!(%address, session_id = %offer.session_id, "输入辅助 client 已写入 TCP 前导"); // to remove
 
     let mut roots = RootCertStore::empty();
     roots.add(CertificateDer::from(offer.certificate_der.clone()))?;
@@ -170,9 +152,7 @@ pub async fn connect(
     let stream = connector
         .connect(input_server_name()?, socket)
         .await?;
-    tracing::trace!(%address, session_id = %offer.session_id, "输入辅助 client TLS 握手完成"); // to remove
     let exporter = export_client(&stream, offer.session_id)?;
-    tracing::trace!(session_id = %offer.session_id, "输入辅助 client 已导出 TLS channel binding"); // to remove
     let mut stream: TlsStream<TcpStream> = stream.into();
     write_message(
         &mut stream,
@@ -187,28 +167,20 @@ pub async fn connect(
         },
     )
     .await?;
-    tracing::trace!(session_id = %offer.session_id, "输入辅助 client 已写入客户端 proof"); // to remove
     let message = read_message(&mut stream).await?;
     let InputMessage::Proof { role, proof } = message else {
-        tracing::trace!(session_id = %offer.session_id, "输入辅助 client 收到非 proof 首帧"); // to remove
         bail!("输入辅助连接缺少服务端证明");
     };
-    tracing::trace!(session_id = %offer.session_id, role = ?role, "输入辅助 client 已读取服务端 proof"); // to remove
     if role != InputChannelRole::Host {
-        tracing::trace!(session_id = %offer.session_id, role = ?role, "输入辅助 client 服务端 proof role 校验失败"); // to remove
         bail!("输入辅助连接服务端角色不正确");
     }
-    if let Err(error) = verify_proof(
+    verify_proof(
         master_secret,
         offer.session_id,
         role,
         &exporter,
         &proof,
-    ) {
-        tracing::trace!(session_id = %offer.session_id, error = %error, "输入辅助 client 服务端 proof 校验失败"); // to remove
-        return Err(error);
-    }
-    tracing::trace!(session_id = %offer.session_id, "输入辅助 client 服务端 proof 校验通过"); // to remove
+    )?;
     Ok(stream)
 }
 
@@ -220,12 +192,10 @@ pub async fn write_preamble<W>(socket: &mut W, session_id: Uuid) -> Result<()>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    tracing::trace!(session_id = %session_id, "输入辅助写入 TCP 前导"); // to remove
     socket.write_all(INPUT_PREAMBLE_MAGIC).await?;
     socket.write_u16(INPUT_AUX_VERSION).await?;
     socket.write_all(session_id.as_bytes()).await?;
     socket.flush().await?;
-    tracing::trace!(session_id = %session_id, "输入辅助 TCP 前导写入完成"); // to remove
     Ok(())
 }
 
@@ -233,23 +203,18 @@ pub async fn read_preamble<R>(socket: &mut R) -> Result<Uuid>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
-    tracing::trace!("输入辅助开始读取 TCP 前导"); // to remove
     let mut magic = [0u8; INPUT_PREAMBLE_MAGIC.len()];
     socket.read_exact(&mut magic).await?;
     if &magic != INPUT_PREAMBLE_MAGIC {
-        tracing::trace!(magic = ?magic, "输入辅助 TCP 前导 magic 校验失败"); // to remove
         bail!("输入辅助连接前导标识无效");
     }
     let version = socket.read_u16().await?;
     if version != INPUT_AUX_VERSION {
-        tracing::trace!(version, expected_version = INPUT_AUX_VERSION, "输入辅助 TCP 前导版本校验失败"); // to remove
         bail!("不支持的输入辅助协议版本: {version}");
     }
     let mut session_id = [0u8; 16];
     socket.read_exact(&mut session_id).await?;
-    let session_id = Uuid::from_bytes(session_id);
-    tracing::trace!(%session_id, version, "输入辅助 TCP 前导读取完成"); // to remove
-    Ok(session_id)
+    Ok(Uuid::from_bytes(session_id))
 }
 
 fn export_client(

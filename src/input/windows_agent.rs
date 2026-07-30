@@ -38,14 +38,13 @@ use windows_sys::Win32::System::Threading::{
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
-const IPC_VERSION: u16 = 6;
+const IPC_VERSION: u16 = 7;
 const IPC_MAX_FRAME: usize = 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const DISPATCH_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_DELIVERY_TIMEOUT: Duration = Duration::from_secs(4);
 const CLIENT_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
 const AGENT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
-const IPC_SLOW_OPERATION_TRACE_AFTER: Duration = Duration::from_millis(250);
 
 static AGENT: OnceLock<Mutex<Option<Arc<AgentClient>>>> = OnceLock::new();
 static ELEVATION_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -89,17 +88,6 @@ impl AgentRequest {
         }
     }
 
-    fn reports_diagnostic(&self) -> bool {
-        matches!(
-            self,
-            Self::Start { .. }
-                | Self::Stop
-                | Self::SetCapture(_)
-                | Self::WarpCursor(_)
-                | Self::ReleaseAll
-        )
-    }
-
     fn requires_cursor_ordering(&self) -> bool {
         matches!(self, Self::InjectButton { .. } | Self::InjectWheel { .. })
     }
@@ -113,13 +101,6 @@ enum AgentResponse {
     Point(Point),
     Snapshot(KeySnapshot),
     Error(String),
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-enum AgentDiagnosticPhase {
-    Started,
-    Completed,
-    Failed,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -151,13 +132,6 @@ enum AgentToGuiPacket {
         id: u64,
         response: AgentResponse,
     },
-    Diagnostic {
-        id: u64,
-        request: String,
-        phase: AgentDiagnosticPhase,
-        elapsed_ms: u64,
-        error: Option<String>,
-    },
     Event(NativeEvent),
     Motion {
         dx: i32,
@@ -184,7 +158,6 @@ struct AgentOutput {
 
 struct ClientCommand {
     request: AgentRequest,
-    queued_at: Instant,
     dispatched: Option<std::sync::mpsc::SyncSender<()>>,
     response: Option<std::sync::mpsc::SyncSender<Result<AgentResponse, String>>>,
 }
@@ -192,7 +165,6 @@ struct ClientCommand {
 #[derive(Clone, Copy, Debug)]
 struct CursorUpdate {
     point: Point,
-    queued_at: Instant,
 }
 
 type PendingResponses = Arc<Mutex<HashMap<
@@ -288,13 +260,6 @@ struct AgentHeartbeat {
     last_seen: Instant,
 }
 
-#[derive(Clone, Copy)]
-struct ActiveAgentRequest {
-    id: u64,
-    request: &'static str,
-    started: Instant,
-}
-
 impl AgentHeartbeat {
     fn new(now: Instant) -> Self {
         Self { last_seen: now }
@@ -352,12 +317,10 @@ impl Drop for PipeSecurity {
 
 impl NativeAgentRuntime {
     async fn stop(self) {
-        tracing::trace!(target: "synly_input_agent", "Windows 输入代理 native runtime 开始停止"); // to remove
         let _ = self.backend.set_capture(false);
         let _ = self.backend.release_all();
         self.task.abort();
         let _ = self.task.await;
-        tracing::trace!(target: "synly_input_agent", "Windows 输入代理 native runtime 已停止"); // to remove
     }
 }
 
@@ -396,11 +359,9 @@ impl AgentMotionSlot {
 }
 
 pub fn request_elevation() -> Result<()> {
-    tracing::trace!("Windows 输入代理授权流程开始"); // to remove
     if let Some(client) = current_client()
         && client.request(AgentRequest::Health).is_ok()
     {
-        tracing::trace!("Windows 输入代理已有可用连接, 跳过重新授权"); // to remove
         return Ok(());
     }
 
@@ -409,7 +370,6 @@ pub fn request_elevation() -> Result<()> {
     let event_pipe_name = format!(r"\\.\pipe\synly-input-event-{connection_id}");
     let token = Uuid::new_v4().to_string();
     let parent_pid = unsafe { GetCurrentProcessId() };
-    tracing::trace!(%command_pipe_name, %event_pipe_name, parent_pid, "Windows 输入代理准备创建双命名管道"); // to remove
     let transport = start_gui_transport(
         command_pipe_name.clone(),
         event_pipe_name.clone(),
@@ -417,12 +377,9 @@ pub fn request_elevation() -> Result<()> {
         parent_pid,
     )?;
     transport.wait_until_created()?;
-    tracing::trace!(%command_pipe_name, %event_pipe_name, parent_pid, "Windows 输入代理双命名管道已创建"); // to remove
 
     let executable = agent_executable()?;
-    tracing::trace!(path = %executable.display(), "Windows 输入代理开始校验组件路径和签名"); // to remove
     validate_binary_signature(&executable)?;
-    tracing::trace!(path = %executable.display(), "Windows 输入代理组件校验完成"); // to remove
     launch_elevated(
         &executable,
         &command_pipe_name,
@@ -430,10 +387,8 @@ pub fn request_elevation() -> Result<()> {
         &token,
         parent_pid,
     )?;
-    tracing::trace!(path = %executable.display(), parent_pid, "Windows 输入代理 UAC 启动请求已提交"); // to remove
 
     let client = transport.wait_until_ready()?;
-    tracing::trace!(parent_pid, "Windows 输入代理授权和 IPC 握手完成"); // to remove
     let slot = AGENT.get_or_init(|| Mutex::new(None));
     *slot.lock().map_err(|_| anyhow!("Windows input agent state poisoned"))? = Some(client);
     ELEVATION_REQUESTED.store(true, Ordering::Release);
@@ -441,14 +396,11 @@ pub fn request_elevation() -> Result<()> {
 }
 
 pub(in crate::input) fn ensure_ready(mode: InputMode) -> Result<()> {
-    tracing::trace!(?mode, "Windows 输入代理 ensure_ready 开始"); // to remove
     if mode == InputMode::Off {
-        tracing::trace!("Windows 输入代理 mode 为 Off, 跳过健康检查"); // to remove
         return Ok(());
     }
     let client = current_client().context("Windows 输入代理尚未获得本机管理员授权")?;
     client.request(AgentRequest::Health)?;
-    tracing::trace!(?mode, "Windows 输入代理 ensure_ready 健康检查完成"); // to remove
     Ok(())
 }
 
@@ -461,7 +413,6 @@ pub(in crate::input) fn elevation_requested() -> bool {
 }
 
 pub(in crate::input) fn start_client(context: CaptureContext) -> Result<Arc<dyn InputBackend>> {
-    tracing::trace!(mode = ?context.mode, hotkey = ?context.hotkey, "Windows 输入代理 start_client 开始"); // to remove
     ensure_ready(context.mode)?;
     let client = current_client().context("Windows 输入代理连接不可用")?;
     let lifecycle = client
@@ -475,14 +426,12 @@ pub(in crate::input) fn start_client(context: CaptureContext) -> Result<Arc<dyn 
         AgentResponse::Started { layout } => layout,
         _ => bail!("Windows input agent returned an invalid Start response"),
     };
-    tracing::trace!(displays = ?layout.displays, "Windows 输入代理 Start response 已解析"); // to remove
     let lease = client.next_lease.fetch_add(1, Ordering::AcqRel);
     client.active_lease.store(lease, Ordering::Release);
     *client
         .context
         .lock()
         .map_err(|_| anyhow!("Windows input agent context poisoned"))? = Some(context);
-    tracing::trace!(lease, "Windows 输入代理 capture context 已安装"); // to remove
     drop(lifecycle);
     Ok(Arc::new(AgentBackend {
         client,
@@ -607,7 +556,6 @@ fn agent_command_owner(
             );
         }
         validate_parent_process(parent_pid)?;
-        tracing::trace!(version, session_id, parent_pid, "Windows 输入代理 command pipe 已校验 HelloAck"); // to remove
         Ok(())
     })();
     startup
@@ -615,7 +563,6 @@ fn agent_command_owner(
         .map_err(|_| anyhow!("Windows input agent event owner stopped during startup"))?;
     startup_result?;
 
-    let mut read_requests = 0usize;
     while alive.load(Ordering::Acquire) {
         let packet = match read_packet::<GuiToAgentPacket>(&mut pipe, Duration::from_secs(1)) {
             Ok(packet) => packet,
@@ -623,17 +570,9 @@ fn agent_command_owner(
             Err(_error) if !alive.load(Ordering::Acquire) => return Ok(()),
             Err(error) => return Err(error),
         };
-        let GuiToAgentPacket::Request { id, ref request } = packet else {
+        let GuiToAgentPacket::Request { .. } = packet else {
             bail!("Windows input agent received an unexpected packet");
         };
-        read_requests = read_requests.saturating_add(1);
-        if request.name() == "InjectCursor" {
-            if read_requests == 1 || read_requests.is_multiple_of(500) {
-                tracing::trace!(target: "synly_input_agent", count = read_requests, request_id = id, "Windows 输入代理 command pipe 读取请求汇总"); // to remove
-            }
-        } else if request.name() != "Health" {
-            tracing::trace!(target: "synly_input_agent", request = request.name(), request_id = id, "Windows 输入代理 command pipe 已读取请求"); // to remove
-        }
         requests
             .blocking_send(packet)
             .map_err(|_| anyhow!("Windows input agent backend request queue closed"))?;
@@ -670,7 +609,6 @@ fn agent_event_owner(
         },
         REQUEST_DELIVERY_TIMEOUT,
     )?;
-    tracing::trace!(parent_pid, "Windows 输入代理 event pipe 已写入 Hello"); // to remove
     match startup.recv_timeout(CONNECT_TIMEOUT) {
         Ok(Ok(())) => {
             write_packet(
@@ -694,7 +632,6 @@ fn agent_event_owner(
     ready
         .send(Ok(()))
         .map_err(|_| anyhow!("Windows input agent startup receiver closed"))?;
-    tracing::trace!(parent_pid, "Windows 输入代理 event pipe 已写入 Ready"); // to remove
     agent_event_writer_loop(pipe, reliable, motion, alive)
 }
 
@@ -732,41 +669,34 @@ pub async fn run_agent(
 impl AgentClient {
     fn request(&self, request: AgentRequest) -> Result<AgentResponse> {
         if !self.alive.load(Ordering::Acquire) {
-            tracing::trace!(request = request.name(), "Windows 输入代理同步请求发现连接已关闭"); // to remove
             bail!("Windows input agent connection is closed");
         }
         let request_name = request.name();
-        tracing::trace!(request = request_name, "Windows 输入代理同步请求准备入队"); // to remove
         let (dispatch_tx, dispatch_rx) = std::sync::mpsc::sync_channel(1);
         let (response_tx, response_rx) = std::sync::mpsc::sync_channel(1);
         self.commands
             .try_send(ClientQueueItem::Command(ClientCommand {
                 request,
-                queued_at: Instant::now(),
                 dispatched: Some(dispatch_tx),
                 response: Some(response_tx),
             }))
             .map_err(|error| {
-                tracing::trace!(request = request_name, error = %error, "Windows 输入代理同步请求入队失败"); // to remove
                 if matches!(&error, std::sync::mpsc::TrySendError::Disconnected(_)) {
                     mark_agent_unavailable(&self.alive, request_name, "command-queue-closed");
                 }
                 anyhow!("Windows input agent {request_name} command queue unavailable: {error}")
             })?;
-        let response = wait_for_agent_response(
+        wait_for_agent_response(
             &self.alive,
             request_name,
             dispatch_rx,
             response_rx,
             DISPATCH_TIMEOUT,
-        );
-        tracing::trace!(request = request_name, result = ?response.as_ref().err(), "Windows 输入代理同步请求等待结束"); // to remove
-        response
+        )
     }
 
     fn notify(&self, request: AgentRequest) -> Result<()> {
         if !self.alive.load(Ordering::Acquire) {
-            tracing::trace!(request = request.name(), "Windows 输入代理通知因连接关闭被丢弃"); // to remove
             bail!("Windows input agent connection is closed");
         }
         let request = match request {
@@ -774,7 +704,6 @@ impl AgentClient {
                 if let Ok(mut latest) = self.cursor.latest.lock() {
                     *latest = Some(CursorUpdate {
                         point,
-                        queued_at: Instant::now(),
                     });
                 }
                 if !self.cursor.queued.swap(true, Ordering::AcqRel) {
@@ -801,12 +730,10 @@ impl AgentClient {
         self.commands
             .try_send(ClientQueueItem::Command(ClientCommand {
                 request,
-                queued_at: Instant::now(),
                 dispatched: None,
                 response: None,
             }))
             .map_err(|error| {
-                tracing::trace!(request = request_name, error = %error, "Windows 输入代理通知入队失败"); // to remove
                 if matches!(&error, std::sync::mpsc::TrySendError::Disconnected(_)) {
                     mark_agent_unavailable(&self.alive, request_name, "notify-queue-closed");
                 }
@@ -842,37 +769,22 @@ fn wait_for_agent_response(
     response_rx: std::sync::mpsc::Receiver<Result<AgentResponse, String>>,
     dispatch_timeout: Duration,
 ) -> Result<AgentResponse> {
-    tracing::trace!(request = request_name, dispatch_timeout_ms = dispatch_timeout.as_millis(), response_timeout_ms = REQUEST_DELIVERY_TIMEOUT.as_millis(), "Windows 输入代理开始等待派发和响应"); // to remove
     match dispatch_rx.recv_timeout(dispatch_timeout) {
-        Ok(()) => {
-            tracing::trace!(request = request_name, "Windows 输入代理请求已确认写入 pipe"); // to remove
-        }
+        Ok(()) => {}
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            tracing::trace!(request = request_name, "Windows 输入代理请求等待 pipe 派发超时"); // to remove
             mark_agent_unavailable(alive, request_name, "dispatch-timeout");
             bail!("Windows input agent {request_name} dispatch timed out");
         }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            tracing::trace!(request = request_name, "Windows 输入代理请求在 pipe 派发前断开"); // to remove
             mark_agent_unavailable(alive, request_name, "dispatch-disconnected");
             bail!("Windows input agent {request_name} dispatch failed before pipe write");
         }
     }
     match response_rx.recv() {
-        Ok(Ok(AgentResponse::Error(message))) => {
-            tracing::trace!(request = request_name, error = %message, "Windows 输入代理返回业务错误"); // to remove
-            Err(anyhow!(message))
-        }
-        Ok(Ok(response)) => {
-            tracing::trace!(request = request_name, "Windows 输入代理响应已匹配"); // to remove
-            Ok(response)
-        }
-        Ok(Err(message)) => {
-            tracing::trace!(request = request_name, error = %message, "Windows 输入代理 pending response 返回连接错误"); // to remove
-            Err(anyhow!(message))
-        }
+        Ok(Ok(AgentResponse::Error(message))) => Err(anyhow!(message)),
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(message)) => Err(anyhow!(message)),
         Err(error) => {
-            tracing::trace!(request = request_name, error = %error, "Windows 输入代理等待 response 时通道断开"); // to remove
             mark_agent_unavailable(alive, request_name, "response-disconnected");
             Err(error).with_context(|| format!("Windows input agent {request_name} response channel closed"))
         }
@@ -970,23 +882,17 @@ impl InputBackend for AgentBackend {
 
 impl AgentBackend {
     fn request(&self, request: AgentRequest) -> Result<AgentResponse> {
-        let request_name = request.name();
-        tracing::trace!(request = request_name, lease = self.lease, active_lease = self.client.active_lease.load(Ordering::Acquire), "Windows 输入代理 backend 同步调用开始"); // to remove
         let _lifecycle = self
             .client
             .lifecycle
             .lock()
             .map_err(|_| anyhow!("Windows input agent lifecycle poisoned"))?;
         if !self.is_current() {
-            tracing::trace!(request = request_name, lease = self.lease, active_lease = self.client.active_lease.load(Ordering::Acquire), "Windows 输入代理 backend lease 已过期"); // to remove
             bail!("Windows input agent backend was superseded by a newer session");
         }
         let response = self.client.request(request);
         if let Err(error) = &response {
-            tracing::trace!(request = request_name, lease = self.lease, error = %error, "Windows 输入代理 backend 同步调用失败"); // to remove
             self.client.emit_failure(error);
-        } else {
-            tracing::trace!(request = request_name, lease = self.lease, "Windows 输入代理 backend 同步调用完成"); // to remove
         }
         response
     }
@@ -996,18 +902,15 @@ impl AgentBackend {
     }
 
     fn notify(&self, request: AgentRequest) -> Result<()> {
-        let request_name = request.name();
         let _lifecycle = self
             .client
             .lifecycle
             .lock()
             .map_err(|_| anyhow!("Windows input agent lifecycle poisoned"))?;
         if !self.is_current() {
-            tracing::trace!(request = request_name, lease = self.lease, active_lease = self.client.active_lease.load(Ordering::Acquire), "Windows 输入代理 backend 通知 lease 已过期"); // to remove
             bail!("Windows input agent backend was superseded by a newer session");
         }
         if !self.client.alive.load(Ordering::Acquire) {
-            tracing::trace!(request = request_name, lease = self.lease, "Windows 输入代理 backend 通知发现连接关闭"); // to remove
             bail!("Windows input agent connection is closed");
         }
         self.client.notify(request)
@@ -1016,9 +919,7 @@ impl AgentBackend {
 
 impl Drop for AgentBackend {
     fn drop(&mut self) {
-        tracing::trace!(lease = self.lease, active_lease = self.client.active_lease.load(Ordering::Acquire), "Windows 输入代理 backend 开始 Drop"); // to remove
         let Ok(_lifecycle) = self.client.lifecycle.lock() else {
-            tracing::trace!(lease = self.lease, "Windows 输入代理 backend Drop 无法获取 lifecycle lock"); // to remove
             return;
         };
         if self
@@ -1027,10 +928,8 @@ impl Drop for AgentBackend {
             .compare_exchange(self.lease, 0, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
-            tracing::trace!(lease = self.lease, active_lease = self.client.active_lease.load(Ordering::Acquire), "Windows 输入代理 backend Drop 忽略过期 lease"); // to remove
             return;
         }
-        tracing::trace!(lease = self.lease, "Windows 输入代理 backend Drop 已入队 Stop"); // to remove
         let _ = self.client.notify(AgentRequest::Stop);
         if let Ok(mut context) = self.client.context.lock() {
             *context = None;
@@ -1177,7 +1076,6 @@ fn gui_command_owner(
         },
         REQUEST_DELIVERY_TIMEOUT,
     )?;
-    tracing::trace!(agent_pid = hello.agent_pid, parent_pid, session_id, "Windows 输入代理 GUI command pipe 已写入 HelloAck"); // to remove
     command_writer_loop(pipe, commands, cursor, pending, alive)
 }
 
@@ -1237,7 +1135,6 @@ fn gui_event_owner(
             agent_path: agent_path.clone(),
         })
         .map_err(|_| anyhow!("Windows input agent command owner stopped during handshake"))?;
-    tracing::trace!(agent_pid, path = %agent_path.display(), "Windows 输入代理 GUI event pipe 已校验 agent 身份"); // to remove
     match read_packet::<AgentToGuiPacket>(&mut pipe, CONNECT_TIMEOUT)? {
         AgentToGuiPacket::Ready => {}
         AgentToGuiPacket::StartupError { error } => {
@@ -1253,7 +1150,6 @@ fn gui_event_owner(
     ready
         .send(Ok(client))
         .map_err(|_| anyhow!("Windows input agent readiness receiver closed"))?;
-    tracing::trace!(agent_pid, parent_pid, "Windows 输入代理 GUI event pipe 已进入读取循环"); // to remove
     client_event_reader_loop(pipe, pending, context, alive)
 }
 
@@ -1263,8 +1159,6 @@ fn client_event_reader_loop(
     context: Arc<Mutex<Option<CaptureContext>>>,
     alive: Arc<AtomicBool>,
 ) -> Result<()> {
-    let mut unmatched_response = 0usize;
-    let mut acknowledged_cursor = 0usize;
     while alive.load(Ordering::Acquire) {
         let packet = match read_packet::<AgentToGuiPacket>(&mut pipe, AGENT_HEARTBEAT_TIMEOUT) {
             Ok(packet) => packet,
@@ -1273,20 +1167,14 @@ fn client_event_reader_loop(
         };
         match packet {
             AgentToGuiPacket::Response { id, response } => {
-                let response_name = agent_response_name(&response);
                 let pending_response = pending
                     .lock()
                     .map_err(|_| anyhow!("Windows input agent pending response state poisoned"))?
                     .remove(&id);
                 let Some(pending_response) = pending_response else {
-                    unmatched_response = unmatched_response.saturating_add(1);
-                    if unmatched_response == 1 || unmatched_response.is_multiple_of(500) {
-                        tracing::trace!(count = unmatched_response, request_id = id, response = response_name, "Windows 输入代理 GUI 收到无 pending response 汇总"); // to remove
-                    }
                     continue;
                 };
                 if pending_response.request == "InjectCursor" {
-                    acknowledged_cursor = acknowledged_cursor.saturating_add(1);
                     if let AgentResponse::Error(message) = &response
                         && let Ok(context) = context.lock()
                         && let Some(context) = context.as_ref()
@@ -1295,34 +1183,12 @@ fn client_event_reader_loop(
                             "Windows input agent cursor injection failed: {message}"
                         )));
                     }
-                    if acknowledged_cursor == 1 || acknowledged_cursor.is_multiple_of(500) {
-                        tracing::trace!(count = acknowledged_cursor, request_id = id, response = response_name, "Windows 输入代理 GUI 光标请求确认汇总"); // to remove
-                    }
-                } else if pending_response.request != "Health" {
-                    tracing::trace!(request = pending_response.request, request_id = id, response = response_name, "Windows 输入代理 GUI response 已匹配 pending"); // to remove
                 }
                 if let Some(caller) = pending_response.caller {
                     let _ = caller.send(Ok(response));
                 }
                 let _ = pending_response.completion.send(Ok(()));
             }
-            AgentToGuiPacket::Diagnostic {
-                id,
-                request,
-                phase,
-                elapsed_ms,
-                error,
-            } => match phase {
-                AgentDiagnosticPhase::Started => {
-                    tracing::info!(target: "synly_input_agent", request_id = id, %request, "Windows 输入代理开始处理请求");
-                }
-                AgentDiagnosticPhase::Completed => {
-                    tracing::debug!(target: "synly_input_agent", request_id = id, %request, elapsed_ms, "Windows 输入代理完成请求");
-                }
-                AgentDiagnosticPhase::Failed => {
-                    tracing::error!(target: "synly_input_agent", request_id = id, %request, elapsed_ms, error = error.as_deref().unwrap_or("unknown error"), "Windows 输入代理请求失败");
-                }
-            },
             AgentToGuiPacket::Event(event) => {
                 if let Ok(context) = context.lock()
                     && let Some(context) = context.as_ref()
@@ -1363,17 +1229,6 @@ fn client_event_reader_loop(
     Ok(())
 }
 
-fn agent_response_name(response: &AgentResponse) -> &'static str {
-    match response {
-        AgentResponse::Ok => "Ok",
-        AgentResponse::Pong => "Pong",
-        AgentResponse::Started { .. } => "Started",
-        AgentResponse::Point(_) => "Point",
-        AgentResponse::Snapshot(_) => "Snapshot",
-        AgentResponse::Error(_) => "Error",
-    }
-}
-
 fn agent_completion_packet(id: u64, response: Result<AgentResponse>) -> AgentToGuiPacket {
     AgentToGuiPacket::Response {
         id,
@@ -1390,9 +1245,7 @@ fn command_writer_loop(
     alive: Arc<AtomicBool>,
 ) -> Result<()> {
     let mut next_id = 1u64;
-    let mut written_inject_cursor = 0usize;
     let mut next_heartbeat = Instant::now() + CLIENT_HEARTBEAT_INTERVAL;
-    tracing::trace!("Windows 输入代理 GUI command writer 开始"); // to remove
     while alive.load(Ordering::Acquire) {
         let heartbeat_wait = next_heartbeat.saturating_duration_since(Instant::now());
         let wait = heartbeat_wait.min(Duration::from_millis(50));
@@ -1405,7 +1258,6 @@ fn command_writer_loop(
                         &pending,
                         &alive,
                         &mut next_id,
-                        &mut written_inject_cursor,
                     )?;
                 }
                 write_client_command(
@@ -1414,7 +1266,6 @@ fn command_writer_loop(
                     &pending,
                     &alive,
                     &mut next_id,
-                    &mut written_inject_cursor,
                 )?;
                 next_heartbeat = Instant::now() + CLIENT_HEARTBEAT_INTERVAL;
             }
@@ -1425,7 +1276,6 @@ fn command_writer_loop(
                     &pending,
                     &alive,
                     &mut next_id,
-                    &mut written_inject_cursor,
                 )?;
                 next_heartbeat = Instant::now() + CLIENT_HEARTBEAT_INTERVAL;
             }
@@ -1436,21 +1286,18 @@ fn command_writer_loop(
                     &pending,
                     &alive,
                     &mut next_id,
-                    &mut written_inject_cursor,
                 )?;
                 if Instant::now() >= next_heartbeat {
                     write_client_command(
                         &mut pipe,
                         ClientCommand {
                             request: AgentRequest::Health,
-                            queued_at: Instant::now(),
                             dispatched: None,
                             response: None,
                         },
                         &pending,
                         &alive,
                         &mut next_id,
-                        &mut written_inject_cursor,
                     )?;
                     next_heartbeat = Instant::now() + CLIENT_HEARTBEAT_INTERVAL;
                 }
@@ -1458,7 +1305,6 @@ fn command_writer_loop(
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
-    tracing::trace!(inject_cursor_count = written_inject_cursor, "Windows 输入代理 GUI command writer 收到关闭信号"); // to remove
     Ok(())
 }
 
@@ -1468,7 +1314,6 @@ fn flush_latest_cursor(
     pending: &PendingResponses,
     alive: &Arc<AtomicBool>,
     next_id: &mut u64,
-    written_inject_cursor: &mut usize,
 ) -> Result<()> {
     let update = {
         let mut latest = cursor
@@ -1484,14 +1329,12 @@ fn flush_latest_cursor(
             pipe,
             ClientCommand {
                 request: AgentRequest::InjectCursor(update.point),
-                queued_at: update.queued_at,
                 dispatched: None,
                 response: None,
             },
             pending,
             alive,
             next_id,
-            written_inject_cursor,
         )?;
     }
     Ok(())
@@ -1503,19 +1346,15 @@ fn write_client_command(
     pending: &PendingResponses,
     alive: &Arc<AtomicBool>,
     next_id: &mut u64,
-    written_inject_cursor: &mut usize,
 ) -> Result<()> {
     let ClientCommand {
         request,
-        queued_at,
         dispatched,
         response,
     } = command;
     let id = *next_id;
     *next_id = next_id.saturating_add(1);
     let request_name = request.name();
-    let report_diagnostic = request.reports_diagnostic();
-    let is_inject_cursor = matches!(&request, AgentRequest::InjectCursor(_));
     let (completion_tx, completion_rx) = std::sync::mpsc::sync_channel(1);
     pending
         .lock()
@@ -1528,9 +1367,6 @@ fn write_client_command(
                 completion: completion_tx,
             },
         );
-    if !is_inject_cursor && !matches!(&request, AgentRequest::Health) {
-        tracing::trace!(request = request_name, request_id = id, queue_ms = queued_at.elapsed().as_millis(), "Windows 输入代理 GUI 开始写入 IPC request"); // to remove
-    }
     if let Err(error) = write_packet(
         pipe,
         &GuiToAgentPacket::Request {
@@ -1540,30 +1376,11 @@ fn write_client_command(
         REQUEST_DELIVERY_TIMEOUT,
     )
     {
-        tracing::trace!(request = request_name, request_id = id, error = %error, "Windows 输入代理 GUI 写入 IPC request 失败"); // to remove
         complete_pending_with_error(pending, id, format!("{error:#}"));
         return Err(error);
     }
-    if is_inject_cursor {
-        *written_inject_cursor = written_inject_cursor.saturating_add(1);
-        if *written_inject_cursor == 1 || written_inject_cursor.is_multiple_of(500) {
-            tracing::trace!(count = *written_inject_cursor, request_id = id, "Windows 输入代理 GUI 已写入 InjectCursor 汇总"); // to remove
-        }
-    } else if request_name != "Health" {
-        tracing::trace!(request = request_name, request_id = id, "Windows 输入代理 GUI IPC request 写入完成"); // to remove
-    }
     if let Some(dispatched) = dispatched {
         let _ = dispatched.send(());
-        tracing::trace!(request = request_name, request_id = id, "Windows 输入代理 GUI 已通知同步调用方 request 完成派发"); // to remove
-    }
-    if report_diagnostic {
-        tracing::debug!(
-            target: "synly_input_agent",
-            request = request_name,
-            request_id = id,
-            queue_ms = queued_at.elapsed().as_millis(),
-            "Windows 输入代理 IPC 请求已写入"
-        );
     }
     match completion_rx.recv_timeout(REQUEST_DELIVERY_TIMEOUT) {
         Ok(Ok(())) => Ok(()),
@@ -1626,15 +1443,11 @@ async fn run_agent_loop(
     output: AgentOutput,
     alive: Arc<AtomicBool>,
 ) -> Result<()> {
-    let active_request = Arc::new(Mutex::new(None));
-    let request_watchdog = spawn_agent_request_watchdog(Arc::clone(&active_request));
     let mut runtime = None;
     let mut heartbeat = AgentHeartbeat::new(Instant::now());
     let mut paused = false;
     let mut desktop_tick = time::interval(Duration::from_millis(250));
     desktop_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut processed_inject_cursor = 0usize;
-    tracing::trace!("Windows 输入代理进程 request loop 开始"); // to remove
 
     let result: Result<()> = async {
         loop {
@@ -1645,91 +1458,19 @@ async fn run_agent_loop(
                         bail!("Windows input agent received an unexpected packet");
                     };
                     heartbeat.observe(Instant::now());
-                    let request_kind = request.name();
-                    let request_name = request_kind.to_string();
-                    let report_diagnostic = request.reports_diagnostic();
-                    let is_inject_cursor = matches!(&request, AgentRequest::InjectCursor(_));
-                    if is_inject_cursor {
-                        processed_inject_cursor = processed_inject_cursor.saturating_add(1);
-                        if processed_inject_cursor == 1
-                            || processed_inject_cursor.is_multiple_of(500)
-                        {
-                            tracing::trace!(target: "synly_input_agent", count = processed_inject_cursor, request_id = id, "Windows 输入代理进程收到 InjectCursor 汇总"); // to remove
-                        }
-                    } else if request_name != "Health" {
-                        tracing::trace!(target: "synly_input_agent", request = %request_name, request_id = id, runtime_started = runtime.is_some(), "Windows 输入代理进程收到 request"); // to remove
-                    }
-                    if report_diagnostic {
-                        output.send_reliable(AgentToGuiPacket::Diagnostic {
-                                id,
-                                request: request_name.clone(),
-                                phase: AgentDiagnosticPhase::Started,
-                                elapsed_ms: 0,
-                                error: None,
-                            })?;
-                    }
-                    let started = Instant::now();
-                    if let Ok(mut active) = active_request.lock() {
-                        *active = Some(ActiveAgentRequest {
-                            id,
-                            request: request_kind,
-                            started,
-                        });
-                    }
                     let response = handle_agent_request(request, &mut runtime, output.clone()).await;
-                    if let Ok(mut active) = active_request.lock()
-                        && active.as_ref().is_some_and(|active| active.id == id)
-                    {
-                        *active = None;
-                    }
-                    if !is_inject_cursor && request_name != "Health" {
-                        tracing::trace!(target: "synly_input_agent", request = %request_name, request_id = id, elapsed_ms = started.elapsed().as_millis(), result = ?response.as_ref().err(), "Windows 输入代理进程 backend 调用结束"); // to remove
-                    }
-                    if report_diagnostic {
-                        let elapsed_ms = started
-                            .elapsed()
-                            .as_millis()
-                            .try_into()
-                            .unwrap_or(u64::MAX);
-                        let (phase, error) = match &response {
-                            Ok(_) => (AgentDiagnosticPhase::Completed, None),
-                            Err(error) => (
-                                AgentDiagnosticPhase::Failed,
-                                Some(format!("{error:#}")),
-                            ),
-                        };
-                        output.send_reliable(AgentToGuiPacket::Diagnostic {
-                                id,
-                                request: request_name.clone(),
-                                phase,
-                                elapsed_ms,
-                                error,
-                            })?;
-                    }
                     let completion = agent_completion_packet(id, response);
                     output.send_reliable(completion)?;
-                    if !is_inject_cursor && request_name != "Health" {
-                        tracing::trace!(target: "synly_input_agent", request = %request_name, request_id = id, "Windows 输入代理进程完成包已入 event 队列"); // to remove
-                    }
                     heartbeat.observe(Instant::now());
                 }
                 _ = desktop_tick.tick() => {
                     if heartbeat.expired(Instant::now()) {
-                        tracing::trace!(target: "synly_input_agent", elapsed_ms = heartbeat.last_seen.elapsed().as_millis(), "Windows 输入代理进程 GUI heartbeat 超时"); // to remove
                         let message = "Windows input agent GUI heartbeat timed out";
-                        let _ = output.send_reliable(AgentToGuiPacket::Diagnostic {
-                                id: 0,
-                                request: "Heartbeat".to_string(),
-                                phase: AgentDiagnosticPhase::Failed,
-                                elapsed_ms: heartbeat.last_seen.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
-                                error: Some(message.to_string()),
-                            });
                         break Err(anyhow!(message));
                     }
                     let current_paused = !is_default_input_desktop();
                     if current_paused != paused {
                         paused = current_paused;
-                        tracing::trace!(target: "synly_input_agent", paused, "Windows 输入代理进程 desktop 状态变化"); // to remove
                         if paused
                             && let Some(runtime) = runtime.as_ref()
                         {
@@ -1743,10 +1484,7 @@ async fn run_agent_loop(
         }
     }
     .await;
-    tracing::trace!(target: "synly_input_agent", inject_cursor_count = processed_inject_cursor, result = ?result.as_ref().err(), "Windows 输入代理进程 request loop 已返回"); // to remove
     alive.store(false, Ordering::Release);
-    request_watchdog.abort();
-    let _ = request_watchdog.await;
     if let Some(runtime) = runtime {
         runtime.stop().await;
     }
@@ -1759,8 +1497,6 @@ fn agent_event_writer_loop(
     motion: Arc<AgentMotionSlot>,
     alive: Arc<AtomicBool>,
 ) -> Result<()> {
-    let mut written_motion = 0usize;
-    tracing::trace!(target: "synly_input_agent", "Windows 输入代理 event writer 开始"); // to remove
     while alive.load(Ordering::Acquire) {
         match reliable.recv_timeout(Duration::from_millis(20)) {
             Ok(packet) => {
@@ -1772,24 +1508,19 @@ fn agent_event_writer_loop(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 if let Some(motion) = motion.take() {
-                    write_motion_packet(&mut pipe, motion, &mut written_motion)?;
+                    write_motion_packet(&mut pipe, motion)?;
                 }
                 break;
             }
         }
         if let Some(motion) = motion.take() {
-            write_motion_packet(&mut pipe, motion, &mut written_motion)?;
+            write_motion_packet(&mut pipe, motion)?;
         }
     }
-    tracing::trace!(target: "synly_input_agent", motion_count = written_motion, "Windows 输入代理 event writer 已关闭"); // to remove
     Ok(())
 }
 
-fn write_motion_packet(
-    pipe: &mut NativePipe,
-    motion: AgentMotion,
-    written_motion: &mut usize,
-) -> Result<()> {
+fn write_motion_packet(pipe: &mut NativePipe, motion: AgentMotion) -> Result<()> {
     write_packet(
         pipe,
         &AgentToGuiPacket::Motion {
@@ -1800,55 +1531,11 @@ fn write_motion_packet(
         },
         REQUEST_DELIVERY_TIMEOUT,
     )?;
-    *written_motion = written_motion.saturating_add(1);
-    if *written_motion == 1 || written_motion.is_multiple_of(500) {
-        tracing::trace!(target: "synly_input_agent", count = *written_motion, "Windows 输入代理 event pipe 已写入 Motion 汇总"); // to remove
-    }
     Ok(())
 }
 
 fn write_agent_event_packet(pipe: &mut NativePipe, packet: AgentToGuiPacket) -> Result<()> {
-    let request_id = packet.request_context().0;
-    let packet_name = packet.packet_name();
-    write_packet(pipe, &packet, REQUEST_DELIVERY_TIMEOUT)?;
-    if let Some(request_id) = request_id {
-        tracing::trace!(target: "synly_input_agent", request_id, packet = packet_name, "Windows 输入代理 event pipe 已写入可靠包"); // to remove
-    }
-    Ok(())
-}
-
-fn spawn_agent_request_watchdog(
-    active_request: Arc<Mutex<Option<ActiveAgentRequest>>>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut tick = time::interval(IPC_SLOW_OPERATION_TRACE_AFTER);
-        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        let mut reported_id = 0u64;
-        loop {
-            tick.tick().await;
-            let active = active_request
-                .lock()
-                .ok()
-                .and_then(|active| *active);
-            match active {
-                Some(active)
-                    if active.started.elapsed() >= IPC_SLOW_OPERATION_TRACE_AFTER
-                        && reported_id != active.id =>
-                {
-                    reported_id = active.id;
-                    tracing::trace!(
-                        target: "synly_input_agent",
-                        request = active.request,
-                        request_id = active.id,
-                        elapsed_ms = active.started.elapsed().as_millis(),
-                        "Windows 输入代理 backend 请求仍在执行"
-                    ); // to remove
-                }
-                None => reported_id = 0,
-                _ => {}
-            }
-        }
-    })
+    write_packet(pipe, &packet, REQUEST_DELIVERY_TIMEOUT)
 }
 
 async fn handle_agent_request(
@@ -1858,21 +1545,17 @@ async fn handle_agent_request(
 ) -> Result<AgentResponse> {
     match request {
         AgentRequest::Start { mode, hotkey } => {
-            tracing::trace!(target: "synly_input_agent", ?mode, ?hotkey, replacing_runtime = runtime.is_some(), "Windows 输入代理开始执行 Start"); // to remove
             if let Some(previous) = runtime.take() {
                 previous.stop().await;
             }
             *runtime = Some(start_native_runtime(mode, hotkey, outgoing)?);
             let layout = agent_backend(runtime)?.layout()?;
-            tracing::trace!(target: "synly_input_agent", displays = ?layout.displays, "Windows 输入代理 Start 已获取布局"); // to remove
             Ok(AgentResponse::Started { layout })
         }
         AgentRequest::Stop => {
-            tracing::trace!(target: "synly_input_agent", runtime_started = runtime.is_some(), "Windows 输入代理开始执行 Stop"); // to remove
             if let Some(previous) = runtime.take() {
                 previous.stop().await;
             }
-            tracing::trace!(target: "synly_input_agent", "Windows 输入代理 Stop 完成"); // to remove
             Ok(AgentResponse::Ok)
         }
         AgentRequest::Health => Ok(AgentResponse::Pong),
@@ -1881,15 +1564,11 @@ async fn handle_agent_request(
         }
         AgentRequest::Snapshot => Ok(AgentResponse::Snapshot(agent_backend(runtime)?.snapshot())),
         AgentRequest::SetCapture(active) => {
-            tracing::trace!(target: "synly_input_agent", active, "Windows 输入代理开始执行 SetCapture"); // to remove
             agent_backend(runtime)?.set_capture(active)?;
-            tracing::trace!(target: "synly_input_agent", active, "Windows 输入代理 SetCapture 完成"); // to remove
             Ok(AgentResponse::Ok)
         }
         AgentRequest::WarpCursor(point) => {
-            tracing::trace!(target: "synly_input_agent", point = ?point, "Windows 输入代理开始执行 WarpCursor"); // to remove
             agent_backend(runtime)?.warp_cursor(point)?;
-            tracing::trace!(target: "synly_input_agent", point = ?point, "Windows 输入代理 WarpCursor 完成"); // to remove
             Ok(AgentResponse::Ok)
         }
         AgentRequest::InjectKey {
@@ -1898,12 +1577,10 @@ async fn handle_agent_request(
             down,
             repeat,
         } => {
-            tracing::trace!(target: "synly_input_agent", usage, down, repeat, "Windows 输入代理开始执行 InjectKey"); // to remove
             agent_backend(runtime)?.inject_key(usage, modifiers, down, repeat)?;
             Ok(AgentResponse::Ok)
         }
         AgentRequest::InjectButton { button, down } => {
-            tracing::trace!(target: "synly_input_agent", button, down, "Windows 输入代理开始执行 InjectButton"); // to remove
             agent_backend(runtime)?.inject_button(button, down)?;
             Ok(AgentResponse::Ok)
         }
@@ -1912,14 +1589,11 @@ async fn handle_agent_request(
             Ok(AgentResponse::Ok)
         }
         AgentRequest::InjectWheel { x, y } => {
-            tracing::trace!(target: "synly_input_agent", x, y, "Windows 输入代理开始执行 InjectWheel"); // to remove
             agent_backend(runtime)?.inject_wheel(x, y)?;
             Ok(AgentResponse::Ok)
         }
         AgentRequest::ReleaseAll => {
-            tracing::trace!(target: "synly_input_agent", "Windows 输入代理开始执行 ReleaseAll"); // to remove
             agent_backend(runtime)?.release_all()?;
-            tracing::trace!(target: "synly_input_agent", "Windows 输入代理 ReleaseAll 完成"); // to remove
             Ok(AgentResponse::Ok)
         }
     }
@@ -1930,7 +1604,6 @@ fn start_native_runtime(
     hotkey: Hotkey,
     outgoing: AgentOutput,
 ) -> Result<NativeAgentRuntime> {
-    tracing::trace!(target: "synly_input_agent", ?mode, ?hotkey, "Windows 输入代理开始创建 native runtime"); // to remove
     let send_motion = mode == InputMode::Send;
     let (events_tx, mut events_rx) = mpsc::channel(256);
     let motion = Arc::new(MotionAccumulator::default());
@@ -1944,7 +1617,6 @@ fn start_native_runtime(
         failed: Arc::new(AtomicBool::new(false)),
     };
     let backend = super::platform::windows::start_native(context)?;
-    tracing::trace!(target: "synly_input_agent", ?mode, "Windows 输入代理 native backend 已启动"); // to remove
     let task = tokio::spawn(async move {
         let mut motion_tick = time::interval(Duration::from_millis(8));
         motion_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -1970,7 +1642,6 @@ fn start_native_runtime(
             }
         }
     });
-    tracing::trace!(target: "synly_input_agent", ?mode, "Windows 输入代理 native runtime 已就绪"); // to remove
     Ok(NativeAgentRuntime { backend, task })
 }
 
@@ -2264,76 +1935,32 @@ fn is_default_input_desktop() -> bool {
     String::from_utf16_lossy(&buffer[..end]).eq_ignore_ascii_case("Default")
 }
 
-trait IpcPacketContext {
-    fn packet_name(&self) -> &'static str;
-
-    fn request_context(&self) -> (Option<u64>, Option<&'static str>) {
-        (None, None)
-    }
-}
-
-impl IpcPacketContext for GuiToAgentPacket {
-    fn packet_name(&self) -> &'static str {
-        match self {
-            Self::HelloAck { .. } => "HelloAck",
-            Self::Request { .. } => "Request",
-        }
-    }
-
-    fn request_context(&self) -> (Option<u64>, Option<&'static str>) {
-        match self {
-            Self::Request { id, request } => (Some(*id), Some(request.name())),
-            Self::HelloAck { .. } => (None, None),
-        }
-    }
-}
-
-impl IpcPacketContext for AgentToGuiPacket {
+impl AgentToGuiPacket {
     fn packet_name(&self) -> &'static str {
         match self {
             Self::Hello { .. } => "Hello",
             Self::Ready => "Ready",
             Self::StartupError { .. } => "StartupError",
             Self::Response { .. } => "Response",
-            Self::Diagnostic { .. } => "Diagnostic",
             Self::Event(_) => "Event",
             Self::Motion { .. } => "Motion",
             Self::SecureDesktopPaused(_) => "SecureDesktopPaused",
-        }
-    }
-
-    fn request_context(&self) -> (Option<u64>, Option<&'static str>) {
-        match self {
-            Self::Response { id, .. } => (Some(*id), None),
-            Self::Diagnostic { id, .. } => (Some(*id), None),
-            _ => (None, None),
         }
     }
 }
 
 fn write_packet<P>(pipe: &mut NativePipe, packet: &P, timeout: Duration) -> Result<()>
 where
-    P: Serialize + IpcPacketContext,
+    P: Serialize,
 {
-    let packet_name = packet.packet_name();
     let bytes = bincode::serialize(packet).context("failed to encode Windows input agent packet")?;
     if bytes.is_empty() || bytes.len() > IPC_MAX_FRAME {
-        tracing::trace!(target: "synly_input_agent", packet = packet_name, length = bytes.len(), "Windows 输入代理 IPC packet 长度校验失败"); // to remove
         bail!("Windows input agent packet length is invalid");
     }
     let mut frame = Vec::with_capacity(4 + bytes.len());
     frame.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
     frame.extend_from_slice(&bytes);
-    let started = Instant::now();
-    pipe.write_all(&frame, timeout).map_err(|error| {
-        tracing::trace!(target: "synly_input_agent", packet = packet_name, error = %error, "Windows 输入代理 IPC packet frame 写入失败"); // to remove
-        error
-    })?;
-    if started.elapsed() >= IPC_SLOW_OPERATION_TRACE_AFTER {
-        let (request_id, request) = packet.request_context();
-        tracing::trace!(target: "synly_input_agent", packet = packet_name, ?request_id, ?request, frame_length = frame.len(), elapsed_ms = started.elapsed().as_millis(), "Windows 输入代理 IPC packet frame 延迟写入完成"); // to remove
-    }
-    Ok(())
+    pipe.write_all(&frame, timeout).map_err(Into::into)
 }
 
 fn read_packet<P>(pipe: &mut NativePipe, timeout: Duration) -> Result<P>
@@ -2342,13 +1969,9 @@ where
 {
     let started = Instant::now();
     let mut length_bytes = [0u8; 4];
-    pipe.read_exact(&mut length_bytes, timeout).map_err(|error| {
-        tracing::trace!(target: "synly_input_agent", error = %error, "Windows 输入代理 IPC packet 长度读取失败"); // to remove
-        error
-    })?;
+    pipe.read_exact(&mut length_bytes, timeout)?;
     let length = u32::from_be_bytes(length_bytes) as usize;
     if length == 0 || length > IPC_MAX_FRAME {
-        tracing::trace!(target: "synly_input_agent", length, "Windows 输入代理 IPC packet 长度校验失败"); // to remove
         bail!("Windows input agent packet length is invalid: {length}");
     }
     let mut bytes = vec![0u8; length];
@@ -2356,14 +1979,8 @@ where
     if remaining.is_zero() {
         bail!("Windows input agent packet read timed out");
     }
-    pipe.read_exact(&mut bytes, remaining).map_err(|error| {
-        tracing::trace!(target: "synly_input_agent", length, error = %error, "Windows 输入代理 IPC packet body 读取失败"); // to remove
-        error
-    })?;
+    pipe.read_exact(&mut bytes, remaining)?;
     bincode::deserialize(&bytes)
-        .inspect_err(|error| {
-            tracing::trace!(target: "synly_input_agent", length, error = %error, "Windows 输入代理 IPC packet 解码失败"); // to remove
-        })
         .context("failed to decode Windows input agent packet")
 }
 
@@ -2626,7 +2243,6 @@ mod tests {
             for x in 0..20_000 {
                 *producer_cursor.latest.lock().unwrap() = Some(CursorUpdate {
                     point: Point { x, y: 720 },
-                    queued_at: Instant::now(),
                 });
             }
             producer_cursor.queued.store(true, Ordering::Release);
@@ -2635,7 +2251,6 @@ mod tests {
                 producer_commands
                     .send(ClientQueueItem::Command(ClientCommand {
                         request: AgentRequest::ReleaseAll,
-                        queued_at: Instant::now(),
                         dispatched: None,
                         response: None,
                     }))
@@ -2646,7 +2261,6 @@ mod tests {
                             x: 2551,
                             y: i32::try_from(cycle % 1440).unwrap(),
                         }),
-                        queued_at: Instant::now(),
                         dispatched: None,
                         response: None,
                     }))
@@ -2658,7 +2272,6 @@ mod tests {
                         button: 1,
                         down: true,
                     },
-                    queued_at: Instant::now(),
                     dispatched: None,
                     response: None,
                 }))
@@ -2668,7 +2281,6 @@ mod tests {
             producer_commands
                 .send(ClientQueueItem::Command(ClientCommand {
                     request: AgentRequest::InjectWheel { x: 0, y: 120 },
-                    queued_at: Instant::now(),
                     dispatched: Some(dispatch_tx),
                     response: Some(response_tx),
                 }))
@@ -2806,19 +2418,16 @@ mod tests {
             pipe.connect_server(CONNECT_TIMEOUT).unwrap();
             let pending = Arc::new(Mutex::new(HashMap::new()));
             let mut next_id = 1;
-            let mut cursor_count = 0;
             write_client_command(
                 &mut pipe,
                 ClientCommand {
                     request: AgentRequest::Stop,
-                    queued_at: Instant::now(),
                     dispatched: None,
                     response: None,
                 },
                 &pending,
                 &server_alive,
                 &mut next_id,
-                &mut cursor_count,
             )
         });
         created_rx.recv_timeout(CONNECT_TIMEOUT).unwrap();
