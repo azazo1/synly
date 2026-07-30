@@ -9,7 +9,7 @@ pub use crate::settings::{
 };
 use crate::sync::WorkspaceSpec;
 use anyhow::{Context, Result, bail};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -19,6 +19,8 @@ use std::path::PathBuf;
     about = "在局域网中发现设备、通过 PIN 配对、建立安全连接并持续同步文件与可选剪贴板"
 )]
 pub struct Cli {
+    #[command(subcommand)]
+    pub internal_command: Option<InternalCommand>,
     #[arg(long, help = "以无界面模式运行; 所有必要参数必须显式提供")]
     pub headless: bool,
     #[arg(
@@ -139,6 +141,19 @@ pub struct Cli {
     pub paths: Vec<PathBuf>,
 }
 
+#[derive(Subcommand, Debug)]
+pub enum InternalCommand {
+    #[command(name = "__input-agent", hide = true)]
+    InputAgent {
+        #[arg(long)]
+        pipe: String,
+        #[arg(long)]
+        token: String,
+        #[arg(long)]
+        parent_pid: u32,
+    },
+}
+
 #[derive(Clone, Debug)]
 pub struct RuntimeOptions {
     pub file_sync_mode: FileSyncMode,
@@ -188,6 +203,7 @@ pub fn cli_from_runtime_config(
     headless: bool,
 ) -> Cli {
     Cli {
+        internal_command: None,
         headless,
         notifications: false,
         no_notifications: false,
@@ -269,6 +285,7 @@ fn collect_runtime_options_from_cli(cli: Cli, config: &SynlyConfig) -> Result<Ru
         interval_secs: cli.interval_secs.max(1),
         sync_delete,
         notifications_enabled,
+        input_backend_generation: 0,
         device_name: config.device.device_name.clone(),
         instance_name: instance_name.clone(),
         discovery: config.discovery.clone(),
@@ -519,6 +536,29 @@ mod tests {
     fn conflicting_connection_flags_still_conflict() {
         let result = Cli::try_parse_from(["synly", "--fs", "receive", ".", "--host", "--join"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn internal_input_agent_command_parses_without_runtime_options() {
+        let cli = Cli::try_parse_from([
+            "synly",
+            "__input-agent",
+            "--pipe",
+            r"\\.\pipe\synly-input-test",
+            "--token",
+            "test-token",
+            "--parent-pid",
+            "42",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.internal_command,
+            Some(InternalCommand::InputAgent {
+                parent_pid: 42,
+                ..
+            })
+        ));
     }
 
     #[test]

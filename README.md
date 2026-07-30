@@ -59,9 +59,9 @@ $env:VCPKG_ROOT="C:\path\to\vcpkg"
 cargo build --release
 ```
 
-Windows 主 GUI 使用 `asInvoker` manifest 以普通权限运行. `synly-input-agent.exe` 使用 `requireAdministrator` manifest, 输入控制开启前通过 `ShellExecuteW("runas")` 按需请求 UAC. 登录启动且窗口隐藏时不会主动弹出 UAC, 需要用户从托盘或设置页确认授权.
+Windows 主 GUI 使用 `asInvoker` manifest 以普通权限运行. 需要管理员输入能力时, GUI 通过 `ShellExecuteW("runas")` 启动当前 `synly.exe` 的隐藏输入代理子进程, 并使用命名管道完成握手. 主进程与子进程来自同一个构建产物, 避免 IPC 协议版本错配. 登录启动且窗口隐藏时不会主动弹出 UAC, 需要用户从托盘或设置页确认授权.
 
-GUI 和代理通过随机命名管道与随机 token 通信. 管道 DACL 只允许当前用户和 SYSTEM, 双方校验 IPC 版本, PID, session ID, 映像路径和安装目录. release 构建要求 GUI 与代理通过 Authenticode 校验, debug 构建会记录签名校验警告但允许本地未签名产物. 管道断开, 心跳超时, 代理退出或进入非 `Default` 输入桌面时会立即释放输入状态.
+GUI 和提权子进程通过随机命名管道与随机 token 通信. 管道 DACL 只允许当前用户和 SYSTEM, 双方校验 IPC 版本, PID, session ID, 映像路径和安装目录. release 构建要求当前可执行文件通过 Authenticode 校验, debug 构建会记录签名校验警告但允许本地未签名产物. 管道断开, 心跳超时, 子进程退出或进入非 `Default` 输入桌面时会立即释放输入状态.
 
 ### macOS
 

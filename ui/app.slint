@@ -87,7 +87,7 @@ export component AppWindow inherits Window {
     in property <string> status-detail: "";
     in property <string> current-peer: "未连接";
     in property <bool> session-active: false;
-    in property <bool> input-permission-ready: true;
+    in property <bool> input-elevation-ready: true;
     in property <string> desired-summary: "";
     in property <string> applied-summary: "";
     in property <string> pending-summary: "";
@@ -319,16 +319,16 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
-                if root.input-mode-index != 0 && !root.input-permission-ready: Rectangle {
+                if root.input-mode-index != 0 && !root.input-elevation-ready: Rectangle {
                     height: 46px;
-                    background: #fff2e8;
-                    border-color: #e27a55;
+                    background: #eef5f1;
+                    border-color: #8aab99;
                     border-width: 1px;
                     border-radius: 5px;
                     HorizontalLayout {
                         padding: 8px;
-                        Text { text: "Windows 输入代理等待本机管理员授权"; vertical-alignment: center; color: #74351f; }
-                        Button { text: "授权"; clicked => { root.request-input-elevation(); } }
+                        Text { text: "基础控制可用, 授权后可控制管理员窗口"; horizontal-stretch: 1; vertical-alignment: center; color: #315442; }
+                        Button { text: "增强授权"; clicked => { root.request-input-elevation(); } }
                     }
                 }
                 Rectangle { vertical-stretch: 1; }

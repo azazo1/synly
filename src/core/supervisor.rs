@@ -56,6 +56,7 @@ pub struct AppSupervisor {
     session_pin: Option<String>,
     discovery_task: Option<JoinHandle<()>>,
     discovery_epoch: u64,
+    input_backend_generation: u64,
     pending_responses: HashMap<Uuid, oneshot::Sender<crate::runtime_control::InteractionResponse>>,
 }
 
@@ -73,7 +74,7 @@ enum InternalEvent {
         result: Result<Vec<DiscoveredPeer>, String>,
     },
     #[cfg_attr(not(windows), allow(dead_code))]
-    InputPermission(bool),
+    InputElevation(bool),
     Runtime {
         session_id: Uuid,
         event: RuntimeEvent,
@@ -107,6 +108,7 @@ impl AppSupervisor {
                 session_pin: None,
                 discovery_task: None,
                 discovery_epoch: 0,
+                input_backend_generation: 0,
                 pending_responses: HashMap::new(),
             },
             AppSupervisorHandle {
@@ -324,15 +326,8 @@ impl AppSupervisor {
                 {
                     match crate::windows_input_agent::request_elevation() {
                         Ok(()) => {
-                            self.snapshot.input_permission_ready = true;
-                            if self.session.is_some()
-                                && self.snapshot.desired.input_mode
-                                    != crate::input::InputMode::Off
-                            {
-                                self.snapshot.pending = Some(self.snapshot.desired.clone());
-                            }
-                            self.update_capabilities();
-                            self.update_tuning();
+                            self.snapshot.input_elevation_ready = true;
+                            self.restart_input_backend_if_active();
                         }
                         Err(error) => self.set_error(error.to_string()),
                     }
@@ -340,7 +335,7 @@ impl AppSupervisor {
                 }
                 #[cfg(not(windows))]
                 {
-                    self.snapshot.input_permission_ready = true;
+                    self.snapshot.input_elevation_ready = true;
                     self.publish();
                 }
             }
@@ -377,24 +372,12 @@ impl AppSupervisor {
                 tracing::warn!(error = %error, "设备发现刷新失败");
             }
             InternalEvent::Discovery { .. } => {}
-            InternalEvent::InputPermission(ready) => {
-                if self.snapshot.input_permission_ready == ready {
+            InternalEvent::InputElevation(ready) => {
+                if self.snapshot.input_elevation_ready == ready {
                     return;
                 }
-                self.snapshot.input_permission_ready = ready;
-                if !ready && self.snapshot.desired.input_mode != crate::input::InputMode::Off {
-                    if let Some(applied) = self.snapshot.applied.as_mut() {
-                        applied.input_mode = crate::input::InputMode::Off;
-                    }
-                    if let Some(actual) = self.snapshot.actual_capabilities.as_mut() {
-                        actual.input_mode = crate::input::InputMode::Off;
-                    }
-                    if self.session.is_some() {
-                        self.snapshot.pending = Some(self.snapshot.desired.clone());
-                        self.update_capabilities();
-                        self.update_tuning();
-                    }
-                }
+                self.snapshot.input_elevation_ready = ready;
+                self.restart_input_backend_if_active();
                 self.publish();
             }
             InternalEvent::Runtime { session_id, event } => {
@@ -516,15 +499,8 @@ impl AppSupervisor {
                 return;
             }
         };
-        #[cfg(windows)]
-        if options.input_mode != crate::input::InputMode::Off
-            && !self.snapshot.input_permission_ready
-        {
-            options.input_mode = crate::input::InputMode::Off;
-            options.input.mode = crate::input::InputMode::Off;
-        }
         let capabilities = self.current_capabilities();
-        let tuning = tuning_from_options(&options);
+        let tuning = tuning_from_options(&options, self.input_backend_generation);
         let (control, control_handle) = RuntimeControl::new(capabilities, tuning);
         if let Err(error) = crate::input::ensure_platform_supported(options.input_mode) {
             self.set_error(error.to_string());
@@ -536,13 +512,8 @@ impl AppSupervisor {
             ConnectionPreference::Host => AppLifecycle::Hosting,
             ConnectionPreference::Join => AppLifecycle::Connecting,
         };
-        let (applied, pending) = initial_session_configs(
-            &self.snapshot.desired,
-            self.snapshot.input_permission_ready,
-            cfg!(windows),
-        );
-        self.snapshot.applied = Some(applied);
-        self.snapshot.pending = pending;
+        self.snapshot.applied = Some(self.snapshot.desired.clone());
+        self.snapshot.pending = None;
         self.snapshot.last_error = None;
         self.publish();
 
@@ -614,11 +585,7 @@ impl AppSupervisor {
         RuntimeCapabilities {
             clipboard_mode: self.snapshot.desired.clipboard_mode,
             audio_mode: self.snapshot.desired.audio_mode,
-            input_mode: if cfg!(windows) && !self.snapshot.input_permission_ready {
-                crate::input::InputMode::Off
-            } else {
-                self.snapshot.desired.input_mode
-            },
+            input_mode: self.snapshot.desired.input_mode,
         }
     }
 
@@ -633,10 +600,24 @@ impl AppSupervisor {
         );
         match collect_runtime_options(cli, &self.config) {
             Ok(options) => {
-                let _ = tuning.send(tuning_from_options(&options));
+                let _ = tuning.send(tuning_from_options(
+                    &options,
+                    self.input_backend_generation,
+                ));
             }
             Err(error) => self.set_error(error.to_string()),
         }
+    }
+
+    fn restart_input_backend_if_active(&mut self) {
+        if self.session.is_none()
+            || self.snapshot.desired.input_mode == crate::input::InputMode::Off
+        {
+            return;
+        }
+        self.input_backend_generation = self.input_backend_generation.saturating_add(1);
+        tracing::trace!(generation = self.input_backend_generation, elevated = self.snapshot.input_elevation_ready, "Windows 输入 backend generation 已更新"); // to remove
+        self.update_tuning();
     }
 
     fn spawn_discovery_loop(&mut self) {
@@ -684,7 +665,7 @@ impl AppSupervisor {
                     let ready = crate::input::windows_input_agent_ready();
                     if previous != Some(ready) {
                         previous = Some(ready);
-                        if internal.send(InternalEvent::InputPermission(ready)).is_err() {
+                        if internal.send(InternalEvent::InputElevation(ready)).is_err() {
                             break;
                         }
                     }
@@ -760,26 +741,13 @@ fn validate_settings(config: &SynlyConfig) -> Result<()> {
     discovery::validate_config(&config.discovery)
 }
 
-fn initial_session_configs(
-    desired: &RuntimeConfig,
-    input_permission_ready: bool,
-    input_requires_elevation: bool,
-) -> (RuntimeConfig, Option<RuntimeConfig>) {
-    let mut applied = desired.clone();
-    let pending = if input_requires_elevation
-        && desired.input_mode != crate::input::InputMode::Off
-        && !input_permission_ready
-    {
-        applied.input_mode = crate::input::InputMode::Off;
-        Some(desired.clone())
-    } else {
-        None
-    };
-    (applied, pending)
-}
-
-fn tuning_from_options(options: &crate::cli::RuntimeOptions) -> RuntimeTuning {
-    options.control.tuning().borrow().clone()
+fn tuning_from_options(
+    options: &crate::cli::RuntimeOptions,
+    input_backend_generation: u64,
+) -> RuntimeTuning {
+    let mut tuning = options.control.tuning().borrow().clone();
+    tuning.input_backend_generation = input_backend_generation;
+    tuning
 }
 
 fn requires_reconnect(previous: &RuntimeConfig, next: &RuntimeConfig) -> bool {
@@ -907,17 +875,15 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_windows_input_stays_pending_without_changing_desired_state() {
-        let desired = RuntimeConfig {
-            input_mode: InputMode::Receive,
-            ..RuntimeConfig::default()
-        };
+    fn unavailable_elevated_agent_does_not_disable_base_input() {
+        let (mut supervisor, _) = AppSupervisor::new(test_config());
+        supervisor.snapshot.input_elevation_ready = false;
+        supervisor.snapshot.desired.input_mode = InputMode::Receive;
 
-        let (applied, pending) = initial_session_configs(&desired, false, true);
-
-        assert_eq!(applied.input_mode, InputMode::Off);
-        assert_eq!(pending.as_ref().map(|value| value.input_mode), Some(InputMode::Receive));
-        assert_eq!(desired.input_mode, InputMode::Receive);
+        assert_eq!(
+            supervisor.current_capabilities().input_mode,
+            InputMode::Receive
+        );
     }
 
     #[tokio::test]
@@ -940,6 +906,7 @@ mod tests {
             interval_secs: 3,
             sync_delete: false,
             notifications_enabled: true,
+            input_backend_generation: 0,
             device_name: "test-device".to_string(),
             instance_name: None,
             discovery: DiscoveryConfig::default(),

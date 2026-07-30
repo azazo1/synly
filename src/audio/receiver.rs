@@ -356,11 +356,7 @@ impl AudioDepacketizer {
     pub fn new(packet_duration_ms: u32, initial_drop_ms: u32) -> Self {
         Self {
             queue: RtpAudioQueue::new(packet_duration_ms),
-            packets_to_drop: if packet_duration_ms == 0 {
-                0
-            } else {
-                initial_drop_ms / packet_duration_ms
-            },
+            packets_to_drop: initial_drop_ms.checked_div(packet_duration_ms).unwrap_or(0),
         }
     }
 

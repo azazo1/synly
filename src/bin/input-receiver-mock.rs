@@ -30,7 +30,7 @@ enum Command {
         address: SocketAddr,
         #[arg(long, value_enum, default_value = "right")]
         edge: ScreenEdge,
-        #[arg(long, default_value_t = 60)]
+        #[arg(long, default_value_t = 1500)]
         motion_steps: u16,
         #[arg(long, default_value_t = 8)]
         step_delay_ms: u64,

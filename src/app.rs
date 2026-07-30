@@ -417,6 +417,7 @@ async fn run_host_session_with_aux(
     session: AuthenticatedSession,
     options: &RuntimeOptions,
 ) -> Result<()> {
+    tracing::trace!("主会话开始建立输入辅助 socket 路由"); // to remove
     let (input_socket_tx, input_socket_rx) = mpsc::channel(4);
     let input_inbox = InputSocketInbox::new(input_socket_rx);
     let (input_session_id_tx, input_session_id) = watch::channel(None);
@@ -441,12 +442,14 @@ async fn run_host_session_with_aux(
             result = &mut session_future => return result,
             accepted = listener.accept() => {
                 let (mut socket, address) = accepted?;
+                tracing::trace!(%address, "主会话运行期间收到额外 TCP 连接"); // to remove
                 configure_session_socket(&socket)?;
                 let mut first_byte = [0u8; 1];
                 let is_input = matches!(
                     time::timeout(Duration::from_millis(100), socket.peek(&mut first_byte)).await,
                     Ok(Ok(1)) if first_byte[0] == b'S'
                 );
+                tracing::trace!(%address, first_byte = ?first_byte, is_input, "额外 TCP 连接已完成输入辅助分类"); // to remove
                 if is_input {
                     match time::timeout(
                         Duration::from_secs(1),
@@ -456,14 +459,21 @@ async fn run_host_session_with_aux(
                     {
                         Ok(Ok(incoming_session_id)) => {
                             let expected_session_id = *input_session_id.borrow();
+                            tracing::trace!(%address, %incoming_session_id, ?expected_session_id, matches_expected = expected_session_id == Some(incoming_session_id), "输入辅助 socket 路由开始校验 session id"); // to remove
                             if expected_session_id == Some(incoming_session_id) {
                                 tracing::debug!(%address, session_id = %incoming_session_id, "收到输入辅助连接");
                                 let connection = input::InputSocketConnection::new(
                                     incoming_session_id,
                                     socket,
                                 );
-                                if input_socket_tx.try_send(connection).is_err() {
-                                    tracing::warn!(%address, "输入辅助连接队列忙, 已拒绝额外连接");
+                                match input_socket_tx.try_send(connection) {
+                                    Ok(()) => {
+                                        tracing::trace!(%address, session_id = %incoming_session_id, "输入辅助 socket 已进入 host inbox"); // to remove
+                                    }
+                                    Err(error) => {
+                                        tracing::trace!(%address, session_id = %incoming_session_id, error = %error, "输入辅助 socket host inbox 入队失败"); // to remove
+                                        tracing::warn!(%address, "输入辅助连接队列忙, 已拒绝额外连接");
+                                    }
                                 }
                             } else {
                                 tracing::warn!(
@@ -475,9 +485,11 @@ async fn run_host_session_with_aux(
                             }
                         }
                         Ok(Err(err)) => {
+                            tracing::trace!(%address, error = %err, "输入辅助 socket 前导读取返回错误"); // to remove
                             tracing::warn!(%address, error = %err, "输入辅助连接前导验证失败");
                         }
                         Err(_) => {
+                            tracing::trace!(%address, "输入辅助 socket 前导读取超时"); // to remove
                             tracing::warn!(%address, "输入辅助连接前导读取超时");
                         }
                     }
@@ -1925,10 +1937,13 @@ impl CapabilityTaskRuntime {
     }
 
     async fn stop_input(&mut self, input_session_id: Option<&watch::Sender<Option<Uuid>>>) {
+        tracing::trace!(epoch = ?self.input_epoch, role = ?self.input_role, task_running = self.input_task.is_some(), "输入 capability runtime 开始停止 input task"); // to remove
         if let Some(session_id) = input_session_id {
+            tracing::trace!(previous_session_id = ?*session_id.borrow(), "输入 capability runtime 清除 host 路由 session id"); // to remove
             session_id.send_replace(None);
         }
         if let Some(task) = self.input_task.take() {
+            tracing::trace!("输入 capability runtime 中止 input task"); // to remove
             task.abort();
             let _ = task.await;
         }
@@ -2048,6 +2063,7 @@ async fn refresh_capability_tasks(
         .is_local_acknowledged()
         .then(|| negotiate_input(local.input_mode, remote.input_mode))
         .flatten();
+    tracing::trace!(?epoch, current_epoch = ?runtime.input_epoch, current_role = ?runtime.input_role, next_role = ?input_role, local_mode = ?local.input_mode, remote_mode = ?remote.input_mode, acknowledged = state.is_local_acknowledged(), "输入 capability runtime 计算任务状态"); // to remove
     if runtime.input_epoch != Some(epoch) || runtime.input_role != input_role {
         runtime.stop_input(context.input_session_id).await;
         runtime.input_epoch = Some(epoch);
@@ -2058,6 +2074,7 @@ async fn refresh_capability_tasks(
             let channel = InputHostChannel::create()?;
             let session_id = channel.offer().session_id;
             let offer = channel.offer().clone();
+            tracing::trace!(?epoch, %session_id, role = ?local_role, "输入 host 已创建辅助通道 offer"); // to remove
             let inbox = context
                 .input_inbox
                 .cloned()
@@ -2066,6 +2083,7 @@ async fn refresh_capability_tasks(
                 .input_session_id
                 .context("输入协商成功但 host 未提供会话路由")?;
             session_id_tx.send_replace(Some(session_id));
+            tracing::trace!(?epoch, %session_id, "输入 host 已更新 socket 路由 session id"); // to remove
             context
                 .tx
                 .send(Frame::Control(ControlMessage::InputChannelOffer {
@@ -2073,10 +2091,12 @@ async fn refresh_capability_tasks(
                     offer,
                 }))
                 .await?;
+            tracing::trace!(?epoch, %session_id, "输入 host offer 已写入主会话发送队列"); // to remove
             let mut input_options = context.input_options.clone();
             input_options.mode = local.input_mode;
             let input_master_secret = context.input_master_secret;
             let task = tokio::spawn(async move {
+                tracing::trace!(?epoch, %session_id, role = ?local_role, "输入 host task 开始"); // to remove
                 if let Err(err) = input::run_input_session(
                     InputSessionContext::host(channel, inbox),
                     input_master_secret,
@@ -2085,7 +2105,10 @@ async fn refresh_capability_tasks(
                 )
                 .await
                 {
+                    tracing::trace!(?epoch, %session_id, error = %err, "输入 host task 返回错误"); // to remove
                     tracing::error!(error = %err, ?epoch, "输入辅助会话失败");
+                } else {
+                    tracing::trace!(?epoch, %session_id, "输入 host task 正常返回"); // to remove
                 }
             });
             tasks.track(&task);
@@ -2111,11 +2134,15 @@ fn report_capability_state(control: &RuntimeControl, state: &CapabilityState) {
     });
 }
 
-fn input_task_settings_changed(
+fn input_task_restart_required(
     previous: &InputRuntimeOptions,
     next: &InputRuntimeOptions,
+    previous_backend_generation: u64,
+    next_backend_generation: u64,
 ) -> bool {
-    previous.edge != next.edge || previous.hotkey != next.hotkey
+    previous.edge != next.edge
+        || previous.hotkey != next.hotkey
+        || previous_backend_generation != next_backend_generation
 }
 
 fn spawn_frame_reader<R>(
@@ -2190,9 +2217,14 @@ async fn run_sync_session(
     let mut capabilities = options.control.capabilities();
     let mut tuning = options.control.tuning();
     let current_tuning = tuning.borrow_and_update().clone();
-    let initial_input_tuning_changed =
-        input_task_settings_changed(&current_tuning.input, &options.input_options);
+    let initial_input_tuning_changed = input_task_restart_required(
+        &current_tuning.input,
+        &options.input_options,
+        current_tuning.input_backend_generation,
+        current_tuning.input_backend_generation,
+    );
     let mut input_options = current_tuning.input;
+    let mut input_backend_generation = current_tuning.input_backend_generation;
     let mut sync_delete = current_tuning.sync_delete;
     let shutdown = options.control.shutdown().clone();
     let mut capability_ack_deadline = None;
@@ -2371,13 +2403,19 @@ async fn run_sync_session(
                     continue;
                 }
                 let next = tuning.borrow_and_update().clone();
-                let input_changed = input_task_settings_changed(&input_options, &next.input);
+                let input_changed = input_task_restart_required(
+                    &input_options,
+                    &next.input,
+                    input_backend_generation,
+                    next.input_backend_generation,
+                );
                 let enable_delete = !sync_delete && next.sync_delete;
                 capability_runtime
                     .clipboard
                     .sync
                     .update_options(next.clipboard)?;
                 input_options = next.input;
+                input_backend_generation = next.input_backend_generation;
                 sync_delete = next.sync_delete;
                 if enable_delete {
                     tx.send(Frame::Control(ControlMessage::SnapshotRescanRequest)).await?;
@@ -2472,7 +2510,9 @@ async fn run_sync_session(
                 }
             }
             Frame::Control(ControlMessage::InputChannelOffer { epoch, offer }) => {
+                tracing::trace!(?epoch, session_id = %offer.session_id, current_epoch = ?capability_state.epoch(), "输入 client 收到辅助通道 offer"); // to remove
                 if !capability_state.current_epoch(epoch) {
+                    tracing::trace!(?epoch, session_id = %offer.session_id, "输入 client 忽略 stale offer"); // to remove
                     tracing::debug!(?epoch, current = ?capability_state.epoch(), "忽略过期输入辅助通道");
                     continue;
                 }
@@ -2482,6 +2522,7 @@ async fn run_sync_session(
                 let local = capability_state.effective_local();
                 let remote = capability_state.effective_remote();
                 let Some(local_role) = negotiate_input(local.input_mode, remote.input_mode) else {
+                    tracing::trace!(?epoch, session_id = %offer.session_id, local_mode = ?local.input_mode, remote_mode = ?remote.input_mode, "输入 client offer 无法匹配 role"); // to remove
                     tracing::debug!(?epoch, "忽略未协商的输入辅助通道");
                     continue;
                 };
@@ -2490,7 +2531,9 @@ async fn run_sync_session(
                 }
                 let mut task_input_options = input_options.clone();
                 task_input_options.mode = local.input_mode;
+                let input_session_id = offer.session_id;
                 let task = tokio::spawn(async move {
+                    tracing::trace!(?epoch, session_id = %input_session_id, role = ?local_role, %remote_socket_addr, "输入 client task 开始"); // to remove
                     if let Err(err) = input::run_input_session(
                         InputSessionContext::client(offer, remote_socket_addr),
                         input_master_secret,
@@ -2499,7 +2542,10 @@ async fn run_sync_session(
                     )
                     .await
                     {
+                        tracing::trace!(?epoch, session_id = %input_session_id, error = %err, "输入 client task 返回错误"); // to remove
                         tracing::error!(error = %err, ?epoch, "输入辅助会话失败");
+                    } else {
+                        tracing::trace!(?epoch, session_id = %input_session_id, "输入 client task 正常返回"); // to remove
                     }
                 });
                 session_tasks.track(&task);
@@ -4576,7 +4622,8 @@ mod tests {
         FILE_STREAM_CHUNK_SIZE, InitialSnapshotPolicy, SessionRole, SessionTaskAbortGuard,
         SnapshotEchoSuppressions, SnapshotPathExpectation, accept_policy_label,
         build_remote_echo_expectations, choose_peer, delete_policy, handle_file_chunk,
-        identity_display_name, is_connection_shutdown_error, next_reconnect_delay,
+        identity_display_name, input_task_restart_required, is_connection_shutdown_error,
+        next_reconnect_delay,
         parse_direct_peer_addr, peer_matches_query, preferred_peer_query, race_peer_addresses,
         resolve_audio_plan, resolve_initial_snapshot_policy, run_with_session_notifications,
         select_peer_from_query, send_one_file, should_auto_accept_request, should_try_direct_trusted,
@@ -4591,7 +4638,7 @@ mod tests {
         TransferConfig, TrustedDeviceConfig,
     };
     use crate::discovery::DiscoveredPeer;
-    use crate::input::InputMode;
+    use crate::input::{Hotkey, InputMode, InputRuntimeOptions, ScreenEdge};
     use crate::protocol::{DeviceIdentity, FileChunkHeader, Frame, PairAuthMethod};
     use crate::sync::{
         ApplyPlan, DeletePolicy, EntryKind, ManifestEntry, ManifestSnapshot, OutgoingSpec,
@@ -4608,6 +4655,18 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::mpsc;
     use uuid::Uuid;
+
+    #[test]
+    fn input_backend_generation_restarts_the_input_task() {
+        let input = InputRuntimeOptions {
+            mode: InputMode::Receive,
+            edge: ScreenEdge::Right,
+            hotkey: Hotkey::DEFAULT.parse().unwrap(),
+        };
+
+        assert!(!input_task_restart_required(&input, &input, 3, 3));
+        assert!(input_task_restart_required(&input, &input, 3, 4));
+    }
 
     #[test]
     fn delete_policy_stays_disabled_when_sync_delete_is_off() {

@@ -44,8 +44,6 @@ enum MockFrame {
 }
 
 pub async fn run_receiver_mock(options: ReceiverMockOptions) -> Result<()> {
-    #[cfg(windows)]
-    super::windows_agent::request_elevation()?;
     super::ensure_platform_supported(InputMode::Receive)?;
 
     let mut platform = platform::start(InputMode::Receive, options.hotkey)?;
@@ -85,11 +83,12 @@ pub async fn run_receiver_mock(options: ReceiverMockOptions) -> Result<()> {
         }
         Result::<()>::Ok(())
     });
-    let (mut incoming, finish, reader_task) = spawn_receiver_reader(reader);
+    let (mut incoming, incoming_motion, finish, reader_task) = spawn_receiver_reader(reader);
     let mut finish = Box::pin(finish);
     let result = {
         let session = runtime::run_receiver(
             &mut incoming,
+            &incoming_motion,
             &outgoing,
             &mut platform,
             local_layout,
@@ -173,8 +172,19 @@ pub async fn run_controller_mock(options: ControllerMockOptions) -> Result<()> {
         },
     )
     .await?;
-    wait_for_receiver_heartbeat(&mut incoming, 1).await?;
-    tracing::info!(generation = 1, "真实被控端已确认第一次接管");
+    let first_pressure_steps = wait_for_receiver_heartbeat_under_motion(
+        &mut incoming,
+        &outgoing,
+        options.edge,
+        1,
+        options.step_delay,
+    )
+    .await?;
+    tracing::info!(
+        generation = 1,
+        pressure_steps = first_pressure_steps,
+        "真实被控端已确认第一次接管"
+    );
     send_full_input_sequence(&outgoing, &options, 1).await?;
     send_input(&outgoing, InputMessage::Deactivate { generation: 1 }).await?;
 
@@ -189,8 +199,19 @@ pub async fn run_controller_mock(options: ControllerMockOptions) -> Result<()> {
         },
     )
     .await?;
-    wait_for_receiver_heartbeat(&mut incoming, 2).await?;
-    tracing::info!(generation = 2, "真实被控端已确认重新接管");
+    let second_pressure_steps = wait_for_receiver_heartbeat_under_motion(
+        &mut incoming,
+        &outgoing,
+        options.edge,
+        2,
+        options.step_delay,
+    )
+    .await?;
+    tracing::info!(
+        generation = 2,
+        pressure_steps = second_pressure_steps,
+        "真实被控端已确认重新接管"
+    );
     send_input(
         &outgoing,
         motion_message(options.edge, 2, 4),
@@ -222,13 +243,21 @@ async fn send_full_input_sequence(
     options: &ControllerMockOptions,
     generation: u64,
 ) -> Result<()> {
-    for _ in 0..options.motion_steps {
+    for step in 0..options.motion_steps {
         send_input(
             outgoing,
             motion_message(options.edge, generation, 4),
         )
         .await?;
         time::sleep(options.step_delay).await;
+        if (step + 1) % 500 == 0 {
+            tracing::info!(
+                generation,
+                completed_steps = step + 1,
+                total_steps = options.motion_steps,
+                "mock 控制端持续运动测试进度"
+            );
+        }
     }
     if options.inject_keyboard {
         send_input(
@@ -324,28 +353,41 @@ async fn send_input(
         .context("mock 控制端写入队列已关闭")
 }
 
-async fn wait_for_receiver_heartbeat(
+async fn wait_for_receiver_heartbeat_under_motion(
     incoming: &mut mpsc::Receiver<Result<MockFrame>>,
+    outgoing: &mpsc::Sender<MockFrame>,
+    edge: ScreenEdge,
     generation: u64,
-) -> Result<()> {
-    time::timeout(CONFIRM_TIMEOUT, async {
-        loop {
-            match incoming.recv().await.context("真实被控端读取任务已停止")?? {
-                MockFrame::Input(InputMessage::Heartbeat {
-                    generation: incoming_generation,
-                }) if incoming_generation == generation => break Ok(()),
-                MockFrame::Input(InputMessage::Return { .. }) => {
-                    break Err(anyhow::anyhow!("真实被控端提前返回了控制权"));
+    step_delay: Duration,
+) -> Result<u64> {
+    let mut pressure_steps = 0u64;
+    let mut pressure = time::interval(step_delay.max(Duration::from_millis(1)));
+    pressure.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let deadline = time::sleep(CONFIRM_TIMEOUT);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            frame = incoming.recv() => {
+                match frame.context("真实被控端读取任务已停止")?? {
+                    MockFrame::Input(InputMessage::Heartbeat {
+                        generation: incoming_generation,
+                    }) if incoming_generation == generation => break Ok(pressure_steps),
+                    MockFrame::Input(InputMessage::Return { .. }) => {
+                        break Err(anyhow::anyhow!("真实被控端提前返回了控制权"));
+                    }
+                    MockFrame::Finish => {
+                        break Err(anyhow::anyhow!("真实被控端提前结束了测试"));
+                    }
+                    _ => {}
                 }
-                MockFrame::Finish => {
-                    break Err(anyhow::anyhow!("真实被控端提前结束了测试"));
-                }
-                _ => {}
             }
+            _ = pressure.tick() => {
+                send_input(outgoing, motion_message(edge, generation, 4)).await?;
+                pressure_steps = pressure_steps.saturating_add(1);
+            }
+            _ = &mut deadline => break Err(anyhow::anyhow!("等待真实被控端确认接管超时")),
         }
-    })
-    .await
-    .context("等待真实被控端确认接管超时")?
+    }
 }
 
 fn spawn_controller_heartbeat(
@@ -371,6 +413,7 @@ fn spawn_receiver_reader<R>(
     mut reader: R,
 ) -> (
     mpsc::Receiver<Result<InputMessage>>,
+    Arc<runtime::IncomingMotion>,
     oneshot::Receiver<()>,
     tokio::task::JoinHandle<()>,
 )
@@ -378,11 +421,29 @@ where
     R: AsyncRead + Unpin + Send + 'static,
 {
     let (incoming_tx, incoming_rx) = mpsc::channel(256);
+    let motion = Arc::new(runtime::IncomingMotion::default());
+    let reader_motion = Arc::clone(&motion);
     let (finish_tx, finish_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
         loop {
             match read_mock_frame(&mut reader).await {
+                Ok(MockFrame::Input(InputMessage::Motion { generation, dx, dy })) => {
+                    reader_motion.push(generation, dx, dy);
+                }
                 Ok(MockFrame::Input(message)) => {
+                    if !matches!(message, InputMessage::Heartbeat { .. })
+                        && let Some(motion) = reader_motion.take()
+                        && incoming_tx
+                            .send(Ok(InputMessage::Motion {
+                                generation: motion.generation,
+                                dx: motion.dx,
+                                dy: motion.dy,
+                            }))
+                            .await
+                            .is_err()
+                    {
+                        break;
+                    }
                     if incoming_tx.send(Ok(message)).await.is_err() {
                         break;
                     }
@@ -398,7 +459,7 @@ where
             }
         }
     });
-    (incoming_rx, finish_rx, task)
+    (incoming_rx, motion, finish_rx, task)
 }
 
 fn spawn_controller_reader<R>(

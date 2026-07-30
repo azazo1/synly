@@ -17,6 +17,7 @@ required-features = ["input-macos-mock"]
 [[bin]]
 name = "synly-input-agent"
 path = "src/bin/synly-input-agent.rs"
+test = false
 
 [[bin]]
 name = "input-receiver-mock"

@@ -473,4 +473,29 @@ mod tests {
             Point { x: 99, y: 50 },
         );
     }
+
+    #[test]
+    fn cursor_bounds_preserve_real_multi_display_coordinates() {
+        let layout = DesktopLayout::new(vec![
+            DisplayRect { x: -1920, y: 180, width: 1920, height: 1080 },
+            DisplayRect { x: 0, y: 0, width: 2560, height: 1440 },
+        ])
+        .unwrap();
+        assert_eq!(
+            layout.move_within_layout(Point { x: -1600, y: 600 }, 0, 0),
+            Point { x: -1600, y: 600 },
+        );
+        assert_eq!(
+            layout.move_within_layout(Point { x: 2400, y: 700 }, 0, 0),
+            Point { x: 2400, y: 700 },
+        );
+        assert_eq!(
+            layout.move_within_layout(Point { x: -100, y: 50 }, 0, 0),
+            Point { x: 0, y: 50 },
+        );
+        assert_eq!(
+            layout.move_within_layout(Point { x: 3000, y: 700 }, 0, 0),
+            Point { x: 2559, y: 700 },
+        );
+    }
 }

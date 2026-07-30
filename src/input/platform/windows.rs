@@ -292,12 +292,24 @@ struct WindowsBackend {
     state: Arc<WindowsState>,
 }
 
-pub fn ensure_permissions(mode: InputMode) -> Result<()> {
-    crate::input::windows_agent::ensure_ready(mode)
+pub fn ensure_permissions(_mode: InputMode) -> Result<()> {
+    Ok(())
 }
 
 pub fn start(context: CaptureContext) -> Result<Arc<dyn InputBackend>> {
-    crate::input::windows_agent::start_client(context)
+    if crate::input::windows_agent::is_ready() {
+        match crate::input::windows_agent::start_client(context.clone()) {
+            Ok(backend) => {
+                tracing::info!("Windows 输入控制已使用管理员代理启动");
+                return Ok(backend);
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "Windows 管理员输入代理不可用, 回退到普通权限输入控制");
+            }
+        }
+    }
+    tracing::info!("Windows 输入控制已使用普通权限启动");
+    start_native(context)
 }
 
 pub(in crate::input) fn start_native(context: CaptureContext) -> Result<Arc<dyn InputBackend>> {
@@ -725,7 +737,12 @@ impl InputBackend for WindowsBackend {
     }
 
     fn inject_cursor(&self, point: Point) -> Result<()> {
-        with_per_monitor_dpi(|| send_absolute_mouse(point))
+        let layout = self.layout()?;
+        let bounded = layout.move_within_layout(point, 0, 0);
+        if bounded != point {
+            tracing::warn!(requested = ?point, bounded = ?bounded, "Windows 远端光标坐标超出显示器布局, 已裁剪");
+        }
+        with_per_monitor_dpi(|| send_absolute_mouse(bounded))
     }
 
     fn inject_wheel(&self, x: i32, y: i32) -> Result<()> {

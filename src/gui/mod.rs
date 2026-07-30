@@ -35,6 +35,7 @@ pub fn run(config: SynlyConfig) -> Result<()> {
         single_instance::SingleInstance::ActivatedExisting => return Ok(()),
     };
     let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
         .enable_all()
         .thread_name("synly-runtime")
         .build()
@@ -68,6 +69,7 @@ pub fn run(config: SynlyConfig) -> Result<()> {
         tray.state_sink(),
     );
     spawn_log_presenter(&runtime, &window);
+    spawn_ctrl_c_handler(&runtime, handle.commands());
 
     tray.start();
     if !config.ui.first_run_completed || !config.ui.start_hidden {
@@ -79,6 +81,26 @@ pub fn run(config: SynlyConfig) -> Result<()> {
     let _ = handle.commands().try_send(AppCommand::Shutdown);
     runtime.shutdown_timeout(std::time::Duration::from_secs(5));
     Ok(())
+}
+
+fn spawn_ctrl_c_handler(
+    runtime: &tokio::runtime::Runtime,
+    commands: tokio::sync::mpsc::Sender<AppCommand>,
+) {
+    runtime.spawn(async move {
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => {
+                tracing::info!("收到 Ctrl-C, 正在退出 GUI 应用");
+                let _ = commands.send(AppCommand::Shutdown).await;
+                if let Err(error) = slint::invoke_from_event_loop(|| {
+                    let _ = slint::quit_event_loop();
+                }) {
+                    tracing::warn!(error = %error, "无法从 Ctrl-C 处理器退出 Slint 事件循环");
+                }
+            }
+            Err(error) => tracing::warn!(error = %error, "无法监听 Ctrl-C"),
+        }
+    });
 }
 
 pub(super) fn show_main_window(
@@ -456,7 +478,7 @@ fn apply_snapshot(
     window.set_lifecycle_text(snapshot.lifecycle.label().into());
     window.set_session_active(active);
     window.set_current_peer(peer_label.into());
-    window.set_input_permission_ready(snapshot.input_permission_ready);
+    window.set_input_elevation_ready(snapshot.input_elevation_ready);
     window.set_clipboard_mode_index(clipboard_mode_index(snapshot.desired.clipboard_mode));
     window.set_audio_mode_index(audio_mode_index(snapshot.desired.audio_mode));
     window.set_input_mode_index(input_mode_index(snapshot.desired.input_mode));
