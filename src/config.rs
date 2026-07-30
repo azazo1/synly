@@ -255,6 +255,14 @@ impl Default for RuntimeConfig {
     }
 }
 
+impl RuntimeConfig {
+    pub fn normalize_file_sync_options(&mut self) {
+        if !matches!(self.file_sync_mode, FileSyncMode::Both | FileSyncMode::Auto) {
+            self.initial = None;
+        }
+    }
+}
+
 impl SynlyConfig {
     pub fn load_or_create() -> Result<Self> {
         Self::load_or_create_in_dir(&config_dir()?)
@@ -635,13 +643,41 @@ fn detect_device_name(device_id: Uuid) -> String {
 mod tests {
     use super::{
         CLIPBOARD_CACHE_DIR_NAME, ClipboardConfig, DeviceConfig, DiscoveryConfig,
-        LndDiscoveryConfig, NotificationConfig, SynlyConfig, TransferConfig, TrustedDeviceConfig,
-        clipboard_cache_base_dir, config_dir, config_path_in, legacy_device_config_path_in,
-        resolve_configured_path,
+        LndDiscoveryConfig, NotificationConfig, RuntimeConfig, SynlyConfig, TransferConfig,
+        TrustedDeviceConfig, clipboard_cache_base_dir, config_dir, config_path_in,
+        legacy_device_config_path_in, resolve_configured_path,
     };
+    use crate::settings::{FileSyncMode, InitialSyncMode};
     use std::fs;
     use std::path::{Path, PathBuf};
     use uuid::Uuid;
+
+    #[test]
+    fn runtime_file_initial_only_applies_to_bidirectional_modes() {
+        for file_sync_mode in [
+            FileSyncMode::Off,
+            FileSyncMode::Send,
+            FileSyncMode::Receive,
+        ] {
+            let mut runtime = RuntimeConfig {
+                file_sync_mode,
+                initial: Some(InitialSyncMode::Other),
+                ..RuntimeConfig::default()
+            };
+            runtime.normalize_file_sync_options();
+            assert_eq!(runtime.initial, None);
+        }
+
+        for file_sync_mode in [FileSyncMode::Both, FileSyncMode::Auto] {
+            let mut runtime = RuntimeConfig {
+                file_sync_mode,
+                initial: Some(InitialSyncMode::Other),
+                ..RuntimeConfig::default()
+            };
+            runtime.normalize_file_sync_options();
+            assert_eq!(runtime.initial, Some(InitialSyncMode::Other));
+        }
+    }
 
     #[test]
     fn load_or_create_in_dir_creates_toml_config() {

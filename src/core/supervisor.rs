@@ -85,7 +85,8 @@ enum InternalEvent {
 }
 
 impl AppSupervisor {
-    pub fn new(config: SynlyConfig) -> (Self, AppSupervisorHandle) {
+    pub fn new(mut config: SynlyConfig) -> (Self, AppSupervisorHandle) {
+        config.runtime.normalize_file_sync_options();
         let mut snapshot = AppSnapshot::idle(
             config.runtime.clone(),
             AppSettings::from_config(&config),
@@ -156,10 +157,11 @@ impl AppSupervisor {
     async fn handle_command(&mut self, command: AppCommand) -> bool {
         match command {
             AppCommand::ApplySettings {
-                runtime,
+                mut runtime,
                 mut settings,
                 session_pin,
             } => {
+                runtime.normalize_file_sync_options();
                 settings.device_name = settings.device_name.trim().to_string();
                 let mut candidate = self.config.clone();
                 apply_settings_to_config(&mut candidate, &runtime, &settings);

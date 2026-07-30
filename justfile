@@ -31,3 +31,8 @@ install:
 # 使用 GUI mock 验证 macOS 输入捕获和虚拟屏幕切换.
 input-macos-mock *args:
     cargo run --features input-macos-mock --bin input-macos-mock -- {{ args }}
+
+# just input-receiver-mock receive --listen 0.0.0.0:59679
+# 使用真实被控端和 mock 控制端验证系统输入注入.
+input-receiver-mock *args:
+    cargo run --features input-receiver-mock --bin input-receiver-mock -- {{ args }}

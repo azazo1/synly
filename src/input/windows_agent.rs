@@ -42,9 +42,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 const IPC_VERSION: u16 = 3;
 const IPC_MAX_FRAME: usize = 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const DISPATCH_TIMEOUT: Duration = Duration::from_secs(10);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
-const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
-const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(2);
+const CLIENT_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
+const AGENT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
 
 static AGENT: OnceLock<Mutex<Option<Arc<AgentClient>>>> = OnceLock::new();
 
@@ -67,7 +68,6 @@ enum AgentRequest {
     InjectCursor(Point),
     InjectWheel { x: i32, y: i32 },
     ReleaseAll,
-    Ping,
 }
 
 impl AgentRequest {
@@ -85,7 +85,6 @@ impl AgentRequest {
             Self::InjectCursor(_) => "InjectCursor",
             Self::InjectWheel { .. } => "InjectWheel",
             Self::ReleaseAll => "ReleaseAll",
-            Self::Ping => "Ping",
         }
     }
 
@@ -157,8 +156,15 @@ enum AgentPacket {
 
 struct ClientCommand {
     request: AgentRequest,
+    queued_at: Instant,
+    dispatched: Option<std::sync::mpsc::SyncSender<()>>,
     response: Option<std::sync::mpsc::SyncSender<Result<AgentResponse, String>>>,
 }
+
+type PendingResponses = Arc<Mutex<HashMap<
+    u64,
+    std::sync::mpsc::SyncSender<Result<AgentResponse, String>>,
+>>>;
 
 struct AgentClient {
     commands: mpsc::Sender<ClientCommand>,
@@ -178,6 +184,24 @@ struct AgentBackend {
 struct NativeAgentRuntime {
     backend: Arc<dyn InputBackend>,
     task: tokio::task::JoinHandle<()>,
+}
+
+struct AgentHeartbeat {
+    last_seen: Instant,
+}
+
+impl AgentHeartbeat {
+    fn new(now: Instant) -> Self {
+        Self { last_seen: now }
+    }
+
+    fn observe(&mut self, now: Instant) {
+        self.last_seen = now;
+    }
+
+    fn expired(&self, now: Instant) -> bool {
+        now.duration_since(self.last_seen) > AGENT_HEARTBEAT_TIMEOUT
+    }
 }
 
 struct PipeSecurity {
@@ -265,7 +289,9 @@ pub fn request_elevation() -> Result<()> {
         .name("synly-input-agent-client".to_string())
         .spawn(move || {
             let error_ready = ready_tx.clone();
-            let result = tokio::runtime::Builder::new_current_thread()
+            let result = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_name("synly-input-agent-io")
                 .enable_all()
                 .build()
                 .map_err(anyhow::Error::from)
@@ -364,10 +390,13 @@ impl AgentClient {
             bail!("Windows input agent connection is closed");
         }
         let request_name = request.name();
+        let (dispatch_tx, dispatch_rx) = std::sync::mpsc::sync_channel(1);
         let (response_tx, response_rx) = std::sync::mpsc::sync_channel(1);
         self.commands
             .try_send(ClientCommand {
                 request,
+                queued_at: Instant::now(),
+                dispatched: Some(dispatch_tx),
                 response: Some(response_tx),
             })
             .map_err(|error| {
@@ -376,17 +405,14 @@ impl AgentClient {
                 }
                 anyhow!("Windows input agent {request_name} command queue unavailable: {error}")
             })?;
-        match response_rx.recv_timeout(REQUEST_TIMEOUT) {
-            Ok(Ok(AgentResponse::Error(message))) => Err(anyhow!(message)),
-            Ok(Ok(response)) => Ok(response),
-            Ok(Err(message)) => Err(anyhow!(message)),
-            Err(error) => {
-                self.alive.store(false, Ordering::Release);
-                Err(error).with_context(|| {
-                    format!("Windows input agent {request_name} request timed out")
-                })
-            }
-        }
+        wait_for_agent_response(
+            &self.alive,
+            request_name,
+            dispatch_rx,
+            response_rx,
+            DISPATCH_TIMEOUT,
+            REQUEST_TIMEOUT,
+        )
     }
 
     fn notify(&self, request: AgentRequest) {
@@ -395,6 +421,8 @@ impl AgentClient {
         }
         if let Err(error) = self.commands.try_send(ClientCommand {
             request,
+            queued_at: Instant::now(),
+            dispatched: None,
             response: None,
         }) && matches!(error, mpsc::error::TrySendError::Closed(_))
         {
@@ -407,6 +435,38 @@ impl AgentClient {
             && let Some(context) = context.as_ref()
         {
             context.emit_reliable(NativeEvent::Failed(format!("{error:#}")));
+        }
+    }
+}
+
+fn wait_for_agent_response(
+    alive: &AtomicBool,
+    request_name: &str,
+    dispatch_rx: std::sync::mpsc::Receiver<()>,
+    response_rx: std::sync::mpsc::Receiver<Result<AgentResponse, String>>,
+    dispatch_timeout: Duration,
+    response_timeout: Duration,
+) -> Result<AgentResponse> {
+    match dispatch_rx.recv_timeout(dispatch_timeout) {
+        Ok(()) => {}
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            alive.store(false, Ordering::Release);
+            bail!("Windows input agent {request_name} dispatch timed out");
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            alive.store(false, Ordering::Release);
+            bail!("Windows input agent {request_name} dispatch failed before pipe write");
+        }
+    }
+    match response_rx.recv_timeout(response_timeout) {
+        Ok(Ok(AgentResponse::Error(message))) => Err(anyhow!(message)),
+        Ok(Ok(response)) => Ok(response),
+        Ok(Err(message)) => Err(anyhow!(message)),
+        Err(error) => {
+            alive.store(false, Ordering::Release);
+            Err(error).with_context(|| {
+                format!("Windows input agent {request_name} request timed out")
+            })
         }
     }
 }
@@ -591,143 +651,172 @@ async fn connect_agent(
     ready
         .send(Ok(Arc::clone(&client)))
         .map_err(|_| anyhow!("Windows input agent readiness receiver closed"))?;
-    client_loop(server, command_rx, context, alive).await
+    let heartbeat_task = spawn_client_heartbeat(client.commands.clone(), Arc::clone(&alive));
+    let result = client_loop(server, command_rx, context, alive).await;
+    heartbeat_task.abort();
+    let _ = heartbeat_task.await;
+    result
+}
+
+fn spawn_client_heartbeat(
+    commands: mpsc::Sender<ClientCommand>,
+    alive: Arc<AtomicBool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut heartbeat = time::interval(CLIENT_HEARTBEAT_INTERVAL);
+        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            heartbeat.tick().await;
+            if !alive.load(Ordering::Acquire) {
+                break;
+            }
+            match commands.try_send(ClientCommand {
+                request: AgentRequest::Health,
+                queued_at: Instant::now(),
+                dispatched: None,
+                response: None,
+            }) {
+                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
+                Err(mpsc::error::TrySendError::Closed(_)) => break,
+            }
+        }
+    })
 }
 
 async fn client_loop(
     server: NamedPipeServer,
-    mut commands: mpsc::Receiver<ClientCommand>,
+    commands: mpsc::Receiver<ClientCommand>,
     context: Arc<Mutex<Option<CaptureContext>>>,
     alive: Arc<AtomicBool>,
 ) -> Result<()> {
-    let (reader, mut writer) = tokio::io::split(server);
+    let (reader, writer) = tokio::io::split(server);
     let (mut packets, reader_task) = spawn_packet_reader(reader);
-    let mut next_id = 1u64;
-    let mut pending = HashMap::<
-        u64,
-        std::sync::mpsc::SyncSender<Result<AgentResponse, String>>,
-    >::new();
-    let mut heartbeat = time::interval(HEARTBEAT_INTERVAL);
-    heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let mut last_pong = Instant::now();
+    let pending = Arc::new(Mutex::new(HashMap::new()));
+    let heartbeat_probe = Arc::new(AtomicU64::new(0));
+    let mut writer_task = tokio::spawn(command_writer_loop(
+        writer,
+        commands,
+        Arc::clone(&pending),
+        Arc::clone(&heartbeat_probe),
+    ));
+    let mut writer_finished = false;
     let result: Result<()> = async {
         loop {
             tokio::select! {
-                command = commands.recv() => {
-                    let Some(command) = command else { break Ok(()) };
-                    let id = next_id;
-                    next_id = next_id.saturating_add(1);
-                    write_packet(
-                        &mut writer,
-                        &AgentPacket::Request {
-                            id,
-                            request: command.request,
-                        },
-                    )
-                    .await?;
-                    if let Some(response) = command.response {
-                        pending.insert(id, response);
+            writer_result = &mut writer_task => {
+                writer_finished = true;
+                break match writer_result {
+                    Ok(result) => result,
+                    Err(error) => Err(error.into()),
+                };
+            }
+            packet = packets.recv() => {
+                let packet = packet.context("Windows input agent packet reader stopped")??;
+                match packet {
+                    AgentPacket::Response { id, response } => {
+                        if heartbeat_probe
+                            .compare_exchange(id, u64::MAX, Ordering::AcqRel, Ordering::Acquire)
+                            .is_ok()
+                        {
+                            tracing::info!(
+                                target: "synly_input_agent",
+                                request_id = id,
+                                "Windows 输入代理保活往返已确认"
+                            );
+                        }
+                        let sender = pending
+                            .lock()
+                            .map_err(|_| anyhow!("Windows input agent pending response state poisoned"))?
+                            .remove(&id);
+                        if let Some(sender) = sender {
+                            let _ = sender.try_send(Ok(response));
+                        }
                     }
-                }
-                packet = packets.recv() => {
-                    match packet.context("Windows input agent packet reader stopped")?? {
-                        AgentPacket::Response { id, response } => {
-                            if id == 0 && matches!(&response, AgentResponse::Pong) {
-                                last_pong = Instant::now();
-                            } else if let Some(sender) = pending.remove(&id) {
-                                let _ = sender.send(Ok(response));
-                            }
+                    AgentPacket::Diagnostic {
+                        request,
+                        phase,
+                        elapsed_ms,
+                        error,
+                    } => match phase {
+                        AgentDiagnosticPhase::Started => {
+                            tracing::info!(
+                                target: "synly_input_agent",
+                                %request,
+                                "Windows 输入代理开始处理请求"
+                            );
                         }
-                        AgentPacket::Diagnostic {
-                            request,
-                            phase,
-                            elapsed_ms,
-                            error,
-                        } => match phase {
-                            AgentDiagnosticPhase::Started => {
-                                tracing::info!(
-                                    target: "synly_input_agent",
-                                    %request,
-                                    "Windows 输入代理开始处理请求"
-                                );
-                            }
-                            AgentDiagnosticPhase::Completed => {
-                                tracing::info!(
-                                    target: "synly_input_agent",
-                                    %request,
-                                    elapsed_ms,
-                                    "Windows 输入代理完成请求"
-                                );
-                            }
-                            AgentDiagnosticPhase::Failed => {
-                                tracing::error!(
-                                    target: "synly_input_agent",
-                                    %request,
-                                    elapsed_ms,
-                                    error = error.as_deref().unwrap_or("unknown error"),
-                                    "Windows 输入代理请求失败"
-                                );
-                            }
-                        },
-                        AgentPacket::Event(event) => {
-                            if let Ok(context) = context.lock()
-                                && let Some(context) = context.as_ref()
-                            {
-                                context.emit_reliable(event);
-                            }
+                        AgentDiagnosticPhase::Completed => {
+                            tracing::info!(
+                                target: "synly_input_agent",
+                                %request,
+                                elapsed_ms,
+                                "Windows 输入代理完成请求"
+                            );
                         }
-                        AgentPacket::Motion {
-                            dx,
-                            dy,
-                            position,
-                            position_updated,
-                        } => {
-                            if let Ok(context) = context.lock()
-                                && let Some(context) = context.as_ref()
-                            {
-                                if position_updated {
-                                    if let Some(position) = position {
-                                        context.motion.add_at(dx, dy, position);
-                                    }
-                                } else {
-                                    context.motion.add(dx, dy);
+                        AgentDiagnosticPhase::Failed => {
+                            tracing::error!(
+                                target: "synly_input_agent",
+                                %request,
+                                elapsed_ms,
+                                error = error.as_deref().unwrap_or("unknown error"),
+                                "Windows 输入代理请求失败"
+                            );
+                        }
+                    },
+                    AgentPacket::Event(event) => {
+                        if let Ok(context) = context.lock()
+                            && let Some(context) = context.as_ref()
+                        {
+                            context.emit_reliable(event);
+                        }
+                    }
+                    AgentPacket::Motion {
+                        dx,
+                        dy,
+                        position,
+                        position_updated,
+                    } => {
+                        if let Ok(context) = context.lock()
+                            && let Some(context) = context.as_ref()
+                        {
+                            if position_updated {
+                                if let Some(position) = position {
+                                    context.motion.add_at(dx, dy, position);
                                 }
+                            } else {
+                                context.motion.add(dx, dy);
                             }
                         }
-                        AgentPacket::SecureDesktopPaused(paused) => {
-                            if let Ok(context) = context.lock()
-                                && let Some(context) = context.as_ref()
-                                && paused
-                            {
-                                context.emit_reliable(NativeEvent::Emergency);
-                            }
-                            tracing::warn!(paused, "Windows 输入代理安全桌面状态变化");
+                    }
+                    AgentPacket::SecureDesktopPaused(paused) => {
+                        if let Ok(context) = context.lock()
+                            && let Some(context) = context.as_ref()
+                            && paused
+                        {
+                            context.emit_reliable(NativeEvent::Emergency);
                         }
-                        _ => bail!("Windows input agent sent an unexpected packet"),
+                        tracing::warn!(paused, "Windows 输入代理安全桌面状态变化");
                     }
+                    _ => break Err(anyhow!("Windows input agent sent an unexpected packet")),
                 }
-                _ = heartbeat.tick() => {
-                    if last_pong.elapsed() > HEARTBEAT_TIMEOUT {
-                        break Err(anyhow!("Windows input agent heartbeat timed out"));
-                    }
-                    write_packet(
-                        &mut writer,
-                        &AgentPacket::Request {
-                            id: 0,
-                            request: AgentRequest::Ping,
-                        },
-                    )
-                    .await?;
-                }
+            }
             }
         }
     }
     .await;
+    if !writer_finished {
+        writer_task.abort();
+        let _ = writer_task.await;
+    }
     reader_task.abort();
     let _ = reader_task.await;
     alive.store(false, Ordering::Release);
+    let pending = pending
+        .lock()
+        .map(|mut pending| std::mem::take(&mut *pending))
+        .unwrap_or_default();
     for (_, sender) in pending {
-        let _ = sender.send(Err("Windows input agent connection closed".to_string()));
+        let _ = sender.try_send(Err("Windows input agent connection closed".to_string()));
     }
     if let Ok(context) = context.lock()
         && let Some(context) = context.as_ref()
@@ -739,12 +828,87 @@ async fn client_loop(
     result
 }
 
+async fn command_writer_loop<W>(
+    mut writer: W,
+    mut commands: mpsc::Receiver<ClientCommand>,
+    pending: PendingResponses,
+    heartbeat_probe: Arc<AtomicU64>,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut next_id = 1u64;
+    while let Some(command) = commands.recv().await {
+        let ClientCommand {
+            request,
+            queued_at,
+            dispatched,
+            response,
+        } = command;
+        let id = next_id;
+        next_id = next_id.saturating_add(1);
+        let request_name = request.name();
+        let report_diagnostic = request.reports_diagnostic();
+        let is_heartbeat_probe = matches!(&request, AgentRequest::Health)
+            && response.is_none()
+            && heartbeat_probe.load(Ordering::Acquire) == 0;
+        if let Some(response) = response {
+            pending
+                .lock()
+                .map_err(|_| anyhow!("Windows input agent pending response state poisoned"))?
+                .insert(id, response);
+        }
+        if let Err(error) = write_packet(
+            &mut writer,
+            &AgentPacket::Request {
+                id,
+                request,
+            },
+        )
+        .await
+        {
+            if let Some(response) = pending
+                .lock()
+                .map_err(|_| anyhow!("Windows input agent pending response state poisoned"))?
+                .remove(&id)
+            {
+                let _ = response.try_send(Err(format!("{error:#}")));
+            }
+            return Err(error);
+        }
+        if let Some(dispatched) = dispatched {
+            let _ = dispatched.send(());
+        }
+        if is_heartbeat_probe
+            && heartbeat_probe
+                .compare_exchange(0, id, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            tracing::info!(
+                target: "synly_input_agent",
+                request_id = id,
+                "Windows 输入代理保活请求已写入"
+            );
+        }
+        if report_diagnostic {
+            tracing::info!(
+                target: "synly_input_agent",
+                request = request_name,
+                request_id = id,
+                queue_ms = queued_at.elapsed().as_millis(),
+                "Windows 输入代理 IPC 请求已写入"
+            );
+        }
+    }
+    Ok(())
+}
+
 async fn run_agent_loop(client: tokio::net::windows::named_pipe::NamedPipeClient) -> Result<()> {
     let (reader, mut writer) = tokio::io::split(client);
     let (mut packets, reader_task) = spawn_packet_reader(reader);
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<AgentPacket>(256);
     let mut runtime = None;
-    let mut heartbeat = Instant::now();
+    let mut heartbeat = AgentHeartbeat::new(Instant::now());
     let mut paused = false;
     let mut desktop_tick = time::interval(Duration::from_millis(250));
     desktop_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -757,7 +921,7 @@ async fn run_agent_loop(client: tokio::net::windows::named_pipe::NamedPipeClient
                     let AgentPacket::Request { id, request } = packet else {
                         bail!("Windows input agent received an unexpected packet");
                     };
-                    heartbeat = Instant::now();
+                    heartbeat.observe(Instant::now());
                     let request_name = request.name().to_string();
                     let report_diagnostic = request.reports_diagnostic();
                     if report_diagnostic {
@@ -806,16 +970,26 @@ async fn run_agent_loop(client: tokio::net::windows::named_pipe::NamedPipeClient
                         },
                     )
                     .await?;
-                    heartbeat = Instant::now();
+                    heartbeat.observe(Instant::now());
                 }
                 outgoing = outgoing_rx.recv() => {
                     let Some(outgoing) = outgoing else { break Ok(()) };
                     write_packet(&mut writer, &outgoing).await?;
                 }
                 _ = desktop_tick.tick() => {
-                    if heartbeat.elapsed() > HEARTBEAT_TIMEOUT {
-                        tracing::warn!("Windows 输入代理心跳超时");
-                        break Ok(());
+                    if heartbeat.expired(Instant::now()) {
+                        let message = "Windows input agent GUI heartbeat timed out";
+                        let _ = write_packet(
+                            &mut writer,
+                            &AgentPacket::Diagnostic {
+                                request: "Heartbeat".to_string(),
+                                phase: AgentDiagnosticPhase::Failed,
+                                elapsed_ms: heartbeat.last_seen.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+                                error: Some(message.to_string()),
+                            },
+                        )
+                        .await;
+                        break Err(anyhow!(message));
                     }
                     let current_paused = !is_default_input_desktop();
                     if current_paused != paused {
@@ -863,7 +1037,7 @@ async fn handle_agent_request(
             }
             Ok(AgentResponse::Ok)
         }
-        AgentRequest::Health | AgentRequest::Ping => Ok(AgentResponse::Pong),
+        AgentRequest::Health => Ok(AgentResponse::Pong),
         AgentRequest::CursorPosition => {
             Ok(AgentResponse::Point(agent_backend(runtime)?.cursor_position()?))
         }
@@ -1429,6 +1603,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_heartbeat_uses_the_ordered_command_queue() {
+        let (commands, mut receiver) = mpsc::channel(1);
+        let alive = Arc::new(AtomicBool::new(true));
+        let heartbeat_task = spawn_client_heartbeat(commands, Arc::clone(&alive));
+
+        let command = time::timeout(Duration::from_secs(1), receiver.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(command.request, AgentRequest::Health));
+        assert!(command.dispatched.is_none());
+        assert!(command.response.is_none());
+
+        alive.store(false, Ordering::Release);
+        heartbeat_task.abort();
+        let _ = heartbeat_task.await;
+    }
+
+    #[test]
+    fn agent_heartbeat_only_expires_after_the_full_timeout() {
+        let started = Instant::now();
+        let heartbeat = AgentHeartbeat::new(started);
+
+        assert!(!heartbeat.expired(started + AGENT_HEARTBEAT_TIMEOUT));
+        assert!(heartbeat.expired(
+            started + AGENT_HEARTBEAT_TIMEOUT + Duration::from_millis(1)
+        ));
+    }
+
+    #[test]
+    fn agent_heartbeat_observation_extends_the_deadline() {
+        let started = Instant::now();
+        let observed = started + AGENT_HEARTBEAT_TIMEOUT;
+        let mut heartbeat = AgentHeartbeat::new(started);
+        heartbeat.observe(observed);
+
+        assert!(!heartbeat.expired(observed + AGENT_HEARTBEAT_TIMEOUT));
+    }
+
+    #[test]
+    fn response_timeout_begins_after_pipe_dispatch() {
+        let alive = Arc::new(AtomicBool::new(true));
+        let worker_alive = Arc::clone(&alive);
+        let (dispatch_tx, dispatch_rx) = std::sync::mpsc::sync_channel(1);
+        let (response_tx, response_rx) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn(move || {
+            wait_for_agent_response(
+                &worker_alive,
+                "ReleaseAll",
+                dispatch_rx,
+                response_rx,
+                Duration::from_secs(1),
+                Duration::from_millis(80),
+            )
+        });
+
+        std::thread::sleep(Duration::from_millis(120));
+        dispatch_tx.send(()).unwrap();
+        response_tx.send(Ok(AgentResponse::Ok)).unwrap();
+
+        assert!(matches!(worker.join().unwrap().unwrap(), AgentResponse::Ok));
+        assert!(alive.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
     async fn packet_reader_preserves_fragmented_frames() {
         let (mut writer, reader) = tokio::io::duplex(4096);
         let packets = [
@@ -1438,7 +1677,7 @@ mod tests {
             },
             AgentPacket::Request {
                 id: 12,
-                request: AgentRequest::Ping,
+                request: AgentRequest::CursorPosition,
             },
         ];
         let writer_task = tokio::spawn(async move {
@@ -1465,7 +1704,7 @@ mod tests {
             packets.recv().await.unwrap().unwrap(),
             AgentPacket::Request {
                 id: 12,
-                request: AgentRequest::Ping,
+                request: AgentRequest::CursorPosition,
             }
         ));
 

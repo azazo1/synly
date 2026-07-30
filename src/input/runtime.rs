@@ -16,6 +16,7 @@ use tokio_rustls::TlsStream;
 const MOTION_INTERVAL: Duration = Duration::from_micros(8_333);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(250);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(1);
+const ACTIVATION_TIMEOUT: Duration = Duration::from_secs(5);
 const RETURN_COOLDOWN: Duration = Duration::from_millis(300);
 const EDGE_INSET: i32 = 8;
 const JUMP_ZONE_SIZE: i32 = 1;
@@ -252,7 +253,7 @@ impl Drop for AbortOnDrop {
     }
 }
 
-fn spawn_input_reader<R>(
+pub(super) fn spawn_input_reader<R>(
     mut reader: R,
 ) -> (
     mpsc::Receiver<Result<InputMessage>>,
@@ -290,6 +291,7 @@ pub(super) async fn run_sender(
 ) -> Result<()> {
     let mut generation = 0u64;
     let mut active = false;
+    let mut activation_confirmed = false;
     let mut recovery = SenderRecoveryGuard::new(
         Arc::clone(&platform.backend),
         local_layout.clone(),
@@ -304,7 +306,7 @@ pub(super) async fn run_sender(
     let mut overflow_poll = time::interval(OVERFLOW_POLL);
     let mut timeout_tick = time::interval(HEARTBEAT_INTERVAL);
     let mut motion_logged = false;
-    let mut last_jump_zone_result = None;
+    let mut last_activation_ready = None;
 
     tracing::info!(
         edge = ?source_edge,
@@ -321,6 +323,7 @@ pub(super) async fn run_sender(
                         if active && remote_generation == generation => {
                             deactivate_sender(platform, &local_layout, source_edge, edge_position)?;
                             active = false;
+                            activation_confirmed = false;
                             recovery.disarm();
                             cooldown_until = Instant::now() + RETURN_COOLDOWN;
                             tracing::info!(generation, "控制已从对端返回本机");
@@ -329,11 +332,16 @@ pub(super) async fn run_sender(
                         if active && remote_generation == generation => {
                             recovery.recover();
                             active = false;
+                            activation_confirmed = false;
                             cooldown_until = Instant::now() + RETURN_COOLDOWN;
                         }
                     InputMessage::Heartbeat { generation: remote_generation }
                         if !active || remote_generation == generation => {
                         last_heartbeat = Instant::now();
+                        if active && remote_generation == generation && !activation_confirmed {
+                            activation_confirmed = true;
+                            tracing::info!(generation, "对端已确认接管输入控制");
+                        }
                     }
                     InputMessage::Layout(_) => {}
                     InputMessage::Proof { .. } => bail!("输入通道收到重复认证消息"),
@@ -346,6 +354,7 @@ pub(super) async fn run_sender(
                         if active {
                             recovery.recover();
                             active = false;
+                            activation_confirmed = false;
                             cooldown_until = Instant::now() + RETURN_COOLDOWN;
                             let _ = tx.try_send(InputMessage::Deactivate { generation });
                             tracing::info!(generation, "紧急热键已收回本机控制");
@@ -390,16 +399,23 @@ pub(super) async fn run_sender(
                         }
                         _ => continue,
                     };
-                    let in_jump_zone = local_layout.is_jump_zone_point(source_edge, point, JUMP_ZONE_SIZE);
-                    if last_jump_zone_result != Some(in_jump_zone) {
+                    let activation_edge_position = sender_activation_edge_position(
+                        &local_layout,
+                        source_edge,
+                        point,
+                        sample.dx,
+                        sample.dy,
+                    );
+                    let activation_ready = activation_edge_position.is_some();
+                    if last_activation_ready != Some(activation_ready) {
                         tracing::info!(
                             point = ?point,
                             edge = ?source_edge,
-                            in_jump_zone,
+                            activation_ready,
                             displays = ?local_layout.displays,
                             "输入发送端边缘判定状态变化"
                         );
-                        last_jump_zone_result = Some(in_jump_zone);
+                        last_activation_ready = Some(activation_ready);
                     }
                     tracing::debug!(
                         point = ?point,
@@ -407,7 +423,7 @@ pub(super) async fn run_sender(
                         dy = sample.dy,
                         position_updated = sample.position_updated,
                         edge = ?source_edge,
-                        in_jump_zone,
+                        activation_ready,
                         displays = ?local_layout.displays,
                         "输入发送端检查本机边缘"
                     );
@@ -421,13 +437,14 @@ pub(super) async fn run_sender(
                         );
                         motion_logged = true;
                     }
-                    if in_jump_zone {
+                    if let Some(edge_position) = activation_edge_position {
                         generation = generation.wrapping_add(1).max(1);
-                        let edge_position = local_layout.normalized_edge_position(source_edge, point);
                         let pressed = platform.backend.snapshot();
                         enqueue_message(tx, InputMessage::Activate { generation, source_edge, edge_position, pressed })?;
                         platform.backend.set_capture(true)?;
                         active = true;
+                        activation_confirmed = false;
+                        last_heartbeat = Instant::now();
                         recovery.arm(edge_position);
                         tracing::info!(
                             generation,
@@ -453,12 +470,37 @@ pub(super) async fn run_sender(
                 }
             }
             _ = timeout_tick.tick() => {
-                if active && Instant::now().duration_since(last_heartbeat) >= HEARTBEAT_TIMEOUT {
+                if active
+                    && Instant::now().duration_since(last_heartbeat)
+                        >= sender_heartbeat_timeout(activation_confirmed)
+                {
                     let _ = platform.backend.set_capture(false);
                     bail!("输入辅助通道心跳超时");
                 }
             }
         }
+    }
+}
+
+fn sender_activation_edge_position(
+    layout: &super::DesktopLayout,
+    edge: ScreenEdge,
+    point: super::Point,
+    dx: i32,
+    dy: i32,
+) -> Option<f32> {
+    if layout.is_jump_zone_point(edge, point, JUMP_ZONE_SIZE) {
+        Some(layout.normalized_edge_position(edge, point))
+    } else {
+        layout.crossed_outer_edge_position(edge, point, dx, dy)
+    }
+}
+
+fn sender_heartbeat_timeout(activation_confirmed: bool) -> Duration {
+    if activation_confirmed {
+        HEARTBEAT_TIMEOUT
+    } else {
+        ACTIVATION_TIMEOUT
     }
 }
 
@@ -540,7 +582,7 @@ fn enqueue_message(tx: &mpsc::Sender<InputMessage>, message: InputMessage) -> Re
     })
 }
 
-async fn run_receiver(
+pub(super) async fn run_receiver(
     incoming: &mut mpsc::Receiver<Result<InputMessage>>,
     tx: &mpsc::Sender<InputMessage>,
     platform: &mut platform::PlatformHandle,
@@ -686,8 +728,9 @@ fn apply_snapshot(backend: &dyn platform::InputBackend, snapshot: &KeySnapshot) 
 #[cfg(test)]
 mod tests {
     use super::{
-        AbortOnDrop, EDGE_INSET, ReceiverMotion, SenderRecoveryGuard, enqueue_message,
-        receiver_motion, run_sender, spawn_input_reader,
+        ACTIVATION_TIMEOUT, AbortOnDrop, EDGE_INSET, HEARTBEAT_TIMEOUT, ReceiverMotion,
+        SenderRecoveryGuard, enqueue_message, receiver_motion, run_sender,
+        sender_activation_edge_position, sender_heartbeat_timeout, spawn_input_reader,
     };
     use crate::input::platform::{InputBackend, MotionAccumulator, PlatformHandle};
     use crate::input::protocol::InputMessage;
@@ -775,6 +818,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sender_activates_when_outward_motion_crosses_the_edge() {
+        let layout = DesktopLayout::new(vec![DisplayRect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        }])
+        .unwrap();
+
+        assert_eq!(
+            sender_activation_edge_position(
+                &layout,
+                ScreenEdge::Right,
+                Point { x: 97, y: 50 },
+                4,
+                0,
+            ),
+            Some(0.5),
+        );
+        assert_eq!(
+            sender_activation_edge_position(
+                &layout,
+                ScreenEdge::Right,
+                Point { x: 97, y: 50 },
+                2,
+                0,
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn sender_uses_a_longer_timeout_until_activation_is_confirmed() {
+        assert_eq!(sender_heartbeat_timeout(false), ACTIVATION_TIMEOUT);
+        assert_eq!(sender_heartbeat_timeout(true), HEARTBEAT_TIMEOUT);
+    }
+
     #[tokio::test]
     async fn input_writer_queue_rejects_overflow_without_waiting() {
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
@@ -817,9 +898,12 @@ mod tests {
             )
             .await
         });
-        let activation = timeout(Duration::from_secs(1), async {
+        let edge_position = timeout(Duration::from_secs(1), async {
             loop {
-                if let InputMessage::Activate { edge_position, .. } =
+                if let InputMessage::Activate {
+                    edge_position,
+                    ..
+                } =
                     messages.recv().await.expect("sender 不应提前停止")
                 {
                     break edge_position;
@@ -829,7 +913,7 @@ mod tests {
         .await
         .expect("sender 应处理零 delta 的边缘坐标更新");
 
-        assert_eq!(activation, 0.5);
+        assert_eq!(edge_position, 0.5);
         assert!(*backend.capture.lock().unwrap());
         task.abort();
         let _ = task.await;

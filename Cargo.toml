@@ -7,6 +7,7 @@ default-run = "synly"
 [features]
 default = []
 input-macos-mock = []
+input-receiver-mock = []
 
 [[bin]]
 name = "input-macos-mock"
@@ -16,6 +17,11 @@ required-features = ["input-macos-mock"]
 [[bin]]
 name = "synly-input-agent"
 path = "src/bin/synly-input-agent.rs"
+
+[[bin]]
+name = "input-receiver-mock"
+path = "src/bin/input-receiver-mock.rs"
+required-features = ["input-receiver-mock"]
 
 [dependencies]
 anyhow = "1.0.102"

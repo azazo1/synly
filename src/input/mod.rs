@@ -3,6 +3,8 @@ mod geometry;
 mod hotkey;
 #[cfg(target_os = "macos")]
 pub mod mock;
+#[cfg(feature = "input-receiver-mock")]
+pub mod receiver_mock;
 mod platform;
 mod protocol;
 mod runtime;

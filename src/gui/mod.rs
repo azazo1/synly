@@ -778,6 +778,14 @@ fn settings_from_window(window: &AppWindow) -> Result<(RuntimeConfig, AppSetting
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
         .collect();
+    let file_sync_mode = file_mode_from_index(window.get_file_mode_index());
+    let initial = matches!(file_sync_mode, FileSyncMode::Both | FileSyncMode::Auto).then(|| {
+        if window.get_initial_index() == 1 {
+            InitialSyncMode::Other
+        } else {
+            InitialSyncMode::This
+        }
+    });
     let runtime = RuntimeConfig {
         connection: Some(if window.get_connection_index() == 1 {
             ConnectionPreference::Join
@@ -787,13 +795,9 @@ fn settings_from_window(window: &AppWindow) -> Result<(RuntimeConfig, AppSetting
         instance_name: window.get_instance_name().trim().to_string(),
         peer_query: window.get_peer_query().trim().to_string(),
         port,
-        file_sync_mode: file_mode_from_index(window.get_file_mode_index()),
+        file_sync_mode,
         paths,
-        initial: Some(if window.get_initial_index() == 1 {
-            InitialSyncMode::Other
-        } else {
-            InitialSyncMode::This
-        }),
+        initial,
         sync_delete: window.get_sync_delete(),
         clipboard_mode: clipboard_mode_from_index(window.get_clipboard_mode_index()),
         audio_mode: audio_mode_from_index(window.get_audio_mode_index()),

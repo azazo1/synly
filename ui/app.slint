@@ -398,7 +398,11 @@ export component AppWindow inherits Window {
                                 LineEdit { text <=> root.path-text; placeholder-text: "同步路径"; horizontal-stretch: 1; }
                                 Button { text: "选择"; clicked => { root.choose-path(); } }
                             }
-                            ComboBox { model: ["本机目录作为初始状态", "对端目录作为初始状态"]; current-index <=> root.initial-index; }
+                            ComboBox {
+                                model: ["本机目录作为初始状态", "对端目录作为初始状态"];
+                                current-index <=> root.initial-index;
+                                enabled: root.file-mode-index == 3 || root.file-mode-index == 4;
+                            }
                             CheckBox { text: "同步删除"; checked <=> root.sync-delete; }
                             HorizontalLayout {
                                 Text { text: "扫描间隔"; vertical-alignment: center; }
