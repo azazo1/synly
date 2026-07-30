@@ -297,6 +297,7 @@ pub fn ensure_permissions(_mode: InputMode) -> Result<()> {
 }
 
 pub fn start(context: CaptureContext) -> Result<Arc<dyn InputBackend>> {
+    let elevation_requested = crate::input::windows_agent::elevation_requested();
     if crate::input::windows_agent::is_ready() {
         match crate::input::windows_agent::start_client(context.clone()) {
             Ok(backend) => {
@@ -304,12 +305,21 @@ pub fn start(context: CaptureContext) -> Result<Arc<dyn InputBackend>> {
                 return Ok(backend);
             }
             Err(error) => {
+                if !allow_native_fallback(elevation_requested) {
+                    return Err(error).context("Windows 管理员输入代理已失效");
+                }
                 tracing::warn!(error = %error, "Windows 管理员输入代理不可用, 回退到普通权限输入控制");
             }
         }
+    } else if !allow_native_fallback(elevation_requested) {
+        bail!("Windows 管理员输入代理已失效, 当前输入会话不会静默降级到普通权限");
     }
     tracing::info!("Windows 输入控制已使用普通权限启动");
     start_native(context)
+}
+
+fn allow_native_fallback(elevation_requested: bool) -> bool {
+    !elevation_requested
 }
 
 pub(in crate::input) fn start_native(context: CaptureContext) -> Result<Arc<dyn InputBackend>> {
@@ -1153,4 +1163,15 @@ fn hid_to_windows_scan(usage: u16) -> Option<(u16, bool)> {
         _ => return None,
     };
     Some(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::allow_native_fallback;
+
+    #[test]
+    fn elevated_receiver_failure_does_not_fallback_to_native_input() {
+        assert!(!allow_native_fallback(true));
+        assert!(allow_native_fallback(false));
+    }
 }

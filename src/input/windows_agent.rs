@@ -1,20 +1,19 @@
 use super::platform::{CaptureContext, InputBackend, MotionAccumulator, NativeEvent};
+use super::windows_ipc::{NativePipe, PipeDirection};
 use super::{DesktopLayout, Hotkey, InputMode, KeySnapshot, ModifierMask, Point};
 use anyhow::{Context, Result, anyhow, bail};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeServer, ServerOptions};
-use tokio::sync::{Notify, mpsc, watch};
-use tokio::time::{self, Instant, MissedTickBehavior};
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
+use tokio::time::{self, MissedTickBehavior};
 use uuid::Uuid;
-use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LocalFree};
+use windows_sys::Win32::Foundation::{CloseHandle, LocalFree};
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
     SDDL_REVISION_1,
@@ -39,16 +38,17 @@ use windows_sys::Win32::System::Threading::{
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
-const IPC_VERSION: u16 = 5;
+const IPC_VERSION: u16 = 6;
 const IPC_MAX_FRAME: usize = 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const DISPATCH_TIMEOUT: Duration = Duration::from_secs(10);
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+const REQUEST_DELIVERY_TIMEOUT: Duration = Duration::from_secs(4);
 const CLIENT_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(500);
 const AGENT_HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
 const IPC_SLOW_OPERATION_TRACE_AFTER: Duration = Duration::from_millis(250);
 
 static AGENT: OnceLock<Mutex<Option<Arc<AgentClient>>>> = OnceLock::new();
+static ELEVATION_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 enum AgentRequest {
@@ -123,7 +123,19 @@ enum AgentDiagnosticPhase {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-enum AgentPacket {
+enum GuiToAgentPacket {
+    HelloAck {
+        version: u16,
+        session_id: u32,
+    },
+    Request {
+        id: u64,
+        request: AgentRequest,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+enum AgentToGuiPacket {
     Hello {
         version: u16,
         token: String,
@@ -131,24 +143,16 @@ enum AgentPacket {
         parent_pid: u32,
         agent_path: PathBuf,
     },
-    HelloAck {
-        version: u16,
-        session_id: u32,
-    },
     Ready,
     StartupError {
         error: String,
-    },
-    Request {
-        id: u64,
-        expects_response: bool,
-        request: AgentRequest,
     },
     Response {
         id: u64,
         response: AgentResponse,
     },
     Diagnostic {
+        id: u64,
         request: String,
         phase: AgentDiagnosticPhase,
         elapsed_ms: u64,
@@ -162,6 +166,20 @@ enum AgentPacket {
         position_updated: bool,
     },
     SecureDesktopPaused(bool),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AgentMotion {
+    dx: i32,
+    dy: i32,
+    position: Option<Point>,
+    position_updated: bool,
+}
+
+#[derive(Clone)]
+struct AgentOutput {
+    reliable: std::sync::mpsc::SyncSender<AgentToGuiPacket>,
+    motion: Arc<AgentMotionSlot>,
 }
 
 struct ClientCommand {
@@ -179,17 +197,72 @@ struct CursorUpdate {
 
 type PendingResponses = Arc<Mutex<HashMap<
     u64,
-    std::sync::mpsc::SyncSender<Result<AgentResponse, String>>,
+    PendingResponse,
 >>>;
 
+struct PendingResponse {
+    request: &'static str,
+    caller: Option<std::sync::mpsc::SyncSender<Result<AgentResponse, String>>>,
+    completion: std::sync::mpsc::SyncSender<Result<(), String>>,
+}
+
+enum ClientQueueItem {
+    Command(ClientCommand),
+    Cursor,
+}
+
+struct ClientCursorState {
+    latest: Mutex<Option<CursorUpdate>>,
+    queued: AtomicBool,
+}
+
+struct AgentMotionSlot {
+    latest: Mutex<Option<AgentMotion>>,
+    changed: AtomicBool,
+}
+
+#[derive(Clone)]
+struct AgentHello {
+    agent_pid: u32,
+    agent_path: PathBuf,
+}
+
 struct AgentClient {
-    commands: mpsc::Sender<ClientCommand>,
-    latest_cursor: watch::Sender<Option<CursorUpdate>>,
+    commands: std::sync::mpsc::SyncSender<ClientQueueItem>,
+    cursor: Arc<ClientCursorState>,
     context: Arc<Mutex<Option<CaptureContext>>>,
     alive: Arc<AtomicBool>,
     lifecycle: Mutex<()>,
     next_lease: AtomicU64,
     active_lease: AtomicU64,
+}
+
+struct GuiTransportStart {
+    created: std::sync::mpsc::Receiver<Result<(), String>>,
+    ready: std::sync::mpsc::Receiver<Result<Arc<AgentClient>, String>>,
+}
+
+impl GuiTransportStart {
+    fn wait_until_created(&self) -> Result<()> {
+        for _ in 0..2 {
+            match self.created.recv_timeout(CONNECT_TIMEOUT) {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => return Err(anyhow!(error)),
+                Err(error) => {
+                    return Err(error).context("等待 Windows 输入代理命名管道创建超时");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn wait_until_ready(self) -> Result<Arc<AgentClient>> {
+        match self.ready.recv_timeout(CONNECT_TIMEOUT) {
+            Ok(Ok(client)) => Ok(client),
+            Ok(Err(error)) => Err(anyhow!(error)),
+            Err(error) => Err(error).context("等待 Windows 输入代理授权和连接超时"),
+        }
+    }
 }
 
 struct AgentBackend {
@@ -201,6 +274,14 @@ struct AgentBackend {
 struct NativeAgentRuntime {
     backend: Arc<dyn InputBackend>,
     task: tokio::task::JoinHandle<()>,
+}
+
+struct AgentTransport {
+    requests: mpsc::Receiver<GuiToAgentPacket>,
+    output: AgentOutput,
+    alive: Arc<AtomicBool>,
+    command_thread: std::thread::JoinHandle<Result<()>>,
+    event_thread: std::thread::JoinHandle<Result<()>>,
 }
 
 struct AgentHeartbeat {
@@ -280,6 +361,40 @@ impl NativeAgentRuntime {
     }
 }
 
+impl AgentOutput {
+    fn send_reliable(&self, packet: AgentToGuiPacket) -> Result<()> {
+        self.reliable
+            .send(packet)
+            .map_err(|_| anyhow!("Windows input agent event queue closed"))
+    }
+
+    fn store_motion(&self, motion: AgentMotion) {
+        if let Ok(mut latest) = self.motion.latest.lock() {
+            match latest.as_mut() {
+                Some(current) => {
+                    current.dx = current.dx.saturating_add(motion.dx);
+                    current.dy = current.dy.saturating_add(motion.dy);
+                    if motion.position_updated {
+                        current.position = motion.position;
+                        current.position_updated = true;
+                    }
+                }
+                None => *latest = Some(motion),
+            }
+            self.motion.changed.store(true, Ordering::Release);
+        }
+    }
+}
+
+impl AgentMotionSlot {
+    fn take(&self) -> Option<AgentMotion> {
+        if !self.changed.swap(false, Ordering::AcqRel) {
+            return None;
+        }
+        self.latest.lock().ok().and_then(|mut latest| latest.take())
+    }
+}
+
 pub fn request_elevation() -> Result<()> {
     tracing::trace!("Windows 输入代理授权流程开始"); // to remove
     if let Some(client) = current_client()
@@ -289,62 +404,39 @@ pub fn request_elevation() -> Result<()> {
         return Ok(());
     }
 
-    let pipe_name = format!(r"\\.\pipe\synly-input-{}", Uuid::new_v4());
+    let connection_id = Uuid::new_v4();
+    let command_pipe_name = format!(r"\\.\pipe\synly-input-command-{connection_id}");
+    let event_pipe_name = format!(r"\\.\pipe\synly-input-event-{connection_id}");
     let token = Uuid::new_v4().to_string();
     let parent_pid = unsafe { GetCurrentProcessId() };
-    tracing::trace!(%pipe_name, parent_pid, "Windows 输入代理准备创建命名管道"); // to remove
-    let mut options = ServerOptions::new();
-    options
-        .access_inbound(true)
-        .access_outbound(true)
-        .first_pipe_instance(true)
-        .reject_remote_clients(true);
-    let mut security = PipeSecurity::for_current_user()?;
-    let server = unsafe {
-        options.create_with_security_attributes_raw(
-            &pipe_name,
-            (&mut security.attributes as *mut SECURITY_ATTRIBUTES).cast(),
-        )
-    }
-    .context("failed to create Windows input agent named pipe")?;
-    tracing::trace!(%pipe_name, parent_pid, "Windows 输入代理命名管道已创建"); // to remove
+    tracing::trace!(%command_pipe_name, %event_pipe_name, parent_pid, "Windows 输入代理准备创建双命名管道"); // to remove
+    let transport = start_gui_transport(
+        command_pipe_name.clone(),
+        event_pipe_name.clone(),
+        token.clone(),
+        parent_pid,
+    )?;
+    transport.wait_until_created()?;
+    tracing::trace!(%command_pipe_name, %event_pipe_name, parent_pid, "Windows 输入代理双命名管道已创建"); // to remove
 
     let executable = agent_executable()?;
     tracing::trace!(path = %executable.display(), "Windows 输入代理开始校验组件路径和签名"); // to remove
     validate_binary_signature(&executable)?;
     tracing::trace!(path = %executable.display(), "Windows 输入代理组件校验完成"); // to remove
-    launch_elevated(&executable, &pipe_name, &token, parent_pid)?;
+    launch_elevated(
+        &executable,
+        &command_pipe_name,
+        &event_pipe_name,
+        &token,
+        parent_pid,
+    )?;
     tracing::trace!(path = %executable.display(), parent_pid, "Windows 输入代理 UAC 启动请求已提交"); // to remove
 
-    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
-    std::thread::Builder::new()
-        .name("synly-input-agent-client".to_string())
-        .spawn(move || {
-            tracing::trace!(parent_pid, "Windows 输入代理 IPC 线程开始"); // to remove
-            let error_ready = ready_tx.clone();
-            let result = tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
-                .thread_name("synly-input-agent-io")
-                .enable_all()
-                .build()
-                .map_err(anyhow::Error::from)
-                .and_then(|runtime| {
-                    runtime.block_on(connect_agent(server, token, parent_pid, ready_tx))
-                });
-            if let Err(error) = result {
-                tracing::trace!(parent_pid, error = %error, "Windows 输入代理 IPC 线程返回错误"); // to remove
-                let _ = error_ready.send(Err(anyhow!(format!("{error:#}"))));
-                tracing::error!(error = %error, "Windows 输入代理连接线程结束");
-            }
-        })
-        .context("failed to start Windows input agent client thread")?;
-
-    let client = ready_rx
-        .recv_timeout(CONNECT_TIMEOUT)
-        .context("等待 Windows 输入代理授权和连接超时")??;
+    let client = transport.wait_until_ready()?;
     tracing::trace!(parent_pid, "Windows 输入代理授权和 IPC 握手完成"); // to remove
     let slot = AGENT.get_or_init(|| Mutex::new(None));
     *slot.lock().map_err(|_| anyhow!("Windows input agent state poisoned"))? = Some(client);
+    ELEVATION_REQUESTED.store(true, Ordering::Release);
     Ok(())
 }
 
@@ -362,6 +454,10 @@ pub(in crate::input) fn ensure_ready(mode: InputMode) -> Result<()> {
 
 pub(in crate::input) fn is_ready() -> bool {
     current_client().is_some()
+}
+
+pub(in crate::input) fn elevation_requested() -> bool {
+    ELEVATION_REQUESTED.load(Ordering::Acquire)
 }
 
 pub(in crate::input) fn start_client(context: CaptureContext) -> Result<Arc<dyn InputBackend>> {
@@ -395,27 +491,103 @@ pub(in crate::input) fn start_client(context: CaptureContext) -> Result<Arc<dyn 
     }))
 }
 
-pub async fn run_agent(pipe_name: String, token: String, parent_pid: u32) -> Result<()> {
-    let mut client = connect_pipe(&pipe_name).await?;
-    tracing::trace!(%pipe_name, parent_pid, "Windows 输入代理已连接 GUI 命名管道"); // to remove
-    validate_pipe_server(&client, parent_pid)?;
-    tracing::trace!(%pipe_name, parent_pid, "Windows 输入代理 pipe server PID 校验通过"); // to remove
-    let agent_path = std::env::current_exe().context("failed to locate input agent executable")?;
-    write_packet(
-        &mut client,
-        &AgentPacket::Hello {
-            version: IPC_VERSION,
-            token,
-            agent_pid: unsafe { GetCurrentProcessId() },
-            parent_pid,
-            agent_path,
-        },
-    )
-    .await?;
-    tracing::trace!(parent_pid, "Windows 输入代理 Hello 已写入"); // to remove
-    let ack = read_packet(&mut client).await?;
-    let startup = (|| -> Result<()> {
-        let AgentPacket::HelloAck {
+fn start_agent_transport(
+    command_pipe_name: String,
+    event_pipe_name: String,
+    token: String,
+    parent_pid: u32,
+) -> Result<AgentTransport> {
+    let (request_tx, request_rx) = mpsc::channel(256);
+    let (reliable_tx, reliable_rx) = std::sync::mpsc::sync_channel(256);
+    let motion = Arc::new(AgentMotionSlot {
+        latest: Mutex::new(None),
+        changed: AtomicBool::new(false),
+    });
+    let output = AgentOutput {
+        reliable: reliable_tx,
+        motion: Arc::clone(&motion),
+    };
+    let alive = Arc::new(AtomicBool::new(true));
+    let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel(1);
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+
+    let command_alive = Arc::clone(&alive);
+    let command_startup = startup_tx.clone();
+    let command_thread = std::thread::Builder::new()
+        .name("synly-agent-command".to_string())
+        .spawn(move || {
+            let result = agent_command_owner(
+                command_pipe_name,
+                parent_pid,
+                request_tx,
+                startup_tx,
+                Arc::clone(&command_alive),
+            );
+            if let Err(error) = &result {
+                command_alive.store(false, Ordering::Release);
+                let _ = command_startup.send(Err(format!("{error:#}")));
+            }
+            result
+        })
+        .context("failed to start Windows input agent command reader")?;
+
+    let event_alive = Arc::clone(&alive);
+    let event_thread = std::thread::Builder::new()
+        .name("synly-agent-event".to_string())
+        .spawn(move || {
+            let result = agent_event_owner(
+                event_pipe_name,
+                token,
+                parent_pid,
+                reliable_rx,
+                motion,
+                startup_rx,
+                ready_tx.clone(),
+                Arc::clone(&event_alive),
+            );
+            if let Err(error) = &result {
+                event_alive.store(false, Ordering::Release);
+                let _ = ready_tx.send(Err(format!("{error:#}")));
+            }
+            result
+        })
+        .context("failed to start Windows input agent event writer")?;
+
+    match ready_rx.recv_timeout(CONNECT_TIMEOUT) {
+        Ok(Ok(())) => Ok(AgentTransport {
+            requests: request_rx,
+            output,
+            alive,
+            command_thread,
+            event_thread,
+        }),
+        Ok(Err(error)) => {
+            alive.store(false, Ordering::Release);
+            Err(anyhow!(error))
+        }
+        Err(error) => {
+            alive.store(false, Ordering::Release);
+            Err(error).context("Windows input agent transport startup timed out")
+        }
+    }
+}
+
+fn agent_command_owner(
+    pipe_name: String,
+    parent_pid: u32,
+    requests: mpsc::Sender<GuiToAgentPacket>,
+    startup: std::sync::mpsc::SyncSender<Result<(), String>>,
+    alive: Arc<AtomicBool>,
+) -> Result<()> {
+    let mut pipe = NativePipe::connect_client(
+        &pipe_name,
+        PipeDirection::ServerToClient,
+        CONNECT_TIMEOUT,
+    )?;
+    validate_pipe_server(&pipe, parent_pid)?;
+    let ack: GuiToAgentPacket = read_packet(&mut pipe, CONNECT_TIMEOUT)?;
+    let startup_result = (|| -> Result<()> {
+        let GuiToAgentPacket::HelloAck {
             version,
             session_id,
         } = ack
@@ -434,21 +606,127 @@ pub async fn run_agent(pipe_name: String, token: String, parent_pid: u32) -> Res
                 "Windows input agent handshake session mismatch: agent={expected_session_id}, GUI={session_id}"
             );
         }
-        tracing::trace!(version, session_id, parent_pid, "Windows 输入代理 HelloAck 校验通过"); // to remove
-        tracing::trace!(%pipe_name, parent_pid, "Windows 输入代理进程开始校验 GUI 父进程"); // to remove
         validate_parent_process(parent_pid)?;
-        tracing::trace!(%pipe_name, parent_pid, "Windows 输入代理父进程校验通过"); // to remove
+        tracing::trace!(version, session_id, parent_pid, "Windows 输入代理 command pipe 已校验 HelloAck"); // to remove
         Ok(())
     })();
-    if let Err(error) = startup {
-        let message = format!("{error:#}");
-        tracing::trace!(parent_pid, error = %message, "Windows 输入代理初始化失败并回传 GUI"); // to remove
-        let _ = write_packet(&mut client, &AgentPacket::StartupError { error: message }).await;
-        return Err(error);
+    startup
+        .send(startup_result.as_ref().map(|_| ()).map_err(|error| format!("{error:#}")))
+        .map_err(|_| anyhow!("Windows input agent event owner stopped during startup"))?;
+    startup_result?;
+
+    let mut read_requests = 0usize;
+    while alive.load(Ordering::Acquire) {
+        let packet = match read_packet::<GuiToAgentPacket>(&mut pipe, Duration::from_secs(1)) {
+            Ok(packet) => packet,
+            Err(error) if is_timeout_error(&error) => continue,
+            Err(_error) if !alive.load(Ordering::Acquire) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let GuiToAgentPacket::Request { id, ref request } = packet else {
+            bail!("Windows input agent received an unexpected packet");
+        };
+        read_requests = read_requests.saturating_add(1);
+        if request.name() == "InjectCursor" {
+            if read_requests == 1 || read_requests.is_multiple_of(500) {
+                tracing::trace!(target: "synly_input_agent", count = read_requests, request_id = id, "Windows 输入代理 command pipe 读取请求汇总"); // to remove
+            }
+        } else if request.name() != "Health" {
+            tracing::trace!(target: "synly_input_agent", request = request.name(), request_id = id, "Windows 输入代理 command pipe 已读取请求"); // to remove
+        }
+        requests
+            .blocking_send(packet)
+            .map_err(|_| anyhow!("Windows input agent backend request queue closed"))?;
     }
-    write_packet(&mut client, &AgentPacket::Ready).await?;
-    tracing::trace!(parent_pid, "Windows 输入代理 Ready 已写入"); // to remove
-    run_agent_loop(client).await
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn agent_event_owner(
+    pipe_name: String,
+    token: String,
+    parent_pid: u32,
+    reliable: std::sync::mpsc::Receiver<AgentToGuiPacket>,
+    motion: Arc<AgentMotionSlot>,
+    startup: std::sync::mpsc::Receiver<Result<(), String>>,
+    ready: std::sync::mpsc::SyncSender<Result<(), String>>,
+    alive: Arc<AtomicBool>,
+) -> Result<()> {
+    let mut pipe = NativePipe::connect_client(
+        &pipe_name,
+        PipeDirection::ClientToServer,
+        CONNECT_TIMEOUT,
+    )?;
+    validate_pipe_server(&pipe, parent_pid)?;
+    let agent_path = std::env::current_exe().context("failed to locate input agent executable")?;
+    write_packet(
+        &mut pipe,
+        &AgentToGuiPacket::Hello {
+            version: IPC_VERSION,
+            token,
+            agent_pid: unsafe { GetCurrentProcessId() },
+            parent_pid,
+            agent_path,
+        },
+        REQUEST_DELIVERY_TIMEOUT,
+    )?;
+    tracing::trace!(parent_pid, "Windows 输入代理 event pipe 已写入 Hello"); // to remove
+    match startup.recv_timeout(CONNECT_TIMEOUT) {
+        Ok(Ok(())) => {
+            write_packet(
+                &mut pipe,
+                &AgentToGuiPacket::Ready,
+                REQUEST_DELIVERY_TIMEOUT,
+            )?;
+        }
+        Ok(Err(error)) => {
+            let _ = write_packet(
+                &mut pipe,
+                &AgentToGuiPacket::StartupError {
+                    error: error.clone(),
+                },
+                REQUEST_DELIVERY_TIMEOUT,
+            );
+            return Err(anyhow!(error));
+        }
+        Err(error) => return Err(error).context("Windows input agent startup result timed out"),
+    }
+    ready
+        .send(Ok(()))
+        .map_err(|_| anyhow!("Windows input agent startup receiver closed"))?;
+    tracing::trace!(parent_pid, "Windows 输入代理 event pipe 已写入 Ready"); // to remove
+    agent_event_writer_loop(pipe, reliable, motion, alive)
+}
+
+pub async fn run_agent(
+    command_pipe_name: String,
+    event_pipe_name: String,
+    token: String,
+    parent_pid: u32,
+) -> Result<()> {
+    let transport = start_agent_transport(
+        command_pipe_name,
+        event_pipe_name,
+        token,
+        parent_pid,
+    )?;
+    let result = run_agent_loop(
+        transport.requests,
+        transport.output.clone(),
+        Arc::clone(&transport.alive),
+    )
+    .await;
+    transport.alive.store(false, Ordering::Release);
+    drop(transport.output);
+    let command_result = transport
+        .command_thread
+        .join()
+        .map_err(|_| anyhow!("Windows input agent command owner panicked"))?;
+    let event_result = transport
+        .event_thread
+        .join()
+        .map_err(|_| anyhow!("Windows input agent event owner panicked"))?;
+    result.and(command_result).and(event_result)
 }
 
 impl AgentClient {
@@ -462,15 +740,15 @@ impl AgentClient {
         let (dispatch_tx, dispatch_rx) = std::sync::mpsc::sync_channel(1);
         let (response_tx, response_rx) = std::sync::mpsc::sync_channel(1);
         self.commands
-            .try_send(ClientCommand {
+            .try_send(ClientQueueItem::Command(ClientCommand {
                 request,
                 queued_at: Instant::now(),
                 dispatched: Some(dispatch_tx),
                 response: Some(response_tx),
-            })
+            }))
             .map_err(|error| {
                 tracing::trace!(request = request_name, error = %error, "Windows 输入代理同步请求入队失败"); // to remove
-                if matches!(&error, mpsc::error::TrySendError::Closed(_)) {
+                if matches!(&error, std::sync::mpsc::TrySendError::Disconnected(_)) {
                     mark_agent_unavailable(&self.alive, request_name, "command-queue-closed");
                 }
                 anyhow!("Windows input agent {request_name} command queue unavailable: {error}")
@@ -481,41 +759,60 @@ impl AgentClient {
             dispatch_rx,
             response_rx,
             DISPATCH_TIMEOUT,
-            REQUEST_TIMEOUT,
         );
         tracing::trace!(request = request_name, result = ?response.as_ref().err(), "Windows 输入代理同步请求等待结束"); // to remove
         response
     }
 
-    fn notify(&self, request: AgentRequest) {
+    fn notify(&self, request: AgentRequest) -> Result<()> {
         if !self.alive.load(Ordering::Acquire) {
             tracing::trace!(request = request.name(), "Windows 输入代理通知因连接关闭被丢弃"); // to remove
-            return;
+            bail!("Windows input agent connection is closed");
         }
         let request = match request {
             AgentRequest::InjectCursor(point) => {
-                if let Err(error) = self.latest_cursor.send(Some(CursorUpdate {
-                    point,
-                    queued_at: Instant::now(),
-                })) {
-                    tracing::trace!(error = %error, "Windows 输入代理最新光标通知发送失败"); // to remove
-                    mark_agent_unavailable(&self.alive, "InjectCursor", "cursor-channel-closed");
+                if let Ok(mut latest) = self.cursor.latest.lock() {
+                    *latest = Some(CursorUpdate {
+                        point,
+                        queued_at: Instant::now(),
+                    });
                 }
-                return;
+                if !self.cursor.queued.swap(true, Ordering::AcqRel) {
+                    match self.commands.try_send(ClientQueueItem::Cursor) {
+                        Ok(()) => {}
+                        Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                            self.cursor.queued.store(false, Ordering::Release);
+                        }
+                        Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {
+                            self.cursor.queued.store(false, Ordering::Release);
+                            mark_agent_unavailable(
+                                &self.alive,
+                                "InjectCursor",
+                                "cursor-channel-closed",
+                            );
+                        }
+                    }
+                }
+                return Ok(());
             }
             request => request,
         };
         let request_name = request.name();
-        if let Err(error) = self.commands.try_send(ClientCommand {
-            request,
-            queued_at: Instant::now(),
-            dispatched: None,
-            response: None,
-        }) && matches!(error, mpsc::error::TrySendError::Closed(_))
-        {
-            tracing::trace!(request = request_name, error = %error, "Windows 输入代理通知入队失败"); // to remove
-            mark_agent_unavailable(&self.alive, request_name, "notify-queue-closed");
-        }
+        self.commands
+            .try_send(ClientQueueItem::Command(ClientCommand {
+                request,
+                queued_at: Instant::now(),
+                dispatched: None,
+                response: None,
+            }))
+            .map_err(|error| {
+                tracing::trace!(request = request_name, error = %error, "Windows 输入代理通知入队失败"); // to remove
+                if matches!(&error, std::sync::mpsc::TrySendError::Disconnected(_)) {
+                    mark_agent_unavailable(&self.alive, request_name, "notify-queue-closed");
+                }
+                anyhow!("Windows input agent {request_name} command queue unavailable: {error}")
+            })?;
+        Ok(())
     }
 
     fn emit_failure(&self, error: &anyhow::Error) {
@@ -544,9 +841,8 @@ fn wait_for_agent_response(
     dispatch_rx: std::sync::mpsc::Receiver<()>,
     response_rx: std::sync::mpsc::Receiver<Result<AgentResponse, String>>,
     dispatch_timeout: Duration,
-    response_timeout: Duration,
 ) -> Result<AgentResponse> {
-    tracing::trace!(request = request_name, dispatch_timeout_ms = dispatch_timeout.as_millis(), response_timeout_ms = response_timeout.as_millis(), "Windows 输入代理开始等待派发和响应"); // to remove
+    tracing::trace!(request = request_name, dispatch_timeout_ms = dispatch_timeout.as_millis(), response_timeout_ms = REQUEST_DELIVERY_TIMEOUT.as_millis(), "Windows 输入代理开始等待派发和响应"); // to remove
     match dispatch_rx.recv_timeout(dispatch_timeout) {
         Ok(()) => {
             tracing::trace!(request = request_name, "Windows 输入代理请求已确认写入 pipe"); // to remove
@@ -562,7 +858,7 @@ fn wait_for_agent_response(
             bail!("Windows input agent {request_name} dispatch failed before pipe write");
         }
     }
-    match response_rx.recv_timeout(response_timeout) {
+    match response_rx.recv() {
         Ok(Ok(AgentResponse::Error(message))) => {
             tracing::trace!(request = request_name, error = %message, "Windows 输入代理返回业务错误"); // to remove
             Err(anyhow!(message))
@@ -576,11 +872,9 @@ fn wait_for_agent_response(
             Err(anyhow!(message))
         }
         Err(error) => {
-            tracing::trace!(request = request_name, error = %error, "Windows 输入代理等待 response 超时或断开"); // to remove
-            mark_agent_unavailable(alive, request_name, "response-timeout");
-            Err(error).with_context(|| {
-                format!("Windows input agent {request_name} request timed out")
-            })
+            tracing::trace!(request = request_name, error = %error, "Windows 输入代理等待 response 时通道断开"); // to remove
+            mark_agent_unavailable(alive, request_name, "response-disconnected");
+            Err(error).with_context(|| format!("Windows input agent {request_name} response channel closed"))
         }
     }
 }
@@ -716,8 +1010,7 @@ impl AgentBackend {
             tracing::trace!(request = request_name, lease = self.lease, "Windows 输入代理 backend 通知发现连接关闭"); // to remove
             bail!("Windows input agent connection is closed");
         }
-        self.client.notify(request);
-        Ok(())
+        self.client.notify(request)
     }
 }
 
@@ -738,26 +1031,187 @@ impl Drop for AgentBackend {
             return;
         }
         tracing::trace!(lease = self.lease, "Windows 输入代理 backend Drop 已入队 Stop"); // to remove
-        self.client.notify(AgentRequest::Stop);
+        let _ = self.client.notify(AgentRequest::Stop);
         if let Ok(mut context) = self.client.context.lock() {
             *context = None;
         }
     }
 }
 
-async fn connect_agent(
-    mut server: NamedPipeServer,
+fn start_gui_transport(
+    command_pipe_name: String,
+    event_pipe_name: String,
     token: String,
     parent_pid: u32,
-    ready: std::sync::mpsc::SyncSender<Result<Arc<AgentClient>>>,
+) -> Result<GuiTransportStart> {
+    let (commands, command_rx) = std::sync::mpsc::sync_channel(64);
+    let cursor = Arc::new(ClientCursorState {
+        latest: Mutex::new(None),
+        queued: AtomicBool::new(false),
+    });
+    let context = Arc::new(Mutex::new(None));
+    let alive = Arc::new(AtomicBool::new(true));
+    let pending = Arc::new(Mutex::new(HashMap::new()));
+    let client = Arc::new(AgentClient {
+        commands,
+        cursor: Arc::clone(&cursor),
+        context: Arc::clone(&context),
+        alive: Arc::clone(&alive),
+        lifecycle: Mutex::new(()),
+        next_lease: AtomicU64::new(1),
+        active_lease: AtomicU64::new(0),
+    });
+    let (created_tx, created_rx) = std::sync::mpsc::sync_channel(2);
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(2);
+    let (hello_tx, hello_rx) = std::sync::mpsc::sync_channel(1);
+
+    let command_created = created_tx.clone();
+    let command_ready = ready_tx.clone();
+    let command_pending = Arc::clone(&pending);
+    let command_alive = Arc::clone(&alive);
+    let command_context = Arc::clone(&context);
+    let command_cursor = Arc::clone(&cursor);
+    std::thread::Builder::new()
+        .name("synly-input-command".to_string())
+        .spawn(move || {
+            let result = gui_command_owner(
+                command_pipe_name,
+                parent_pid,
+                command_created,
+                hello_rx,
+                command_rx,
+                command_cursor,
+                Arc::clone(&command_pending),
+                Arc::clone(&command_alive),
+            );
+            if let Err(error) = result {
+                let message = format!("{error:#}");
+                let _ = command_ready.send(Err(message.clone()));
+                fail_gui_transport(
+                    &command_alive,
+                    &command_pending,
+                    &command_context,
+                    &message,
+                );
+                tracing::error!(error = %message, "Windows 输入代理 command pipe 线程结束");
+            }
+        })
+        .context("failed to start Windows input agent command owner")?;
+
+    let event_client = Arc::clone(&client);
+    let event_pending = Arc::clone(&pending);
+    let event_alive = Arc::clone(&alive);
+    let event_context = Arc::clone(&context);
+    std::thread::Builder::new()
+        .name("synly-input-event".to_string())
+        .spawn(move || {
+            let result = gui_event_owner(
+                event_pipe_name,
+                token,
+                parent_pid,
+                created_tx,
+                hello_tx,
+                Arc::clone(&event_client),
+                Arc::clone(&event_pending),
+                Arc::clone(&event_context),
+                Arc::clone(&event_alive),
+                ready_tx.clone(),
+            );
+            if let Err(error) = result {
+                let message = format!("{error:#}");
+                let _ = ready_tx.send(Err(message.clone()));
+                fail_gui_transport(
+                    &event_alive,
+                    &event_pending,
+                    &event_context,
+                    &message,
+                );
+                tracing::error!(error = %message, "Windows 输入代理 event pipe 线程结束");
+            }
+        })
+        .context("failed to start Windows input agent event owner")?;
+
+    Ok(GuiTransportStart {
+        created: created_rx,
+        ready: ready_rx,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gui_command_owner(
+    pipe_name: String,
+    parent_pid: u32,
+    created: std::sync::mpsc::SyncSender<Result<(), String>>,
+    hello: std::sync::mpsc::Receiver<AgentHello>,
+    commands: std::sync::mpsc::Receiver<ClientQueueItem>,
+    cursor: Arc<ClientCursorState>,
+    pending: PendingResponses,
+    alive: Arc<AtomicBool>,
 ) -> Result<()> {
-    tracing::trace!(parent_pid, "Windows 输入代理 GUI 端等待命名管道连接"); // to remove
-    time::timeout(CONNECT_TIMEOUT, server.connect())
-        .await
-        .context("Windows input agent did not connect to the named pipe")??;
-    tracing::trace!(parent_pid, "Windows 输入代理 GUI 端命名管道已连接"); // to remove
-    let hello = read_packet(&mut server).await?;
-    let AgentPacket::Hello {
+    let security = PipeSecurity::for_current_user()?;
+    let mut pipe = match NativePipe::create_server(
+        &pipe_name,
+        PipeDirection::ServerToClient,
+        &security.attributes,
+    ) {
+        Ok(pipe) => pipe,
+        Err(error) => {
+            let _ = created.send(Err(format!("{error:#}")));
+            return Err(error);
+        }
+    };
+    created
+        .send(Ok(()))
+        .map_err(|_| anyhow!("Windows input agent pipe creation receiver closed"))?;
+    pipe.connect_server(CONNECT_TIMEOUT)?;
+    let hello = hello
+        .recv_timeout(CONNECT_TIMEOUT)
+        .context("Windows input agent command owner did not receive agent identity")?;
+    validate_pipe_client(&pipe, hello.agent_pid, &hello.agent_path)?;
+    let session_id = process_session_id(parent_pid)?;
+    write_packet(
+        &mut pipe,
+        &GuiToAgentPacket::HelloAck {
+            version: IPC_VERSION,
+            session_id,
+        },
+        REQUEST_DELIVERY_TIMEOUT,
+    )?;
+    tracing::trace!(agent_pid = hello.agent_pid, parent_pid, session_id, "Windows 输入代理 GUI command pipe 已写入 HelloAck"); // to remove
+    command_writer_loop(pipe, commands, cursor, pending, alive)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gui_event_owner(
+    pipe_name: String,
+    token: String,
+    parent_pid: u32,
+    created: std::sync::mpsc::SyncSender<Result<(), String>>,
+    hello_sender: std::sync::mpsc::SyncSender<AgentHello>,
+    client: Arc<AgentClient>,
+    pending: PendingResponses,
+    context: Arc<Mutex<Option<CaptureContext>>>,
+    alive: Arc<AtomicBool>,
+    ready: std::sync::mpsc::SyncSender<Result<Arc<AgentClient>, String>>,
+) -> Result<()> {
+    let security = PipeSecurity::for_current_user()?;
+    let mut pipe = match NativePipe::create_server(
+        &pipe_name,
+        PipeDirection::ClientToServer,
+        &security.attributes,
+    ) {
+        Ok(pipe) => pipe,
+        Err(error) => {
+            let _ = created.send(Err(format!("{error:#}")));
+            return Err(error);
+        }
+    };
+    created
+        .send(Ok(()))
+        .map_err(|_| anyhow!("Windows input agent pipe creation receiver closed"))?;
+    pipe.connect_server(CONNECT_TIMEOUT)?;
+    let hello: AgentToGuiPacket = read_packet(&mut pipe, CONNECT_TIMEOUT)?;
+    let AgentToGuiPacket::Hello {
         version,
         token: incoming_token,
         agent_pid,
@@ -765,274 +1219,148 @@ async fn connect_agent(
         agent_path,
     } = hello
     else {
-        tracing::trace!(parent_pid, "Windows 输入代理 GUI 端收到非 Hello 握手包"); // to remove
         bail!("Windows input agent sent an invalid handshake");
     };
-    tracing::trace!(version, agent_pid, incoming_parent, expected_parent = parent_pid, token_matches = incoming_token == token, "Windows 输入代理 GUI 端收到 Hello"); // to remove
     if version != IPC_VERSION {
-        tracing::trace!(version, expected_version = IPC_VERSION, agent_pid, incoming_parent, expected_parent = parent_pid, token_matches = incoming_token == token, "Windows 输入代理 GUI 端 Hello 版本校验失败"); // to remove
         bail!(
             "Windows input agent handshake version mismatch: agent={version}, GUI={}",
             IPC_VERSION
         );
     }
     if incoming_token != token || incoming_parent != parent_pid {
-        tracing::trace!(version, expected_version = IPC_VERSION, agent_pid, incoming_parent, expected_parent = parent_pid, token_matches = incoming_token == token, "Windows 输入代理 GUI 端 Hello 校验失败"); // to remove
         bail!("Windows input agent handshake token or parent mismatch");
     }
-    validate_pipe_client(&server, agent_pid, &agent_path)?;
-    tracing::trace!(agent_pid, path = %agent_path.display(), "Windows 输入代理 GUI 端 pipe client 校验通过"); // to remove
-    let session_id = process_session_id(parent_pid)?;
-    write_packet(
-        &mut server,
-        &AgentPacket::HelloAck {
-            version: IPC_VERSION,
-            session_id,
-        },
-    )
-    .await?;
-    tracing::trace!(agent_pid, parent_pid, session_id, "Windows 输入代理 GUI 端 HelloAck 已写入"); // to remove
-    let startup = time::timeout(CONNECT_TIMEOUT, read_packet(&mut server))
-        .await
-        .context("Windows input agent startup confirmation timed out")??;
-    match startup {
-        AgentPacket::Ready => {
-            tracing::trace!(agent_pid, parent_pid, "Windows 输入代理 GUI 端收到 Ready"); // to remove
-        }
-        AgentPacket::StartupError { error } => {
-            tracing::trace!(agent_pid, parent_pid, error = %error, "Windows 输入代理 GUI 端收到初始化错误"); // to remove
+    validate_pipe_client(&pipe, agent_pid, &agent_path)?;
+    hello_sender
+        .send(AgentHello {
+            agent_pid,
+            agent_path: agent_path.clone(),
+        })
+        .map_err(|_| anyhow!("Windows input agent command owner stopped during handshake"))?;
+    tracing::trace!(agent_pid, path = %agent_path.display(), "Windows 输入代理 GUI event pipe 已校验 agent 身份"); // to remove
+    match read_packet::<AgentToGuiPacket>(&mut pipe, CONNECT_TIMEOUT)? {
+        AgentToGuiPacket::Ready => {}
+        AgentToGuiPacket::StartupError { error } => {
             bail!("Windows input agent startup failed: {error}");
         }
         other => {
             bail!(
                 "Windows input agent sent an invalid startup packet: {}",
-                agent_packet_name(&other)
+                other.packet_name()
             );
         }
     }
-
-    let (commands, command_rx) = mpsc::channel(64);
-    let (latest_cursor, cursor_rx) = watch::channel(None);
-    let context = Arc::new(Mutex::new(None));
-    let alive = Arc::new(AtomicBool::new(true));
-    let client = Arc::new(AgentClient {
-        commands,
-        latest_cursor,
-        context: Arc::clone(&context),
-        alive: Arc::clone(&alive),
-        lifecycle: Mutex::new(()),
-        next_lease: AtomicU64::new(1),
-        active_lease: AtomicU64::new(0),
-    });
     ready
-        .send(Ok(Arc::clone(&client)))
+        .send(Ok(client))
         .map_err(|_| anyhow!("Windows input agent readiness receiver closed"))?;
-    tracing::trace!(agent_pid, parent_pid, "Windows 输入代理 GUI 端 client 已发布为 ready"); // to remove
-    let heartbeat_task = spawn_client_heartbeat(client.commands.clone(), Arc::clone(&alive));
-    let result = client_loop(server, command_rx, cursor_rx, context, alive).await;
-    tracing::trace!(agent_pid, parent_pid, result = ?result.as_ref().err(), "Windows 输入代理 GUI 端 client loop 已返回"); // to remove
-    heartbeat_task.abort();
-    let _ = heartbeat_task.await;
-    result
+    tracing::trace!(agent_pid, parent_pid, "Windows 输入代理 GUI event pipe 已进入读取循环"); // to remove
+    client_event_reader_loop(pipe, pending, context, alive)
 }
 
-fn spawn_client_heartbeat(
-    commands: mpsc::Sender<ClientCommand>,
-    alive: Arc<AtomicBool>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut heartbeat = time::interval(CLIENT_HEARTBEAT_INTERVAL);
-        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        loop {
-            heartbeat.tick().await;
-            if !alive.load(Ordering::Acquire) {
-                break;
-            }
-            match commands.try_send(ClientCommand {
-                request: AgentRequest::Health,
-                queued_at: Instant::now(),
-                dispatched: None,
-                response: None,
-            }) {
-                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
-                Err(mpsc::error::TrySendError::Closed(_)) => break,
-            }
-        }
-    })
-}
-
-async fn client_loop(
-    server: NamedPipeServer,
-    commands: mpsc::Receiver<ClientCommand>,
-    latest_cursor: watch::Receiver<Option<CursorUpdate>>,
+fn client_event_reader_loop(
+    mut pipe: NativePipe,
+    pending: PendingResponses,
     context: Arc<Mutex<Option<CaptureContext>>>,
     alive: Arc<AtomicBool>,
 ) -> Result<()> {
-    tracing::trace!("Windows 输入代理 GUI client loop 开始"); // to remove
-    let (reader, writer) = tokio::io::split(server);
-    let (mut packets, reader_task) = spawn_packet_reader(reader, "gui-response");
-    let pending = Arc::new(Mutex::new(HashMap::new()));
-    let heartbeat_probe = Arc::new(AtomicU64::new(0));
-    let cursor_probe = Arc::new(AtomicU64::new(0));
-    let cursor_ready = Arc::new(Notify::new());
-    let mut writer_task = tokio::spawn(command_writer_loop(
-        writer,
-        commands,
-        latest_cursor,
-        Arc::clone(&pending),
-        Arc::clone(&heartbeat_probe),
-        Arc::clone(&cursor_probe),
-        Arc::clone(&cursor_ready),
-    ));
-    let mut writer_finished = false;
     let mut unmatched_response = 0usize;
     let mut acknowledged_cursor = 0usize;
-    let result: Result<()> = async {
-        loop {
-            tokio::select! {
-            writer_result = &mut writer_task => {
-                writer_finished = true;
-                tracing::trace!(result = ?writer_result.as_ref().err(), "Windows 输入代理 GUI command writer 已结束"); // to remove
-                break match writer_result {
-                    Ok(result) => result,
-                    Err(error) => Err(error.into()),
+    while alive.load(Ordering::Acquire) {
+        let packet = match read_packet::<AgentToGuiPacket>(&mut pipe, AGENT_HEARTBEAT_TIMEOUT) {
+            Ok(packet) => packet,
+            Err(_) if !alive.load(Ordering::Acquire) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        match packet {
+            AgentToGuiPacket::Response { id, response } => {
+                let response_name = agent_response_name(&response);
+                let pending_response = pending
+                    .lock()
+                    .map_err(|_| anyhow!("Windows input agent pending response state poisoned"))?
+                    .remove(&id);
+                let Some(pending_response) = pending_response else {
+                    unmatched_response = unmatched_response.saturating_add(1);
+                    if unmatched_response == 1 || unmatched_response.is_multiple_of(500) {
+                        tracing::trace!(count = unmatched_response, request_id = id, response = response_name, "Windows 输入代理 GUI 收到无 pending response 汇总"); // to remove
+                    }
+                    continue;
                 };
+                if pending_response.request == "InjectCursor" {
+                    acknowledged_cursor = acknowledged_cursor.saturating_add(1);
+                    if let AgentResponse::Error(message) = &response
+                        && let Ok(context) = context.lock()
+                        && let Some(context) = context.as_ref()
+                    {
+                        context.emit_reliable(NativeEvent::Failed(format!(
+                            "Windows input agent cursor injection failed: {message}"
+                        )));
+                    }
+                    if acknowledged_cursor == 1 || acknowledged_cursor.is_multiple_of(500) {
+                        tracing::trace!(count = acknowledged_cursor, request_id = id, response = response_name, "Windows 输入代理 GUI 光标请求确认汇总"); // to remove
+                    }
+                } else if pending_response.request != "Health" {
+                    tracing::trace!(request = pending_response.request, request_id = id, response = response_name, "Windows 输入代理 GUI response 已匹配 pending"); // to remove
+                }
+                if let Some(caller) = pending_response.caller {
+                    let _ = caller.send(Ok(response));
+                }
+                let _ = pending_response.completion.send(Ok(()));
             }
-            packet = packets.recv() => {
-                let packet = packet.context("Windows input agent packet reader stopped")??;
-                match packet {
-                    AgentPacket::Response { id, response } => {
-                        let response_name = agent_response_name(&response);
-                        let heartbeat_response = heartbeat_probe
-                            .compare_exchange(id, 0, Ordering::AcqRel, Ordering::Acquire)
-                            .is_ok();
-                        let cursor_response = cursor_probe
-                            .compare_exchange(id, 0, Ordering::AcqRel, Ordering::Acquire)
-                            .is_ok();
-                        if cursor_response {
-                            cursor_ready.notify_one();
-                            acknowledged_cursor = acknowledged_cursor.saturating_add(1);
-                            if let AgentResponse::Error(message) = &response
-                                && let Ok(context) = context.lock()
-                                && let Some(context) = context.as_ref()
-                            {
-                                context.emit_reliable(NativeEvent::Failed(format!(
-                                    "Windows input agent cursor injection failed: {message}"
-                                )));
-                            }
-                            if acknowledged_cursor == 1 || acknowledged_cursor % 500 == 0 {
-                                tracing::trace!(count = acknowledged_cursor, request_id = id, response = response_name, "Windows 输入代理 GUI 光标请求确认汇总"); // to remove
-                            }
-                        }
-                        let sender = pending
-                            .lock()
-                            .map_err(|_| anyhow!("Windows input agent pending response state poisoned"))?
-                            .remove(&id);
-                        if let Some(sender) = sender {
-                            tracing::trace!(request_id = id, response = response_name, "Windows 输入代理 GUI response id 已匹配 pending"); // to remove
-                            let _ = sender.try_send(Ok(response));
-                        } else if !heartbeat_response && !cursor_response {
-                            unmatched_response = unmatched_response.saturating_add(1);
-                            if unmatched_response == 1 || unmatched_response % 500 == 0 {
-                                tracing::trace!(count = unmatched_response, request_id = id, response = response_name, "Windows 输入代理 GUI 收到无 waiter response 汇总"); // to remove
-                            }
-                        }
-                    }
-                    AgentPacket::Diagnostic {
-                        request,
-                        phase,
-                        elapsed_ms,
-                        error,
-                    } => match phase {
-                        AgentDiagnosticPhase::Started => {
-                            tracing::info!(
-                                target: "synly_input_agent",
-                                %request,
-                                "Windows 输入代理开始处理请求"
-                            );
-                        }
-                        AgentDiagnosticPhase::Completed => {
-                            tracing::debug!(
-                                target: "synly_input_agent",
-                                %request,
-                                elapsed_ms,
-                                "Windows 输入代理完成请求"
-                            );
-                        }
-                        AgentDiagnosticPhase::Failed => {
-                            tracing::error!(
-                                target: "synly_input_agent",
-                                %request,
-                                elapsed_ms,
-                                error = error.as_deref().unwrap_or("unknown error"),
-                                "Windows 输入代理请求失败"
-                            );
-                        }
-                    },
-                    AgentPacket::Event(event) => {
-                        if let Ok(context) = context.lock()
-                            && let Some(context) = context.as_ref()
-                        {
-                            context.emit_reliable(event);
-                        }
-                    }
-                    AgentPacket::Motion {
-                        dx,
-                        dy,
-                        position,
-                        position_updated,
-                    } => {
-                        if let Ok(context) = context.lock()
-                            && let Some(context) = context.as_ref()
-                        {
-                            if position_updated {
-                                if let Some(position) = position {
-                                    context.motion.add_at(dx, dy, position);
-                                }
-                            } else {
-                                context.motion.add(dx, dy);
-                            }
-                        }
-                    }
-                    AgentPacket::SecureDesktopPaused(paused) => {
-                        if let Ok(context) = context.lock()
-                            && let Some(context) = context.as_ref()
-                            && paused
-                        {
-                            context.emit_reliable(NativeEvent::Emergency);
-                        }
-                        tracing::warn!(paused, "Windows 输入代理安全桌面状态变化");
-                    }
-                    _ => break Err(anyhow!("Windows input agent sent an unexpected packet")),
+            AgentToGuiPacket::Diagnostic {
+                id,
+                request,
+                phase,
+                elapsed_ms,
+                error,
+            } => match phase {
+                AgentDiagnosticPhase::Started => {
+                    tracing::info!(target: "synly_input_agent", request_id = id, %request, "Windows 输入代理开始处理请求");
+                }
+                AgentDiagnosticPhase::Completed => {
+                    tracing::debug!(target: "synly_input_agent", request_id = id, %request, elapsed_ms, "Windows 输入代理完成请求");
+                }
+                AgentDiagnosticPhase::Failed => {
+                    tracing::error!(target: "synly_input_agent", request_id = id, %request, elapsed_ms, error = error.as_deref().unwrap_or("unknown error"), "Windows 输入代理请求失败");
+                }
+            },
+            AgentToGuiPacket::Event(event) => {
+                if let Ok(context) = context.lock()
+                    && let Some(context) = context.as_ref()
+                {
+                    context.emit_reliable(event);
                 }
             }
+            AgentToGuiPacket::Motion {
+                dx,
+                dy,
+                position,
+                position_updated,
+            } => {
+                if let Ok(context) = context.lock()
+                    && let Some(context) = context.as_ref()
+                {
+                    if position_updated {
+                        if let Some(position) = position {
+                            context.motion.add_at(dx, dy, position);
+                        }
+                    } else {
+                        context.motion.add(dx, dy);
+                    }
+                }
             }
+            AgentToGuiPacket::SecureDesktopPaused(paused) => {
+                if let Ok(context) = context.lock()
+                    && let Some(context) = context.as_ref()
+                    && paused
+                {
+                    context.emit_reliable(NativeEvent::Emergency);
+                }
+                tracing::warn!(paused, "Windows 输入代理安全桌面状态变化");
+            }
+            _ => bail!("Windows input agent sent an unexpected packet"),
         }
     }
-    .await;
-    tracing::trace!(writer_finished, unmatched_response, acknowledged_cursor, result = ?result.as_ref().err(), "Windows 输入代理 GUI client loop 准备清理"); // to remove
-    if !writer_finished {
-        writer_task.abort();
-        let _ = writer_task.await;
-    }
-    reader_task.abort();
-    let _ = reader_task.await;
-    alive.store(false, Ordering::Release);
-    let pending = pending
-        .lock()
-        .map(|mut pending| std::mem::take(&mut *pending))
-        .unwrap_or_default();
-    for (_, sender) in pending {
-        let _ = sender.try_send(Err("Windows input agent connection closed".to_string()));
-    }
-    if let Ok(context) = context.lock()
-        && let Some(context) = context.as_ref()
-    {
-        context.emit_reliable(NativeEvent::Failed(
-            "Windows 输入代理连接已断开".to_string(),
-        ));
-    }
-    result
+    Ok(())
 }
 
 fn agent_response_name(response: &AgentResponse) -> &'static str {
@@ -1046,136 +1374,137 @@ fn agent_response_name(response: &AgentResponse) -> &'static str {
     }
 }
 
-fn agent_completion_packet(
-    id: u64,
-    expects_response: bool,
-    response: Result<AgentResponse>,
-) -> Option<AgentPacket> {
-    if expects_response {
-        return Some(AgentPacket::Response {
-            id,
-            response: response
-                .unwrap_or_else(|error| AgentResponse::Error(format!("{error:#}"))),
-        });
+fn agent_completion_packet(id: u64, response: Result<AgentResponse>) -> AgentToGuiPacket {
+    AgentToGuiPacket::Response {
+        id,
+        response: response
+            .unwrap_or_else(|error| AgentResponse::Error(format!("{error:#}"))),
     }
-    response.err().map(|error| {
-        AgentPacket::Event(NativeEvent::Failed(format!(
-            "Windows input agent notification failed: {error:#}"
-        )))
-    })
 }
 
-async fn command_writer_loop<W>(
-    mut writer: W,
-    mut commands: mpsc::Receiver<ClientCommand>,
-    mut latest_cursor: watch::Receiver<Option<CursorUpdate>>,
+fn command_writer_loop(
+    mut pipe: NativePipe,
+    commands: std::sync::mpsc::Receiver<ClientQueueItem>,
+    cursor: Arc<ClientCursorState>,
     pending: PendingResponses,
-    heartbeat_probe: Arc<AtomicU64>,
-    cursor_probe: Arc<AtomicU64>,
-    cursor_ready: Arc<Notify>,
-) -> Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
+    alive: Arc<AtomicBool>,
+) -> Result<()> {
     let mut next_id = 1u64;
     let mut written_inject_cursor = 0usize;
-    let mut commands_open = true;
-    let mut cursor_open = true;
+    let mut next_heartbeat = Instant::now() + CLIENT_HEARTBEAT_INTERVAL;
     tracing::trace!("Windows 输入代理 GUI command writer 开始"); // to remove
-    while commands_open || cursor_open {
-        tokio::select! {
-            biased;
-            command = commands.recv(), if commands_open => {
-                let Some(command) = command else {
-                    commands_open = false;
-                    continue;
-                };
-                if cursor_open && command.request.requires_cursor_ordering() {
-                    match latest_cursor.has_changed() {
-                        Ok(true) => {
-                            let update = { *latest_cursor.borrow_and_update() };
-                            if let Some(update) = update {
-                                let acknowledge_cursor =
-                                    cursor_probe.load(Ordering::Acquire) == 0;
-                                write_client_command(
-                                    &mut writer,
-                                    ClientCommand {
-                                        request: AgentRequest::InjectCursor(update.point),
-                                        queued_at: update.queued_at,
-                                        dispatched: None,
-                                        response: None,
-                                    },
-                                    &pending,
-                                    &heartbeat_probe,
-                                    &cursor_probe,
-                                    acknowledge_cursor,
-                                    &mut next_id,
-                                    &mut written_inject_cursor,
-                                )
-                                .await?;
-                            }
-                        }
-                        Ok(false) => {}
-                        Err(_) => cursor_open = false,
-                    }
+    while alive.load(Ordering::Acquire) {
+        let heartbeat_wait = next_heartbeat.saturating_duration_since(Instant::now());
+        let wait = heartbeat_wait.min(Duration::from_millis(50));
+        match commands.recv_timeout(wait) {
+            Ok(ClientQueueItem::Command(command)) => {
+                if command.request.requires_cursor_ordering() {
+                    flush_latest_cursor(
+                        &mut pipe,
+                        &cursor,
+                        &pending,
+                        &alive,
+                        &mut next_id,
+                        &mut written_inject_cursor,
+                    )?;
                 }
                 write_client_command(
-                    &mut writer,
+                    &mut pipe,
                     command,
                     &pending,
-                    &heartbeat_probe,
-                    &cursor_probe,
-                    false,
+                    &alive,
                     &mut next_id,
                     &mut written_inject_cursor,
-                )
-                .await?;
+                )?;
+                next_heartbeat = Instant::now() + CLIENT_HEARTBEAT_INTERVAL;
             }
-            changed = latest_cursor.changed(), if cursor_open && cursor_probe.load(Ordering::Acquire) == 0 => {
-                if changed.is_err() {
-                    cursor_open = false;
-                    continue;
-                }
-                let update = { *latest_cursor.borrow_and_update() };
-                if let Some(update) = update {
+            Ok(ClientQueueItem::Cursor) => {
+                flush_latest_cursor(
+                    &mut pipe,
+                    &cursor,
+                    &pending,
+                    &alive,
+                    &mut next_id,
+                    &mut written_inject_cursor,
+                )?;
+                next_heartbeat = Instant::now() + CLIENT_HEARTBEAT_INTERVAL;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                flush_latest_cursor(
+                    &mut pipe,
+                    &cursor,
+                    &pending,
+                    &alive,
+                    &mut next_id,
+                    &mut written_inject_cursor,
+                )?;
+                if Instant::now() >= next_heartbeat {
                     write_client_command(
-                        &mut writer,
+                        &mut pipe,
                         ClientCommand {
-                            request: AgentRequest::InjectCursor(update.point),
-                            queued_at: update.queued_at,
+                            request: AgentRequest::Health,
+                            queued_at: Instant::now(),
                             dispatched: None,
                             response: None,
                         },
                         &pending,
-                        &heartbeat_probe,
-                        &cursor_probe,
-                        true,
+                        &alive,
                         &mut next_id,
                         &mut written_inject_cursor,
-                    )
-                    .await?;
+                    )?;
+                    next_heartbeat = Instant::now() + CLIENT_HEARTBEAT_INTERVAL;
                 }
             }
-            _ = cursor_ready.notified(), if cursor_open && cursor_probe.load(Ordering::Acquire) != 0 => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
     tracing::trace!(inject_cursor_count = written_inject_cursor, "Windows 输入代理 GUI command writer 收到关闭信号"); // to remove
     Ok(())
 }
 
-async fn write_client_command<W>(
-    writer: &mut W,
-    command: ClientCommand,
+fn flush_latest_cursor(
+    pipe: &mut NativePipe,
+    cursor: &ClientCursorState,
     pending: &PendingResponses,
-    heartbeat_probe: &AtomicU64,
-    cursor_probe: &AtomicU64,
-    acknowledge_cursor: bool,
+    alive: &Arc<AtomicBool>,
     next_id: &mut u64,
     written_inject_cursor: &mut usize,
-) -> Result<()>
-where
-    W: AsyncWrite + Unpin,
-{
+) -> Result<()> {
+    let update = {
+        let mut latest = cursor
+            .latest
+            .lock()
+            .map_err(|_| anyhow!("Windows input agent cursor state poisoned"))?;
+        let update = latest.take();
+        cursor.queued.store(false, Ordering::Release);
+        update
+    };
+    if let Some(update) = update {
+        write_client_command(
+            pipe,
+            ClientCommand {
+                request: AgentRequest::InjectCursor(update.point),
+                queued_at: update.queued_at,
+                dispatched: None,
+                response: None,
+            },
+            pending,
+            alive,
+            next_id,
+            written_inject_cursor,
+        )?;
+    }
+    Ok(())
+}
+
+fn write_client_command(
+    pipe: &mut NativePipe,
+    command: ClientCommand,
+    pending: &PendingResponses,
+    alive: &Arc<AtomicBool>,
+    next_id: &mut u64,
+    written_inject_cursor: &mut usize,
+) -> Result<()> {
     let ClientCommand {
         request,
         queued_at,
@@ -1183,76 +1512,41 @@ where
         response,
     } = command;
     let id = *next_id;
-    *next_id = (*next_id).saturating_add(1);
+    *next_id = next_id.saturating_add(1);
     let request_name = request.name();
     let report_diagnostic = request.reports_diagnostic();
     let is_inject_cursor = matches!(&request, AgentRequest::InjectCursor(_));
-    let is_heartbeat_probe = matches!(&request, AgentRequest::Health)
-        && response.is_none()
-        && heartbeat_probe
-            .compare_exchange(0, id, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok();
-    if matches!(&request, AgentRequest::Health)
-        && response.is_none()
-        && !is_heartbeat_probe
-    {
-        return Ok(());
-    }
-    let is_cursor_probe = is_inject_cursor
-        && acknowledge_cursor
-        && cursor_probe
-            .compare_exchange(0, id, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok();
-    let expects_response = response.is_some() || is_heartbeat_probe || is_cursor_probe;
-    if let Some(response) = response {
-        pending
-            .lock()
-            .map_err(|_| anyhow!("Windows input agent pending response state poisoned"))?
-            .insert(id, response);
-        tracing::trace!(request = request_name, request_id = id, "Windows 输入代理 GUI 已登记 pending response"); // to remove
-    }
+    let (completion_tx, completion_rx) = std::sync::mpsc::sync_channel(1);
+    pending
+        .lock()
+        .map_err(|_| anyhow!("Windows input agent pending response state poisoned"))?
+        .insert(
+            id,
+            PendingResponse {
+                request: request_name,
+                caller: response,
+                completion: completion_tx,
+            },
+        );
     if !is_inject_cursor && !matches!(&request, AgentRequest::Health) {
         tracing::trace!(request = request_name, request_id = id, queue_ms = queued_at.elapsed().as_millis(), "Windows 输入代理 GUI 开始写入 IPC request"); // to remove
     }
     if let Err(error) = write_packet(
-        writer,
-        &AgentPacket::Request {
+        pipe,
+        &GuiToAgentPacket::Request {
             id,
-            expects_response,
             request,
         },
+        REQUEST_DELIVERY_TIMEOUT,
     )
-    .await
     {
         tracing::trace!(request = request_name, request_id = id, error = %error, "Windows 输入代理 GUI 写入 IPC request 失败"); // to remove
-        if let Some(response) = pending
-            .lock()
-            .map_err(|_| anyhow!("Windows input agent pending response state poisoned"))?
-            .remove(&id)
-        {
-            let _ = response.try_send(Err(format!("{error:#}")));
-        }
-        if is_heartbeat_probe {
-            let _ = heartbeat_probe.compare_exchange(
-                id,
-                0,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
-        }
-        if is_cursor_probe {
-            let _ = cursor_probe.compare_exchange(
-                id,
-                0,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            );
-        }
+        complete_pending_with_error(pending, id, format!("{error:#}"));
         return Err(error);
     }
     if is_inject_cursor {
-        *written_inject_cursor = (*written_inject_cursor).saturating_add(1);
-        if *written_inject_cursor == 1 || *written_inject_cursor % 500 == 0 {
+        *written_inject_cursor = written_inject_cursor.saturating_add(1);
+        if *written_inject_cursor == 1 || written_inject_cursor.is_multiple_of(500) {
             tracing::trace!(count = *written_inject_cursor, request_id = id, "Windows 输入代理 GUI 已写入 InjectCursor 汇总"); // to remove
         }
     } else if request_name != "Health" {
@@ -1271,13 +1565,67 @@ where
             "Windows 输入代理 IPC 请求已写入"
         );
     }
-    Ok(())
+    match completion_rx.recv_timeout(REQUEST_DELIVERY_TIMEOUT) {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(message)) => Err(anyhow!(message)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            let message = format!("Windows input agent {request_name} response timed out");
+            complete_pending_with_error(pending, id, message.clone());
+            mark_agent_unavailable(alive, request_name, "response-timeout");
+            Err(anyhow!(message))
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            let message = format!("Windows input agent {request_name} response channel closed");
+            complete_pending_with_error(pending, id, message.clone());
+            mark_agent_unavailable(alive, request_name, "response-disconnected");
+            Err(anyhow!(message))
+        }
+    }
 }
 
-async fn run_agent_loop(client: tokio::net::windows::named_pipe::NamedPipeClient) -> Result<()> {
-    let (reader, mut writer) = tokio::io::split(client);
-    let (mut packets, reader_task) = spawn_packet_reader(reader, "agent-request");
-    let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<AgentPacket>(256);
+fn complete_pending_with_error(pending: &PendingResponses, id: u64, message: String) {
+    let pending_response = pending
+        .lock()
+        .ok()
+        .and_then(|mut pending| pending.remove(&id));
+    if let Some(pending_response) = pending_response {
+        if let Some(caller) = pending_response.caller {
+            let _ = caller.send(Err(message.clone()));
+        }
+        let _ = pending_response.completion.send(Err(message));
+    }
+}
+
+fn fail_gui_transport(
+    alive: &AtomicBool,
+    pending: &PendingResponses,
+    context: &Mutex<Option<CaptureContext>>,
+    message: &str,
+) {
+    let first_failure = alive.swap(false, Ordering::AcqRel);
+    let pending_responses = pending
+        .lock()
+        .map(|mut pending| std::mem::take(&mut *pending))
+        .unwrap_or_default();
+    for (_, pending_response) in pending_responses {
+        if let Some(caller) = pending_response.caller {
+            let _ = caller.send(Err(message.to_string()));
+        }
+        let _ = pending_response.completion.send(Err(message.to_string()));
+    }
+    if first_failure
+        && let Ok(context) = context.lock()
+        && let Some(context) = context.as_ref()
+    {
+        context.emit_reliable(NativeEvent::Failed(message.to_string()));
+    }
+}
+
+async fn run_agent_loop(
+    mut packets: mpsc::Receiver<GuiToAgentPacket>,
+    output: AgentOutput,
+    alive: Arc<AtomicBool>,
+) -> Result<()> {
     let active_request = Arc::new(Mutex::new(None));
     let request_watchdog = spawn_agent_request_watchdog(Arc::clone(&active_request));
     let mut runtime = None;
@@ -1286,19 +1634,14 @@ async fn run_agent_loop(client: tokio::net::windows::named_pipe::NamedPipeClient
     let mut desktop_tick = time::interval(Duration::from_millis(250));
     desktop_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut processed_inject_cursor = 0usize;
-    let mut outgoing_motion = 0usize;
     tracing::trace!("Windows 输入代理进程 request loop 开始"); // to remove
 
     let result: Result<()> = async {
         loop {
             tokio::select! {
                 packet = packets.recv() => {
-                    let packet = packet.context("Windows input agent request reader stopped")??;
-                    let AgentPacket::Request {
-                        id,
-                        expects_response,
-                        request,
-                    } = packet else {
+                    let packet = packet.context("Windows input agent request reader stopped")?;
+                    let GuiToAgentPacket::Request { id, request } = packet else {
                         bail!("Windows input agent received an unexpected packet");
                     };
                     heartbeat.observe(Instant::now());
@@ -1308,23 +1651,22 @@ async fn run_agent_loop(client: tokio::net::windows::named_pipe::NamedPipeClient
                     let is_inject_cursor = matches!(&request, AgentRequest::InjectCursor(_));
                     if is_inject_cursor {
                         processed_inject_cursor = processed_inject_cursor.saturating_add(1);
-                        if processed_inject_cursor == 1 || processed_inject_cursor % 500 == 0 {
+                        if processed_inject_cursor == 1
+                            || processed_inject_cursor.is_multiple_of(500)
+                        {
                             tracing::trace!(target: "synly_input_agent", count = processed_inject_cursor, request_id = id, "Windows 输入代理进程收到 InjectCursor 汇总"); // to remove
                         }
                     } else if request_name != "Health" {
                         tracing::trace!(target: "synly_input_agent", request = %request_name, request_id = id, runtime_started = runtime.is_some(), "Windows 输入代理进程收到 request"); // to remove
                     }
                     if report_diagnostic {
-                        write_packet(
-                            &mut writer,
-                            &AgentPacket::Diagnostic {
+                        output.send_reliable(AgentToGuiPacket::Diagnostic {
+                                id,
                                 request: request_name.clone(),
                                 phase: AgentDiagnosticPhase::Started,
                                 elapsed_ms: 0,
                                 error: None,
-                            },
-                        )
-                        .await?;
+                            })?;
                     }
                     let started = Instant::now();
                     if let Ok(mut active) = active_request.lock() {
@@ -1334,7 +1676,7 @@ async fn run_agent_loop(client: tokio::net::windows::named_pipe::NamedPipeClient
                             started,
                         });
                     }
-                    let response = handle_agent_request(request, &mut runtime, outgoing_tx.clone()).await;
+                    let response = handle_agent_request(request, &mut runtime, output.clone()).await;
                     if let Ok(mut active) = active_request.lock()
                         && active.as_ref().is_some_and(|active| active.id == id)
                     {
@@ -1356,52 +1698,32 @@ async fn run_agent_loop(client: tokio::net::windows::named_pipe::NamedPipeClient
                                 Some(format!("{error:#}")),
                             ),
                         };
-                        write_packet(
-                            &mut writer,
-                            &AgentPacket::Diagnostic {
+                        output.send_reliable(AgentToGuiPacket::Diagnostic {
+                                id,
                                 request: request_name.clone(),
                                 phase,
                                 elapsed_ms,
                                 error,
-                            },
-                        )
-                        .await?;
+                            })?;
                     }
-                    if let Some(completion) =
-                        agent_completion_packet(id, expects_response, response)
-                    {
-                        let completion_name = agent_packet_name(&completion);
-                        write_packet(&mut writer, &completion).await?;
-                        if !is_inject_cursor && request_name != "Health" {
-                            tracing::trace!(target: "synly_input_agent", request = %request_name, request_id = id, packet = completion_name, "Windows 输入代理进程完成包已写入"); // to remove
-                        }
+                    let completion = agent_completion_packet(id, response);
+                    output.send_reliable(completion)?;
+                    if !is_inject_cursor && request_name != "Health" {
+                        tracing::trace!(target: "synly_input_agent", request = %request_name, request_id = id, "Windows 输入代理进程完成包已入 event 队列"); // to remove
                     }
                     heartbeat.observe(Instant::now());
-                }
-                outgoing = outgoing_rx.recv() => {
-                    let Some(outgoing) = outgoing else { break Ok(()) };
-                    if matches!(&outgoing, AgentPacket::Motion { .. }) {
-                        outgoing_motion = outgoing_motion.saturating_add(1);
-                        if outgoing_motion == 1 || outgoing_motion % 500 == 0 {
-                            tracing::trace!(target: "synly_input_agent", count = outgoing_motion, "Windows 输入代理进程已写入 Motion 汇总"); // to remove
-                        }
-                    }
-                    write_packet(&mut writer, &outgoing).await?;
                 }
                 _ = desktop_tick.tick() => {
                     if heartbeat.expired(Instant::now()) {
                         tracing::trace!(target: "synly_input_agent", elapsed_ms = heartbeat.last_seen.elapsed().as_millis(), "Windows 输入代理进程 GUI heartbeat 超时"); // to remove
                         let message = "Windows input agent GUI heartbeat timed out";
-                        let _ = write_packet(
-                            &mut writer,
-                            &AgentPacket::Diagnostic {
+                        let _ = output.send_reliable(AgentToGuiPacket::Diagnostic {
+                                id: 0,
                                 request: "Heartbeat".to_string(),
                                 phase: AgentDiagnosticPhase::Failed,
                                 elapsed_ms: heartbeat.last_seen.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
                                 error: Some(message.to_string()),
-                            },
-                        )
-                        .await;
+                            });
                         break Err(anyhow!(message));
                     }
                     let current_paused = !is_default_input_desktop();
@@ -1414,24 +1736,85 @@ async fn run_agent_loop(client: tokio::net::windows::named_pipe::NamedPipeClient
                             let _ = runtime.backend.set_capture(false);
                             let _ = runtime.backend.release_all();
                         }
-                        outgoing_tx
-                            .send(AgentPacket::SecureDesktopPaused(paused))
-                            .await?;
+                        output.send_reliable(AgentToGuiPacket::SecureDesktopPaused(paused))?;
                     }
                 }
             }
         }
     }
     .await;
-    tracing::trace!(target: "synly_input_agent", inject_cursor_count = processed_inject_cursor, outgoing_motion_count = outgoing_motion, result = ?result.as_ref().err(), "Windows 输入代理进程 request loop 已返回"); // to remove
+    tracing::trace!(target: "synly_input_agent", inject_cursor_count = processed_inject_cursor, result = ?result.as_ref().err(), "Windows 输入代理进程 request loop 已返回"); // to remove
+    alive.store(false, Ordering::Release);
     request_watchdog.abort();
     let _ = request_watchdog.await;
-    reader_task.abort();
-    let _ = reader_task.await;
     if let Some(runtime) = runtime {
         runtime.stop().await;
     }
     result
+}
+
+fn agent_event_writer_loop(
+    mut pipe: NativePipe,
+    reliable: std::sync::mpsc::Receiver<AgentToGuiPacket>,
+    motion: Arc<AgentMotionSlot>,
+    alive: Arc<AtomicBool>,
+) -> Result<()> {
+    let mut written_motion = 0usize;
+    tracing::trace!(target: "synly_input_agent", "Windows 输入代理 event writer 开始"); // to remove
+    while alive.load(Ordering::Acquire) {
+        match reliable.recv_timeout(Duration::from_millis(20)) {
+            Ok(packet) => {
+                write_agent_event_packet(&mut pipe, packet)?;
+                while let Ok(packet) = reliable.try_recv() {
+                    write_agent_event_packet(&mut pipe, packet)?;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                if let Some(motion) = motion.take() {
+                    write_motion_packet(&mut pipe, motion, &mut written_motion)?;
+                }
+                break;
+            }
+        }
+        if let Some(motion) = motion.take() {
+            write_motion_packet(&mut pipe, motion, &mut written_motion)?;
+        }
+    }
+    tracing::trace!(target: "synly_input_agent", motion_count = written_motion, "Windows 输入代理 event writer 已关闭"); // to remove
+    Ok(())
+}
+
+fn write_motion_packet(
+    pipe: &mut NativePipe,
+    motion: AgentMotion,
+    written_motion: &mut usize,
+) -> Result<()> {
+    write_packet(
+        pipe,
+        &AgentToGuiPacket::Motion {
+            dx: motion.dx,
+            dy: motion.dy,
+            position: motion.position,
+            position_updated: motion.position_updated,
+        },
+        REQUEST_DELIVERY_TIMEOUT,
+    )?;
+    *written_motion = written_motion.saturating_add(1);
+    if *written_motion == 1 || written_motion.is_multiple_of(500) {
+        tracing::trace!(target: "synly_input_agent", count = *written_motion, "Windows 输入代理 event pipe 已写入 Motion 汇总"); // to remove
+    }
+    Ok(())
+}
+
+fn write_agent_event_packet(pipe: &mut NativePipe, packet: AgentToGuiPacket) -> Result<()> {
+    let request_id = packet.request_context().0;
+    let packet_name = packet.packet_name();
+    write_packet(pipe, &packet, REQUEST_DELIVERY_TIMEOUT)?;
+    if let Some(request_id) = request_id {
+        tracing::trace!(target: "synly_input_agent", request_id, packet = packet_name, "Windows 输入代理 event pipe 已写入可靠包"); // to remove
+    }
+    Ok(())
 }
 
 fn spawn_agent_request_watchdog(
@@ -1471,7 +1854,7 @@ fn spawn_agent_request_watchdog(
 async fn handle_agent_request(
     request: AgentRequest,
     runtime: &mut Option<NativeAgentRuntime>,
-    outgoing: mpsc::Sender<AgentPacket>,
+    outgoing: AgentOutput,
 ) -> Result<AgentResponse> {
     match request {
         AgentRequest::Start { mode, hotkey } => {
@@ -1545,7 +1928,7 @@ async fn handle_agent_request(
 fn start_native_runtime(
     mode: InputMode,
     hotkey: Hotkey,
-    outgoing: mpsc::Sender<AgentPacket>,
+    outgoing: AgentOutput,
 ) -> Result<NativeAgentRuntime> {
     tracing::trace!(target: "synly_input_agent", ?mode, ?hotkey, "Windows 输入代理开始创建 native runtime"); // to remove
     let send_motion = mode == InputMode::Send;
@@ -1569,24 +1952,19 @@ fn start_native_runtime(
             tokio::select! {
                 event = events_rx.recv() => {
                     let Some(event) = event else { break };
-                    if outgoing.send(AgentPacket::Event(event)).await.is_err() {
+                    if outgoing.send_reliable(AgentToGuiPacket::Event(event)).is_err() {
                         break;
                     }
                 }
                 _ = motion_tick.tick(), if send_motion => {
                     let sample = motion.take_observed();
-                    if (sample.dx != 0 || sample.dy != 0 || sample.position_updated)
-                        && outgoing
-                            .send(AgentPacket::Motion {
+                    if sample.dx != 0 || sample.dy != 0 || sample.position_updated {
+                        outgoing.store_motion(AgentMotion {
                                 dx: sample.dx,
                                 dy: sample.dy,
                                 position: sample.position,
                                 position_updated: sample.position_updated,
-                            })
-                            .await
-                            .is_err()
-                    {
-                        break;
+                            });
                     }
                 }
             }
@@ -1601,31 +1979,6 @@ fn agent_backend(runtime: &Option<NativeAgentRuntime>) -> Result<&Arc<dyn InputB
         .as_ref()
         .map(|runtime| &runtime.backend)
         .context("Windows input agent runtime is not started")
-}
-
-async fn connect_pipe(
-    pipe_name: &str,
-) -> Result<tokio::net::windows::named_pipe::NamedPipeClient> {
-    tracing::trace!(%pipe_name, "Windows 输入代理进程开始连接 GUI pipe"); // to remove
-    let deadline = Instant::now() + CONNECT_TIMEOUT;
-    let mut attempts = 0usize;
-    loop {
-        attempts = attempts.saturating_add(1);
-        match ClientOptions::new().read(true).write(true).open(pipe_name) {
-            Ok(client) => {
-                tracing::trace!(%pipe_name, attempts, "Windows 输入代理进程连接 GUI pipe 成功"); // to remove
-                return Ok(client);
-            }
-            Err(error) if Instant::now() < deadline => {
-                tracing::debug!(error = %error, "等待 GUI 命名管道就绪");
-                time::sleep(Duration::from_millis(100)).await;
-            }
-            Err(error) => {
-                tracing::trace!(%pipe_name, attempts, error = %error, "Windows 输入代理进程连接 GUI pipe 失败"); // to remove
-                return Err(error).context("failed to connect Windows input agent pipe");
-            }
-        }
-    }
 }
 
 fn current_client() -> Option<Arc<AgentClient>> {
@@ -1646,14 +1999,15 @@ fn agent_executable() -> Result<PathBuf> {
 
 fn launch_elevated(
     executable: &Path,
-    pipe_name: &str,
+    command_pipe_name: &str,
+    event_pipe_name: &str,
     token: &str,
     parent_pid: u32,
 ) -> Result<()> {
     let verb = wide("runas");
     let executable = wide(&executable.to_string_lossy());
     let parameters = wide(&format!(
-        "__input-agent --pipe \"{pipe_name}\" --token \"{token}\" --parent-pid {parent_pid}"
+        "__input-agent --command-pipe \"{command_pipe_name}\" --event-pipe \"{event_pipe_name}\" --token \"{token}\" --parent-pid {parent_pid}"
     ));
     let result = unsafe {
         ShellExecuteW(
@@ -1683,13 +2037,11 @@ fn validate_parent_process(parent_pid: u32) -> Result<()> {
 }
 
 fn validate_pipe_server(
-    client: &tokio::net::windows::named_pipe::NamedPipeClient,
+    client: &NativePipe,
     expected_pid: u32,
 ) -> Result<()> {
     let mut actual_pid = 0u32;
-    let ok = unsafe {
-        GetNamedPipeServerProcessId(client.as_raw_handle() as HANDLE, &mut actual_pid)
-    };
+    let ok = unsafe { GetNamedPipeServerProcessId(client.raw_handle(), &mut actual_pid) };
     if ok == 0 || actual_pid != expected_pid {
         bail!("Windows input agent named pipe server PID validation failed");
     }
@@ -1697,14 +2049,12 @@ fn validate_pipe_server(
 }
 
 fn validate_pipe_client(
-    server: &NamedPipeServer,
+    server: &NativePipe,
     expected_pid: u32,
     reported_path: &Path,
 ) -> Result<()> {
     let mut actual_pid = 0u32;
-    let ok = unsafe {
-        GetNamedPipeClientProcessId(server.as_raw_handle() as HANDLE, &mut actual_pid)
-    };
+    let ok = unsafe { GetNamedPipeClientProcessId(server.raw_handle(), &mut actual_pid) };
     if ok == 0 || actual_pid != expected_pid {
         bail!("Windows input agent named pipe client PID validation failed");
     }
@@ -1914,11 +2264,58 @@ fn is_default_input_desktop() -> bool {
     String::from_utf16_lossy(&buffer[..end]).eq_ignore_ascii_case("Default")
 }
 
-async fn write_packet<W>(writer: &mut W, packet: &AgentPacket) -> Result<()>
+trait IpcPacketContext {
+    fn packet_name(&self) -> &'static str;
+
+    fn request_context(&self) -> (Option<u64>, Option<&'static str>) {
+        (None, None)
+    }
+}
+
+impl IpcPacketContext for GuiToAgentPacket {
+    fn packet_name(&self) -> &'static str {
+        match self {
+            Self::HelloAck { .. } => "HelloAck",
+            Self::Request { .. } => "Request",
+        }
+    }
+
+    fn request_context(&self) -> (Option<u64>, Option<&'static str>) {
+        match self {
+            Self::Request { id, request } => (Some(*id), Some(request.name())),
+            Self::HelloAck { .. } => (None, None),
+        }
+    }
+}
+
+impl IpcPacketContext for AgentToGuiPacket {
+    fn packet_name(&self) -> &'static str {
+        match self {
+            Self::Hello { .. } => "Hello",
+            Self::Ready => "Ready",
+            Self::StartupError { .. } => "StartupError",
+            Self::Response { .. } => "Response",
+            Self::Diagnostic { .. } => "Diagnostic",
+            Self::Event(_) => "Event",
+            Self::Motion { .. } => "Motion",
+            Self::SecureDesktopPaused(_) => "SecureDesktopPaused",
+        }
+    }
+
+    fn request_context(&self) -> (Option<u64>, Option<&'static str>) {
+        match self {
+            Self::Response { id, .. } => (Some(*id), None),
+            Self::Diagnostic { id, .. } => (Some(*id), None),
+            _ => (None, None),
+        }
+    }
+}
+
+fn write_packet<P>(pipe: &mut NativePipe, packet: &P, timeout: Duration) -> Result<()>
 where
-    W: AsyncWrite + Unpin,
+    P: Serialize + IpcPacketContext,
 {
-    let packet_name = agent_packet_name(packet);
+    let packet_name = packet.packet_name();
     let bytes = bincode::serialize(packet).context("failed to encode Windows input agent packet")?;
     if bytes.is_empty() || bytes.len() > IPC_MAX_FRAME {
         tracing::trace!(target: "synly_input_agent", packet = packet_name, length = bytes.len(), "Windows 输入代理 IPC packet 长度校验失败"); // to remove
@@ -1927,72 +2324,39 @@ where
     let mut frame = Vec::with_capacity(4 + bytes.len());
     frame.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
     frame.extend_from_slice(&bytes);
-    write_packet_frame(writer, &frame, packet).await.map_err(|error| {
+    let started = Instant::now();
+    pipe.write_all(&frame, timeout).map_err(|error| {
         tracing::trace!(target: "synly_input_agent", packet = packet_name, error = %error, "Windows 输入代理 IPC packet frame 写入失败"); // to remove
         error
     })?;
-    writer.flush().await.map_err(|error| {
-        tracing::trace!(target: "synly_input_agent", packet = packet_name, error = %error, "Windows 输入代理 IPC packet flush 失败"); // to remove
-        error
-    })?;
+    if started.elapsed() >= IPC_SLOW_OPERATION_TRACE_AFTER {
+        let (request_id, request) = packet.request_context();
+        tracing::trace!(target: "synly_input_agent", packet = packet_name, ?request_id, ?request, frame_length = frame.len(), elapsed_ms = started.elapsed().as_millis(), "Windows 输入代理 IPC packet frame 延迟写入完成"); // to remove
+    }
     Ok(())
 }
 
-async fn write_packet_frame<W>(
-    writer: &mut W,
-    frame: &[u8],
-    packet: &AgentPacket,
-) -> std::io::Result<()>
+fn read_packet<P>(pipe: &mut NativePipe, timeout: Duration) -> Result<P>
 where
-    W: AsyncWrite + Unpin,
+    P: DeserializeOwned,
 {
-    let packet_name = agent_packet_name(packet);
-    let (request_id, request) = agent_packet_request_context(packet);
     let started = Instant::now();
-    let write = writer.write_all(frame);
-    tokio::pin!(write);
-    tokio::select! {
-        result = &mut write => result,
-        _ = time::sleep(IPC_SLOW_OPERATION_TRACE_AFTER) => {
-            tracing::trace!(
-                target: "synly_input_agent",
-                packet = packet_name,
-                ?request_id,
-                ?request,
-                frame_length = frame.len(),
-                elapsed_ms = started.elapsed().as_millis(),
-                "Windows 输入代理 IPC packet frame 写入仍在等待"
-            ); // to remove
-            let result = write.await;
-            tracing::trace!(
-                target: "synly_input_agent",
-                packet = packet_name,
-                ?request_id,
-                ?request,
-                frame_length = frame.len(),
-                elapsed_ms = started.elapsed().as_millis(),
-                result = ?result.as_ref().err(),
-                "Windows 输入代理 IPC packet frame 延迟写入已返回"
-            ); // to remove
-            result
-        }
-    }
-}
-
-async fn read_packet<R>(reader: &mut R) -> Result<AgentPacket>
-where
-    R: AsyncRead + Unpin,
-{
-    let length = reader.read_u32().await.map_err(|error| {
+    let mut length_bytes = [0u8; 4];
+    pipe.read_exact(&mut length_bytes, timeout).map_err(|error| {
         tracing::trace!(target: "synly_input_agent", error = %error, "Windows 输入代理 IPC packet 长度读取失败"); // to remove
         error
-    })? as usize;
+    })?;
+    let length = u32::from_be_bytes(length_bytes) as usize;
     if length == 0 || length > IPC_MAX_FRAME {
         tracing::trace!(target: "synly_input_agent", length, "Windows 输入代理 IPC packet 长度校验失败"); // to remove
         bail!("Windows input agent packet length is invalid: {length}");
     }
     let mut bytes = vec![0u8; length];
-    reader.read_exact(&mut bytes).await.map_err(|error| {
+    let remaining = timeout.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        bail!("Windows input agent packet read timed out");
+    }
+    pipe.read_exact(&mut bytes, remaining).map_err(|error| {
         tracing::trace!(target: "synly_input_agent", length, error = %error, "Windows 输入代理 IPC packet body 读取失败"); // to remove
         error
     })?;
@@ -2003,85 +2367,13 @@ where
         .context("failed to decode Windows input agent packet")
 }
 
-fn agent_packet_name(packet: &AgentPacket) -> &'static str {
-    match packet {
-        AgentPacket::Hello { .. } => "Hello",
-        AgentPacket::HelloAck { .. } => "HelloAck",
-        AgentPacket::Ready => "Ready",
-        AgentPacket::StartupError { .. } => "StartupError",
-        AgentPacket::Request { .. } => "Request",
-        AgentPacket::Response { .. } => "Response",
-        AgentPacket::Diagnostic { .. } => "Diagnostic",
-        AgentPacket::Event(_) => "Event",
-        AgentPacket::Motion { .. } => "Motion",
-        AgentPacket::SecureDesktopPaused(_) => "SecureDesktopPaused",
-    }
-}
-
-fn agent_packet_request_context(
-    packet: &AgentPacket,
-) -> (Option<u64>, Option<&'static str>) {
-    match packet {
-        AgentPacket::Request { id, request, .. } => (Some(*id), Some(request.name())),
-        AgentPacket::Response { id, .. } => (Some(*id), None),
-        _ => (None, None),
-    }
-}
-
-fn spawn_packet_reader<R>(
-    mut reader: R,
-    reader_name: &'static str,
-) -> (
-    mpsc::Receiver<Result<AgentPacket>>,
-    tokio::task::JoinHandle<()>,
-)
-where
-    R: AsyncRead + Unpin + Send + 'static,
-{
-    let (packets, receiver) = mpsc::channel(256);
-    let task = tokio::spawn(async move {
-        loop {
-            match read_packet(&mut reader).await {
-                Ok(packet) => {
-                    let packet_name = agent_packet_name(&packet);
-                    let (request_id, request) = agent_packet_request_context(&packet);
-                    let queued_at = Instant::now();
-                    if packets.capacity() == 0 {
-                        tracing::trace!(
-                            target: "synly_input_agent",
-                            %reader_name,
-                            packet = packet_name,
-                            ?request_id,
-                            ?request,
-                            "Windows 输入代理 IPC packet reader 下游队列已满"
-                        ); // to remove
-                    }
-                    if packets.send(Ok(packet)).await.is_err() {
-                        tracing::trace!(target: "synly_input_agent", "Windows 输入代理 IPC packet reader 下游已关闭"); // to remove
-                        break;
-                    }
-                    if queued_at.elapsed() >= IPC_SLOW_OPERATION_TRACE_AFTER {
-                        tracing::trace!(
-                            target: "synly_input_agent",
-                            %reader_name,
-                            packet = packet_name,
-                            ?request_id,
-                            ?request,
-                            queue_ms = queued_at.elapsed().as_millis(),
-                            "Windows 输入代理 IPC packet reader 下游派发延迟"
-                        ); // to remove
-                    }
-                }
-                Err(error) => {
-                    tracing::trace!(target: "synly_input_agent", error = %error, "Windows 输入代理 IPC packet reader 返回错误"); // to remove
-                    let _ = packets.send(Err(error)).await;
-                    break;
-                }
-            }
-        }
-        tracing::trace!(target: "synly_input_agent", "Windows 输入代理 IPC packet reader task 已退出"); // to remove
-    });
-    (receiver, task)
+fn is_timeout_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::TimedOut)
+            || cause.to_string().contains("timed out")
+    })
 }
 
 fn wide(value: &str) -> Vec<u16> {
@@ -2103,21 +2395,39 @@ mod tests {
         .unwrap()
     }
 
-    #[test]
-    fn closed_command_queue_marks_agent_unavailable() {
-        let (commands, receiver) = mpsc::channel(1);
-        drop(receiver);
-        let (latest_cursor, _latest_cursor_rx) = watch::channel(None);
-        let alive = Arc::new(AtomicBool::new(true));
-        let client = AgentClient {
+    fn test_cursor() -> Arc<ClientCursorState> {
+        Arc::new(ClientCursorState {
+            latest: Mutex::new(None),
+            queued: AtomicBool::new(false),
+        })
+    }
+
+    fn test_client(
+        commands: std::sync::mpsc::SyncSender<ClientQueueItem>,
+        alive: Arc<AtomicBool>,
+    ) -> AgentClient {
+        AgentClient {
             commands,
-            latest_cursor,
+            cursor: test_cursor(),
             context: Arc::new(Mutex::new(None)),
-            alive: Arc::clone(&alive),
+            alive,
             lifecycle: Mutex::new(()),
             next_lease: AtomicU64::new(1),
             active_lease: AtomicU64::new(0),
-        };
+        }
+    }
+
+    fn create_test_server(name: &str, direction: PipeDirection) -> NativePipe {
+        let security = PipeSecurity::for_current_user().unwrap();
+        NativePipe::create_server(name, direction, &security.attributes).unwrap()
+    }
+
+    #[test]
+    fn closed_command_queue_marks_agent_unavailable() {
+        let (commands, receiver) = std::sync::mpsc::sync_channel(1);
+        drop(receiver);
+        let alive = Arc::new(AtomicBool::new(true));
+        let client = test_client(commands, Arc::clone(&alive));
 
         assert!(client.request(AgentRequest::Health).is_err());
         assert!(!alive.load(Ordering::Acquire));
@@ -2125,17 +2435,10 @@ mod tests {
 
     #[test]
     fn stale_backend_drop_does_not_stop_current_lease() {
-        let (commands, mut receiver) = mpsc::channel(4);
-        let (latest_cursor, _latest_cursor_rx) = watch::channel(None);
-        let client = Arc::new(AgentClient {
-            commands,
-            latest_cursor,
-            context: Arc::new(Mutex::new(None)),
-            alive: Arc::new(AtomicBool::new(true)),
-            lifecycle: Mutex::new(()),
-            next_lease: AtomicU64::new(3),
-            active_lease: AtomicU64::new(2),
-        });
+        let (commands, receiver) = std::sync::mpsc::sync_channel(4);
+        let client = Arc::new(test_client(commands, Arc::new(AtomicBool::new(true))));
+        client.next_lease.store(3, Ordering::Release);
+        client.active_lease.store(2, Ordering::Release);
         drop(AgentBackend {
             client: Arc::clone(&client),
             lease: 1,
@@ -2148,223 +2451,398 @@ mod tests {
 
     #[test]
     fn current_backend_drop_stops_runtime_without_closing_reusable_agent() {
-        let (commands, mut receiver) = mpsc::channel(4);
-        let (latest_cursor, _latest_cursor_rx) = watch::channel(None);
-        let client = Arc::new(AgentClient {
-            commands,
-            latest_cursor,
-            context: Arc::new(Mutex::new(None)),
-            alive: Arc::new(AtomicBool::new(true)),
-            lifecycle: Mutex::new(()),
-            next_lease: AtomicU64::new(2),
-            active_lease: AtomicU64::new(1),
-        });
+        let (commands, receiver) = std::sync::mpsc::sync_channel(4);
+        let client = Arc::new(test_client(commands, Arc::new(AtomicBool::new(true))));
+        client.next_lease.store(2, Ordering::Release);
+        client.active_lease.store(1, Ordering::Release);
         drop(AgentBackend {
             client: Arc::clone(&client),
             lease: 1,
             layout: test_layout(),
         });
 
-        let command = receiver.try_recv().unwrap();
+        let item = receiver.try_recv().unwrap();
+        let ClientQueueItem::Command(command) = item else {
+            panic!("expected Stop command");
+        };
         assert!(matches!(command.request, AgentRequest::Stop));
         assert!(command.response.is_none());
         assert_eq!(client.active_lease.load(Ordering::Acquire), 0);
         assert!(client.alive.load(Ordering::Acquire));
-        assert!(receiver.try_recv().is_err());
     }
 
     #[test]
-    fn backend_layout_and_health_use_local_state_without_queueing_requests() {
-        let (commands, mut receiver) = mpsc::channel(1);
-        let (latest_cursor, _latest_cursor_rx) = watch::channel(None);
-        let alive = Arc::new(AtomicBool::new(true));
-        let client = Arc::new(AgentClient {
-            commands,
-            latest_cursor,
-            context: Arc::new(Mutex::new(None)),
-            alive: Arc::clone(&alive),
-            lifecycle: Mutex::new(()),
-            next_lease: AtomicU64::new(2),
-            active_lease: AtomicU64::new(1),
-        });
-        let backend = AgentBackend {
-            client,
-            lease: 1,
-            layout: test_layout(),
-        };
+    fn cursor_notifications_keep_only_the_latest_value() {
+        let (commands, receiver) = std::sync::mpsc::sync_channel(1);
+        let client = test_client(commands, Arc::new(AtomicBool::new(true)));
 
-        assert!(backend.health_check().is_ok());
-        assert_eq!(backend.layout().unwrap(), test_layout());
-        assert!(receiver.try_recv().is_err());
-        alive.store(false, Ordering::Release);
-        assert!(backend.health_check().is_err());
-        assert!(receiver.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn client_heartbeat_uses_the_ordered_command_queue() {
-        let (commands, mut receiver) = mpsc::channel(1);
-        let alive = Arc::new(AtomicBool::new(true));
-        let heartbeat_task = spawn_client_heartbeat(commands, Arc::clone(&alive));
-
-        let command = time::timeout(Duration::from_secs(1), receiver.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(matches!(command.request, AgentRequest::Health));
-        assert!(command.dispatched.is_none());
-        assert!(command.response.is_none());
-
-        alive.store(false, Ordering::Release);
-        heartbeat_task.abort();
-        let _ = heartbeat_task.await;
-    }
-
-    #[test]
-    fn cursor_notifications_do_not_fill_the_reliable_command_queue() {
-        let (commands, mut command_rx) = mpsc::channel(1);
-        let (latest_cursor, mut latest_cursor_rx) = watch::channel(None);
-        let client = AgentClient {
-            commands,
-            latest_cursor,
-            context: Arc::new(Mutex::new(None)),
-            alive: Arc::new(AtomicBool::new(true)),
-            lifecycle: Mutex::new(()),
-            next_lease: AtomicU64::new(1),
-            active_lease: AtomicU64::new(0),
-        };
-
-        for x in 0..1024 {
-            client.notify(AgentRequest::InjectCursor(Point { x, y: 10 }));
-        }
-        client.notify(AgentRequest::Stop);
-
-        let command = command_rx.try_recv().unwrap();
-        assert!(matches!(command.request, AgentRequest::Stop));
-        assert!(command_rx.try_recv().is_err());
-        let update = (*latest_cursor_rx.borrow_and_update()).unwrap();
-        assert_eq!(update.point, Point { x: 1023, y: 10 });
-    }
-
-    #[tokio::test]
-    async fn reliable_command_follows_latest_cursor_without_motion_backlog() {
-        let (writer, mut reader) = tokio::io::duplex(4096);
-        let (commands, command_rx) = mpsc::channel(1);
-        let (latest_cursor, latest_cursor_rx) = watch::channel(None);
-        for x in 0..1024 {
-            latest_cursor
-                .send(Some(CursorUpdate {
-                    point: Point { x, y: 20 },
-                    queued_at: Instant::now(),
-                }))
+        for x in 0..20_000 {
+            client
+                .notify(AgentRequest::InjectCursor(Point { x, y: 10 }))
                 .unwrap();
         }
-        let (dispatch_tx, dispatch_rx) = std::sync::mpsc::sync_channel(1);
-        let (response_tx, _response_rx) = std::sync::mpsc::sync_channel(1);
-        assert!(
-            commands
-                .try_send(ClientCommand {
+
+        assert!(matches!(receiver.try_recv().unwrap(), ClientQueueItem::Cursor));
+        assert!(receiver.try_recv().is_err());
+        let latest = client.cursor.latest.lock().unwrap().unwrap();
+        assert_eq!(latest.point, Point { x: 19_999, y: 10 });
+    }
+
+    #[test]
+    fn native_dual_pipe_transport_survives_cursor_lifecycle_and_event_pressure() {
+        const CYCLES: usize = 1000;
+        const EXPECTED_REQUESTS: usize = 1 + CYCLES * 2 + 2;
+
+        let connection_id = Uuid::new_v4();
+        let command_name = format!(r"\\.\pipe\synly-test-command-{connection_id}");
+        let event_name = format!(r"\\.\pipe\synly-test-event-{connection_id}");
+        let alive = Arc::new(AtomicBool::new(true));
+        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let context = Arc::new(Mutex::new(None));
+        let cursor = test_cursor();
+        let (commands, command_rx) = std::sync::mpsc::sync_channel(64);
+        let (created_tx, created_rx) = std::sync::mpsc::sync_channel(2);
+
+        let command_pending = Arc::clone(&pending);
+        let command_alive = Arc::clone(&alive);
+        let command_cursor = Arc::clone(&cursor);
+        let command_created = created_tx.clone();
+        let command_server_name = command_name.clone();
+        let gui_command = std::thread::spawn(move || -> Result<()> {
+            let mut pipe = create_test_server(
+                &command_server_name,
+                PipeDirection::ServerToClient,
+            );
+            command_created.send(()).unwrap();
+            pipe.connect_server(CONNECT_TIMEOUT)?;
+            command_writer_loop(
+                pipe,
+                command_rx,
+                command_cursor,
+                command_pending,
+                command_alive,
+            )
+        });
+
+        let event_pending = Arc::clone(&pending);
+        let event_alive = Arc::clone(&alive);
+        let event_context = Arc::clone(&context);
+        let event_created = created_tx;
+        let event_server_name = event_name.clone();
+        let gui_event = std::thread::spawn(move || -> Result<()> {
+            let mut pipe = create_test_server(
+                &event_server_name,
+                PipeDirection::ClientToServer,
+            );
+            event_created.send(()).unwrap();
+            pipe.connect_server(CONNECT_TIMEOUT)?;
+            client_event_reader_loop(pipe, event_pending, event_context, event_alive)
+        });
+
+        created_rx.recv_timeout(CONNECT_TIMEOUT).unwrap();
+        created_rx.recv_timeout(CONNECT_TIMEOUT).unwrap();
+
+        let (reliable_tx, reliable_rx) = std::sync::mpsc::sync_channel(256);
+        let motion = Arc::new(AgentMotionSlot {
+            latest: Mutex::new(None),
+            changed: AtomicBool::new(false),
+        });
+        let output = AgentOutput {
+            reliable: reliable_tx,
+            motion: Arc::clone(&motion),
+        };
+        let agent_event_alive = Arc::clone(&alive);
+        let agent_event_name = event_name;
+        let agent_event = std::thread::spawn(move || -> Result<()> {
+            let pipe = NativePipe::connect_client(
+                &agent_event_name,
+                PipeDirection::ClientToServer,
+                CONNECT_TIMEOUT,
+            )?;
+            agent_event_writer_loop(pipe, reliable_rx, motion, agent_event_alive)
+        });
+
+        let agent_output = output.clone();
+        let agent_command_name = command_name;
+        let agent_command = std::thread::spawn(move || -> Result<Vec<u64>> {
+            let mut pipe = NativePipe::connect_client(
+                &agent_command_name,
+                PipeDirection::ServerToClient,
+                CONNECT_TIMEOUT,
+            )?;
+            let mut ids = Vec::with_capacity(EXPECTED_REQUESTS);
+            for expected_id in 1..=u64::try_from(EXPECTED_REQUESTS).unwrap() {
+                let packet = read_packet::<GuiToAgentPacket>(
+                    &mut pipe,
+                    REQUEST_DELIVERY_TIMEOUT,
+                )?;
+                let GuiToAgentPacket::Request { id, request } = packet else {
+                    bail!("expected request packet");
+                };
+                assert_eq!(id, expected_id);
+                if expected_id == 1 {
+                    assert!(matches!(
+                        request,
+                        AgentRequest::InjectCursor(Point { x: 19_999, y: 720 })
+                    ));
+                } else if expected_id == u64::try_from(EXPECTED_REQUESTS - 1).unwrap() {
+                    assert!(matches!(
+                        request,
+                        AgentRequest::InjectButton {
+                            button: 1,
+                            down: true,
+                        }
+                    ));
+                } else if expected_id == u64::try_from(EXPECTED_REQUESTS).unwrap() {
+                    assert!(matches!(
+                        request,
+                        AgentRequest::InjectWheel { x: 0, y: 120 }
+                    ));
+                }
+                ids.push(id);
+                agent_output.send_reliable(AgentToGuiPacket::Event(
+                    NativeEvent::Button {
+                        button: 1,
+                        down: false,
+                    },
+                ))?;
+                agent_output.store_motion(AgentMotion {
+                    dx: 1,
+                    dy: -1,
+                    position: Some(Point { x: 10, y: 20 }),
+                    position_updated: true,
+                });
+                agent_output.send_reliable(AgentToGuiPacket::Response {
+                    id,
+                    response: AgentResponse::Ok,
+                })?;
+            }
+            Ok(ids)
+        });
+
+        let producer_commands = commands.clone();
+        let producer_cursor = Arc::clone(&cursor);
+        let producer = std::thread::spawn(move || {
+            for x in 0..20_000 {
+                *producer_cursor.latest.lock().unwrap() = Some(CursorUpdate {
+                    point: Point { x, y: 720 },
+                    queued_at: Instant::now(),
+                });
+            }
+            producer_cursor.queued.store(true, Ordering::Release);
+            producer_commands.send(ClientQueueItem::Cursor).unwrap();
+            for cycle in 0..CYCLES {
+                producer_commands
+                    .send(ClientQueueItem::Command(ClientCommand {
+                        request: AgentRequest::ReleaseAll,
+                        queued_at: Instant::now(),
+                        dispatched: None,
+                        response: None,
+                    }))
+                    .unwrap();
+                producer_commands
+                    .send(ClientQueueItem::Command(ClientCommand {
+                        request: AgentRequest::WarpCursor(Point {
+                            x: 2551,
+                            y: i32::try_from(cycle % 1440).unwrap(),
+                        }),
+                        queued_at: Instant::now(),
+                        dispatched: None,
+                        response: None,
+                    }))
+                    .unwrap();
+            }
+            producer_commands
+                .send(ClientQueueItem::Command(ClientCommand {
                     request: AgentRequest::InjectButton {
                         button: 1,
                         down: true,
                     },
                     queued_at: Instant::now(),
-                    dispatched: Some(dispatch_tx),
-                    response: Some(response_tx),
-                })
-                .is_ok()
-        );
-        let pending = Arc::new(Mutex::new(HashMap::new()));
-        let heartbeat_probe = Arc::new(AtomicU64::new(0));
-        let cursor_probe = Arc::new(AtomicU64::new(0));
-        let cursor_ready = Arc::new(Notify::new());
-        let writer_pending = Arc::clone(&pending);
-        let writer_heartbeat = Arc::clone(&heartbeat_probe);
-        let writer_cursor_probe = Arc::clone(&cursor_probe);
-        let writer_cursor_ready = Arc::clone(&cursor_ready);
-        let writer_task = tokio::spawn(command_writer_loop(
-            writer,
-            command_rx,
-            latest_cursor_rx,
-            writer_pending,
-            writer_heartbeat,
-            writer_cursor_probe,
-            writer_cursor_ready,
-        ));
-
-        let cursor_packet = time::timeout(Duration::from_secs(1), read_packet(&mut reader))
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(matches!(
-            cursor_packet,
-            AgentPacket::Request {
-                id: 1,
-                expects_response: true,
-                request: AgentRequest::InjectCursor(Point { x: 1023, y: 20 }),
-            }
-        ));
-        let button_packet = time::timeout(Duration::from_secs(1), read_packet(&mut reader))
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(matches!(
-            button_packet,
-            AgentPacket::Request {
-                id: 2,
-                expects_response: true,
-                request: AgentRequest::InjectButton {
-                    button: 1,
-                    down: true,
-                },
-            }
-        ));
-        assert!(dispatch_rx.try_recv().is_ok());
-        assert!(pending.lock().unwrap().contains_key(&2));
-        assert_eq!(cursor_probe.load(Ordering::Acquire), 1);
-
-        for x in 1024..2048 {
-            latest_cursor
-                .send(Some(CursorUpdate {
-                    point: Point { x, y: 30 },
-                    queued_at: Instant::now(),
+                    dispatched: None,
+                    response: None,
                 }))
                 .unwrap();
-        }
-        assert!(
-            cursor_probe
-                .compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        );
-        cursor_ready.notify_one();
-        let next_cursor_packet =
-            time::timeout(Duration::from_secs(1), read_packet(&mut reader))
-                .await
-                .unwrap()
+            let (dispatch_tx, dispatch_rx) = std::sync::mpsc::sync_channel(1);
+            let (response_tx, response_rx) = std::sync::mpsc::sync_channel(1);
+            producer_commands
+                .send(ClientQueueItem::Command(ClientCommand {
+                    request: AgentRequest::InjectWheel { x: 0, y: 120 },
+                    queued_at: Instant::now(),
+                    dispatched: Some(dispatch_tx),
+                    response: Some(response_tx),
+                }))
                 .unwrap();
+            (dispatch_rx, response_rx)
+        });
+
+        let (dispatch_rx, response_rx) = producer.join().unwrap();
         assert!(matches!(
-            next_cursor_packet,
-            AgentPacket::Request {
-                id: 3,
-                expects_response: true,
-                request: AgentRequest::InjectCursor(Point { x: 2047, y: 30 }),
+            wait_for_agent_response(
+                &alive,
+                "InjectWheel",
+                dispatch_rx,
+                response_rx,
+                Duration::from_secs(30),
+            )
+            .unwrap(),
+            AgentResponse::Ok
+        ));
+        let ids = agent_command.join().unwrap().unwrap();
+        assert_eq!(ids.len(), EXPECTED_REQUESTS);
+        assert!(ids.windows(2).all(|pair| pair[1] == pair[0] + 1));
+
+        alive.store(false, Ordering::Release);
+        drop(commands);
+        drop(output);
+        gui_command.join().unwrap().unwrap();
+        agent_event.join().unwrap().unwrap();
+        gui_event.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn native_pipe_rejects_invalid_frame_length() {
+        let name = format!(r"\\.\pipe\synly-test-length-{}", Uuid::new_v4());
+        let (created_tx, created_rx) = std::sync::mpsc::sync_channel(1);
+        let server_name = name.clone();
+        let server = std::thread::spawn(move || {
+            let mut pipe = create_test_server(
+                &server_name,
+                PipeDirection::ClientToServer,
+            );
+            created_tx.send(()).unwrap();
+            pipe.connect_server(CONNECT_TIMEOUT).unwrap();
+            read_packet::<GuiToAgentPacket>(&mut pipe, Duration::from_secs(1))
+        });
+        created_rx.recv_timeout(CONNECT_TIMEOUT).unwrap();
+        let mut client = NativePipe::connect_client(
+            &name,
+            PipeDirection::ClientToServer,
+            CONNECT_TIMEOUT,
+        )
+        .unwrap();
+        client
+            .write_all(
+                &(u32::try_from(IPC_MAX_FRAME).unwrap() + 1).to_be_bytes(),
+                Duration::from_secs(1),
+            )
+            .unwrap();
+
+        assert!(server.join().unwrap().is_err());
+    }
+
+    #[test]
+    fn native_pipe_reports_half_frame_when_peer_exits() {
+        let name = format!(r"\\.\pipe\synly-test-half-frame-{}", Uuid::new_v4());
+        let (created_tx, created_rx) = std::sync::mpsc::sync_channel(1);
+        let server_name = name.clone();
+        let server = std::thread::spawn(move || {
+            let mut pipe = create_test_server(
+                &server_name,
+                PipeDirection::ClientToServer,
+            );
+            created_tx.send(()).unwrap();
+            pipe.connect_server(CONNECT_TIMEOUT).unwrap();
+            read_packet::<GuiToAgentPacket>(&mut pipe, Duration::from_secs(1))
+        });
+        created_rx.recv_timeout(CONNECT_TIMEOUT).unwrap();
+        let mut client = NativePipe::connect_client(
+            &name,
+            PipeDirection::ClientToServer,
+            CONNECT_TIMEOUT,
+        )
+        .unwrap();
+        client
+            .write_all(&16u32.to_be_bytes(), Duration::from_secs(1))
+            .unwrap();
+        client
+            .write_all(&[1, 2, 3], Duration::from_secs(1))
+            .unwrap();
+        drop(client);
+
+        assert!(server.join().unwrap().is_err());
+    }
+
+    #[test]
+    fn native_pipe_read_timeout_is_cancelled() {
+        let name = format!(r"\\.\pipe\synly-test-timeout-{}", Uuid::new_v4());
+        let (created_tx, created_rx) = std::sync::mpsc::sync_channel(1);
+        let server_name = name.clone();
+        let server = std::thread::spawn(move || {
+            let mut pipe = create_test_server(
+                &server_name,
+                PipeDirection::ClientToServer,
+            );
+            created_tx.send(()).unwrap();
+            pipe.connect_server(CONNECT_TIMEOUT).unwrap();
+            let mut byte = [0u8; 1];
+            pipe.read_exact(&mut byte, Duration::from_millis(50))
+        });
+        created_rx.recv_timeout(CONNECT_TIMEOUT).unwrap();
+        let _client = NativePipe::connect_client(
+            &name,
+            PipeDirection::ClientToServer,
+            CONNECT_TIMEOUT,
+        )
+        .unwrap();
+
+        let error = server.join().unwrap().unwrap_err();
+        assert!(is_timeout_error(&error));
+    }
+
+    #[test]
+    fn reliable_request_timeout_marks_transport_unavailable() {
+        let name = format!(r"\\.\pipe\synly-test-response-timeout-{}", Uuid::new_v4());
+        let (created_tx, created_rx) = std::sync::mpsc::sync_channel(1);
+        let alive = Arc::new(AtomicBool::new(true));
+        let server_alive = Arc::clone(&alive);
+        let server_name = name.clone();
+        let server = std::thread::spawn(move || {
+            let mut pipe = create_test_server(
+                &server_name,
+                PipeDirection::ServerToClient,
+            );
+            created_tx.send(()).unwrap();
+            pipe.connect_server(CONNECT_TIMEOUT).unwrap();
+            let pending = Arc::new(Mutex::new(HashMap::new()));
+            let mut next_id = 1;
+            let mut cursor_count = 0;
+            write_client_command(
+                &mut pipe,
+                ClientCommand {
+                    request: AgentRequest::Stop,
+                    queued_at: Instant::now(),
+                    dispatched: None,
+                    response: None,
+                },
+                &pending,
+                &server_alive,
+                &mut next_id,
+                &mut cursor_count,
+            )
+        });
+        created_rx.recv_timeout(CONNECT_TIMEOUT).unwrap();
+        let mut client = NativePipe::connect_client(
+            &name,
+            PipeDirection::ServerToClient,
+            CONNECT_TIMEOUT,
+        )
+        .unwrap();
+        let packet = read_packet::<GuiToAgentPacket>(
+            &mut client,
+            REQUEST_DELIVERY_TIMEOUT,
+        )
+        .unwrap();
+        assert!(matches!(
+            packet,
+            GuiToAgentPacket::Request {
+                id: 1,
+                request: AgentRequest::Stop,
             }
         ));
-        assert_eq!(cursor_probe.load(Ordering::Acquire), 3);
-        assert!(
-            cursor_probe
-                .compare_exchange(3, 0, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-        );
-        cursor_ready.notify_one();
 
-        drop(commands);
-        drop(latest_cursor);
-        time::timeout(Duration::from_secs(1), writer_task)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        assert!(server.join().unwrap().is_err());
+        assert!(!alive.load(Ordering::Acquire));
     }
 
     #[test]
@@ -2379,112 +2857,13 @@ mod tests {
     }
 
     #[test]
-    fn agent_heartbeat_observation_extends_the_deadline() {
-        let started = Instant::now();
-        let observed = started + AGENT_HEARTBEAT_TIMEOUT;
-        let mut heartbeat = AgentHeartbeat::new(started);
-        heartbeat.observe(observed);
+    #[ignore = "requires interactive UAC approval and a real Windows desktop"]
+    fn elevated_agent_process_is_reused_across_requests() {
+        request_elevation().unwrap();
+        let first = current_client().unwrap();
+        request_elevation().unwrap();
+        let second = current_client().unwrap();
 
-        assert!(!heartbeat.expired(observed + AGENT_HEARTBEAT_TIMEOUT));
-    }
-
-    #[test]
-    fn response_timeout_begins_after_pipe_dispatch() {
-        let alive = Arc::new(AtomicBool::new(true));
-        let worker_alive = Arc::clone(&alive);
-        let (dispatch_tx, dispatch_rx) = std::sync::mpsc::sync_channel(1);
-        let (response_tx, response_rx) = std::sync::mpsc::sync_channel(1);
-        let worker = std::thread::spawn(move || {
-            wait_for_agent_response(
-                &worker_alive,
-                "ReleaseAll",
-                dispatch_rx,
-                response_rx,
-                Duration::from_secs(1),
-                Duration::from_millis(80),
-            )
-        });
-
-        std::thread::sleep(Duration::from_millis(120));
-        dispatch_tx.send(()).unwrap();
-        response_tx.send(Ok(AgentResponse::Ok)).unwrap();
-
-        assert!(matches!(worker.join().unwrap().unwrap(), AgentResponse::Ok));
-        assert!(alive.load(Ordering::Acquire));
-    }
-
-    #[tokio::test]
-    async fn packet_reader_preserves_fragmented_frames() {
-        let (mut writer, reader) = tokio::io::duplex(4096);
-        let packets = [
-            AgentPacket::Request {
-                id: 11,
-                expects_response: false,
-                request: AgentRequest::Health,
-            },
-            AgentPacket::Request {
-                id: 12,
-                expects_response: true,
-                request: AgentRequest::CursorPosition,
-            },
-        ];
-        let writer_task = tokio::spawn(async move {
-            for packet in packets {
-                let bytes = bincode::serialize(&packet).unwrap();
-                let mut frame = (bytes.len() as u32).to_be_bytes().to_vec();
-                frame.extend_from_slice(&bytes);
-                for byte in frame {
-                    writer.write_all(&[byte]).await.unwrap();
-                    tokio::task::yield_now().await;
-                }
-            }
-        });
-        let (mut packets, reader_task) = spawn_packet_reader(reader, "test");
-
-        assert!(matches!(
-            packets.recv().await.unwrap().unwrap(),
-            AgentPacket::Request {
-                id: 11,
-                expects_response: false,
-                request: AgentRequest::Health,
-            }
-        ));
-        assert!(matches!(
-            packets.recv().await.unwrap().unwrap(),
-            AgentPacket::Request {
-                id: 12,
-                expects_response: true,
-                request: AgentRequest::CursorPosition,
-            }
-        ));
-
-        writer_task.await.unwrap();
-        reader_task.abort();
-        let _ = reader_task.await;
-    }
-
-    #[test]
-    fn fire_and_forget_success_does_not_create_response() {
-        assert!(agent_completion_packet(7, false, Ok(AgentResponse::Ok)).is_none());
-    }
-
-    #[test]
-    fn fire_and_forget_failure_is_forwarded_as_native_failure() {
-        assert!(matches!(
-            agent_completion_packet(8, false, Err(anyhow!("inject failed"))),
-            Some(AgentPacket::Event(NativeEvent::Failed(message)))
-                if message.contains("inject failed")
-        ));
-    }
-
-    #[test]
-    fn reliable_request_keeps_its_response_id() {
-        assert!(matches!(
-            agent_completion_packet(9, true, Ok(AgentResponse::Pong)),
-            Some(AgentPacket::Response {
-                id: 9,
-                response: AgentResponse::Pong,
-            })
-        ));
+        assert!(Arc::ptr_eq(&first, &second));
     }
 }

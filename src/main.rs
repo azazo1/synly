@@ -47,38 +47,30 @@ fn main() -> Result<()> {
 fn run_internal_command(command: &cli::InternalCommand) -> Result<()> {
     match command {
         cli::InternalCommand::InputAgent {
-            pipe,
+            command_pipe,
+            event_pipe,
             token,
             parent_pid,
         } => {
             #[cfg(windows)]
             {
-                tracing_subscriber::fmt()
-                    .with_target(true)
-                    .with_ansi(false)
-                    .with_env_filter(
-                        tracing_subscriber::EnvFilter::try_from_default_env()
-                            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-                    )
-                    .try_init()
-                    .map_err(|error| {
-                        anyhow::anyhow!("failed to initialize input agent tracing: {error}")
-                    })?;
-                tracing::trace!(%pipe, parent_pid, "Windows 输入代理内部子进程入口已启动"); // to remove
+                let _tracing_guard = input::init_windows_agent_tracing()?;
+                tracing::trace!(%command_pipe, %event_pipe, parent_pid, "Windows 输入代理内部子进程入口已启动"); // to remove
                 let runtime = tokio::runtime::Builder::new_multi_thread()
                     .worker_threads(2)
                     .thread_name("synly-input-agent")
                     .enable_all()
                     .build()?;
-                return runtime.block_on(input::run_agent(
-                    pipe.clone(),
+                runtime.block_on(input::run_agent(
+                    command_pipe.clone(),
+                    event_pipe.clone(),
                     token.clone(),
                     *parent_pid,
-                ));
+                ))
             }
             #[cfg(not(windows))]
             {
-                let _ = (pipe, token, parent_pid);
+                let _ = (command_pipe, event_pipe, token, parent_pid);
                 anyhow::bail!("Windows input agent internal command is only available on Windows");
             }
         }

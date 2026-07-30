@@ -146,7 +146,9 @@ pub enum InternalCommand {
     #[command(name = "__input-agent", hide = true)]
     InputAgent {
         #[arg(long)]
-        pipe: String,
+        command_pipe: String,
+        #[arg(long)]
+        event_pipe: String,
         #[arg(long)]
         token: String,
         #[arg(long)]
@@ -543,8 +545,10 @@ mod tests {
         let cli = Cli::try_parse_from([
             "synly",
             "__input-agent",
-            "--pipe",
-            r"\\.\pipe\synly-input-test",
+            "--command-pipe",
+            r"\\.\pipe\synly-input-command-test",
+            "--event-pipe",
+            r"\\.\pipe\synly-input-event-test",
             "--token",
             "test-token",
             "--parent-pid",

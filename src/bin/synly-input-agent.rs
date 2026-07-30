@@ -9,7 +9,9 @@ use clap::Parser;
 #[derive(Parser)]
 struct AgentCli {
     #[arg(long)]
-    pipe: String,
+    command_pipe: String,
+    #[arg(long)]
+    event_pipe: String,
     #[arg(long)]
     token: String,
     #[arg(long)]
@@ -18,15 +20,7 @@ struct AgentCli {
 
 #[cfg(windows)]
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_target(true)
-        .with_ansi(false)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .try_init()
-        .map_err(|error| anyhow::anyhow!("failed to initialize input agent tracing: {error}"))?;
+    let _tracing_guard = synly::input::init_windows_agent_tracing()?;
     let cli = AgentCli::parse();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -35,7 +29,8 @@ fn main() -> Result<()> {
         .build()
         .context("failed to create input agent runtime")?;
     runtime.block_on(synly::input::run_agent(
-        cli.pipe,
+        cli.command_pipe,
+        cli.event_pipe,
         cli.token,
         cli.parent_pid,
     ))
