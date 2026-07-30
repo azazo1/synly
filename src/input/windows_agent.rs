@@ -482,7 +482,8 @@ async fn client_loop(
     context: Arc<Mutex<Option<CaptureContext>>>,
     alive: Arc<AtomicBool>,
 ) -> Result<()> {
-    let (mut reader, mut writer) = tokio::io::split(server);
+    let (reader, mut writer) = tokio::io::split(server);
+    let (mut packets, reader_task) = spawn_packet_reader(reader);
     let mut next_id = 1u64;
     let mut pending = HashMap::<
         u64,
@@ -508,8 +509,8 @@ async fn client_loop(
                     .await?;
                     pending.insert(id, command.response);
                 }
-                packet = read_packet(&mut reader) => {
-                    match packet? {
+                packet = packets.recv() => {
+                    match packet.context("Windows input agent packet reader stopped")?? {
                         AgentPacket::Response { id, response } => {
                             if id == 0 && matches!(&response, AgentResponse::Pong) {
                                 last_pong = Instant::now();
@@ -571,6 +572,8 @@ async fn client_loop(
         }
     }
     .await;
+    reader_task.abort();
+    let _ = reader_task.await;
     alive.store(false, Ordering::Release);
     for (_, sender) in pending {
         let _ = sender.send(Err("Windows input agent connection closed".to_string()));
@@ -586,7 +589,8 @@ async fn client_loop(
 }
 
 async fn run_agent_loop(client: tokio::net::windows::named_pipe::NamedPipeClient) -> Result<()> {
-    let (mut reader, mut writer) = tokio::io::split(client);
+    let (reader, mut writer) = tokio::io::split(client);
+    let (mut packets, reader_task) = spawn_packet_reader(reader);
     let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<AgentPacket>(256);
     let mut runtime = None;
     let mut heartbeat = Instant::now();
@@ -597,8 +601,9 @@ async fn run_agent_loop(client: tokio::net::windows::named_pipe::NamedPipeClient
     let result: Result<()> = async {
         loop {
             tokio::select! {
-                packet = read_packet(&mut reader) => {
-                    let AgentPacket::Request { id, request } = packet? else {
+                packet = packets.recv() => {
+                    let packet = packet.context("Windows input agent request reader stopped")??;
+                    let AgentPacket::Request { id, request } = packet else {
                         bail!("Windows input agent received an unexpected packet");
                     };
                     heartbeat = Instant::now();
@@ -640,6 +645,8 @@ async fn run_agent_loop(client: tokio::net::windows::named_pipe::NamedPipeClient
         }
     }
     .await;
+    reader_task.abort();
+    let _ = reader_task.await;
     if let Some(runtime) = runtime {
         runtime.stop().await;
     }
@@ -1094,6 +1101,34 @@ where
     bincode::deserialize(&bytes).context("failed to decode Windows input agent packet")
 }
 
+fn spawn_packet_reader<R>(
+    mut reader: R,
+) -> (
+    mpsc::Receiver<Result<AgentPacket>>,
+    tokio::task::JoinHandle<()>,
+)
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    let (packets, receiver) = mpsc::channel(256);
+    let task = tokio::spawn(async move {
+        loop {
+            match read_packet(&mut reader).await {
+                Ok(packet) => {
+                    if packets.send(Ok(packet)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = packets.send(Err(error)).await;
+                    break;
+                }
+            }
+        }
+    });
+    (receiver, task)
+}
+
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -1115,5 +1150,51 @@ mod tests {
 
         assert!(client.request(AgentRequest::Health).is_err());
         assert!(!alive.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn packet_reader_preserves_fragmented_frames() {
+        let (mut writer, reader) = tokio::io::duplex(4096);
+        let packets = [
+            AgentPacket::Request {
+                id: 11,
+                request: AgentRequest::Health,
+            },
+            AgentPacket::Request {
+                id: 12,
+                request: AgentRequest::Ping,
+            },
+        ];
+        let writer_task = tokio::spawn(async move {
+            for packet in packets {
+                let bytes = bincode::serialize(&packet).unwrap();
+                let mut frame = (bytes.len() as u32).to_be_bytes().to_vec();
+                frame.extend_from_slice(&bytes);
+                for byte in frame {
+                    writer.write_all(&[byte]).await.unwrap();
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+        let (mut packets, reader_task) = spawn_packet_reader(reader);
+
+        assert!(matches!(
+            packets.recv().await.unwrap().unwrap(),
+            AgentPacket::Request {
+                id: 11,
+                request: AgentRequest::Health,
+            }
+        ));
+        assert!(matches!(
+            packets.recv().await.unwrap().unwrap(),
+            AgentPacket::Request {
+                id: 12,
+                request: AgentRequest::Ping,
+            }
+        ));
+
+        writer_task.await.unwrap();
+        reader_task.abort();
+        let _ = reader_task.await;
     }
 }
