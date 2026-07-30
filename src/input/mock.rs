@@ -5,58 +5,104 @@ use super::{
     KeyMappingConfig, Point, ScreenEdge,
 };
 use anyhow::{Context, Result, bail};
+use slint::{CloseRequestResponse, ComponentHandle};
 use std::collections::BTreeSet;
-use std::ffi::CString;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::{self, MissedTickBehavior};
 
-const GUI_INTERVAL: Duration = Duration::from_micros(8_333);
+slint::include_modules!();
+
+const GUI_INTERVAL: Duration = Duration::from_millis(16);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(250);
 const EDGE_INSET: i32 = 8;
 
 #[derive(Clone, Debug)]
-pub struct MacosMockOptions {
+pub struct ScreenMockOptions {
     pub edge: ScreenEdge,
     pub hotkey: Hotkey,
     pub width: i32,
     pub height: i32,
 }
 
-pub fn run_macos_mock(options: MacosMockOptions) -> Result<()> {
-    if options.width <= EDGE_INSET * 2 || options.height <= EDGE_INSET * 2 {
-        bail!("mock 虚拟屏幕尺寸过小")
-    }
-    let edge = CString::new(options.edge.as_arg())?;
-    let prepared = unsafe {
-        synly_input_mock_gui_prepare(options.width, options.height, edge.as_ptr())
-    };
-    if prepared != 0 {
-        bail!("无法创建 macOS mock GUI")
-    }
+pub fn run_screen_mock(options: ScreenMockOptions) -> Result<()> {
+    validate_options(&options)?;
+    let local_platform = InputPlatform::current();
+    let remote_platform = opposite_platform(local_platform);
+    let window = InputScreenMockWindow::new().context("无法创建输入虚拟屏幕窗口")?;
+    window.set_route_text(
+        format!(
+            "{} -> {} mock",
+            platform_label(local_platform),
+            platform_label(remote_platform),
+        )
+        .into(),
+    );
+    window.set_source_edge(options.edge.as_arg().into());
+    window.set_virtual_width(options.width);
+    window.set_virtual_height(options.height);
+    window.set_event_text(format!("等待从 {} 边缘接入", options.edge.as_arg()).into());
+    window.show().context("无法显示输入虚拟屏幕窗口")?;
 
     let stop = Arc::new(AtomicBool::new(false));
+    wire_window_shutdown(&window, Arc::clone(&stop));
     spawn_signal_monitor(Arc::clone(&stop))?;
+
+    let presenter = GuiPresenter::new(window.as_weak(), options.width, options.height);
+
     let worker_stop = Arc::clone(&stop);
+    let worker_presenter = presenter.clone();
     let worker = std::thread::Builder::new()
-        .name("synly-input-macos-mock".to_string())
+        .name("synly-input-screen-mock".to_string())
         .spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .context("无法创建 macOS 输入 mock 运行时")?;
-            runtime.block_on(run_mock_worker(options, worker_stop))
+                .context("无法创建输入虚拟屏幕运行时")?;
+            runtime.block_on(run_mock_worker(
+                options,
+                remote_platform,
+                worker_stop,
+                worker_presenter,
+            ))
         })
-        .context("无法启动 macOS 输入 mock 线程")?;
+        .context("无法启动输入虚拟屏幕线程")?;
 
-    unsafe { synly_input_mock_gui_run() };
+    let ui_result = slint::run_event_loop_until_quit().context("输入虚拟屏幕事件循环失败");
     stop.store(true, Ordering::Release);
-    match worker.join() {
+    let worker_result = match worker.join() {
         Ok(result) => result,
-        Err(_) => bail!("macOS 输入 mock 线程异常退出"),
+        Err(_) => bail!("输入虚拟屏幕线程异常退出"),
+    };
+    ui_result?;
+    worker_result
+}
+
+fn validate_options(options: &ScreenMockOptions) -> Result<()> {
+    if options.width <= EDGE_INSET * 2 || options.height <= EDGE_INSET * 2 {
+        bail!("mock 虚拟屏幕尺寸过小")
     }
+    Ok(())
+}
+
+fn wire_window_shutdown(window: &InputScreenMockWindow, stop: Arc<AtomicBool>) {
+    let callback_stop = Arc::clone(&stop);
+    let weak = window.as_weak();
+    window.on_quit_requested(move || {
+        callback_stop.store(true, Ordering::Release);
+        if let Some(window) = weak.upgrade() {
+            let _ = window.hide();
+        }
+        let _ = slint::quit_event_loop();
+    });
+
+    window.window().on_close_requested(move || {
+        stop.store(true, Ordering::Release);
+        let _ = slint::quit_event_loop();
+        CloseRequestResponse::HideWindow
+    });
 }
 
 fn spawn_signal_monitor(stop: Arc<AtomicBool>) -> Result<()> {
@@ -69,39 +115,40 @@ fn spawn_signal_monitor(stop: Arc<AtomicBool>) -> Result<()> {
             {
                 Ok(runtime) => runtime,
                 Err(error) => {
-                    tracing::error!(error = %error, "无法创建 macOS mock 信号运行时");
+                    tracing::error!(error = %error, "无法创建输入 mock 信号运行时");
                     return;
                 }
             };
             match runtime.block_on(tokio::signal::ctrl_c()) {
                 Ok(()) => {
-                    tracing::info!("收到 Ctrl-C, 正在恢复 macOS 光标");
+                    tracing::info!("收到 Ctrl-C, 正在恢复本机光标");
                     stop.store(true, Ordering::Release);
-                    unsafe { synly_input_mock_gui_stop() };
+                    if let Err(error) = slint::invoke_from_event_loop(|| {
+                        let _ = slint::quit_event_loop();
+                    }) {
+                        tracing::debug!(error = %error, "输入 mock 事件循环已经停止");
+                    }
                 }
                 Err(error) => {
-                    tracing::error!(error = %error, "macOS mock 无法监听 Ctrl-C");
+                    tracing::error!(error = %error, "输入 mock 无法监听 Ctrl-C");
                 }
             }
         })
-        .context("无法启动 macOS mock 信号线程")?;
+        .context("无法启动输入 mock 信号线程")?;
     Ok(())
 }
 
-async fn run_mock_worker(options: MacosMockOptions, stop: Arc<AtomicBool>) -> Result<()> {
+async fn run_mock_worker(
+    options: ScreenMockOptions,
+    remote_platform: InputPlatform,
+    stop: Arc<AtomicBool>,
+    presenter: GuiPresenter,
+) -> Result<()> {
     let mut platform = match platform::start(InputMode::Send, options.hotkey) {
         Ok(platform) => platform,
         Err(error) => {
-            tracing::error!(error = %error, "macOS 输入 mock 启动失败");
-            update_gui(&GuiUpdate {
-                active: false,
-                cursor: Point::default(),
-                delta: Point::default(),
-                key_count: 0,
-                button_mask: 0,
-                wheel: Point::default(),
-                event: &format!("启动失败: {error}"),
-            });
+            tracing::error!(error = %error, "输入虚拟屏幕 mock 启动失败");
+            presenter.publish(GuiUpdate::idle(format!("启动失败: {error}")));
             wait_for_shutdown(&stop).await;
             return Err(error);
         }
@@ -113,16 +160,12 @@ async fn run_mock_worker(options: MacosMockOptions, stop: Arc<AtomicBool>) -> Re
         width: options.width,
         height: options.height,
     }])?;
-    update_gui(&GuiUpdate {
-        active: false,
-        cursor: Point::default(),
-        delta: Point::default(),
-        key_count: 0,
-        button_mask: 0,
-        wheel: Point::default(),
-        event: &format!("等待从 {} 边缘接入", options.edge.as_arg()),
-    });
-    tracing::info!(edge = options.edge.as_arg(), "macOS 输入 mock 已启动");
+    tracing::info!(
+        local_platform = platform_label(InputPlatform::current()),
+        remote_platform = platform_label(remote_platform),
+        edge = options.edge.as_arg(),
+        "输入虚拟屏幕 mock 已启动"
+    );
 
     let observed_motion = Arc::clone(&platform.motion);
     let (incoming_tx, mut incoming_rx) = mpsc::channel(256);
@@ -141,7 +184,7 @@ async fn run_mock_worker(options: MacosMockOptions, stop: Arc<AtomicBool>) -> Re
         &mut platform,
         local_layout,
         options.edge,
-        InputPlatform::current(),
+        remote_platform,
         &runtime_options,
     );
     tokio::pin!(sender);
@@ -151,13 +194,18 @@ async fn run_mock_worker(options: MacosMockOptions, stop: Arc<AtomicBool>) -> Re
         incoming_tx,
         outgoing_rx,
         &stop,
+        &presenter,
     );
     tokio::pin!(peer);
     let result = tokio::select! {
         result = &mut sender => result,
         result = &mut peer => result,
     };
-    unsafe { synly_input_mock_gui_stop() };
+    if let Err(error) = &result {
+        tracing::error!(error = %error, "输入虚拟屏幕 mock 已停止");
+        presenter.publish(GuiUpdate::idle(format!("运行失败: {error}")));
+        wait_for_shutdown(&stop).await;
+    }
     result
 }
 
@@ -167,6 +215,7 @@ async fn run_mock_peer(
     incoming: mpsc::Sender<Result<InputMessage>>,
     mut outgoing: mpsc::Receiver<InputMessage>,
     stop: &AtomicBool,
+    presenter: &GuiPresenter,
 ) -> Result<()> {
     let mut gui_tick = time::interval(GUI_INTERVAL);
     gui_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -254,30 +303,53 @@ async fn run_mock_peer(
                             remote_cursor = mock_layout.move_within_layout(remote_cursor, dx, dy);
                         }
                     }
-                    InputMessage::Key { generation: incoming_generation, usage, modifiers, down, repeat }
-                        if active && incoming_generation == generation => {
-                        if down { keys.insert(usage); } else { keys.remove(&usage); }
+                    InputMessage::Key {
+                        generation: incoming_generation,
+                        usage,
+                        modifiers,
+                        down,
+                        repeat,
+                    } if active && incoming_generation == generation => {
+                        if down {
+                            keys.insert(usage);
+                        } else {
+                            keys.remove(&usage);
+                        }
                         last_event = format!(
                             "按键 hid=0x{usage:04x}, down={down}, repeat={repeat}, modifiers=0x{:02x}",
                             modifiers.bits(),
                         );
                     }
-                    InputMessage::Button { generation: incoming_generation, button, down }
-                        if active && incoming_generation == generation => {
-                        if down { buttons.insert(button); } else { buttons.remove(&button); }
+                    InputMessage::Button {
+                        generation: incoming_generation,
+                        button,
+                        down,
+                    } if active && incoming_generation == generation => {
+                        if down {
+                            buttons.insert(button);
+                        } else {
+                            buttons.remove(&button);
+                        }
                         last_event = format!("鼠标按钮 button={button}, down={down}");
                     }
-                    InputMessage::Wheel { generation: incoming_generation, x, y }
-                        if active && incoming_generation == generation => {
+                    InputMessage::Wheel {
+                        generation: incoming_generation,
+                        x,
+                        y,
+                    } if active && incoming_generation == generation => {
                         wheel.x = wheel.x.saturating_add(x);
                         wheel.y = wheel.y.saturating_add(y);
                         last_event = format!("滚轮 x={x}, y={y}");
                     }
                     InputMessage::Heartbeat { .. } => {}
-                    InputMessage::Hello { .. } | InputMessage::Proof { .. } | InputMessage::Return { .. }
+                    InputMessage::Hello { .. }
+                    | InputMessage::Proof { .. }
+                    | InputMessage::Return { .. }
                     | InputMessage::Deactivate { .. }
-                    | InputMessage::Key { .. } | InputMessage::Button { .. }
-                    | InputMessage::Motion { .. } | InputMessage::Wheel { .. } => {}
+                    | InputMessage::Key { .. }
+                    | InputMessage::Button { .. }
+                    | InputMessage::Motion { .. }
+                    | InputMessage::Wheel { .. } => {}
                 }
             }
             _ = heartbeat.tick() => {
@@ -287,7 +359,7 @@ async fn run_mock_peer(
                     .context("无法向正式 sender 发送 mock 心跳")?;
             }
             _ = gui_tick.tick() => {
-                if stop.load(Ordering::Acquire) || !unsafe { synly_input_mock_gui_is_running() } {
+                if stop.load(Ordering::Acquire) {
                     break;
                 }
                 if !active {
@@ -314,14 +386,14 @@ async fn run_mock_peer(
                         }
                     }
                 }
-                update_gui(&GuiUpdate {
+                presenter.publish(GuiUpdate {
                     active,
                     cursor: remote_cursor,
                     delta: last_delta,
                     key_count: keys.len() as u32,
                     button_mask: button_mask(&buttons),
                     wheel,
-                    event: &last_event,
+                    event: last_event.clone(),
                 });
             }
         }
@@ -333,63 +405,160 @@ async fn wait_for_shutdown(stop: &AtomicBool) {
     let mut tick = time::interval(GUI_INTERVAL);
     loop {
         tick.tick().await;
-        if stop.load(Ordering::Acquire) || !unsafe { synly_input_mock_gui_is_running() } {
+        if stop.load(Ordering::Acquire) {
             break;
         }
     }
 }
 
+fn opposite_platform(platform: InputPlatform) -> InputPlatform {
+    match platform {
+        InputPlatform::Macos => InputPlatform::Windows,
+        InputPlatform::Windows => InputPlatform::Macos,
+    }
+}
+
+fn platform_label(platform: InputPlatform) -> &'static str {
+    match platform {
+        InputPlatform::Macos => "macOS",
+        InputPlatform::Windows => "Windows",
+    }
+}
+
 fn button_mask(buttons: &BTreeSet<u8>) -> u32 {
     buttons.iter().fold(0u32, |mask, button| {
-        mask | 1u32.checked_shl(u32::from(button.saturating_sub(1))).unwrap_or(0)
+        mask | 1u32
+            .checked_shl(u32::from(button.saturating_sub(1)))
+            .unwrap_or(0)
     })
 }
 
-struct GuiUpdate<'a> {
+#[derive(Clone)]
+struct GuiPresenter {
+    window: slint::Weak<InputScreenMockWindow>,
+    latest: Arc<Mutex<GuiUpdate>>,
+    scheduled: Arc<AtomicBool>,
+    width: i32,
+    height: i32,
+}
+
+impl GuiPresenter {
+    fn new(window: slint::Weak<InputScreenMockWindow>, width: i32, height: i32) -> Self {
+        Self {
+            window,
+            latest: Arc::new(Mutex::new(GuiUpdate::idle("正在启动".to_string()))),
+            scheduled: Arc::new(AtomicBool::new(false)),
+            width,
+            height,
+        }
+    }
+
+    fn publish(&self, update: GuiUpdate) {
+        if let Ok(mut latest) = self.latest.lock() {
+            *latest = update;
+        } else {
+            tracing::error!("输入 mock GUI 状态锁已损坏");
+            return;
+        }
+        if self.scheduled.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        let window = self.window.clone();
+        let latest = Arc::clone(&self.latest);
+        let scheduled = Arc::clone(&self.scheduled);
+        let width = self.width;
+        let height = self.height;
+        if let Err(error) = slint::invoke_from_event_loop(move || {
+            scheduled.store(false, Ordering::Release);
+            let update = match latest.lock() {
+                Ok(update) => update.clone(),
+                Err(_) => return,
+            };
+            if let Some(window) = window.upgrade() {
+                apply_gui_update(&window, &update, width, height);
+            }
+        }) {
+            self.scheduled.store(false, Ordering::Release);
+            tracing::debug!(error = %error, "无法调度输入 mock GUI 更新");
+        }
+    }
+}
+
+#[derive(Clone)]
+struct GuiUpdate {
     active: bool,
     cursor: Point,
     delta: Point,
     key_count: u32,
     button_mask: u32,
     wheel: Point,
-    event: &'a str,
+    event: String,
 }
 
-fn update_gui(update: &GuiUpdate<'_>) {
-    let event = CString::new(update.event.replace('\0', " "))
-        .unwrap_or_else(|_| CString::new("无法显示事件").unwrap());
-    unsafe {
-        synly_input_mock_gui_update(
-            update.active,
-            update.cursor.x,
-            update.cursor.y,
-            update.delta.x,
-            update.delta.y,
-            update.key_count,
-            update.button_mask,
-            update.wheel.x,
-            update.wheel.y,
-            event.as_ptr(),
-        );
+impl GuiUpdate {
+    fn idle(event: String) -> Self {
+        Self {
+            active: false,
+            cursor: Point::default(),
+            delta: Point::default(),
+            key_count: 0,
+            button_mask: 0,
+            wheel: Point::default(),
+            event,
+        }
     }
 }
 
-#[link(name = "macos_audio", kind = "static")]
-unsafe extern "C" {
-    fn synly_input_mock_gui_prepare(width: i32, height: i32, source_edge: *const std::ffi::c_char) -> i32;
-    fn synly_input_mock_gui_run();
-    fn synly_input_mock_gui_is_running() -> bool;
-    fn synly_input_mock_gui_stop();
-    fn synly_input_mock_gui_update(
-        active: bool,
-        x: i32,
-        y: i32,
-        dx: i32,
-        dy: i32,
-        key_count: u32,
-        button_mask: u32,
-        wheel_x: i32,
-        wheel_y: i32,
-        event: *const std::ffi::c_char,
-    );
+fn apply_gui_update(
+    window: &InputScreenMockWindow,
+    update: &GuiUpdate,
+    width: i32,
+    height: i32,
+) {
+    window.set_active(update.active);
+    window.set_cursor_x(update.cursor.x);
+    window.set_cursor_y(update.cursor.y);
+    window.set_cursor_ratio_x(normalized_coordinate(update.cursor.x, width));
+    window.set_cursor_ratio_y(normalized_coordinate(update.cursor.y, height));
+    window.set_delta_x(update.delta.x);
+    window.set_delta_y(update.delta.y);
+    window.set_key_count(update.key_count.min(i32::MAX as u32) as i32);
+    window.set_button_summary(format!("0x{:08x}", update.button_mask).into());
+    window.set_wheel_x(update.wheel.x);
+    window.set_wheel_y(update.wheel.y);
+    window.set_event_text(update.event.clone().into());
+}
+
+fn normalized_coordinate(value: i32, extent: i32) -> f32 {
+    if extent <= 1 {
+        return 0.0;
+    }
+    (value as f32 / (extent - 1) as f32).clamp(0.0, 1.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{button_mask, normalized_coordinate, opposite_platform};
+    use crate::input::InputPlatform;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn mock_uses_the_opposite_remote_platform() {
+        assert_eq!(
+            opposite_platform(InputPlatform::Macos),
+            InputPlatform::Windows,
+        );
+        assert_eq!(
+            opposite_platform(InputPlatform::Windows),
+            InputPlatform::Macos,
+        );
+    }
+
+    #[test]
+    fn gui_values_are_bounded_and_buttons_use_stable_bits() {
+        assert_eq!(normalized_coordinate(-4, 100), 0.0);
+        assert_eq!(normalized_coordinate(99, 100), 1.0);
+        assert_eq!(button_mask(&BTreeSet::from([1, 3])), 0b101);
+    }
 }

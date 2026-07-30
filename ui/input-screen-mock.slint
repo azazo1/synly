@@ -1,0 +1,186 @@
+import { Button, Palette } from "std-widgets.slint";
+
+component Metric inherits Rectangle {
+    in property <string> label;
+    in property <string> value;
+    background: #f6f8f7;
+    border-color: #d8dedb;
+    border-width: 1px;
+    border-radius: 5px;
+    min-height: 58px;
+
+    VerticalLayout {
+        padding: 9px;
+        spacing: 3px;
+
+        Text {
+            text: root.label;
+            color: #6a736f;
+            font-size: 11px;
+        }
+
+        Text {
+            text: root.value;
+            color: #202624;
+            font-size: 14px;
+            font-weight: 600;
+            overflow: elide;
+        }
+    }
+}
+
+export component InputScreenMockWindow inherits Window {
+    init => { Palette.color-scheme = ColorScheme.light; }
+    title: "Synly input screen mock";
+    preferred-width: 900px;
+    preferred-height: 650px;
+    min-width: 720px;
+    min-height: 540px;
+    background: #edf1ef;
+
+    in property <string> route-text: "-";
+    in property <string> source-edge: "right";
+    in property <int> virtual-width: 1280;
+    in property <int> virtual-height: 720;
+    in property <bool> active: false;
+    in property <int> cursor-x: 0;
+    in property <int> cursor-y: 0;
+    in property <float> cursor-ratio-x: 0;
+    in property <float> cursor-ratio-y: 0;
+    in property <int> delta-x: 0;
+    in property <int> delta-y: 0;
+    in property <int> key-count: 0;
+    in property <string> button-summary: "0x00000000";
+    in property <int> wheel-x: 0;
+    in property <int> wheel-y: 0;
+    in property <string> event-text: "正在启动";
+
+    callback quit-requested();
+
+    VerticalLayout {
+        padding: 18px;
+        spacing: 12px;
+
+        HorizontalLayout {
+            height: 42px;
+            spacing: 10px;
+
+            VerticalLayout {
+                spacing: 2px;
+
+                Text {
+                    text: "无连接虚拟屏幕";
+                    color: #202624;
+                    font-size: 21px;
+                    font-weight: 680;
+                }
+
+                Text {
+                    text: root.route-text + " / 接入边缘: " + root.source-edge;
+                    color: #66706b;
+                    font-size: 11px;
+                }
+            }
+
+            Rectangle { horizontal-stretch: 1; }
+
+            Rectangle {
+                width: 110px;
+                height: 28px;
+                background: root.active ? #dff2e8 : #e1e6e3;
+                border-color: root.active ? #84bea1 : #c4ccc8;
+                border-width: 1px;
+                border-radius: 5px;
+
+                Text {
+                    text: root.active ? "远端控制中" : "等待接入";
+                    color: root.active ? #176844 : #515b56;
+                    font-size: 12px;
+                    font-weight: 600;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+
+            Button {
+                text: "退出";
+                clicked => { root.quit-requested(); }
+            }
+        }
+
+        Rectangle {
+            horizontal-stretch: 1;
+            vertical-stretch: 1;
+            background: #161d1a;
+            border-color: root.active ? #65b78e : #77817c;
+            border-width: root.active ? 2px : 1px;
+            border-radius: 6px;
+
+            Rectangle {
+                x: 7px;
+                y: 7px;
+                width: parent.width - 14px;
+                height: parent.height - 14px;
+                background: #202a26;
+                border-color: #3a4641;
+                border-width: 1px;
+                border-radius: 4px;
+
+                Text {
+                    x: 12px;
+                    y: 10px;
+                    text: root.virtual-width + " x " + root.virtual-height;
+                    color: #aeb8b3;
+                    font-size: 11px;
+                }
+
+                Rectangle {
+                    x: 16px + (parent.width - 32px) * root.cursor-ratio-x - self.width / 2;
+                    y: 16px + (parent.height - 32px) * root.cursor-ratio-y - self.height / 2;
+                    width: 13px;
+                    height: 13px;
+                    background: root.active ? #79d6a7 : #89938e;
+                    border-color: #f4fff9;
+                    border-width: 2px;
+                    border-radius: 6px;
+                }
+            }
+        }
+
+        HorizontalLayout {
+            height: 58px;
+            spacing: 8px;
+
+            Metric { label: "虚拟光标"; value: "x=" + root.cursor-x + ", y=" + root.cursor-y; horizontal-stretch: 2; }
+            Metric { label: "原始增量"; value: "dx=" + root.delta-x + ", dy=" + root.delta-y; horizontal-stretch: 2; }
+            Metric { label: "按键 / 按钮"; value: root.key-count + " / " + root.button-summary; horizontal-stretch: 2; }
+            Metric { label: "滚轮累计"; value: "x=" + root.wheel-x + ", y=" + root.wheel-y; horizontal-stretch: 2; }
+        }
+
+        Rectangle {
+            height: 54px;
+            background: #ffffff;
+            border-color: #d8dedb;
+            border-width: 1px;
+            border-radius: 5px;
+
+            VerticalLayout {
+                padding: 9px;
+                spacing: 3px;
+
+                Text {
+                    text: "最近事件";
+                    color: #6a736f;
+                    font-size: 11px;
+                }
+
+                Text {
+                    text: root.event-text;
+                    color: #29312d;
+                    font-size: 12px;
+                    overflow: elide;
+                }
+            }
+        }
+    }
+}

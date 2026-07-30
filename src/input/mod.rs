@@ -2,7 +2,10 @@ mod channel;
 mod geometry;
 mod hotkey;
 mod mapping;
-#[cfg(target_os = "macos")]
+#[cfg(all(
+    any(target_os = "macos", target_os = "windows"),
+    feature = "input-screen-mock"
+))]
 pub mod mock;
 #[cfg(all(target_os = "macos", feature = "input-macos-trackpad-debug"))]
 pub mod trackpad_debug;

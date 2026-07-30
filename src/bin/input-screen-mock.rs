@@ -1,17 +1,20 @@
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use anyhow::Result;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use clap::Parser;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::str::FromStr;
-#[cfg(target_os = "macos")]
-use synly::input::mock::{MacosMockOptions, run_macos_mock};
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use synly::input::mock::{ScreenMockOptions, run_screen_mock};
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 use synly::input::{Hotkey, ScreenEdge};
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 #[derive(Debug, Parser)]
-#[command(name = "input-macos-mock", about = "使用 GUI mock 验证 macOS 输入捕获和虚拟屏幕切换")]
+#[command(
+    name = "input-screen-mock",
+    about = "使用 Slint 无连接虚拟屏幕验证本机输入捕获和返回"
+)]
 struct Cli {
     #[arg(long, value_enum, default_value = "right", help = "从本机接入 mock 的屏幕边缘")]
     edge: ScreenEdge,
@@ -23,7 +26,7 @@ struct Cli {
     height: i32,
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -33,7 +36,7 @@ fn main() -> Result<()> {
         .with_target(true)
         .init();
     let cli = Cli::parse();
-    run_macos_mock(MacosMockOptions {
+    run_screen_mock(ScreenMockOptions {
         edge: cli.edge,
         hotkey: Hotkey::from_str(&cli.hotkey)?,
         width: cli.width,
@@ -41,7 +44,7 @@ fn main() -> Result<()> {
     })
 }
 
-#[cfg(not(target_os = "macos"))]
-fn main() {
-    tracing::error!("input-macos-mock 只支持 macOS");
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn main() -> anyhow::Result<()> {
+    anyhow::bail!("input-screen-mock 只支持 macOS 和 Windows")
 }

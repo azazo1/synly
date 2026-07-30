@@ -27,10 +27,10 @@ build:
 install:
     cargo install --path .
 
-# just input-macos-mock --edge right
-# 使用 GUI mock 验证 macOS 输入捕获和虚拟屏幕切换.
-input-macos-mock *args:
-    cargo run --features input-macos-mock --bin input-macos-mock -- {{ args }}
+# just input-screen-mock --edge right
+# 使用 Slint 虚拟屏幕验证当前平台的输入捕获和返回.
+input-screen-mock *args:
+    cargo run --features input-screen-mock --bin input-screen-mock -- {{ args }}
 
 # 完全捕获 macOS trackpad 事件并输出诊断日志, 按任意键退出.
 input-macos-trackpad-debug:

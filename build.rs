@@ -18,6 +18,7 @@ struct ResolvedOpusLib {
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=ui/app.slint");
+    println!("cargo:rerun-if-changed=ui/input-screen-mock.slint");
     println!("cargo:rerun-if-changed=assets/windows/synly.manifest");
     slint_build::compile("ui/app.slint").expect("failed to compile Slint UI");
     for key in [
@@ -383,10 +384,7 @@ fn is_opus_lib_name(lib_name: &str) -> bool {
 
 fn build_macos_native() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR is missing"));
-    let sources = [
-        PathBuf::from("native/macos_audio.m"),
-        PathBuf::from("native/macos_input_mock.m"),
-    ];
+    let sources = [PathBuf::from("native/macos_audio.m")];
     let objects = sources
         .iter()
         .map(|source| {
@@ -429,7 +427,6 @@ fn build_macos_native() {
     println!("cargo:rustc-link-lib=static=macos_audio");
     println!("cargo:rustc-link-lib=framework=Foundation");
     println!("cargo:rustc-link-lib=framework=AVFoundation");
-    println!("cargo:rustc-link-lib=framework=AppKit");
     println!("cargo:rustc-link-lib=framework=AudioToolbox");
     println!("cargo:rustc-link-lib=framework=CoreMedia");
     println!("cargo:rustc-link-lib=framework=CoreAudio");

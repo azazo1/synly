@@ -6,14 +6,14 @@ default-run = "synly"
 
 [features]
 default = []
-input-macos-mock = []
+input-screen-mock = []
 input-macos-trackpad-debug = []
 input-receiver-mock = []
 
 [[bin]]
-name = "input-macos-mock"
-path = "src/bin/input-macos-mock.rs"
-required-features = ["input-macos-mock"]
+name = "input-screen-mock"
+path = "src/bin/input-screen-mock.rs"
+required-features = ["input-screen-mock"]
 
 [[bin]]
 name = "input-macos-trackpad-debug"
