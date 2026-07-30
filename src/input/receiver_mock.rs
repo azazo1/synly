@@ -2,7 +2,7 @@ use super::platform;
 use super::protocol::InputMessage;
 use super::runtime;
 use super::{
-    DesktopLayout, Hotkey, InputMode, KeySnapshot, ModifierMask, ScreenEdge,
+    DesktopLayout, Hotkey, InputMode, InputPlatform, KeySnapshot, ModifierMask, ScreenEdge,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -63,11 +63,14 @@ pub async fn run_receiver_mock(options: ReceiverMockOptions) -> Result<()> {
     let (mut reader, mut writer) = stream.into_split();
     write_mock_frame(
         &mut writer,
-        &MockFrame::Input(InputMessage::Layout(local_layout.clone())),
+        &MockFrame::Input(InputMessage::Hello {
+            platform: InputPlatform::current(),
+            layout: local_layout.clone(),
+        }),
     )
     .await?;
     let remote_layout = match read_mock_frame(&mut reader).await? {
-        MockFrame::Input(InputMessage::Layout(layout)) => layout,
+        MockFrame::Input(InputMessage::Hello { layout, .. }) => layout,
         _ => bail!("mock 控制端未先发送桌面布局"),
     };
     tracing::info!(
@@ -134,11 +137,14 @@ pub async fn run_controller_mock(options: ControllerMockOptions) -> Result<()> {
     }])?;
     write_mock_frame(
         &mut writer,
-        &MockFrame::Input(InputMessage::Layout(mock_layout)),
+        &MockFrame::Input(InputMessage::Hello {
+            platform: InputPlatform::current(),
+            layout: mock_layout,
+        }),
     )
     .await?;
     let remote_layout = match read_mock_frame(&mut reader).await? {
-        MockFrame::Input(InputMessage::Layout(layout)) => layout,
+        MockFrame::Input(InputMessage::Hello { layout, .. }) => layout,
         _ => bail!("真实输入被控端未先发送桌面布局"),
     };
     tracing::info!(

@@ -217,9 +217,9 @@ pub fn cli_from_runtime_config(
         no_sync_delete: !runtime.sync_delete,
         clipboard: Some(runtime.clipboard_mode),
         audio: Some(runtime.audio_mode),
-        input_mode: Some(runtime.input_mode),
-        input_edge: (runtime.input_mode == InputMode::Send).then_some(runtime.input_edge),
-        input_hotkey: runtime.input_hotkey.clone(),
+        input_mode: Some(runtime.input.mode),
+        input_edge: (runtime.input.mode == InputMode::Send).then_some(runtime.input.edge),
+        input_hotkey: runtime.input.hotkey.clone(),
         initial: runtime.initial,
         interval_secs: runtime.interval_secs.max(1),
         max_folder_depth: runtime.max_folder_depth,
@@ -271,6 +271,9 @@ fn collect_runtime_options_from_cli(cli: Cli, config: &SynlyConfig) -> Result<Ru
         mode: input_mode,
         edge: cli.input_edge.unwrap_or(ScreenEdge::Right),
         hotkey: cli.input_hotkey.parse()?,
+        reverse_mouse_wheel: config.runtime.input.reverse_mouse_wheel,
+        reverse_trackpad: config.runtime.input.reverse_trackpad,
+        key_mapping: config.runtime.input.key_mapping.clone(),
     };
     let clipboard = ClipboardRuntimeOptions {
         max_file_bytes: config.clipboard.max_file_bytes,
@@ -955,8 +958,8 @@ mod tests {
             device: DeviceConfig {
                 device_id: Uuid::nil(),
                 device_name: "test-device".to_string(),
-                identity_private_key: None,
-                identity_public_key: None,
+                identity_private_key: String::new(),
+                identity_public_key: String::new(),
             },
             clipboard: ClipboardConfig::default(),
             transfer: TransferConfig::default(),

@@ -1,4 +1,4 @@
-use super::{CaptureContext, InputBackend, NativeEvent};
+use super::{CaptureContext, InputBackend, NativeEvent, ScrollSource};
 use crate::input::{DesktopLayout, DisplayRect, InputMode, KeySnapshot, ModifierMask, Point};
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeSet;
@@ -62,6 +62,7 @@ const FIELD_MOUSE_DELTA_X: u32 = 4;
 const FIELD_MOUSE_DELTA_Y: u32 = 5;
 const FIELD_SCROLL_DELTA_Y: u32 = 11;
 const FIELD_SCROLL_DELTA_X: u32 = 12;
+const FIELD_SCROLL_IS_CONTINUOUS: u32 = 88;
 const FIELD_KEY_AUTOREPEAT: u32 = 8;
 const FIELD_KEY_CODE: u32 = 9;
 const FIELD_SOURCE_USER_DATA: u32 = 42;
@@ -339,8 +340,11 @@ unsafe extern "C" fn event_callback(
         EVENT_SCROLL => {
             let x = unsafe { CGEventGetIntegerValueField(event, FIELD_SCROLL_DELTA_X) } as i32;
             let y = unsafe { CGEventGetIntegerValueField(event, FIELD_SCROLL_DELTA_Y) } as i32;
+            let source = scroll_source(unsafe {
+                CGEventGetIntegerValueField(event, FIELD_SCROLL_IS_CONTINUOUS)
+            });
             if active {
-                state.context.emit_reliable(NativeEvent::Wheel { x, y });
+                state.context.emit_reliable(NativeEvent::Wheel { x, y, source });
                 ptr::null_mut()
             } else {
                 event
@@ -397,6 +401,14 @@ unsafe extern "C" fn event_callback(
 
 fn suppress_local_gesture(event_type: CGEventType, capture_active: bool) -> bool {
     capture_active && event_type == EVENT_GESTURE
+}
+
+fn scroll_source(is_continuous: i64) -> ScrollSource {
+    if is_continuous != 0 {
+        ScrollSource::Trackpad
+    } else {
+        ScrollSource::MouseWheel
+    }
 }
 
 fn usage_is_modifier(usage: u16) -> bool {
@@ -747,9 +759,9 @@ fn hid_to_mac_keycode(usage: u16) -> Option<u16> {
 mod tests {
     use super::{
         CaptureContext, EVENT_GESTURE, EVENT_SCROLL, MacBackend, MacState, NativeEvent,
-        mac_mouse_button, suppress_local_gesture,
+        mac_mouse_button, scroll_source, suppress_local_gesture,
     };
-    use crate::input::platform::{InputBackend, MotionAccumulator};
+    use crate::input::platform::{InputBackend, MotionAccumulator, ScrollSource};
     use crate::input::{Hotkey, InputMode, ModifierMask};
     use std::collections::BTreeSet;
     use std::sync::atomic::AtomicBool;
@@ -770,6 +782,12 @@ mod tests {
         assert!(suppress_local_gesture(EVENT_GESTURE, true));
         assert!(!suppress_local_gesture(EVENT_GESTURE, false));
         assert!(!suppress_local_gesture(EVENT_SCROLL, true));
+    }
+
+    #[test]
+    fn continuous_scroll_events_are_classified_as_trackpad_input() {
+        assert_eq!(scroll_source(0), ScrollSource::MouseWheel);
+        assert_eq!(scroll_source(1), ScrollSource::Trackpad);
     }
 
     #[test]

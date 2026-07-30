@@ -1,6 +1,9 @@
 use super::platform;
 use super::protocol::InputMessage;
-use super::{DesktopLayout, DisplayRect, Hotkey, InputMode, Point, ScreenEdge};
+use super::{
+    DesktopLayout, DisplayRect, Hotkey, InputMode, InputPlatform, InputRuntimeOptions,
+    KeyMappingConfig, Point, ScreenEdge,
+};
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeSet;
 use std::ffi::CString;
@@ -124,13 +127,22 @@ async fn run_mock_worker(options: MacosMockOptions, stop: Arc<AtomicBool>) -> Re
     let observed_motion = Arc::clone(&platform.motion);
     let (incoming_tx, mut incoming_rx) = mpsc::channel(256);
     let (outgoing_tx, outgoing_rx) = mpsc::channel(256);
+    let runtime_options = InputRuntimeOptions {
+        mode: InputMode::Send,
+        edge: options.edge,
+        hotkey: options.hotkey,
+        reverse_mouse_wheel: false,
+        reverse_trackpad: false,
+        key_mapping: KeyMappingConfig::default(),
+    };
     let sender = super::runtime::run_sender(
         &mut incoming_rx,
         &outgoing_tx,
         &mut platform,
         local_layout,
-        mock_layout.clone(),
         options.edge,
+        InputPlatform::current(),
+        &runtime_options,
     );
     tokio::pin!(sender);
     let peer = run_mock_peer(
@@ -262,7 +274,7 @@ async fn run_mock_peer(
                         last_event = format!("滚轮 x={x}, y={y}");
                     }
                     InputMessage::Heartbeat { .. } => {}
-                    InputMessage::Layout(_) | InputMessage::Proof { .. } | InputMessage::Return { .. }
+                    InputMessage::Hello { .. } | InputMessage::Proof { .. } | InputMessage::Return { .. }
                     | InputMessage::Deactivate { .. }
                     | InputMessage::Key { .. } | InputMessage::Button { .. }
                     | InputMessage::Motion { .. } | InputMessage::Wheel { .. } => {}

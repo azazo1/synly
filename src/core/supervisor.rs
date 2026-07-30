@@ -122,7 +122,7 @@ impl AppSupervisor {
         if !self.snapshot.settings.ui.first_run_completed {
             self.snapshot.settings.ui.first_run_completed = true;
             self.config.ui.first_run_completed = true;
-            self.save_config();
+            self.save_settings();
             self.publish();
         }
         self.spawn_discovery_loop();
@@ -201,7 +201,7 @@ impl AppSupervisor {
                 self.snapshot.settings = *settings;
                 self.config = candidate;
                 self.session_pin = session_pin;
-                self.save_config();
+                self.save_settings();
                 if discovery_changed {
                     self.spawn_discovery_loop();
                 }
@@ -226,7 +226,7 @@ impl AppSupervisor {
                         {
                             applied.clipboard_mode = previous.clipboard_mode;
                             applied.audio_mode = previous.audio_mode;
-                            applied.input_mode = previous.input_mode;
+                            applied.input.mode = previous.input.mode;
                         }
                         self.snapshot.applied = Some(applied);
                         self.snapshot.pending = capability_change
@@ -239,7 +239,7 @@ impl AppSupervisor {
             AppCommand::StartHosting => {
                 self.snapshot.desired.connection = Some(ConnectionPreference::Host);
                 self.config.runtime = self.snapshot.desired.clone();
-                self.save_config();
+                self.save_settings();
                 self.restart_session().await;
             }
             AppCommand::RefreshDiscovery => {
@@ -250,13 +250,13 @@ impl AppSupervisor {
                 self.snapshot.desired.connection = Some(ConnectionPreference::Join);
                 self.snapshot.desired.peer_query = peer;
                 self.config.runtime = self.snapshot.desired.clone();
-                self.save_config();
+                self.save_settings();
                 self.restart_session().await;
             }
             AppCommand::SetClipboardMode(mode) => {
                 self.snapshot.desired.clipboard_mode = mode;
                 self.config.runtime.clipboard_mode = mode;
-                self.save_config();
+                self.save_settings();
                 if self.session.is_some() {
                     self.snapshot.pending = Some(self.snapshot.desired.clone());
                 }
@@ -267,7 +267,7 @@ impl AppSupervisor {
             AppCommand::SetAudioMode(mode) => {
                 self.snapshot.desired.audio_mode = mode;
                 self.config.runtime.audio_mode = mode;
-                self.save_config();
+                self.save_settings();
                 if self.session.is_some() {
                     self.snapshot.pending = Some(self.snapshot.desired.clone());
                 }
@@ -276,9 +276,9 @@ impl AppSupervisor {
                 self.publish();
             }
             AppCommand::SetInputMode(mode) => {
-                self.snapshot.desired.input_mode = mode;
-                self.config.runtime.input_mode = mode;
-                self.save_config();
+                self.snapshot.desired.input.mode = mode;
+                self.config.runtime.input.mode = mode;
+                self.save_settings();
                 if self.session.is_some() {
                     self.snapshot.pending = Some(self.snapshot.desired.clone());
                 }
@@ -289,7 +289,7 @@ impl AppSupervisor {
             AppCommand::SelectPaths(paths) => {
                 self.snapshot.desired.paths = paths;
                 self.config.runtime = self.snapshot.desired.clone();
-                self.save_config();
+                self.save_settings();
                 if self.session.is_some() {
                     self.restart_session().await;
                 } else {
@@ -313,7 +313,7 @@ impl AppSupervisor {
             }
             AppCommand::RevokeTrust(device_id) => {
                 if self.config.revoke_trusted_device(device_id) {
-                    self.save_config();
+                    self.save_trusted_devices();
                     self.snapshot.trusted_devices = self.config.trusted_devices.clone();
                     if self.snapshot.current_peer.as_deref() == Some(&device_id.to_string()) {
                         self.stop_session().await;
@@ -344,7 +344,7 @@ impl AppSupervisor {
                 self.snapshot.settings.ui.window_height = height;
                 self.config.ui.window_width = width;
                 self.config.ui.window_height = height;
-                self.save_config();
+                self.save_settings();
                 self.publish();
             }
             AppCommand::Shutdown => return true,
@@ -447,12 +447,12 @@ impl AppSupervisor {
                 if let Some(applied) = self.snapshot.applied.as_mut() {
                     applied.clipboard_mode = local.clipboard_mode;
                     applied.audio_mode = local.audio_mode;
-                    applied.input_mode = local.input_mode;
+                    applied.input.mode = local.input_mode;
                 }
                 if acknowledged
                     && local.clipboard_mode == self.snapshot.desired.clipboard_mode
                     && local.audio_mode == self.snapshot.desired.audio_mode
-                    && local.input_mode == self.snapshot.desired.input_mode
+                    && local.input_mode == self.snapshot.desired.input.mode
                 {
                     self.snapshot.pending = None;
                 }
@@ -585,7 +585,7 @@ impl AppSupervisor {
         RuntimeCapabilities {
             clipboard_mode: self.snapshot.desired.clipboard_mode,
             audio_mode: self.snapshot.desired.audio_mode,
-            input_mode: self.snapshot.desired.input_mode,
+            input_mode: self.snapshot.desired.input.mode,
         }
     }
 
@@ -611,7 +611,7 @@ impl AppSupervisor {
 
     fn restart_input_backend_if_active(&mut self) {
         if self.session.is_none()
-            || self.snapshot.desired.input_mode == crate::input::InputMode::Off
+            || self.snapshot.desired.input.mode == crate::input::InputMode::Off
         {
             return;
         }
@@ -691,12 +691,15 @@ impl AppSupervisor {
         });
     }
 
-    fn save_config(&mut self) {
-        if let Ok(latest) = SynlyConfig::load_or_create() {
-            self.config.trusted_devices = latest.trusted_devices;
-        }
-        if let Err(error) = self.config.save() {
+    fn save_settings(&mut self) {
+        if let Err(error) = self.config.save_settings() {
             self.set_error(format!("无法保存设置: {error:#}"));
+        }
+    }
+
+    fn save_trusted_devices(&mut self) {
+        if let Err(error) = self.config.save_trusted_devices() {
+            self.set_error(format!("无法保存可信设备: {error:#}"));
         }
         self.snapshot.trusted_devices = self.config.trusted_devices.clone();
     }
@@ -767,7 +770,7 @@ fn capability_fields_changed(
     applied.is_some_and(|applied| {
         applied.clipboard_mode != desired.clipboard_mode
             || applied.audio_mode != desired.audio_mode
-            || applied.input_mode != desired.input_mode
+            || applied.input.mode != desired.input.mode
     })
 }
 
@@ -826,7 +829,7 @@ mod tests {
         let mut hot = current.clone();
         hot.clipboard_mode = ClipboardMode::Both;
         hot.audio_mode = AudioMode::Receive;
-        hot.input_mode = InputMode::Receive;
+        hot.input.mode = InputMode::Receive;
         hot.interval_secs += 1;
         hot.sync_delete = !hot.sync_delete;
         hot.instance_name = "desk-b".to_string();
@@ -877,7 +880,7 @@ mod tests {
     fn unavailable_elevated_agent_does_not_disable_base_input() {
         let (mut supervisor, _) = AppSupervisor::new(test_config());
         supervisor.snapshot.input_elevation_ready = false;
-        supervisor.snapshot.desired.input_mode = InputMode::Receive;
+        supervisor.snapshot.desired.input.mode = InputMode::Receive;
 
         assert_eq!(
             supervisor.current_capabilities().input_mode,
@@ -913,6 +916,9 @@ mod tests {
                 mode: InputMode::Off,
                 edge: crate::input::ScreenEdge::Right,
                 hotkey: crate::input::Hotkey::DEFAULT.parse().unwrap(),
+                reverse_mouse_wheel: false,
+                reverse_trackpad: false,
+                key_mapping: crate::input::KeyMappingConfig::default(),
             },
             clipboard: crate::clipboard::ClipboardRuntimeOptions {
                 max_file_bytes: 1,
@@ -950,8 +956,8 @@ mod tests {
             device: DeviceConfig {
                 device_id: Uuid::nil(),
                 device_name: "test-device".to_string(),
-                identity_private_key: None,
-                identity_public_key: None,
+                identity_private_key: String::new(),
+                identity_public_key: String::new(),
             },
             clipboard: ClipboardConfig::default(),
             transfer: TransferConfig::default(),

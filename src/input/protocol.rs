@@ -1,4 +1,4 @@
-use super::{DesktopLayout, InputChannelRole, ModifierMask, ScreenEdge};
+use super::{DesktopLayout, InputChannelRole, InputPlatform, ModifierMask, ScreenEdge};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -18,7 +18,10 @@ pub enum InputMessage {
         role: InputChannelRole,
         proof: [u8; 32],
     },
-    Layout(DesktopLayout),
+    Hello {
+        platform: InputPlatform,
+        layout: DesktopLayout,
+    },
     Activate {
         generation: u64,
         source_edge: ScreenEdge,
@@ -94,12 +97,33 @@ where
 #[cfg(test)]
 mod tests {
     use super::{InputMessage, MAX_INPUT_FRAME_LEN, read_message, write_message};
+    use crate::input::{DesktopLayout, DisplayRect, InputPlatform};
     use tokio::io::{AsyncWriteExt, duplex};
 
     #[tokio::test]
     async fn input_messages_roundtrip() {
         let (mut left, mut right) = duplex(4096);
         let message = InputMessage::Motion { generation: 7, dx: -12, dy: 34 };
+        let expected = message.clone();
+        let write = tokio::spawn(async move { write_message(&mut left, &message).await });
+        let actual = read_message(&mut right).await.unwrap();
+        write.await.unwrap().unwrap();
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn hello_roundtrip_preserves_platform_and_layout() {
+        let (mut left, mut right) = duplex(4096);
+        let message = InputMessage::Hello {
+            platform: InputPlatform::Windows,
+            layout: DesktopLayout::new(vec![DisplayRect {
+                x: -1920,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            }])
+            .unwrap(),
+        };
         let expected = message.clone();
         let write = tokio::spawn(async move { write_message(&mut left, &message).await });
         let actual = read_message(&mut right).await.unwrap();

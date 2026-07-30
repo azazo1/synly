@@ -1013,7 +1013,7 @@ async fn handle_trusted_incoming_connection(
     }
 
     config.note_trusted_device_session(payload.client.device_id, &payload.client.device_name);
-    config.save()?;
+    config.save_trusted_devices()?;
 
     let tls_stream: TlsStream<TcpStream> = server_stream.into();
     Ok(Some(AuthenticatedSession {
@@ -1406,7 +1406,7 @@ async fn handle_bootstrap_incoming_connection(
             payload.client.identity_public_key.clone(),
             payload.client.tls_root_certificate.clone(),
         );
-        config.save()?;
+        config.save_trusted_devices()?;
         if trust_established {
             tracing::info!("已保存对侧身份和 TLS 根证书, 后续连接将使用长期 mTLS");
         } else {
@@ -1580,7 +1580,7 @@ where
     };
 
     config.note_trusted_device_session(remote.device_id, &remote.device_name);
-    config.save()?;
+    config.save_trusted_devices()?;
 
     let tls_stream: TlsStream<TcpStream> = client_stream.into();
     print_connected_peer(&remote, &agreement, &remote_workspace, options.input_mode)?;
@@ -1809,7 +1809,7 @@ async fn connect_to_untrusted_peer(
                 remote.identity_public_key.clone(),
                 remote.tls_root_certificate.clone(),
             );
-            config.save()?;
+            config.save_trusted_devices()?;
             if options.pairing.trust_device {
                 tracing::info!("服务端已信任本机, 已按 --trust-device 保存对侧身份");
             } else if trust_established {
@@ -2123,6 +2123,9 @@ fn input_task_restart_required(
 ) -> bool {
     previous.edge != next.edge
         || previous.hotkey != next.hotkey
+        || previous.reverse_mouse_wheel != next.reverse_mouse_wheel
+        || previous.reverse_trackpad != next.reverse_trackpad
+        || previous.key_mapping != next.key_mapping
         || previous_backend_generation != next_backend_generation
 }
 
@@ -4635,6 +4638,9 @@ mod tests {
             mode: InputMode::Receive,
             edge: ScreenEdge::Right,
             hotkey: Hotkey::DEFAULT.parse().unwrap(),
+            reverse_mouse_wheel: false,
+            reverse_trackpad: false,
+            key_mapping: crate::input::KeyMappingConfig::default(),
         };
 
         assert!(!input_task_restart_required(&input, &input, 3, 3));
@@ -5387,8 +5393,8 @@ mod tests {
             device: DeviceConfig {
                 device_id: Uuid::nil(),
                 device_name: "local-device".to_string(),
-                identity_private_key: None,
-                identity_public_key: None,
+                identity_private_key: String::new(),
+                identity_public_key: String::new(),
             },
             clipboard: ClipboardConfig::default(),
             transfer: TransferConfig::default(),

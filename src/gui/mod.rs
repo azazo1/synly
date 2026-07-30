@@ -44,10 +44,7 @@ pub fn run(config: SynlyConfig) -> Result<()> {
     runtime.spawn(supervisor.run());
 
     let window = AppWindow::new().context("failed to create Slint main window")?;
-    window.window().set_size(restored_window_size(
-        &window,
-        &config.ui,
-    ));
+    window.window().set_size(restored_window_size(&config.ui));
     let _single_instance_guard =
         single_instance::SingleInstanceGuard::start(listener, window.as_weak())?;
     let tray = tray::TrayController::new(&window, &handle);
@@ -158,7 +155,8 @@ fn wire_window_callbacks(
     let weak = window.as_weak();
     window.on_apply_settings(move || {
         if let Some(window) = weak.upgrade() {
-            match settings_from_window(&window) {
+            let current_input = snapshots.borrow().desired.input.clone();
+            match settings_from_window(&window, &current_input) {
                 Ok((runtime, settings, session_pin)) => {
                     let enabling_delete = runtime.sync_delete
                         && !snapshots.borrow().desired.sync_delete;
@@ -481,7 +479,7 @@ fn apply_snapshot(
     window.set_input_elevation_ready(snapshot.input_elevation_ready);
     window.set_clipboard_mode_index(clipboard_mode_index(snapshot.desired.clipboard_mode));
     window.set_audio_mode_index(audio_mode_index(snapshot.desired.audio_mode));
-    window.set_input_mode_index(input_mode_index(snapshot.desired.input_mode));
+    window.set_input_mode_index(input_mode_index(snapshot.desired.input.mode));
     window.set_desired_summary(runtime_capability_summary(&snapshot.desired).into());
     window.set_applied_summary(
         snapshot
@@ -719,9 +717,9 @@ fn apply_settings_to_window(
     );
     window.set_clipboard_mode_index(clipboard_mode_index(runtime.clipboard_mode));
     window.set_audio_mode_index(audio_mode_index(runtime.audio_mode));
-    window.set_input_mode_index(input_mode_index(runtime.input_mode));
-    window.set_input_edge_index(input_edge_index(runtime.input_edge));
-    window.set_input_hotkey(runtime.input_hotkey.clone().into());
+    window.set_input_mode_index(input_mode_index(runtime.input.mode));
+    window.set_input_edge_index(input_edge_index(runtime.input.edge));
+    window.set_input_hotkey(runtime.input.hotkey.clone().into());
     window.set_accept_untrusted(runtime.accept);
     window.set_trust_device(runtime.trust_device);
     window.set_trusted_only(runtime.trusted_only);
@@ -786,7 +784,10 @@ fn apply_settings_to_window(
     window.set_log_level_index(log_level_index(settings.ui.log_level));
 }
 
-fn settings_from_window(window: &AppWindow) -> Result<(RuntimeConfig, AppSettings, Option<String>)> {
+fn settings_from_window(
+    window: &AppWindow,
+    current_input: &crate::config::InputConfig,
+) -> Result<(RuntimeConfig, AppSettings, Option<String>)> {
     let port_text = window.get_port_text().trim().to_string();
     let port = if port_text.is_empty() {
         None
@@ -823,9 +824,14 @@ fn settings_from_window(window: &AppWindow) -> Result<(RuntimeConfig, AppSetting
         sync_delete: window.get_sync_delete(),
         clipboard_mode: clipboard_mode_from_index(window.get_clipboard_mode_index()),
         audio_mode: audio_mode_from_index(window.get_audio_mode_index()),
-        input_mode: input_mode_from_index(window.get_input_mode_index()),
-        input_edge: input_edge_from_index(window.get_input_edge_index()),
-        input_hotkey: window.get_input_hotkey().trim().to_string(),
+        input: crate::config::InputConfig {
+            mode: input_mode_from_index(window.get_input_mode_index()),
+            edge: input_edge_from_index(window.get_input_edge_index()),
+            hotkey: window.get_input_hotkey().trim().to_string(),
+            reverse_mouse_wheel: current_input.reverse_mouse_wheel,
+            reverse_trackpad: current_input.reverse_trackpad,
+            key_mapping: current_input.key_mapping.clone(),
+        },
         interval_secs: window.get_interval_secs().max(1) as u64,
         max_folder_depth: (window.get_max_depth() >= 0)
             .then_some(window.get_max_depth() as usize),
@@ -918,7 +924,7 @@ fn save_window_state(
     );
 }
 
-fn restored_window_size(window: &AppWindow, ui: &UiConfig) -> LogicalSize {
+fn restored_window_size(ui: &UiConfig) -> LogicalSize {
     if !ui.first_run_completed {
         return LogicalSize::new(DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT);
     }
@@ -926,21 +932,10 @@ fn restored_window_size(window: &AppWindow, ui: &UiConfig) -> LogicalSize {
     normalized_restored_window_size(
         ui.window_width as f32,
         ui.window_height as f32,
-        window.window().scale_factor(),
     )
 }
 
-fn normalized_restored_window_size(
-    mut width: f32,
-    mut height: f32,
-    scale_factor: f32,
-) -> LogicalSize {
-    if width > MAX_WINDOW_WIDTH || height > MAX_WINDOW_HEIGHT {
-        let scale_factor = scale_factor.max(1.0);
-        width /= scale_factor;
-        height /= scale_factor;
-    }
-
+fn normalized_restored_window_size(width: f32, height: f32) -> LogicalSize {
     clamped_window_size(width, height)
 }
 
@@ -992,7 +987,7 @@ fn runtime_form_fields_changed(previous: &RuntimeConfig, next: &RuntimeConfig) -
     let mut previous = previous.clone();
     previous.clipboard_mode = next.clipboard_mode;
     previous.audio_mode = next.audio_mode;
-    previous.input_mode = next.input_mode;
+    previous.input.mode = next.input.mode;
     &previous != next
 }
 
@@ -1008,7 +1003,7 @@ fn runtime_capability_summary(runtime: &RuntimeConfig) -> String {
         runtime.file_sync_mode.label(),
         runtime.clipboard_mode.label(),
         runtime.audio_mode.label(),
-        runtime.input_mode.label()
+        runtime.input.mode.label()
     )
 }
 
@@ -1162,8 +1157,8 @@ mod tests {
     }
 
     #[test]
-    fn legacy_physical_window_size_is_migrated_and_clamped() {
-        let size = normalized_restored_window_size(2880.0, 1568.0, 2.0);
+    fn oversized_logical_window_size_is_clamped() {
+        let size = normalized_restored_window_size(2880.0, 1568.0);
 
         assert_eq!(size.width, 1180.0);
         assert_eq!(size.height, 760.0);
@@ -1171,7 +1166,7 @@ mod tests {
 
     #[test]
     fn logical_window_size_is_preserved_inside_supported_bounds() {
-        let size = normalized_restored_window_size(980.0, 640.0, 2.0);
+        let size = normalized_restored_window_size(980.0, 640.0);
 
         assert_eq!(size.width, 980.0);
         assert_eq!(size.height, 640.0);

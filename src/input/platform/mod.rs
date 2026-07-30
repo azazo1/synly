@@ -29,10 +29,17 @@ pub enum NativeEvent {
     Wheel {
         x: i32,
         y: i32,
+        source: ScrollSource,
     },
     Emergency,
     ReliableQueueOverflow,
     Failed(String),
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ScrollSource {
+    MouseWheel,
+    Trackpad,
 }
 
 pub trait InputBackend: Send + Sync {

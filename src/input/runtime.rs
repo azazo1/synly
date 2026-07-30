@@ -1,7 +1,10 @@
 use super::channel::{InputChannelOffer, InputHostChannel};
-use super::platform::{self, NativeEvent};
+use super::mapping::KeyMapper;
+use super::platform::{self, NativeEvent, ScrollSource};
 use super::protocol::{InputMessage, read_message, write_message};
-use super::{Hotkey, InputMode, KeySnapshot, LocalInputRole, ScreenEdge};
+use super::{
+    Hotkey, InputMode, InputPlatform, KeyMappingConfig, KeySnapshot, LocalInputRole, ScreenEdge,
+};
 use anyhow::{Context, Result, bail};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -30,6 +33,9 @@ pub struct InputRuntimeOptions {
     pub mode: InputMode,
     pub edge: ScreenEdge,
     pub hotkey: Hotkey,
+    pub reverse_mouse_wheel: bool,
+    pub reverse_trackpad: bool,
+    pub key_mapping: KeyMappingConfig,
 }
 
 #[derive(Clone)]
@@ -113,7 +119,7 @@ pub async fn run_input_session(
                         if let Err(err) = run_established(
                             stream,
                             local_role,
-                            options.edge,
+                            &options,
                             &mut platform,
                         )
                         .await
@@ -147,7 +153,7 @@ pub async fn run_input_session(
                 {
                     Ok(Ok(stream)) => {
                         delay = RECONNECT_MIN;
-                        run_established(stream, local_role, options.edge, &mut platform).await
+                        run_established(stream, local_role, &options, &mut platform).await
                     }
                     Ok(Err(err)) => Err(err),
                     Err(_) => Err(anyhow::anyhow!("输入辅助连接认证超时")),
@@ -183,10 +189,11 @@ fn platform_is_terminal(platform: &platform::PlatformHandle) -> bool {
 async fn run_established(
     stream: TlsStream<TcpStream>,
     local_role: LocalInputRole,
-    source_edge: ScreenEdge,
+    options: &InputRuntimeOptions,
     platform: &mut platform::PlatformHandle,
 ) -> Result<()> {
     let local_layout = platform.backend.layout()?;
+    let local_platform = InputPlatform::current();
     let (mut reader, mut writer) = tokio::io::split(stream);
     let (tx, mut rx) = mpsc::channel::<InputMessage>(256);
     let writer_task = tokio::spawn(async move {
@@ -196,9 +203,13 @@ async fn run_established(
         Result::<()>::Ok(())
     });
     let _writer_abort = AbortOnDrop(writer_task.abort_handle());
-    tx.send(InputMessage::Layout(local_layout.clone())).await?;
-    let remote_layout = match read_message(&mut reader).await? {
-        InputMessage::Layout(layout) => layout,
+    tx.send(InputMessage::Hello {
+        platform: local_platform,
+        layout: local_layout.clone(),
+    })
+    .await?;
+    let (remote_platform, remote_layout) = match read_message(&mut reader).await? {
+        InputMessage::Hello { platform, layout } => (platform, layout),
         InputMessage::Proof { .. } => bail!("输入通道认证完成后收到了重复证明"),
         _ => bail!("输入通道在布局交换前收到了事件"),
     };
@@ -218,8 +229,9 @@ async fn run_established(
             &tx,
             platform,
             local_layout,
-            remote_layout,
-            source_edge,
+            options.edge,
+            remote_platform,
+            options,
         )
         .await,
         LocalInputRole::Receive => {
@@ -348,9 +360,15 @@ pub(super) async fn run_sender(
     tx: &mpsc::Sender<InputMessage>,
     platform: &mut platform::PlatformHandle,
     local_layout: super::DesktopLayout,
-    _remote_layout: super::DesktopLayout,
     source_edge: ScreenEdge,
+    remote_platform: InputPlatform,
+    options: &InputRuntimeOptions,
 ) -> Result<()> {
+    let mut key_mapper = KeyMapper::new(
+        &options.key_mapping,
+        InputPlatform::current(),
+        remote_platform,
+    )?;
     let mut generation = 0u64;
     let mut active = false;
     let mut activation_confirmed = false;
@@ -387,6 +405,7 @@ pub(super) async fn run_sender(
                             deactivate_sender(platform, &local_layout, source_edge, edge_position)?;
                             active = false;
                             activation_confirmed = false;
+                            key_mapper.clear();
                             recovery.disarm();
                             cooldown_until = Instant::now() + RETURN_COOLDOWN;
                             tracing::info!(generation, "控制已从对端返回本机");
@@ -396,6 +415,7 @@ pub(super) async fn run_sender(
                             recovery.recover();
                             active = false;
                             activation_confirmed = false;
+                            key_mapper.clear();
                             cooldown_until = Instant::now() + RETURN_COOLDOWN;
                         }
                     InputMessage::Heartbeat { generation: remote_generation }
@@ -409,7 +429,7 @@ pub(super) async fn run_sender(
                     InputMessage::Heartbeat { .. }
                     | InputMessage::Return { .. }
                     | InputMessage::Deactivate { .. } => {}
-                    InputMessage::Layout(_) => {}
+                    InputMessage::Hello { .. } => {}
                     InputMessage::Proof { .. } => bail!("输入通道收到重复认证消息"),
                     _ => {}
                 }
@@ -421,18 +441,34 @@ pub(super) async fn run_sender(
                             recovery.recover();
                             active = false;
                             activation_confirmed = false;
+                            key_mapper.clear();
                             cooldown_until = Instant::now() + RETURN_COOLDOWN;
                             let _ = tx.try_send(InputMessage::Deactivate { generation });
                             tracing::info!(generation, "紧急热键已收回本机控制");
                         }
                     }
-                    NativeEvent::Key { usage, modifiers, down, repeat } if active => {
-                        enqueue_message(tx, InputMessage::Key { generation, usage, modifiers, down, repeat })?;
+                    NativeEvent::Key { usage, modifiers: _, down, repeat } if active => {
+                        if let Some(mapped) = key_mapper.map_key(usage, down, repeat) {
+                            enqueue_message(tx, InputMessage::Key {
+                                generation,
+                                usage: mapped.usage,
+                                modifiers: mapped.modifiers,
+                                down: mapped.down,
+                                repeat: mapped.repeat,
+                            })?;
+                        }
                     }
                     NativeEvent::Button { button, down } if active => {
                         enqueue_message(tx, InputMessage::Button { generation, button, down })?;
                     }
-                    NativeEvent::Wheel { x, y } if active => {
+                    NativeEvent::Wheel { x, y, source } if active => {
+                        let (x, y) = transform_scroll(
+                            x,
+                            y,
+                            source,
+                            options.reverse_mouse_wheel,
+                            options.reverse_trackpad,
+                        );
                         enqueue_message(tx, InputMessage::Wheel { generation, x, y })?;
                     }
                     NativeEvent::ReliableQueueOverflow => {
@@ -497,7 +533,7 @@ pub(super) async fn run_sender(
                     }
                     if let Some(edge_position) = activation_edge_position {
                         generation = generation.wrapping_add(1).max(1);
-                        let pressed = platform.backend.snapshot();
+                        let pressed = key_mapper.map_snapshot(&platform.backend.snapshot());
                         enqueue_message(tx, InputMessage::Activate { generation, source_edge, edge_position, pressed })?;
                         platform.backend.set_capture(true)?;
                         active = true;
@@ -734,6 +770,7 @@ pub(super) async fn run_receiver(
                             }
                     }
                     InputMessage::Proof { .. } => bail!("输入通道收到重复认证消息"),
+                    InputMessage::Hello { .. } => {}
                     _ => {}
                 }
             }
@@ -775,6 +812,24 @@ pub(super) async fn run_receiver(
                 }
             }
         }
+    }
+}
+
+fn transform_scroll(
+    x: i32,
+    y: i32,
+    source: ScrollSource,
+    reverse_mouse_wheel: bool,
+    reverse_trackpad: bool,
+) -> (i32, i32) {
+    let reverse = match source {
+        ScrollSource::MouseWheel => reverse_mouse_wheel,
+        ScrollSource::Trackpad => reverse_trackpad,
+    };
+    if reverse {
+        (x.saturating_neg(), y.saturating_neg())
+    } else {
+        (x, y)
     }
 }
 
@@ -837,10 +892,15 @@ mod tests {
         ACTIVATION_TIMEOUT, AbortOnDrop, EDGE_INSET, HEARTBEAT_TIMEOUT, ReceiverMotion,
         IncomingMotion, SenderRecoveryGuard, enqueue_message, receiver_motion, run_receiver, run_sender,
         sender_activation_edge_position, sender_heartbeat_timeout, spawn_input_reader,
+        transform_scroll,
     };
     use crate::input::platform::{InputBackend, MotionAccumulator, PlatformHandle};
+    use crate::input::platform::ScrollSource;
     use crate::input::protocol::{InputMessage, write_message};
-    use crate::input::{DesktopLayout, DisplayRect, KeySnapshot, ModifierMask, Point, ScreenEdge};
+    use crate::input::{
+        DesktopLayout, DisplayRect, Hotkey, InputMode, InputPlatform, InputRuntimeOptions,
+        KeyMappingConfig, KeySnapshot, ModifierMask, Point, ScreenEdge,
+    };
     use anyhow::Result;
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
@@ -992,6 +1052,7 @@ mod tests {
         let (_incoming_tx, mut incoming) = mpsc::channel(1);
         let (outgoing, mut messages) = mpsc::channel(8);
         motion.add_at(0, 0, Point { x: 0, y: 50 });
+        let input_options = test_input_options(ScreenEdge::Left);
 
         let task = tokio::spawn(async move {
             run_sender(
@@ -999,8 +1060,9 @@ mod tests {
                 &outgoing,
                 &mut platform,
                 layout.clone(),
-                layout,
                 ScreenEdge::Left,
+                InputPlatform::current(),
+                &input_options,
             )
             .await
         });
@@ -1023,6 +1085,33 @@ mod tests {
         assert!(*backend.capture.lock().unwrap());
         task.abort();
         let _ = task.await;
+    }
+
+    #[test]
+    fn scroll_reversal_is_selected_by_source() {
+        assert_eq!(
+            transform_scroll(4, -7, ScrollSource::MouseWheel, true, false),
+            (-4, 7)
+        );
+        assert_eq!(
+            transform_scroll(4, -7, ScrollSource::Trackpad, true, false),
+            (4, -7)
+        );
+        assert_eq!(
+            transform_scroll(i32::MIN, i32::MAX, ScrollSource::Trackpad, false, true),
+            (i32::MAX, -i32::MAX)
+        );
+    }
+
+    fn test_input_options(edge: ScreenEdge) -> InputRuntimeOptions {
+        InputRuntimeOptions {
+            mode: InputMode::Send,
+            edge,
+            hotkey: Hotkey::DEFAULT.parse().unwrap(),
+            reverse_mouse_wheel: false,
+            reverse_trackpad: false,
+            key_mapping: KeyMappingConfig::default(),
+        }
     }
 
     #[tokio::test]

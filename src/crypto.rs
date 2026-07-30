@@ -1253,8 +1253,8 @@ mod tests {
         DeviceConfig {
             device_id: Uuid::new_v4(),
             device_name: "tester".into(),
-            identity_private_key: Some(private_key),
-            identity_public_key: Some(public_key),
+            identity_private_key: private_key,
+            identity_public_key: public_key,
         }
     }
 

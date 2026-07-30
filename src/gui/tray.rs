@@ -101,7 +101,7 @@ impl TrayState {
             connected: snapshot.applied.is_some(),
             clipboard_enabled: snapshot.desired.clipboard_mode != ClipboardMode::Off,
             audio_enabled: snapshot.desired.audio_mode != AudioMode::Off,
-            input_enabled: snapshot.desired.input_mode != InputMode::Off,
+            input_enabled: snapshot.desired.input.mode != InputMode::Off,
         }
     }
 }
@@ -291,7 +291,7 @@ fn handle_action(inner: &Weak<RefCell<ControllerInner>>, action: &str) {
         }
         INPUT_ID => {
             let inner = inner.borrow();
-            let mode = if inner.snapshots.borrow().desired.input_mode == InputMode::Off {
+            let mode = if inner.snapshots.borrow().desired.input.mode == InputMode::Off {
                 InputMode::Receive
             } else {
                 InputMode::Off

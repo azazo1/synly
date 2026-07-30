@@ -1,4 +1,4 @@
-use super::super::{CaptureContext, InputBackend, NativeEvent};
+use super::super::{CaptureContext, InputBackend, NativeEvent, ScrollSource};
 use crate::input::{DesktopLayout, DisplayRect, KeySnapshot, ModifierMask, Point};
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeSet;
@@ -600,6 +600,7 @@ unsafe extern "system" fn mouse_callback(code: i32, w_param: WParam, l_param: LP
                 context.context.emit_reliable(NativeEvent::Wheel {
                     x: 0,
                     y: (event.mouse_data >> 16) as i16 as i32 / WHEEL_DELTA,
+                    source: ScrollSource::MouseWheel,
                 });
             }
         }
@@ -607,6 +608,7 @@ unsafe extern "system" fn mouse_callback(code: i32, w_param: WParam, l_param: LP
             context.context.emit_reliable(NativeEvent::Wheel {
                 x: (event.mouse_data >> 16) as i16 as i32 / WHEEL_DELTA,
                 y: 0,
+                source: ScrollSource::MouseWheel,
             });
         }
         _ => {}

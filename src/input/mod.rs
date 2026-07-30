@@ -1,6 +1,7 @@
 mod channel;
 mod geometry;
 mod hotkey;
+mod mapping;
 #[cfg(target_os = "macos")]
 pub mod mock;
 #[cfg(feature = "input-receiver-mock")]
@@ -16,6 +17,7 @@ pub use channel::{
 };
 pub use geometry::{DesktopLayout, DisplayRect, Point, ScreenEdge};
 pub use hotkey::{Hotkey, ModifierMask};
+pub use mapping::{InputPlatform, KeyMappingConfig, validate_key_mapping};
 pub use protocol::KeySnapshot;
 pub use runtime::{
     InputRuntimeOptions, InputSessionContext, InputSocketConnection, InputSocketInbox,

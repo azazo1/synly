@@ -1257,8 +1257,8 @@ mod tests {
             device: DeviceConfig {
                 device_id: Uuid::new_v4(),
                 device_name: "demo-device".to_string(),
-                identity_private_key: None,
-                identity_public_key: None,
+                identity_private_key: String::new(),
+                identity_public_key: String::new(),
             },
             file_sync_mode: FileSyncMode::Both,
             clipboard_mode: ClipboardMode::Receive,

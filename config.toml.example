@@ -1,6 +1,5 @@
-# 每台设备必须使用不同的 UUID.
+# 每台设备的 UUID 和身份密钥由 identity.toml 保存.
 [device]
-device_id = "2d0d69d8-0f7f-40e4-8fd3-fd0a29a2ed84"
 device_name = "workstation"
 
 [clipboard]
@@ -36,13 +35,29 @@ paths = []
 sync_delete = false
 clipboard_mode = "off"
 audio_mode = "off"
-input_mode = "off"
-input_edge = "right"
-input_hotkey = "ctrl+alt+shift+esc"
 interval_secs = 3
 accept = false
 trust_device = false
 trusted_only = false
+
+[input]
+mode = "off"
+edge = "right"
+hotkey = "ctrl+alt+shift+esc"
+reverse_mouse_wheel = false
+reverse_trackpad = false
+
+[input.key_mapping.macos_to_windows]
+left_option = "left_win"
+right_option = "right_win"
+left_command = "left_alt"
+right_command = "right_alt"
+
+[input.key_mapping.windows_to_macos]
+left_win = "left_option"
+right_win = "right_option"
+left_alt = "left_command"
+right_alt = "right_command"
 
 [discovery]
 mdns_enabled = true
