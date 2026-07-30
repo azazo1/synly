@@ -54,6 +54,7 @@ const EVENT_SCROLL: CGEventType = 22;
 const EVENT_OTHER_DOWN: CGEventType = 25;
 const EVENT_OTHER_UP: CGEventType = 26;
 const EVENT_OTHER_DRAGGED: CGEventType = 27;
+const EVENT_GESTURE: CGEventType = 29;
 const EVENT_TAP_DISABLED_TIMEOUT: CGEventType = u32::MAX - 1;
 const EVENT_TAP_DISABLED_USER_INPUT: CGEventType = u32::MAX;
 const FIELD_MOUSE_BUTTON: u32 = 3;
@@ -224,6 +225,7 @@ fn run_event_tap(state: Arc<MacState>, ready: std::sync::mpsc::SyncSender<Result
         EVENT_OTHER_DOWN,
         EVENT_OTHER_UP,
         EVENT_OTHER_DRAGGED,
+        EVENT_GESTURE,
     ]
     .into_iter()
     .fold(0u64, |mask, event| mask | (1u64 << event));
@@ -344,6 +346,9 @@ unsafe extern "C" fn event_callback(
                 event
             }
         }
+        EVENT_GESTURE => {
+            if suppress_local_gesture(event_type, active) { ptr::null_mut() } else { event }
+        }
         EVENT_KEY_DOWN | EVENT_KEY_UP | EVENT_FLAGS_CHANGED => {
             let keycode = unsafe { CGEventGetIntegerValueField(event, FIELD_KEY_CODE) } as u16;
             let Some(usage) = mac_keycode_to_hid(keycode) else {
@@ -388,6 +393,10 @@ unsafe extern "C" fn event_callback(
         }
         _ => event,
     }
+}
+
+fn suppress_local_gesture(event_type: CGEventType, capture_active: bool) -> bool {
+    capture_active && event_type == EVENT_GESTURE
 }
 
 fn usage_is_modifier(usage: u16) -> bool {
@@ -736,7 +745,10 @@ fn hid_to_mac_keycode(usage: u16) -> Option<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::{CaptureContext, MacBackend, MacState, NativeEvent, mac_mouse_button};
+    use super::{
+        CaptureContext, EVENT_GESTURE, EVENT_SCROLL, MacBackend, MacState, NativeEvent,
+        mac_mouse_button, suppress_local_gesture,
+    };
     use crate::input::platform::{InputBackend, MotionAccumulator};
     use crate::input::{Hotkey, InputMode, ModifierMask};
     use std::collections::BTreeSet;
@@ -751,6 +763,13 @@ mod tests {
         assert_eq!(mac_mouse_button(2), 2);
         assert_eq!(mac_mouse_button(3), 1);
         assert_eq!(mac_mouse_button(4), 3);
+    }
+
+    #[test]
+    fn active_capture_suppresses_gestures_but_not_scroll_events() {
+        assert!(suppress_local_gesture(EVENT_GESTURE, true));
+        assert!(!suppress_local_gesture(EVENT_GESTURE, false));
+        assert!(!suppress_local_gesture(EVENT_SCROLL, true));
     }
 
     #[test]
