@@ -17,7 +17,7 @@ pub fn init() -> Result<WorkerGuard> {
     let console_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info"));
     let trace_filter = EnvFilter::new(
-        "info,synly_input_agent=trace,synly::input::windows_agent=trace,synly::input::windows_ipc=trace",
+        "info,synly_input_agent=trace,synly::input::platform::windows::agent=trace",
     );
     tracing_subscriber::registry()
         .with(

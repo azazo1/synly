@@ -9,11 +9,7 @@ mod platform;
 mod protocol;
 mod runtime;
 #[cfg(windows)]
-pub mod windows_agent;
-#[cfg(windows)]
-mod windows_ipc;
-#[cfg(windows)]
-mod windows_agent_tracing;
+pub use platform::windows as windows_agent;
 
 pub use channel::{
     InputChannelOffer, InputChannelRole, InputHostChannel, read_preamble as read_input_preamble,
@@ -97,14 +93,14 @@ pub fn ensure_platform_supported(mode: InputMode) -> Result<()> {
 }
 
 #[cfg(windows)]
-pub use windows_agent::{request_elevation as request_windows_input_elevation, run_agent};
+pub use platform::windows::{request_elevation as request_windows_input_elevation, run_agent};
 
 #[cfg(windows)]
-pub use windows_agent_tracing::init as init_windows_agent_tracing;
+pub use platform::windows::init_agent_tracing as init_windows_agent_tracing;
 
 #[cfg(windows)]
 pub fn windows_input_agent_ready() -> bool {
-    windows_agent::is_ready()
+    platform::windows::agent_ready()
 }
 
 #[cfg(test)]

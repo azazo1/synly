@@ -10,7 +10,7 @@ mod macos;
 #[cfg(not(any(target_os = "macos", windows)))]
 mod unsupported;
 #[cfg(windows)]
-pub(in crate::input) mod windows;
+pub mod windows;
 
 const EVENT_QUEUE_CAPACITY: usize = 256;
 
