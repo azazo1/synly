@@ -3,10 +3,6 @@ use crate::input::{
     self, InputHostChannel, InputMode, InputRuntimeOptions, InputSessionContext, InputSocketInbox,
     LocalInputRole, negotiate_input,
 };
-use crate::cli::{
-    AudioMode, ClipboardMode, ConnectionPreference, FileSyncMode, InitialSyncMode,
-    PairingRuntimeOptions, RuntimeOptions, normalize_pin, require_peer_query, sync_delete_label,
-};
 use crate::clipboard::{ClipboardSync, ClipboardWatcherHandle};
 use crate::config::{DeviceConfig, SynlyConfig, TrustedDeviceConfig};
 use crate::crypto;
@@ -20,7 +16,13 @@ use crate::runtime_control::{
     InteractionRequest, InteractionResponse, RuntimeControl, RuntimeEvent, RuntimeLifecycle,
     RuntimePeerSummary, RuntimeTuning,
 };
+use crate::runtime_options::{
+    PairingRuntimeOptions, RuntimeOptions, normalize_pin, require_peer_query, sync_delete_label,
+};
 use crate::session::CapabilityState;
+use crate::settings::{
+    AudioMode, ClipboardMode, ConnectionPreference, FileSyncMode, InitialSyncMode,
+};
 use crate::sync::{
     DeletePolicy, EntryKind, ManifestEntry, ManifestSnapshot, TimestampComparisonContext,
     WorkspaceSpec, apply_file_metadata, build_apply_plan_with_time, build_incoming_snapshot,
@@ -717,7 +719,7 @@ async fn connect_to_peer(
             let trusted_transport = trusted_transport_for_peer(config, peer)?;
             if options.pairing.trusted_only && trusted_transport.is_none() {
                 bail!(
-                    "目标设备尚未建立完整的可信 mTLS 信任，请先用一次 PIN 配对并加上 --trust-device"
+                    "目标设备尚未建立完整的可信 mTLS 信任, 请先在 GUI 中完成一次 PIN 配对并启用 trust_device"
                 );
             }
             let socket = connect_to_discovered_peer(peer).await?;
@@ -1375,7 +1377,7 @@ async fn handle_bootstrap_incoming_connection(
         if should_auto_accept_request(&options.pairing, PairAuthMethod::Pin) {
             (true, options.pairing.trust_device)
         } else if options.pairing.headless {
-            tracing::warn!("headless 模式未启用 --accept, 已拒绝未信任设备");
+            tracing::warn!("headless 模式拒绝未信任设备");
             (false, false)
         } else {
             let interaction_id = Uuid::new_v4();
@@ -1492,7 +1494,7 @@ async fn connect_to_direct_trusted_peer(
 ) -> Result<AuthenticatedSession> {
     if !has_trusted_transport(config) {
         bail!(
-            "本机尚未保存任何可用于长期 mTLS 的可信设备根证书；请先完成一次带 `--trust-device` 的配对"
+            "本机尚未保存可用于长期 mTLS 的可信设备根证书, 请先在 GUI 中完成一次 PIN 配对并启用 trust_device"
         );
     }
 
@@ -1669,7 +1671,7 @@ async fn connect_to_untrusted_peer(
     let pin = match options.pairing.pin.as_deref() {
         Some(pin) => normalize_pin(pin)?,
         None if options.pairing.headless => {
-            bail!("headless 配对需要通过 --pin 提供 6 位 PIN")
+            bail!("headless 模式不允许 PIN 配对, 请先建立长期信任并配置 trusted_only = true")
         }
         None => {
             let response = options
@@ -1838,7 +1840,7 @@ async fn connect_to_untrusted_peer(
             );
             config.save_trusted_devices()?;
             if options.pairing.trust_device {
-                tracing::info!("服务端已信任本机, 已按 --trust-device 保存对侧身份");
+                tracing::info!("服务端已信任本机, 已按 trust_device 配置保存对侧身份");
             } else if trust_established {
                 tracing::info!("双方已保存彼此身份, 后续连接将优先使用长期 mTLS");
             } else {
@@ -4104,7 +4106,7 @@ fn trusted_transport_for_identity(
         );
     }
     bail!(
-        "设备 `{}` 尚未被本机信任，不能使用 `--trusted-only` 直连",
+        "设备 `{}` 尚未被本机信任, 不能使用 trusted_only 直连",
         identity_display_name(identity)
     );
 }
@@ -4349,10 +4351,10 @@ fn resolve_initial_snapshot_policy(
             Ok(InitialSnapshotPolicy::WaitForRemoteSeed)
         }
         (InitialSyncMode::This, InitialSyncMode::This) => bail!(
-            "双向初始状态冲突：本机和对端都选择了 `--initial this`；请让一端选 `this`，另一端选 `other`"
+            "双向初始状态冲突: 本机和对端都配置了 initial = this, 请让一端配置 this, 另一端配置 other"
         ),
         (InitialSyncMode::Other, InitialSyncMode::Other) => bail!(
-            "双向初始状态冲突：本机和对端都选择了 `--initial other`；请让一端选 `this`，另一端选 `other`"
+            "双向初始状态冲突: 本机和对端都配置了 initial = other, 请让一端配置 this, 另一端配置 other"
         ),
     }
 }
@@ -4634,9 +4636,6 @@ mod tests {
         trusted_transport_for_device, trusted_transport_for_identity,
     };
     use crate::audio::AudioChannelDirection;
-    use crate::cli::{
-        AudioMode, ClipboardMode, FileSyncMode, InitialSyncMode, PairingRuntimeOptions,
-    };
     use crate::config::{
         ClipboardConfig, DeviceConfig, DiscoveryConfig, NotificationConfig, SynlyConfig,
         TransferConfig, TrustedDeviceConfig,
@@ -4644,6 +4643,8 @@ mod tests {
     use crate::discovery::DiscoveredPeer;
     use crate::input::{Hotkey, InputMode, InputRuntimeOptions, ScreenEdge};
     use crate::protocol::{DeviceIdentity, FileChunkHeader, Frame, PairAuthMethod};
+    use crate::runtime_options::PairingRuntimeOptions;
+    use crate::settings::{AudioMode, ClipboardMode, FileSyncMode, InitialSyncMode};
     use crate::sync::{
         ApplyPlan, DeletePolicy, EntryKind, ManifestEntry, ManifestSnapshot, OutgoingSpec,
         SnapshotLayout, WorkspaceSpec, build_snapshot,
@@ -4752,7 +4753,7 @@ mod tests {
             .to_string();
 
         assert!(err.contains("双向初始状态冲突"));
-        assert!(err.contains("--initial this"));
+        assert!(err.contains("initial = this"));
     }
 
     #[test]
@@ -5109,7 +5110,7 @@ mod tests {
         .unwrap_err()
         .to_string();
 
-        assert!(err.contains("`--peer`"));
+        assert!(err.contains("peer_query"));
     }
 
     #[tokio::test]

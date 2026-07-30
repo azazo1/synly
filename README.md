@@ -59,7 +59,7 @@ $env:VCPKG_ROOT="C:\path\to\vcpkg"
 cargo build --release
 ```
 
-Windows 主 GUI 使用 `asInvoker` manifest 以普通权限运行. 需要管理员输入能力时, GUI 通过 `ShellExecuteW("runas")` 启动当前 `synly.exe` 的隐藏输入代理子进程, 并使用命名管道完成握手. 主进程与子进程来自同一个构建产物, 避免 IPC 协议版本错配. 登录启动且窗口隐藏时不会主动弹出 UAC, 需要用户从托盘或设置页确认授权.
+Windows 主 GUI 使用 `asInvoker` manifest 以普通权限运行. 需要管理员输入能力时, GUI 通过 `ShellExecuteW("runas")` 启动当前 `synly.exe` 的隐藏输入代理子进程, 并使用命名管道完成握手. 主进程与子进程来自同一个构建产物, 避免 IPC 协议版本错配. 配置 `input.elevate_on_start = true` 后, 主实例会在恢复会话前请求 UAC, 授权失败时本次启动直接失败.
 
 GUI 和提权子进程通过随机命名管道与随机 token 通信. 管道 DACL 只允许当前用户和 SYSTEM, 双方校验 IPC 版本, PID, session ID, 映像路径和安装目录. release 构建要求当前可执行文件通过 Authenticode 校验, debug 构建会记录签名校验警告但允许本地未签名产物. 管道断开, 心跳超时, 子进程退出或进入非 `Default` 输入桌面时会立即释放输入状态.
 
@@ -119,47 +119,15 @@ synly
 
 ## Headless
 
-只有显式传入 `--headless` 才会进入无界面模式. Headless 不进行任何终端询问. 参数不足时直接失败.
+只有显式传入 `--headless` 才会进入无界面模式. Headless 从 `config.toml` 读取全部会话参数, 不接受 host, peer, fs, pin 等会话 CLI 参数, 也不进行任何终端询问.
 
-Host 示例:
-
-```shell
-synly --headless --host --fs auto --initial this --pin 123456 --accept --trust-device .
-```
-
-Join 示例:
+Headless 只支持已经建立长期 mTLS 信任的设备. 请先在 GUI 中完成 PIN 配对, 保存双方信任, 再将 `[runtime]` 中的 `trusted_only` 设置为 `true`. Join 模式还必须配置非空 `peer_query`.
 
 ```shell
-synly --headless --join --peer workstation --fs auto --initial other --pin 123456 --trust-device .
+synly --headless
 ```
 
-后续仅允许可信设备:
-
-```shell
-synly --headless --host --fs auto --initial this --trusted-only .
-synly --headless --join --peer workstation --fs auto --initial other --trusted-only .
-```
-
-只同步剪贴板:
-
-```shell
-synly --headless --host --fs off --clipboard both --pin 123456 --accept
-synly --headless --join --peer workstation --fs off --clipboard both --pin 123456
-```
-
-音频发送和接收:
-
-```shell
-synly --headless --host --fs off --audio send --pin 123456 --accept
-synly --headless --join --peer workstation --fs off --audio receive --pin 123456
-```
-
-输入发送和接收:
-
-```shell
-synly --headless --host --fs off --input send --input-edge right --input-hotkey ctrl+alt+shift+esc --pin 123456 --accept
-synly --headless --join --peer workstation --fs off --input receive --pin 123456
-```
+配置缺少角色, 工作区, 初始来源或可信策略时, Headless 会在启动会话前直接失败.
 
 ## 配置文件
 
@@ -172,7 +140,7 @@ Synly 使用固定的三文件配置目录:
 └── trusted-devices.toml
 ```
 
-- `config.toml` 保存用户设置和运行参数. 输入方向, 屏幕边缘, 热键, 按键映射和滚动反向都位于 `[input]`.
+- `config.toml` 保存用户设置和运行参数. 输入方向, 屏幕边缘, 热键, 启动提权, 按键映射和滚动反向都位于 `[input]`.
 - `identity.toml` 保存 `device_id`, `private_key`, `public_key`. 文件缺失时自动生成, 已存在但密钥无效时启动失败.
 - `trusted-devices.toml` 使用 `[[devices]]` 保存可信设备和会话统计.
 - 配置采用严格 schema. 未知字段, 缺失必填字段和旧单文件格式都会导致启动失败, 不会自动迁移或覆盖.
@@ -182,6 +150,10 @@ Synly 使用固定的三文件配置目录:
 普通键使用 `a` 到 `z`, `0` 到 `9`, `f1` 到 `f12`, `enter`, `escape`, `backspace`, `tab`, `space`, `minus`, `equal`, `left_bracket`, `right_bracket`, `backslash`, `semicolon`, `apostrophe`, `comma`, `period`, `slash`, `caps_lock`, `insert`, `home`, `page_up`, `delete`, `end`, `page_down` 和方向键名称. 修饰键按平台使用 `left_ctrl`, `left_shift`, `left_option`, `left_command`, `left_alt`, `left_win` 及对应的 `right_` 名称. 实际可用键位仍受源端捕获和目标端注入能力限制.
 
 `reverse_mouse_wheel` 和 `reverse_trackpad` 会同时反转水平与垂直滚动. macOS 能区分普通滚轮和连续触控板滚动. Windows 发送端会将所有滚动视为鼠标滚轮, 因此 `reverse_trackpad` 在 Windows 上不生效. 这些配置在应用启动时读取, 修改后需要重启.
+
+`elevate_on_start` 仅在 Windows 生效. 设置为 `true` 后, GUI 主实例和 Headless 都会在启动会话前请求 UAC 并启动管理员输入代理. macOS 和 Linux 会保存但忽略该字段.
+
+`elevate_on_start` 是严格配置 schema 的必填字段. 现有 `config.toml` 需要显式补充该字段, 本版本不执行自动迁移.
 
 ## 配置生效方式
 

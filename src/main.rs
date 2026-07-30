@@ -11,6 +11,7 @@ mod gui;
 mod path_expand;
 mod protocol;
 mod runtime_control;
+mod runtime_options;
 mod settings;
 mod session;
 mod system_notification;
@@ -32,7 +33,11 @@ fn main() -> Result<()> {
     let mut config = config::SynlyConfig::load_or_create()?;
     let _tracing_guard = tracing_utils::init_tracing(config.ui.log_level.as_filter())?;
     if cli.headless {
-        let options = cli::collect_runtime_options(cli, &config)?;
+        let options = runtime_options::runtime_options_from_config(&config, None, true)?;
+        #[cfg(windows)]
+        if config.runtime.input.elevate_on_start {
+            windows_input_agent::request_startup_elevation()?;
+        }
         input::ensure_platform_supported(options.input_mode)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(4)

@@ -2,7 +2,6 @@ use super::model::{
     AppCommand, AppLifecycle, AppSettings, AppSnapshot, DiscoveredPeerView,
     PendingInteraction,
 };
-use crate::cli::{cli_from_runtime_config, collect_runtime_options};
 use crate::config::{RuntimeConfig, SynlyConfig};
 use crate::discovery::{self, DiscoveredPeer};
 use crate::protocol::{PROTOCOL_VERSION, RuntimeCapabilities};
@@ -10,6 +9,7 @@ use crate::runtime_control::{
     InteractionEnvelope, RuntimeControl, RuntimeControlHandle, RuntimeEvent, RuntimeLifecycle,
     RuntimeTuning,
 };
+use crate::runtime_options::{RuntimeOptions, runtime_options_from_config};
 use crate::settings::ConnectionPreference;
 use anyhow::Result;
 use std::collections::HashMap;
@@ -167,9 +167,11 @@ impl AppSupervisor {
                 settings.device_name = settings.device_name.trim().to_string();
                 let mut candidate = self.config.clone();
                 apply_settings_to_config(&mut candidate, &runtime, &settings);
-                let cli = cli_from_runtime_config(&runtime, session_pin.clone(), false);
                 if let Err(error) = validate_settings(&candidate)
-                    .and_then(|_| collect_runtime_options(cli, &candidate).map(|_| ()))
+                    .and_then(|_| {
+                        runtime_options_from_config(&candidate, session_pin.clone(), false)
+                            .map(|_| ())
+                    })
                 {
                     self.set_error(error.to_string());
                     self.publish();
@@ -491,12 +493,11 @@ impl AppSupervisor {
         if self.session.is_some() {
             return;
         }
-        let cli = cli_from_runtime_config(
-            &self.snapshot.desired,
+        let mut options = match runtime_options_from_config(
+            &self.config,
             self.session_pin.clone(),
             false,
-        );
-        let mut options = match collect_runtime_options(cli, &self.config) {
+        ) {
             Ok(options) => options,
             Err(error) => {
                 self.set_error(error.to_string());
@@ -598,12 +599,7 @@ impl AppSupervisor {
         let Some(tuning) = self.session.as_ref().map(|session| session.tuning.clone()) else {
             return;
         };
-        let cli = cli_from_runtime_config(
-            &self.snapshot.desired,
-            self.session_pin.clone(),
-            false,
-        );
-        match collect_runtime_options(cli, &self.config) {
+        match runtime_options_from_config(&self.config, self.session_pin.clone(), false) {
             Ok(options) => {
                 let _ = tuning.send(tuning_from_options(
                     &options,
@@ -749,7 +745,7 @@ fn validate_settings(config: &SynlyConfig) -> Result<()> {
 }
 
 fn tuning_from_options(
-    options: &crate::cli::RuntimeOptions,
+    options: &RuntimeOptions,
     input_backend_generation: u64,
 ) -> RuntimeTuning {
     let mut tuning = options.control.tuning().borrow().clone();

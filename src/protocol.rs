@@ -640,7 +640,7 @@ mod tests {
         ControlMessage, Frame, FrameReader, FrameWriter, PROTOCOL_VERSION, PairRequestPayload,
         SessionAgreement, decode_payload, encode_payload,
     };
-    use crate::cli::{AudioMode, ClipboardMode, FileSyncMode};
+    use crate::settings::{AudioMode, ClipboardMode, FileSyncMode, InitialSyncMode};
     use crate::sync::WorkspaceSummary;
     use serde_json::json;
     use tokio::io::duplex;
@@ -703,7 +703,7 @@ mod tests {
                 send_layout: None,
                 send_items: vec!["docs".to_string()],
                 receive_root: Some("/tmp".to_string()),
-                initial_sync: Some(crate::cli::InitialSyncMode::This),
+                initial_sync: Some(InitialSyncMode::This),
                 max_folder_depth: Some(2),
                 clipboard_mode: ClipboardMode::Both,
                 audio_mode: AudioMode::Receive,

@@ -44,6 +44,7 @@ trusted_only = false
 mode = "off"
 edge = "right"
 hotkey = "ctrl+alt+shift+esc"
+elevate_on_start = false
 reverse_mouse_wheel = false
 reverse_trackpad = false
 

@@ -1,4 +1,3 @@
-use crate::cli::normalize_pin;
 use crate::config::{
     ClipboardConfig, DiscoveryConfig, LndDiscoveryConfig, RuntimeConfig, SynlyConfig,
     TransferConfig, UiConfig,
@@ -6,6 +5,7 @@ use crate::config::{
 use crate::core::{AppCommand, AppSettings, AppSnapshot, AppSupervisor};
 use crate::input::{InputMode, ScreenEdge};
 use crate::runtime_control::{InteractionRequest, InteractionResponse};
+use crate::runtime_options::normalize_pin;
 use crate::settings::{
     AudioMode, ClipboardMode, ConnectionPreference, FileSyncMode, InitialSyncMode,
     LogLevel,
@@ -34,6 +34,10 @@ pub fn run(config: SynlyConfig) -> Result<()> {
         single_instance::SingleInstance::Primary(listener) => listener,
         single_instance::SingleInstance::ActivatedExisting => return Ok(()),
     };
+    #[cfg(windows)]
+    if config.runtime.input.elevate_on_start {
+        crate::windows_input_agent::request_startup_elevation()?;
+    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -837,6 +841,7 @@ fn settings_from_window(
             mode: input_mode_from_index(window.get_input_mode_index()),
             edge: input_edge_from_index(window.get_input_edge_index()),
             hotkey: window.get_input_hotkey().trim().to_string(),
+            elevate_on_start: current_input.elevate_on_start,
             reverse_mouse_wheel: current_input.reverse_mouse_wheel,
             reverse_trackpad: current_input.reverse_trackpad,
             key_mapping: current_input.key_mapping.clone(),

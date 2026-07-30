@@ -1,6 +1,6 @@
-use crate::cli::{AudioMode, ClipboardMode, FileSyncMode};
-use crate::input::InputMode;
 use crate::config::{DeviceConfig, DiscoveryConfig, LndDiscoveryConfig};
+use crate::input::InputMode;
+use crate::settings::{AudioMode, ClipboardMode, FileSyncMode};
 use anyhow::{Context, Result, anyhow, bail};
 use if_addrs::{IfAddr, get_if_addrs};
 use lnd::{AnnounceHandle, AnnounceSpec, DiscoveryFilter, DiscoveredNode, LndClient};
@@ -1007,9 +1007,9 @@ mod tests {
         discovered_peers_from_lnd, group_peer_addresses_for_interfaces, merge_peers,
         normalize_lnd_config, should_report_lnd_failure,
     };
-    use crate::cli::{AudioMode, ClipboardMode, FileSyncMode};
     use crate::config::{DeviceConfig, LndDiscoveryConfig};
     use crate::input::InputMode;
+    use crate::settings::{AudioMode, ClipboardMode, FileSyncMode};
     use lnd::{
         DiscoveredNode, DiscoveryFilter, InMemoryRegistry, LeaseInfo, LndClient, ServerConfig,
         build_router,

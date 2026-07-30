@@ -1224,13 +1224,13 @@ fn decode_certificate_der(certificate: &str) -> Result<CertificateDer<'static>> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::{AudioMode, ClipboardMode, FileSyncMode};
     use crate::config::DeviceConfig;
     use crate::protocol::{
         ControlMessage, DeviceIdentity, PROTOCOL_VERSION, PairAuthMethod, PairRequestPayload,
         SessionAgreement,
     };
     use crate::sync::WorkspaceSummary;
+    use crate::settings::{AudioMode, ClipboardMode, FileSyncMode, InitialSyncMode};
     use ring::rand::SystemRandom;
     use ring::signature::KeyPair;
     use uuid::Uuid;
@@ -1276,7 +1276,7 @@ mod tests {
                 send_layout: None,
                 send_items: vec![],
                 receive_root: Some("/tmp".into()),
-                initial_sync: Some(crate::cli::InitialSyncMode::This),
+                initial_sync: Some(InitialSyncMode::This),
                 max_folder_depth: None,
                 clipboard_mode: ClipboardMode::Off,
                 audio_mode: AudioMode::Off,
@@ -1309,7 +1309,7 @@ mod tests {
                 send_layout: None,
                 send_items: vec![],
                 receive_root: Some("/tmp".into()),
-                initial_sync: Some(crate::cli::InitialSyncMode::This),
+                initial_sync: Some(InitialSyncMode::This),
                 max_folder_depth: None,
                 clipboard_mode: ClipboardMode::Off,
                 audio_mode: AudioMode::Off,
@@ -1351,7 +1351,7 @@ mod tests {
             send_layout: None,
             send_items: vec![],
             receive_root: Some("/tmp".into()),
-            initial_sync: Some(crate::cli::InitialSyncMode::This),
+            initial_sync: Some(InitialSyncMode::This),
             max_folder_depth: None,
             clipboard_mode: ClipboardMode::Off,
             audio_mode: AudioMode::Off,
@@ -1425,7 +1425,7 @@ mod tests {
             send_layout: None,
             send_items: vec![],
             receive_root: Some("/tmp".into()),
-            initial_sync: Some(crate::cli::InitialSyncMode::This),
+            initial_sync: Some(InitialSyncMode::This),
             max_folder_depth: None,
             clipboard_mode: ClipboardMode::Both,
             audio_mode: AudioMode::Off,

@@ -404,6 +404,7 @@ mod tests {
             config.runtime.input.key_mapping,
             crate::input::KeyMappingConfig::default()
         );
+        assert!(!config.runtime.input.elevate_on_start);
         let reloaded = load_or_create_in_dir(&dir).unwrap();
         assert_eq!(reloaded.device.device_id, config.device.device_id);
         assert_eq!(reloaded.runtime, config.runtime);
@@ -486,7 +487,7 @@ mod tests {
         let raw = toml::to_string_pretty(&main).unwrap();
         let unknown = format!("{raw}\nunknown = true\n");
         assert!(toml::from_str::<MainConfigFile>(&unknown).is_err());
-        let missing = raw.replace("reverse_trackpad = false\n", "");
+        let missing = raw.replace("elevate_on_start = false\n", "");
         assert!(toml::from_str::<MainConfigFile>(&missing).is_err());
     }
 
@@ -513,6 +514,7 @@ mod tests {
         let config: MainConfigFile =
             toml::from_str(include_str!("../../config.toml.example")).unwrap();
         assert_eq!(config.input.key_mapping, crate::input::KeyMappingConfig::default());
+        assert!(!config.input.elevate_on_start);
     }
 
     fn unique_test_dir(label: &str) -> PathBuf {

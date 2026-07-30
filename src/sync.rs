@@ -1,5 +1,5 @@
-use crate::cli::{AudioMode, ClipboardMode, FileSyncMode, InitialSyncMode};
 use crate::input::InputMode;
+use crate::settings::{AudioMode, ClipboardMode, FileSyncMode, InitialSyncMode};
 use anyhow::{Context, Result, bail};
 use filetime::{FileTime, set_file_mtime};
 use ignore::gitignore::Gitignore;
