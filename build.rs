@@ -19,7 +19,6 @@ fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=ui/app.slint");
     println!("cargo:rerun-if-changed=assets/windows/synly.manifest");
-    println!("cargo:rerun-if-changed=assets/windows/synly-input-agent.manifest");
     slint_build::compile("ui/app.slint").expect("failed to compile Slint UI");
     for key in [
         "OPUS_DIR",
@@ -47,23 +46,15 @@ fn embed_windows_manifests(target: &str) {
         return;
     }
 
-    for (binary, manifest) in [
-        ("synly", "assets/windows/synly.manifest"),
-        (
-            "synly-input-agent",
-            "assets/windows/synly-input-agent.manifest",
-        ),
-    ] {
-        let manifest = Path::new(manifest)
-            .canonicalize()
-            .expect("failed to locate Windows application manifest");
-        println!("cargo:rustc-link-arg-bin={binary}=/MANIFEST:EMBED");
-        println!("cargo:rustc-link-arg-bin={binary}=/MANIFESTUAC:NO");
-        println!(
-            "cargo:rustc-link-arg-bin={binary}=/MANIFESTINPUT:{}",
-            manifest.display()
-        );
-    }
+    let manifest = Path::new("assets/windows/synly.manifest")
+        .canonicalize()
+        .expect("failed to locate Windows application manifest");
+    println!("cargo:rustc-link-arg-bin=synly=/MANIFEST:EMBED");
+    println!("cargo:rustc-link-arg-bin=synly=/MANIFESTUAC:NO");
+    println!(
+        "cargo:rustc-link-arg-bin=synly=/MANIFESTINPUT:{}",
+        manifest.display()
+    );
 }
 
 fn opus_link_preference() -> OpusLinkPreference {
