@@ -42,6 +42,7 @@ export component InputScreenMockWindow inherits Window {
     in property <string> source-edge: "right";
     in property <int> virtual-width: 1280;
     in property <int> virtual-height: 720;
+    in property <float> virtual-aspect-ratio: 1.7777778;
     in property <bool> active: false;
     in property <int> cursor-x: 0;
     in property <int> cursor-y: 0;
@@ -111,19 +112,23 @@ export component InputScreenMockWindow inherits Window {
         Rectangle {
             horizontal-stretch: 1;
             vertical-stretch: 1;
-            background: #161d1a;
-            border-color: root.active ? #65b78e : #77817c;
-            border-width: root.active ? 2px : 1px;
+            background: #121816;
+            border-color: #77817c;
+            border-width: 1px;
             border-radius: 6px;
 
-            Rectangle {
-                x: 7px;
-                y: 7px;
-                width: parent.width - 14px;
-                height: parent.height - 14px;
+            screen := Rectangle {
+                width: root.virtual-aspect-ratio > (parent.width - 20px) / (parent.height - 20px)
+                    ? parent.width - 20px
+                    : (parent.height - 20px) * root.virtual-aspect-ratio;
+                height: root.virtual-aspect-ratio > (parent.width - 20px) / (parent.height - 20px)
+                    ? (parent.width - 20px) / root.virtual-aspect-ratio
+                    : parent.height - 20px;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
                 background: #202a26;
-                border-color: #3a4641;
-                border-width: 1px;
+                border-color: root.active ? #65b78e : #3a4641;
+                border-width: root.active ? 2px : 1px;
                 border-radius: 4px;
 
                 Text {
@@ -135,8 +140,8 @@ export component InputScreenMockWindow inherits Window {
                 }
 
                 Rectangle {
-                    x: 16px + (parent.width - 32px) * root.cursor-ratio-x - self.width / 2;
-                    y: 16px + (parent.height - 32px) * root.cursor-ratio-y - self.height / 2;
+                    x: parent.width * root.cursor-ratio-x - self.width / 2;
+                    y: parent.height * root.cursor-ratio-y - self.height / 2;
                     width: 13px;
                     height: 13px;
                     background: root.active ? #79d6a7 : #89938e;

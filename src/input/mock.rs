@@ -43,6 +43,7 @@ pub fn run_screen_mock(options: ScreenMockOptions) -> Result<()> {
     window.set_source_edge(options.edge.as_arg().into());
     window.set_virtual_width(options.width);
     window.set_virtual_height(options.height);
+    window.set_virtual_aspect_ratio(options.width as f32 / options.height as f32);
     window.set_event_text(format!("等待从 {} 边缘接入", options.edge.as_arg()).into());
     window.show().context("无法显示输入虚拟屏幕窗口")?;
 
