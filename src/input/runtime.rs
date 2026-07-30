@@ -33,18 +33,29 @@ pub struct InputRuntimeOptions {
 
 #[derive(Clone)]
 pub struct InputSocketInbox {
-    sockets: Arc<Mutex<mpsc::Receiver<TcpStream>>>,
+    sockets: Arc<Mutex<mpsc::Receiver<InputSocketConnection>>>,
 }
 
 impl InputSocketInbox {
-    pub fn new(sockets: mpsc::Receiver<TcpStream>) -> Self {
+    pub fn new(sockets: mpsc::Receiver<InputSocketConnection>) -> Self {
         Self {
             sockets: Arc::new(Mutex::new(sockets)),
         }
     }
 
-    async fn recv(&self) -> Option<TcpStream> {
+    async fn recv(&self) -> Option<InputSocketConnection> {
         self.sockets.lock().await.recv().await
+    }
+}
+
+pub struct InputSocketConnection {
+    pub session_id: uuid::Uuid,
+    pub socket: TcpStream,
+}
+
+impl InputSocketConnection {
+    pub fn new(session_id: uuid::Uuid, socket: TcpStream) -> Self {
+        Self { session_id, socket }
     }
 }
 
@@ -83,11 +94,20 @@ pub async fn run_input_session(
             sockets,
         } => {
             loop {
-                let socket = sockets
+                let connection = sockets
                     .recv()
                     .await
                     .context("输入辅助连接等待期间主会话已结束")?;
-                match time::timeout(AUTH_TIMEOUT, channel.accept(socket, &master_secret)).await {
+                match time::timeout(
+                    AUTH_TIMEOUT,
+                    channel.accept_after_preamble(
+                        connection.socket,
+                        connection.session_id,
+                        &master_secret,
+                    ),
+                )
+                .await
+                {
                     Ok(Ok(stream)) => {
                         if let Err(err) = run_established(
                             stream,

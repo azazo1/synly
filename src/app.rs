@@ -440,7 +440,7 @@ async fn run_host_session_with_aux(
         tokio::select! {
             result = &mut session_future => return result,
             accepted = listener.accept() => {
-                let (socket, address) = accepted?;
+                let (mut socket, address) = accepted?;
                 configure_session_socket(&socket)?;
                 let mut first_byte = [0u8; 1];
                 let is_input = matches!(
@@ -448,10 +448,37 @@ async fn run_host_session_with_aux(
                     Ok(Ok(1)) if first_byte[0] == b'S'
                 );
                 if is_input {
-                    if let Some(session_id) = *input_session_id.borrow() {
-                        tracing::debug!(%address, %session_id, "收到输入辅助连接");
-                        if input_socket_tx.try_send(socket).is_err() {
-                            tracing::warn!(%address, "输入辅助连接队列忙, 已拒绝额外连接");
+                    match time::timeout(
+                        Duration::from_secs(1),
+                        input::read_input_preamble(&mut socket),
+                    )
+                    .await
+                    {
+                        Ok(Ok(incoming_session_id)) => {
+                            let expected_session_id = *input_session_id.borrow();
+                            if expected_session_id == Some(incoming_session_id) {
+                                tracing::debug!(%address, session_id = %incoming_session_id, "收到输入辅助连接");
+                                let connection = input::InputSocketConnection::new(
+                                    incoming_session_id,
+                                    socket,
+                                );
+                                if input_socket_tx.try_send(connection).is_err() {
+                                    tracing::warn!(%address, "输入辅助连接队列忙, 已拒绝额外连接");
+                                }
+                            } else {
+                                tracing::warn!(
+                                    %address,
+                                    %incoming_session_id,
+                                    ?expected_session_id,
+                                    "已拒绝过期的输入辅助连接",
+                                );
+                            }
+                        }
+                        Ok(Err(err)) => {
+                            tracing::warn!(%address, error = %err, "输入辅助连接前导验证失败");
+                        }
+                        Err(_) => {
+                            tracing::warn!(%address, "输入辅助连接前导读取超时");
                         }
                     }
                 } else {

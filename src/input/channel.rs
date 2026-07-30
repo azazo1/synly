@@ -79,6 +79,17 @@ impl InputHostChannel {
     ) -> Result<TlsStream<TcpStream>> {
         socket.set_nodelay(true)?;
         let session_id = read_preamble(&mut socket).await?;
+        self.accept_after_preamble(socket, session_id, master_secret)
+            .await
+    }
+
+    pub async fn accept_after_preamble(
+        &self,
+        socket: TcpStream,
+        session_id: Uuid,
+        master_secret: &[u8; 32],
+    ) -> Result<TlsStream<TcpStream>> {
+        socket.set_nodelay(true)?;
         if session_id != self.offer.session_id {
             bail!("输入辅助连接 session_id 不匹配");
         }
@@ -265,7 +276,7 @@ fn verify_proof(
 mod tests {
     use super::{InputChannelRole, InputHostChannel, connect, make_proof, read_preamble, verify_proof, write_preamble};
     use tokio::io::duplex;
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
     use uuid::Uuid;
 
     #[test]
@@ -301,6 +312,34 @@ mod tests {
         });
         let client = connect(address, &offer, &secret).await;
         assert!(client.is_ok());
+        assert!(server.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn auxiliary_tls_recovers_after_stale_preamble() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let channel = InputHostChannel::create().unwrap();
+        let offer = channel.offer().clone();
+        let expected_session_id = offer.session_id;
+        let secret = [9u8; 32];
+        let server = tokio::spawn(async move {
+            let (mut stale, _) = listener.accept().await.unwrap();
+            let stale_session_id = read_preamble(&mut stale).await.unwrap();
+            assert_ne!(stale_session_id, expected_session_id);
+            drop(stale);
+
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let session_id = read_preamble(&mut socket).await.unwrap();
+            channel
+                .accept_after_preamble(socket, session_id, &secret)
+                .await
+        });
+        let mut stale = TcpStream::connect(address).await.unwrap();
+        write_preamble(&mut stale, Uuid::nil()).await.unwrap();
+        drop(stale);
+
+        assert!(connect(address, &offer, &secret).await.is_ok());
         assert!(server.await.unwrap().is_ok());
     }
 

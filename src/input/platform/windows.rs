@@ -23,10 +23,6 @@ const WH_MOUSE_LL: i32 = 14;
 const HC_ACTION: i32 = 0;
 const WM_QUIT: u32 = 0x0012;
 const WM_SYNLY_CAPTURE: u32 = 0x8001;
-const WM_SYNLY_WARP: u32 = 0x8002;
-const WM_SYNLY_LAYOUT: u32 = 0x8003;
-const WM_SYNLY_CURSOR_POSITION: u32 = 0x8004;
-const WM_SYNLY_INJECT_CURSOR: u32 = 0x8005;
 const WM_MOUSEMOVE: u32 = 0x0200;
 const WM_LBUTTONDOWN: u32 = 0x0201;
 const WM_LBUTTONUP: u32 = 0x0202;
@@ -84,6 +80,9 @@ const SWP_NOMOVE: u32 = 0x0002;
 const SWP_NOACTIVATE: u32 = 0x0010;
 const SWP_SHOWWINDOW: u32 = 0x0040;
 const SWP_HIDEWINDOW: u32 = 0x0080;
+const SMTO_BLOCK: u32 = 0x0001;
+const SMTO_ABORTIFHUNG: u32 = 0x0002;
+const CAPTURE_MESSAGE_TIMEOUT_MS: u32 = 1_000;
 const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
 
 #[repr(C)]
@@ -206,7 +205,15 @@ unsafe extern "system" {
     fn TranslateMessage(message: *const Msg) -> i32;
     fn DispatchMessageW(message: *const Msg) -> LResult;
     fn PostThreadMessageW(thread_id: u32, message: u32, w_param: WParam, l_param: LParam) -> i32;
-    fn SendMessageW(window: HWnd, message: u32, w_param: WParam, l_param: LParam) -> LResult;
+    fn SendMessageTimeoutW(
+        window: HWnd,
+        message: u32,
+        w_param: WParam,
+        l_param: LParam,
+        flags: u32,
+        timeout_ms: u32,
+        result: *mut usize,
+    ) -> LResult;
     fn GetCurrentThreadId() -> u32;
     fn GetCursorPos(point: *mut PointRaw) -> i32;
     fn SetCursorPos(x: i32, y: i32) -> i32;
@@ -490,37 +497,6 @@ unsafe extern "system" fn cursor_hider_window_proc(
         }
         return isize::from(sync_cursor_capture(unsafe { &*state }, w_param != 0));
     }
-    if message == WM_SYNLY_WARP {
-        let state = HOOK_STATE.load(Ordering::Acquire);
-        if state.is_null() {
-            return 0;
-        }
-        let point = Point { x: w_param as i32, y: l_param as i32 };
-        if unsafe { SetCursorPos(point.x, point.y) } == 0 {
-            return 0;
-        }
-        *unsafe { &*state }.last_point.lock().unwrap() = Some(point);
-        return 1;
-    }
-    if message == WM_SYNLY_LAYOUT {
-        let displays = w_param as *mut Vec<DisplayRect>;
-        if displays.is_null() {
-            return 0;
-        }
-        unsafe { *displays = collect_display_rects() };
-        return isize::from(!unsafe { &*displays }.is_empty());
-    }
-    if message == WM_SYNLY_CURSOR_POSITION {
-        let point = w_param as *mut PointRaw;
-        if point.is_null() {
-            return 0;
-        }
-        return unsafe { GetCursorPos(point) } as isize;
-    }
-    if message == WM_SYNLY_INJECT_CURSOR {
-        let point = Point { x: w_param as i32, y: l_param as i32 };
-        return isize::from(send_absolute_mouse(point).is_ok());
-    }
     unsafe { DefWindowProcW(window, message, w_param, l_param) }
 }
 
@@ -654,39 +630,17 @@ fn update_set<T: Ord + Copy>(set: &Mutex<BTreeSet<T>>, value: T, down: bool) {
 
 impl InputBackend for WindowsBackend {
     fn layout(&self) -> Result<DesktopLayout> {
-        let mut displays = Vec::new();
-        let window = self.state.hider_window.load(Ordering::Acquire);
-        if window == 0
-            || unsafe {
-                SendMessageW(
-                    window,
-                    WM_SYNLY_LAYOUT,
-                    (&mut displays as *mut Vec<DisplayRect>) as usize,
-                    0,
-                )
-            } == 0
-        {
-            bail!("无法从 Windows 输入线程读取显示器布局");
-        }
-        DesktopLayout::new(displays)
+        with_per_monitor_dpi(|| DesktopLayout::new(collect_display_rects()))
     }
 
     fn cursor_position(&self) -> Result<Point> {
-        let mut point = PointRaw::default();
-        let window = self.state.hider_window.load(Ordering::Acquire);
-        if window == 0
-            || unsafe {
-                SendMessageW(
-                    window,
-                    WM_SYNLY_CURSOR_POSITION,
-                    (&mut point as *mut PointRaw) as usize,
-                    0,
-                )
-            } == 0
-        {
-            bail!("无法读取 Windows 光标位置");
-        }
-        Ok(Point { x: point.x, y: point.y })
+        with_per_monitor_dpi(|| {
+            let mut point = PointRaw::default();
+            if unsafe { GetCursorPos(&mut point) } == 0 {
+                bail!("无法读取 Windows 光标位置");
+            }
+            Ok(Point { x: point.x, y: point.y })
+        })
     }
 
     fn snapshot(&self) -> KeySnapshot {
@@ -703,14 +657,10 @@ impl InputBackend for WindowsBackend {
             return Ok(());
         }
         let window = self.state.hider_window.load(Ordering::Acquire);
-        if window == 0
-            || unsafe { SendMessageW(window, WM_SYNLY_CAPTURE, usize::from(active), 0) } == 0
-        {
+        if window == 0 || !send_capture_message(window, active) {
             self.state.context.capture_active.store(previous, Ordering::Release);
             if window != 0 {
-                let _ = unsafe {
-                    SendMessageW(window, WM_SYNLY_CAPTURE, usize::from(previous), 0)
-                };
+                let _ = send_capture_message(window, previous);
             }
             bail!("无法切换 Windows 光标捕获状态")
         }
@@ -718,19 +668,13 @@ impl InputBackend for WindowsBackend {
     }
 
     fn warp_cursor(&self, point: Point) -> Result<()> {
-        let window = self.state.hider_window.load(Ordering::Acquire);
-        if window == 0
-            || unsafe {
-                SendMessageW(
-                    window,
-                    WM_SYNLY_WARP,
-                    point.x as isize as usize,
-                    point.y as isize,
-                )
-            } == 0
-        {
-            bail!("无法移动 Windows 光标");
-        }
+        with_per_monitor_dpi(|| {
+            if unsafe { SetCursorPos(point.x, point.y) } == 0 {
+                bail!("无法移动 Windows 光标");
+            }
+            Ok(())
+        })?;
+        *self.state.last_point.lock().unwrap() = Some(point);
         Ok(())
     }
 
@@ -763,20 +707,7 @@ impl InputBackend for WindowsBackend {
     }
 
     fn inject_cursor(&self, point: Point) -> Result<()> {
-        let window = self.state.hider_window.load(Ordering::Acquire);
-        if window == 0
-            || unsafe {
-                SendMessageW(
-                    window,
-                    WM_SYNLY_INJECT_CURSOR,
-                    point.x as isize as usize,
-                    point.y as isize,
-                )
-            } == 0
-        {
-            bail!("Windows SendInput 鼠标移动注入失败");
-        }
-        Ok(())
+        with_per_monitor_dpi(|| send_absolute_mouse(point))
     }
 
     fn inject_wheel(&self, x: i32, y: i32) -> Result<()> {
@@ -810,6 +741,33 @@ impl InputBackend for WindowsBackend {
         }
         Ok(())
     }
+}
+
+fn with_per_monitor_dpi<T>(operation: impl FnOnce() -> T) -> T {
+    let previous = unsafe {
+        SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
+    };
+    let result = operation();
+    if previous != 0 {
+        unsafe { SetThreadDpiAwarenessContext(previous) };
+    }
+    result
+}
+
+fn send_capture_message(window: HWnd, active: bool) -> bool {
+    let mut result = 0usize;
+    (unsafe {
+        SendMessageTimeoutW(
+            window,
+            WM_SYNLY_CAPTURE,
+            usize::from(active),
+            0,
+            SMTO_BLOCK | SMTO_ABORTIFHUNG,
+            CAPTURE_MESSAGE_TIMEOUT_MS,
+            &mut result,
+        )
+    }) != 0
+        && result != 0
 }
 
 fn sync_cursor_capture(state: &WindowsState, active: bool) -> bool {

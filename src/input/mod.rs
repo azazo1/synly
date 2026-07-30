@@ -9,11 +9,16 @@ mod runtime;
 #[cfg(windows)]
 pub mod windows_agent;
 
-pub use channel::{InputChannelOffer, InputChannelRole, InputHostChannel};
+pub use channel::{
+    InputChannelOffer, InputChannelRole, InputHostChannel, read_preamble as read_input_preamble,
+};
 pub use geometry::{DesktopLayout, DisplayRect, Point, ScreenEdge};
 pub use hotkey::{Hotkey, ModifierMask};
 pub use protocol::KeySnapshot;
-pub use runtime::{InputRuntimeOptions, InputSessionContext, InputSocketInbox, run_input_session};
+pub use runtime::{
+    InputRuntimeOptions, InputSessionContext, InputSocketConnection, InputSocketInbox,
+    run_input_session,
+};
 
 use anyhow::Result;
 use clap::ValueEnum;

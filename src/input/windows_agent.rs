@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -71,6 +71,27 @@ enum AgentRequest {
     Ping,
 }
 
+impl AgentRequest {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Start { .. } => "Start",
+            Self::Stop => "Stop",
+            Self::Health => "Health",
+            Self::Layout => "Layout",
+            Self::CursorPosition => "CursorPosition",
+            Self::Snapshot => "Snapshot",
+            Self::SetCapture(_) => "SetCapture",
+            Self::WarpCursor(_) => "WarpCursor",
+            Self::InjectKey { .. } => "InjectKey",
+            Self::InjectButton { .. } => "InjectButton",
+            Self::InjectCursor(_) => "InjectCursor",
+            Self::InjectWheel { .. } => "InjectWheel",
+            Self::ReleaseAll => "ReleaseAll",
+            Self::Ping => "Ping",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 enum AgentResponse {
     Ok,
@@ -121,10 +142,14 @@ struct AgentClient {
     commands: mpsc::Sender<ClientCommand>,
     context: Arc<Mutex<Option<CaptureContext>>>,
     alive: Arc<AtomicBool>,
+    lifecycle: Mutex<()>,
+    next_lease: AtomicU64,
+    active_lease: AtomicU64,
 }
 
 struct AgentBackend {
     client: Arc<AgentClient>,
+    lease: u64,
 }
 
 struct NativeAgentRuntime {
@@ -255,15 +280,22 @@ pub(in crate::input) fn is_ready() -> bool {
 pub(in crate::input) fn start_client(context: CaptureContext) -> Result<Arc<dyn InputBackend>> {
     ensure_ready(context.mode)?;
     let client = current_client().context("Windows 输入代理连接不可用")?;
+    let lifecycle = client
+        .lifecycle
+        .lock()
+        .map_err(|_| anyhow!("Windows input agent lifecycle poisoned"))?;
     client.request(AgentRequest::Start {
         mode: context.mode,
         hotkey: context.hotkey,
     })?;
+    let lease = client.next_lease.fetch_add(1, Ordering::AcqRel);
+    client.active_lease.store(lease, Ordering::Release);
     *client
         .context
         .lock()
         .map_err(|_| anyhow!("Windows input agent context poisoned"))? = Some(context);
-    Ok(Arc::new(AgentBackend { client }))
+    drop(lifecycle);
+    Ok(Arc::new(AgentBackend { client, lease }))
 }
 
 pub async fn run_agent(pipe_name: String, token: String, parent_pid: u32) -> Result<()> {
@@ -301,6 +333,7 @@ impl AgentClient {
         if !self.alive.load(Ordering::Acquire) {
             bail!("Windows input agent connection is closed");
         }
+        let request_name = request.name();
         let (response_tx, response_rx) = std::sync::mpsc::sync_channel(1);
         self.commands
             .try_send(ClientCommand {
@@ -311,13 +344,14 @@ impl AgentClient {
                 if matches!(&error, mpsc::error::TrySendError::Closed(_)) {
                     self.alive.store(false, Ordering::Release);
                 }
-                anyhow!("Windows input agent command queue unavailable: {error}")
+                anyhow!("Windows input agent {request_name} command queue unavailable: {error}")
             })?;
         match response_rx.recv_timeout(REQUEST_TIMEOUT) {
             Ok(Ok(AgentResponse::Error(message))) => Err(anyhow!(message)),
             Ok(Ok(response)) => Ok(response),
             Ok(Err(message)) => Err(anyhow!(message)),
-            Err(error) => Err(error).context("Windows input agent request timed out"),
+            Err(error) => Err(error)
+                .with_context(|| format!("Windows input agent {request_name} request timed out")),
         }
     }
 
@@ -332,26 +366,26 @@ impl AgentClient {
 
 impl InputBackend for AgentBackend {
     fn health_check(&self) -> Result<()> {
-        self.client.request(AgentRequest::Health)?;
+        self.request(AgentRequest::Health)?;
         Ok(())
     }
 
     fn layout(&self) -> Result<DesktopLayout> {
-        match self.client.request(AgentRequest::Layout)? {
+        match self.request(AgentRequest::Layout)? {
             AgentResponse::Layout(layout) => Ok(layout),
             _ => bail!("Windows input agent returned an invalid layout response"),
         }
     }
 
     fn cursor_position(&self) -> Result<Point> {
-        match self.client.request(AgentRequest::CursorPosition)? {
+        match self.request(AgentRequest::CursorPosition)? {
             AgentResponse::Point(point) => Ok(point),
             _ => bail!("Windows input agent returned an invalid cursor response"),
         }
     }
 
     fn snapshot(&self) -> KeySnapshot {
-        match self.client.request(AgentRequest::Snapshot) {
+        match self.request(AgentRequest::Snapshot) {
             Ok(AgentResponse::Snapshot(snapshot)) => snapshot,
             Ok(_) => KeySnapshot {
                 usages: Vec::new(),
@@ -359,7 +393,9 @@ impl InputBackend for AgentBackend {
                 buttons: Vec::new(),
             },
             Err(error) => {
-                self.client.emit_failure(&error);
+                if self.is_current() {
+                    self.client.emit_failure(&error);
+                }
                 KeySnapshot {
                     usages: Vec::new(),
                     modifiers: ModifierMask::default(),
@@ -370,12 +406,12 @@ impl InputBackend for AgentBackend {
     }
 
     fn set_capture(&self, active: bool) -> Result<()> {
-        self.client.request(AgentRequest::SetCapture(active))?;
+        self.request(AgentRequest::SetCapture(active))?;
         Ok(())
     }
 
     fn warp_cursor(&self, point: Point) -> Result<()> {
-        self.client.request(AgentRequest::WarpCursor(point))?;
+        self.request(AgentRequest::WarpCursor(point))?;
         Ok(())
     }
 
@@ -386,7 +422,7 @@ impl InputBackend for AgentBackend {
         down: bool,
         repeat: bool,
     ) -> Result<()> {
-        self.client.request(AgentRequest::InjectKey {
+        self.request(AgentRequest::InjectKey {
             usage,
             modifiers,
             down,
@@ -396,29 +432,57 @@ impl InputBackend for AgentBackend {
     }
 
     fn inject_button(&self, button: u8, down: bool) -> Result<()> {
-        self.client
-            .request(AgentRequest::InjectButton { button, down })?;
+        self.request(AgentRequest::InjectButton { button, down })?;
         Ok(())
     }
 
     fn inject_cursor(&self, point: Point) -> Result<()> {
-        self.client.request(AgentRequest::InjectCursor(point))?;
+        self.request(AgentRequest::InjectCursor(point))?;
         Ok(())
     }
 
     fn inject_wheel(&self, x: i32, y: i32) -> Result<()> {
-        self.client.request(AgentRequest::InjectWheel { x, y })?;
+        self.request(AgentRequest::InjectWheel { x, y })?;
         Ok(())
     }
 
     fn release_all(&self) -> Result<()> {
-        self.client.request(AgentRequest::ReleaseAll)?;
+        self.request(AgentRequest::ReleaseAll)?;
         Ok(())
+    }
+}
+
+impl AgentBackend {
+    fn request(&self, request: AgentRequest) -> Result<AgentResponse> {
+        let _lifecycle = self
+            .client
+            .lifecycle
+            .lock()
+            .map_err(|_| anyhow!("Windows input agent lifecycle poisoned"))?;
+        if !self.is_current() {
+            bail!("Windows input agent backend was superseded by a newer session");
+        }
+        self.client.request(request)
+    }
+
+    fn is_current(&self) -> bool {
+        self.client.active_lease.load(Ordering::Acquire) == self.lease
     }
 }
 
 impl Drop for AgentBackend {
     fn drop(&mut self) {
+        let Ok(_lifecycle) = self.client.lifecycle.lock() else {
+            return;
+        };
+        if self
+            .client
+            .active_lease
+            .compare_exchange(self.lease, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
         let _ = self.client.request(AgentRequest::SetCapture(false));
         let _ = self.client.request(AgentRequest::ReleaseAll);
         let _ = self.client.request(AgentRequest::Stop);
@@ -469,6 +533,9 @@ async fn connect_agent(
         commands,
         context: Arc::clone(&context),
         alive: Arc::clone(&alive),
+        lifecycle: Mutex::new(()),
+        next_lease: AtomicU64::new(1),
+        active_lease: AtomicU64::new(0),
     });
     ready
         .send(Ok(Arc::clone(&client)))
@@ -1146,10 +1213,33 @@ mod tests {
             commands,
             context: Arc::new(Mutex::new(None)),
             alive: Arc::clone(&alive),
+            lifecycle: Mutex::new(()),
+            next_lease: AtomicU64::new(1),
+            active_lease: AtomicU64::new(0),
         };
 
         assert!(client.request(AgentRequest::Health).is_err());
         assert!(!alive.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn stale_backend_drop_does_not_stop_current_lease() {
+        let (commands, mut receiver) = mpsc::channel(4);
+        let client = Arc::new(AgentClient {
+            commands,
+            context: Arc::new(Mutex::new(None)),
+            alive: Arc::new(AtomicBool::new(true)),
+            lifecycle: Mutex::new(()),
+            next_lease: AtomicU64::new(3),
+            active_lease: AtomicU64::new(2),
+        });
+        drop(AgentBackend {
+            client: Arc::clone(&client),
+            lease: 1,
+        });
+
+        assert_eq!(client.active_lease.load(Ordering::Acquire), 2);
+        assert!(receiver.try_recv().is_err());
     }
 
     #[tokio::test]
