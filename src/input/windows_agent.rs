@@ -307,7 +307,12 @@ impl AgentClient {
                 request,
                 response: response_tx,
             })
-            .map_err(|error| anyhow!("Windows input agent command queue unavailable: {error}"))?;
+            .map_err(|error| {
+                if matches!(&error, mpsc::error::TrySendError::Closed(_)) {
+                    self.alive.store(false, Ordering::Release);
+                }
+                anyhow!("Windows input agent command queue unavailable: {error}")
+            })?;
         match response_rx.recv_timeout(REQUEST_TIMEOUT) {
             Ok(Ok(AgentResponse::Error(message))) => Err(anyhow!(message)),
             Ok(Ok(response)) => Ok(response),
@@ -486,83 +491,86 @@ async fn client_loop(
     let mut heartbeat = time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut last_pong = Instant::now();
-    let result = loop {
-        tokio::select! {
-            command = commands.recv() => {
-                let Some(command) = command else { break Ok(()) };
-                let id = next_id;
-                next_id = next_id.saturating_add(1);
-                write_packet(
-                    &mut writer,
-                    &AgentPacket::Request {
-                        id,
-                        request: command.request,
-                    },
-                )
-                .await?;
-                pending.insert(id, command.response);
-            }
-            packet = read_packet(&mut reader) => {
-                match packet? {
-                    AgentPacket::Response { id, response } => {
-                        if id == 0 && matches!(&response, AgentResponse::Pong) {
-                            last_pong = Instant::now();
-                        } else if let Some(sender) = pending.remove(&id) {
-                            let _ = sender.send(Ok(response));
-                        }
-                    }
-                    AgentPacket::Event(event) => {
-                        if let Ok(context) = context.lock()
-                            && let Some(context) = context.as_ref()
-                        {
-                            context.emit_reliable(event);
-                        }
-                    }
-                    AgentPacket::Motion {
-                        dx,
-                        dy,
-                        position,
-                        position_updated,
-                    } => {
-                        if let Ok(context) = context.lock()
-                            && let Some(context) = context.as_ref()
-                        {
-                            if position_updated {
-                                if let Some(position) = position {
-                                    context.motion.add_at(dx, dy, position);
-                                }
-                            } else {
-                                context.motion.add(dx, dy);
+    let result: Result<()> = async {
+        loop {
+            tokio::select! {
+                command = commands.recv() => {
+                    let Some(command) = command else { break Ok(()) };
+                    let id = next_id;
+                    next_id = next_id.saturating_add(1);
+                    write_packet(
+                        &mut writer,
+                        &AgentPacket::Request {
+                            id,
+                            request: command.request,
+                        },
+                    )
+                    .await?;
+                    pending.insert(id, command.response);
+                }
+                packet = read_packet(&mut reader) => {
+                    match packet? {
+                        AgentPacket::Response { id, response } => {
+                            if id == 0 && matches!(&response, AgentResponse::Pong) {
+                                last_pong = Instant::now();
+                            } else if let Some(sender) = pending.remove(&id) {
+                                let _ = sender.send(Ok(response));
                             }
                         }
-                    }
-                    AgentPacket::SecureDesktopPaused(paused) => {
-                        if let Ok(context) = context.lock()
-                            && let Some(context) = context.as_ref()
-                            && paused
-                        {
-                            context.emit_reliable(NativeEvent::Emergency);
+                        AgentPacket::Event(event) => {
+                            if let Ok(context) = context.lock()
+                                && let Some(context) = context.as_ref()
+                            {
+                                context.emit_reliable(event);
+                            }
                         }
-                        tracing::warn!(paused, "Windows 输入代理安全桌面状态变化");
+                        AgentPacket::Motion {
+                            dx,
+                            dy,
+                            position,
+                            position_updated,
+                        } => {
+                            if let Ok(context) = context.lock()
+                                && let Some(context) = context.as_ref()
+                            {
+                                if position_updated {
+                                    if let Some(position) = position {
+                                        context.motion.add_at(dx, dy, position);
+                                    }
+                                } else {
+                                    context.motion.add(dx, dy);
+                                }
+                            }
+                        }
+                        AgentPacket::SecureDesktopPaused(paused) => {
+                            if let Ok(context) = context.lock()
+                                && let Some(context) = context.as_ref()
+                                && paused
+                            {
+                                context.emit_reliable(NativeEvent::Emergency);
+                            }
+                            tracing::warn!(paused, "Windows 输入代理安全桌面状态变化");
+                        }
+                        _ => bail!("Windows input agent sent an unexpected packet"),
                     }
-                    _ => bail!("Windows input agent sent an unexpected packet"),
                 }
-            }
-            _ = heartbeat.tick() => {
-                if last_pong.elapsed() > HEARTBEAT_TIMEOUT {
-                    break Err(anyhow!("Windows input agent heartbeat timed out"));
+                _ = heartbeat.tick() => {
+                    if last_pong.elapsed() > HEARTBEAT_TIMEOUT {
+                        break Err(anyhow!("Windows input agent heartbeat timed out"));
+                    }
+                    write_packet(
+                        &mut writer,
+                        &AgentPacket::Request {
+                            id: 0,
+                            request: AgentRequest::Ping,
+                        },
+                    )
+                    .await?;
                 }
-                write_packet(
-                    &mut writer,
-                    &AgentPacket::Request {
-                        id: 0,
-                        request: AgentRequest::Ping,
-                    },
-                )
-                .await?;
             }
         }
-    };
+    }
+    .await;
     alive.store(false, Ordering::Release);
     for (_, sender) in pending {
         let _ = sender.send(Err("Windows input agent connection closed".to_string()));
@@ -586,52 +594,56 @@ async fn run_agent_loop(client: tokio::net::windows::named_pipe::NamedPipeClient
     let mut desktop_tick = time::interval(Duration::from_millis(250));
     desktop_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
-    loop {
-        tokio::select! {
-            packet = read_packet(&mut reader) => {
-                let AgentPacket::Request { id, request } = packet? else {
-                    bail!("Windows input agent received an unexpected packet");
-                };
-                heartbeat = Instant::now();
-                let response = handle_agent_request(request, &mut runtime, outgoing_tx.clone()).await;
-                write_packet(
-                    &mut writer,
-                    &AgentPacket::Response {
-                        id,
-                        response: response.unwrap_or_else(|error| AgentResponse::Error(format!("{error:#}"))),
-                    },
-                )
-                .await?;
-            }
-            outgoing = outgoing_rx.recv() => {
-                let Some(outgoing) = outgoing else { break };
-                write_packet(&mut writer, &outgoing).await?;
-            }
-            _ = desktop_tick.tick() => {
-                if heartbeat.elapsed() > HEARTBEAT_TIMEOUT {
-                    tracing::warn!("Windows 输入代理心跳超时");
-                    break;
+    let result: Result<()> = async {
+        loop {
+            tokio::select! {
+                packet = read_packet(&mut reader) => {
+                    let AgentPacket::Request { id, request } = packet? else {
+                        bail!("Windows input agent received an unexpected packet");
+                    };
+                    heartbeat = Instant::now();
+                    let response = handle_agent_request(request, &mut runtime, outgoing_tx.clone()).await;
+                    write_packet(
+                        &mut writer,
+                        &AgentPacket::Response {
+                            id,
+                            response: response.unwrap_or_else(|error| AgentResponse::Error(format!("{error:#}"))),
+                        },
+                    )
+                    .await?;
+                    heartbeat = Instant::now();
                 }
-                let current_paused = !is_default_input_desktop();
-                if current_paused != paused {
-                    paused = current_paused;
-                    if paused
-                        && let Some(runtime) = runtime.as_ref()
-                    {
-                        let _ = runtime.backend.set_capture(false);
-                        let _ = runtime.backend.release_all();
+                outgoing = outgoing_rx.recv() => {
+                    let Some(outgoing) = outgoing else { break Ok(()) };
+                    write_packet(&mut writer, &outgoing).await?;
+                }
+                _ = desktop_tick.tick() => {
+                    if heartbeat.elapsed() > HEARTBEAT_TIMEOUT {
+                        tracing::warn!("Windows 输入代理心跳超时");
+                        break Ok(());
                     }
-                    outgoing_tx
-                        .send(AgentPacket::SecureDesktopPaused(paused))
-                        .await?;
+                    let current_paused = !is_default_input_desktop();
+                    if current_paused != paused {
+                        paused = current_paused;
+                        if paused
+                            && let Some(runtime) = runtime.as_ref()
+                        {
+                            let _ = runtime.backend.set_capture(false);
+                            let _ = runtime.backend.release_all();
+                        }
+                        outgoing_tx
+                            .send(AgentPacket::SecureDesktopPaused(paused))
+                            .await?;
+                    }
                 }
             }
         }
     }
+    .await;
     if let Some(runtime) = runtime {
         runtime.stop().await;
     }
-    Ok(())
+    result
 }
 
 async fn handle_agent_request(
@@ -1084,4 +1096,24 @@ where
 
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn closed_command_queue_marks_agent_unavailable() {
+        let (commands, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let alive = Arc::new(AtomicBool::new(true));
+        let client = AgentClient {
+            commands,
+            context: Arc::new(Mutex::new(None)),
+            alive: Arc::clone(&alive),
+        };
+
+        assert!(client.request(AgentRequest::Health).is_err());
+        assert!(!alive.load(Ordering::Acquire));
+    }
 }
