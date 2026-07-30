@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use slint::{ComponentHandle, Weak};
+use slint::Weak;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
 use std::sync::Arc;
@@ -96,8 +96,10 @@ fn activation_loop(listener: TcpListener, window: Weak<AppWindow>, stop: Arc<Ato
                     tracing::info!(%address, "收到重复启动激活请求");
                     let window = window.clone();
                     let _ = slint::invoke_from_event_loop(move || {
-                        if let Some(window) = window.upgrade() {
-                            let _ = window.show();
+                        if let Some(window) = window.upgrade()
+                            && let Err(error) = super::show_main_window(&window)
+                        {
+                            tracing::warn!(error = %error, "无法激活主窗口");
                         }
                     });
                 }

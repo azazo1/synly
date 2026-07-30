@@ -11,14 +11,22 @@ use crate::settings::{
     LogLevel,
 };
 use anyhow::{Context, Result};
-use slint::{CloseRequestResponse, ComponentHandle, ModelRc, VecModel};
+use slint::{CloseRequestResponse, ComponentHandle, LogicalSize, ModelRc, VecModel};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
 mod single_instance;
+mod tray;
 
 slint::include_modules!();
+
+const DEFAULT_WINDOW_WIDTH: f32 = 980.0;
+const DEFAULT_WINDOW_HEIGHT: f32 = 640.0;
+const MIN_WINDOW_WIDTH: f32 = 820.0;
+const MIN_WINDOW_HEIGHT: f32 = 560.0;
+const MAX_WINDOW_WIDTH: f32 = 1180.0;
+const MAX_WINDOW_HEIGHT: f32 = 760.0;
 
 pub fn run(config: SynlyConfig) -> Result<()> {
     let single_instance = single_instance::SingleInstance::acquire(config.device.device_id)?;
@@ -35,42 +43,49 @@ pub fn run(config: SynlyConfig) -> Result<()> {
     runtime.spawn(supervisor.run());
 
     let window = AppWindow::new().context("failed to create Slint main window")?;
-    window.window().set_size(slint::PhysicalSize::new(
-        config.ui.window_width,
-        config.ui.window_height,
+    window.window().set_size(restored_window_size(
+        &window,
+        &config.ui,
     ));
     let _single_instance_guard =
         single_instance::SingleInstanceGuard::start(listener, window.as_weak())?;
-    let tray = AppTray::new().context("failed to create Slint tray")?;
+    let tray = tray::TrayController::new(&window, &handle);
     apply_settings_to_window(
         &window,
         &config.runtime,
         &AppSettings::from_config(&config),
     );
-    apply_snapshot(&window, &tray, &handle.snapshots().borrow(), None);
+    apply_snapshot(&window, &handle.snapshots().borrow(), None);
 
     let current_interaction = Arc::new(Mutex::new(None::<Uuid>));
     wire_window_callbacks(&window, &handle, Arc::clone(&current_interaction));
-    wire_tray_callbacks(&window, &tray, &handle);
     wire_close_to_tray(&window, &handle);
     spawn_snapshot_presenter(
         &runtime,
         &window,
-        &tray,
         handle.snapshots(),
         Arc::clone(&current_interaction),
+        tray.state_sink(),
     );
     spawn_log_presenter(&runtime, &window);
 
-    tray.show().context("failed to show Slint tray")?;
+    tray.start();
     if !config.ui.first_run_completed || !config.ui.start_hidden {
-        window.show().context("failed to show Slint window")?;
+        show_main_window(&window).context("failed to show Slint window")?;
     }
 
-    slint::run_event_loop().context("Slint event loop failed")?;
+    slint::run_event_loop_until_quit().context("Slint event loop failed")?;
     save_window_state(&window, &handle.commands());
     let _ = handle.commands().try_send(AppCommand::Shutdown);
     runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+    Ok(())
+}
+
+pub(super) fn show_main_window(
+    window: &AppWindow,
+) -> std::result::Result<(), slint::PlatformError> {
+    window.show()?;
+    window.invoke_bring_to_front();
     Ok(())
 }
 
@@ -267,73 +282,6 @@ fn wire_window_callbacks(
     });
 }
 
-fn wire_tray_callbacks(
-    window: &AppWindow,
-    tray: &AppTray,
-    handle: &crate::core::AppSupervisorHandle,
-) {
-    let weak = window.as_weak();
-    tray.on_open_window(move || {
-        if let Some(window) = weak.upgrade() {
-            let _ = window.show();
-        }
-    });
-
-    let commands = handle.commands();
-    let snapshots = handle.snapshots();
-    tray.on_connect_or_disconnect(move || {
-        let snapshot = snapshots.borrow();
-        if snapshot.applied.is_some() {
-            send_command(&commands, AppCommand::Disconnect);
-        } else {
-            send_command(&commands, AppCommand::Start);
-        }
-    });
-
-    let commands = handle.commands();
-    let snapshots = handle.snapshots();
-    tray.on_toggle_clipboard(move || {
-        let mode = if snapshots.borrow().desired.clipboard_mode == ClipboardMode::Off {
-            ClipboardMode::Both
-        } else {
-            ClipboardMode::Off
-        };
-        send_command(&commands, AppCommand::SetClipboardMode(mode));
-    });
-
-    let commands = handle.commands();
-    let snapshots = handle.snapshots();
-    tray.on_toggle_audio(move || {
-        let mode = if snapshots.borrow().desired.audio_mode == AudioMode::Off {
-            AudioMode::Receive
-        } else {
-            AudioMode::Off
-        };
-        send_command(&commands, AppCommand::SetAudioMode(mode));
-    });
-
-    let commands = handle.commands();
-    let snapshots = handle.snapshots();
-    tray.on_toggle_input(move || {
-        let mode = if snapshots.borrow().desired.input_mode == InputMode::Off {
-            InputMode::Receive
-        } else {
-            InputMode::Off
-        };
-        send_command(&commands, AppCommand::SetInputMode(mode));
-    });
-
-    let commands = handle.commands();
-    let weak = window.as_weak();
-    tray.on_quit(move || {
-        if let Some(window) = weak.upgrade() {
-            save_window_state(&window, &commands);
-        }
-        send_command(&commands, AppCommand::Shutdown);
-        let _ = slint::quit_event_loop();
-    });
-}
-
 fn wire_close_to_tray(
     window: &AppWindow,
     handle: &crate::core::AppSupervisorHandle,
@@ -359,12 +307,11 @@ fn wire_close_to_tray(
 fn spawn_snapshot_presenter(
     runtime: &tokio::runtime::Runtime,
     window: &AppWindow,
-    tray: &AppTray,
     mut snapshots: tokio::sync::watch::Receiver<AppSnapshot>,
     current_interaction: Arc<Mutex<Option<Uuid>>>,
+    tray_state: tray::TrayStateSink,
 ) {
     let window = window.as_weak();
-    let tray = tray.as_weak();
     runtime.spawn(async move {
         let mut previous_runtime = snapshots.borrow().desired.clone();
         let mut previous_settings = snapshots.borrow().settings.clone();
@@ -378,6 +325,7 @@ fn spawn_snapshot_presenter(
                 break;
             }
             let snapshot = snapshots.borrow().clone();
+            tray_state.apply_snapshot(&snapshot);
             let settings_changed = runtime_form_fields_changed(
                 &previous_runtime,
                 &snapshot.desired,
@@ -392,12 +340,11 @@ fn spawn_snapshot_presenter(
             previous_interaction = interaction_id;
             let interaction = Arc::clone(&current_interaction);
             let window_weak = window.clone();
-            let tray_weak = tray.clone();
             if slint::invoke_from_event_loop(move || {
-                let (Some(window), Some(tray)) = (window_weak.upgrade(), tray_weak.upgrade()) else {
+                let Some(window) = window_weak.upgrade() else {
                     return;
                 };
-                apply_snapshot(&window, &tray, &snapshot, Some(&interaction));
+                apply_snapshot(&window, &snapshot, Some(&interaction));
                 if new_interaction
                     && !window.window().is_visible()
                     && let Some(interaction) = snapshot.interaction.as_ref()
@@ -411,8 +358,10 @@ fn spawn_snapshot_presenter(
                         move || {
                             let window = window.clone();
                             let _ = slint::invoke_from_event_loop(move || {
-                                if let Some(window) = window.upgrade() {
-                                    let _ = window.show();
+                                if let Some(window) = window.upgrade()
+                                    && let Err(error) = show_main_window(&window)
+                                {
+                                    tracing::warn!(error = %error, "无法从通知打开主窗口");
                                 }
                             });
                         },
@@ -473,7 +422,6 @@ fn interaction_notification_text(request: &InteractionRequest) -> (String, Strin
 
 fn apply_snapshot(
     window: &AppWindow,
-    tray: &AppTray,
     snapshot: &AppSnapshot,
     current_interaction: Option<&Arc<Mutex<Option<Uuid>>>>,
 ) {
@@ -582,12 +530,6 @@ fn apply_snapshot(
         })
         .collect::<Vec<_>>();
     window.set_trusted_devices(ModelRc::new(VecModel::from(trusted)));
-    tray.set_status_text(format!("Synly {}", snapshot.lifecycle.label()).into());
-    tray.set_connected(active);
-    tray.set_clipboard_enabled(snapshot.desired.clipboard_mode != ClipboardMode::Off);
-    tray.set_audio_enabled(snapshot.desired.audio_mode != AudioMode::Off);
-    tray.set_input_enabled(snapshot.desired.input_mode != InputMode::Off);
-
     apply_interaction(window, snapshot, current_interaction);
 }
 
@@ -896,6 +838,7 @@ fn settings_from_window(window: &AppWindow) -> Result<(RuntimeConfig, AppSetting
         mdns_enabled: window.get_mdns_enabled(),
         lnd,
     };
+    let (window_width, window_height) = logical_window_size(window);
     let ui = UiConfig {
         first_run_completed: true,
         start_hidden: window.get_start_hidden(),
@@ -903,8 +846,8 @@ fn settings_from_window(window: &AppWindow) -> Result<(RuntimeConfig, AppSetting
         launch_at_login: window.get_launch_at_login(),
         resume_last_session: window.get_resume_last_session(),
         log_level: log_level_from_index(window.get_log_level_index()),
-        window_width: window.window().size().width,
-        window_height: window.window().size().height,
+        window_width,
+        window_height,
     };
     let settings = AppSettings {
         device_name,
@@ -924,14 +867,56 @@ fn save_window_state(
     window: &AppWindow,
     commands: &tokio::sync::mpsc::Sender<AppCommand>,
 ) {
-    let size = window.window().size();
+    let (width, height) = logical_window_size(window);
     send_command(
         commands,
         AppCommand::SaveWindowState {
-            width: size.width,
-            height: size.height,
+            width,
+            height,
         },
     );
+}
+
+fn restored_window_size(window: &AppWindow, ui: &UiConfig) -> LogicalSize {
+    if !ui.first_run_completed {
+        return LogicalSize::new(DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT);
+    }
+
+    normalized_restored_window_size(
+        ui.window_width as f32,
+        ui.window_height as f32,
+        window.window().scale_factor(),
+    )
+}
+
+fn normalized_restored_window_size(
+    mut width: f32,
+    mut height: f32,
+    scale_factor: f32,
+) -> LogicalSize {
+    if width > MAX_WINDOW_WIDTH || height > MAX_WINDOW_HEIGHT {
+        let scale_factor = scale_factor.max(1.0);
+        width /= scale_factor;
+        height /= scale_factor;
+    }
+
+    clamped_window_size(width, height)
+}
+
+fn logical_window_size(window: &AppWindow) -> (u32, u32) {
+    let logical = window
+        .window()
+        .size()
+        .to_logical(window.window().scale_factor());
+    let size = clamped_window_size(logical.width, logical.height);
+    (size.width.round() as u32, size.height.round() as u32)
+}
+
+fn clamped_window_size(width: f32, height: f32) -> LogicalSize {
+    LogicalSize::new(
+        width.clamp(MIN_WINDOW_WIDTH, MAX_WINDOW_WIDTH),
+        height.clamp(MIN_WINDOW_HEIGHT, MAX_WINDOW_HEIGHT),
+    )
 }
 
 fn parse_required_u64(value: &str, label: &str) -> Result<u64> {
@@ -1111,7 +1096,7 @@ fn log_level_from_index(index: i32) -> LogLevel {
 
 #[cfg(test)]
 mod tests {
-    use super::interaction_notification_text;
+    use super::{interaction_notification_text, normalized_restored_window_size};
     use crate::runtime_control::InteractionRequest;
     use uuid::Uuid;
 
@@ -1133,5 +1118,21 @@ mod tests {
         assert!(!title.contains("123456"));
         assert!(!body.contains("123456"));
         assert!(body.contains("ABCD"));
+    }
+
+    #[test]
+    fn legacy_physical_window_size_is_migrated_and_clamped() {
+        let size = normalized_restored_window_size(2880.0, 1568.0, 2.0);
+
+        assert_eq!(size.width, 1180.0);
+        assert_eq!(size.height, 760.0);
+    }
+
+    #[test]
+    fn logical_window_size_is_preserved_inside_supported_bounds() {
+        let size = normalized_restored_window_size(980.0, 640.0, 2.0);
+
+        assert_eq!(size.width, 980.0);
+        assert_eq!(size.height, 640.0);
     }
 }

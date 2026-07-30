@@ -1,6 +1,6 @@
 import {
-    AboutSlint, Button, CheckBox, ComboBox, GroupBox, LineEdit, ScrollView,
-    SpinBox, Switch, TextEdit, VerticalBox, HorizontalBox
+    AboutSlint, Button, CheckBox, ComboBox, LineEdit, Palette, ScrollView,
+    SpinBox, TextEdit
 } from "std-widgets.slint";
 
 export struct PeerRow {
@@ -17,18 +17,69 @@ export struct TrustedRow {
     subtitle: string,
 }
 
-component NavButton inherits Button {
+component NavButton inherits Rectangle {
+    in property <string> text;
     in property <bool> active;
-    min-height: 38px;
+    callback clicked;
+    background: active ? #31433c : nav-touch.has-hover ? #29322f : transparent;
+    border-radius: 5px;
+    preferred-height: 34px;
+    min-height: 34px;
+    max-height: 34px;
+    vertical-stretch: 0;
+
+    if root.active: Rectangle {
+        width: 3px;
+        height: 18px;
+        x: 0px;
+        y: (parent.height - self.height) / 2;
+        background: #73b597;
+        border-radius: 2px;
+    }
+
+    Text {
+        text: root.text;
+        color: root.active ? #ffffff : #d5d9d7;
+        font-weight: root.active ? 600 : 400;
+        x: 14px;
+        width: parent.width - 24px;
+        horizontal-alignment: left;
+        vertical-alignment: center;
+    }
+
+    nav-touch := TouchArea {
+        clicked => { root.clicked(); }
+    }
+}
+
+component Panel inherits Rectangle {
+    in property <string> title;
+    background: #ffffff;
+    border-color: #d8dedb;
+    border-width: 1px;
+    border-radius: 6px;
+
+    VerticalLayout {
+        padding: 12px;
+        spacing: 8px;
+        Text {
+            text: root.title;
+            color: #252b28;
+            font-size: 14px;
+            font-weight: 650;
+        }
+        @children
+    }
 }
 
 export component AppWindow inherits Window {
+    init => { Palette.color-scheme = ColorScheme.light; }
     title: "Synly";
-    preferred-width: 1080px;
-    preferred-height: 720px;
+    preferred-width: 980px;
+    preferred-height: 640px;
     min-width: 820px;
     min-height: 560px;
-    background: #f5f6f4;
+    background: #eef1ef;
     icon: @image-url("tray-icon.svg");
 
     in-out property <int> selected-page: 0;
@@ -107,33 +158,36 @@ export component AppWindow inherits Window {
     callback interaction-accept();
     callback interaction-reject();
     callback interaction-submit-pin();
+    callback bring-to-front();
+
+    bring-to-front => { Platform.macos-bring-all-windows-to-front(); }
 
     HorizontalLayout {
         spacing: 0px;
 
         Rectangle {
-            width: 184px;
-            background: #202523;
+            width: 156px;
+            background: #1d2421;
 
             VerticalLayout {
-                padding: 16px;
-                spacing: 8px;
+                padding: 12px;
+                spacing: 5px;
 
                 Text {
                     text: "SYNLY";
                     color: #ffffff;
-                    font-size: 22px;
+                    font-size: 20px;
                     font-weight: 700;
-                    height: 44px;
+                    height: 38px;
                     vertical-alignment: center;
                 }
                 Text {
                     text: root.lifecycle-text;
                     color: root.session-active ? #75d6a8 : #c6cbc8;
                     font-size: 12px;
-                    height: 24px;
+                    height: 20px;
                 }
-                Rectangle { height: 8px; }
+                Rectangle { height: 5px; }
                 NavButton { text: "状态"; active: root.selected-page == 0; clicked => { root.selected-page = 0; } }
                 NavButton { text: "设备"; active: root.selected-page == 1; clicked => { root.selected-page = 1; } }
                 NavButton { text: "同步"; active: root.selected-page == 2; clicked => { root.selected-page = 2; } }
@@ -147,82 +201,129 @@ export component AppWindow inherits Window {
                     color: #c6cbc8;
                     wrap: word-wrap;
                     font-size: 11px;
-                    height: 44px;
+                    height: 38px;
                 }
             }
         }
 
         Rectangle {
             horizontal-stretch: 1;
-            background: #f5f6f4;
+            background: #eef1ef;
 
             if root.selected-page == 0: VerticalLayout {
-                padding: 24px;
-                spacing: 16px;
-                Text { text: "运行状态"; font-size: 24px; font-weight: 650; color: #202523; }
-                GroupBox {
-                    title: "当前会话";
+                padding: 18px;
+                spacing: 10px;
+                HorizontalLayout {
+                    height: 48px;
                     VerticalLayout {
-                        spacing: 10px;
-                        Text { text: root.lifecycle-text; font-size: 20px; color: root.session-active ? #2e7d5b : #555b58; }
-                        Text { text: root.status-detail; wrap: word-wrap; color: #555b58; }
-                        Text { text: "对侧: " + root.current-peer; color: #343936; }
-                        HorizontalLayout {
-                            spacing: 8px;
-                            Button { text: "开始监听"; enabled: !root.session-active; clicked => { root.start-hosting(); } }
-                            Button { text: "连接设备"; enabled: !root.session-active; clicked => { root.selected-page = 1; } }
-                            Button { text: "断开"; enabled: root.session-active; clicked => { root.disconnect(); } }
+                        spacing: 2px;
+                        Text { text: "运行状态"; font-size: 22px; font-weight: 680; color: #202523; }
+                        Text { text: root.status-detail; color: #68706c; font-size: 11px; overflow: elide; }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    Rectangle {
+                        width: 122px;
+                        height: 30px;
+                        background: root.session-active ? #e1f1e9 : #e4e8e6;
+                        border-color: root.session-active ? #93c6ad : #c9cfcc;
+                        border-width: 1px;
+                        border-radius: 15px;
+                        Text {
+                            text: root.lifecycle-text;
+                            color: root.session-active ? #216a4c : #535c57;
+                            font-size: 12px;
+                            font-weight: 600;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
                         }
                     }
                 }
-                GroupBox {
+                HorizontalLayout {
+                    height: 184px;
+                    spacing: 10px;
+                    Panel {
+                        title: "当前会话";
+                        horizontal-stretch: 3;
+                        VerticalLayout {
+                            spacing: 6px;
+                            HorizontalLayout {
+                                Text { text: "状态"; color: #737b77; width: 58px; }
+                                Text { text: root.lifecycle-text; color: root.session-active ? #247554 : #343a37; font-weight: 600; }
+                            }
+                            HorizontalLayout {
+                                Text { text: "对侧"; color: #737b77; width: 58px; }
+                                Text { text: root.current-peer; color: #343a37; overflow: elide; }
+                            }
+                            Rectangle { vertical-stretch: 1; }
+                            HorizontalLayout {
+                                spacing: 6px;
+                                Button { text: "监听"; enabled: !root.session-active; clicked => { root.start-hosting(); } }
+                                Button { text: "连接"; enabled: !root.session-active; clicked => { root.selected-page = 1; } }
+                                Button { text: "断开"; enabled: root.session-active; clicked => { root.disconnect(); } }
+                            }
+                        }
+                    }
+                    Panel {
+                        title: "快捷开关";
+                        horizontal-stretch: 2;
+                        VerticalLayout {
+                            spacing: 5px;
+                            HorizontalLayout {
+                                Text { text: "剪贴板"; color: #555d59; width: 58px; vertical-alignment: center; }
+                                clipboard-box := ComboBox {
+                                    model: ["关闭", "发送", "接收", "双向"];
+                                    current-index <=> root.clipboard-mode-index;
+                                    selected(_) => { root.set-clipboard-mode(clipboard-box.current-index); }
+                                }
+                            }
+                            HorizontalLayout {
+                                Text { text: "音频"; color: #555d59; width: 58px; vertical-alignment: center; }
+                                audio-box := ComboBox {
+                                    model: ["关闭", "发送", "接收"];
+                                    current-index <=> root.audio-mode-index;
+                                    selected(_) => { root.set-audio-mode(audio-box.current-index); }
+                                }
+                            }
+                            HorizontalLayout {
+                                Text { text: "输入"; color: #555d59; width: 58px; vertical-alignment: center; }
+                                input-box := ComboBox {
+                                    model: ["关闭", "发送控制", "接受控制"];
+                                    current-index <=> root.input-mode-index;
+                                    selected(_) => { root.set-input-mode(input-box.current-index); }
+                                }
+                            }
+                        }
+                    }
+                }
+                Panel {
                     title: "配置状态";
-                    VerticalLayout {
-                        spacing: 5px;
-                        Text { text: "期望: " + root.desired-summary; color: #343936; wrap: word-wrap; }
-                        Text { text: "已应用: " + root.applied-summary; color: #343936; wrap: word-wrap; }
-                        Text { text: "待应用: " + root.pending-summary; color: #8a4b2c; wrap: word-wrap; }
-                        Text { text: "对侧: " + root.remote-summary; color: #555b58; wrap: word-wrap; }
-                        Text { text: "Epoch: " + root.epoch-summary; color: #666c68; }
-                    }
-                }
-                GroupBox {
-                    title: "快捷开关";
+                    height: 156px;
                     HorizontalLayout {
-                        spacing: 18px;
+                        spacing: 16px;
                         VerticalLayout {
-                            Text { text: "剪贴板"; }
-                            clipboard-box := ComboBox {
-                                model: ["关闭", "发送", "接收", "双向"];
-                                current-index <=> root.clipboard-mode-index;
-                                selected(_) => { root.set-clipboard-mode(clipboard-box.current-index); }
-                            }
+                            horizontal-stretch: 3;
+                            spacing: 5px;
+                            Text { text: "期望: " + root.desired-summary; color: #343936; wrap: word-wrap; }
+                            Text { text: "已应用: " + root.applied-summary; color: #343936; wrap: word-wrap; }
+                            Text { text: "待应用: " + root.pending-summary; color: #9a542f; wrap: word-wrap; }
                         }
                         VerticalLayout {
-                            Text { text: "音频"; }
-                            audio-box := ComboBox {
-                                model: ["关闭", "发送", "接收"];
-                                current-index <=> root.audio-mode-index;
-                                selected(_) => { root.set-audio-mode(audio-box.current-index); }
-                            }
-                        }
-                        VerticalLayout {
-                            Text { text: "输入"; }
-                            input-box := ComboBox {
-                                model: ["关闭", "发送控制", "接受控制"];
-                                current-index <=> root.input-mode-index;
-                                selected(_) => { root.set-input-mode(input-box.current-index); }
-                            }
+                            horizontal-stretch: 2;
+                            spacing: 5px;
+                            Text { text: "对侧能力"; color: #737b77; font-size: 11px; }
+                            Text { text: root.remote-summary; color: #343936; wrap: word-wrap; }
+                            Text { text: "Epoch: " + root.epoch-summary; color: #666c68; }
                         }
                     }
                 }
                 if root.input-mode-index != 0 && !root.input-permission-ready: Rectangle {
-                    height: 56px;
+                    height: 46px;
                     background: #fff2e8;
                     border-color: #e27a55;
                     border-width: 1px;
+                    border-radius: 5px;
                     HorizontalLayout {
-                        padding: 10px;
+                        padding: 8px;
                         Text { text: "Windows 输入代理等待本机管理员授权"; vertical-alignment: center; color: #74351f; }
                         Button { text: "授权"; clicked => { root.request-input-elevation(); } }
                     }
@@ -231,26 +332,27 @@ export component AppWindow inherits Window {
             }
 
             if root.selected-page == 1: VerticalLayout {
-                padding: 24px;
-                spacing: 12px;
-                Text { text: "设备"; font-size: 24px; font-weight: 650; color: #202523; }
+                padding: 18px;
+                spacing: 10px;
+                Text { text: "设备"; font-size: 22px; font-weight: 680; color: #202523; height: 34px; }
                 HorizontalLayout {
-                    spacing: 8px;
+                    height: 34px;
+                    spacing: 6px;
                     LineEdit { text <=> root.peer-query; placeholder-text: "设备名, ID 或地址"; horizontal-stretch: 1; }
                     Button { text: "直连"; clicked => { root.connect-query(); } }
                 }
                 ScrollView {
                     vertical-stretch: 1;
                     VerticalLayout {
-                        spacing: 8px;
+                        spacing: 6px;
                         for peer in root.peers: Rectangle {
-                            height: 78px;
+                            height: 64px;
                             background: #ffffff;
                             border-color: peer.compatible ? #d8dcda : #e27a55;
                             border-width: 1px;
-                            border-radius: 6px;
+                            border-radius: 5px;
                             HorizontalLayout {
-                                padding: 12px;
+                                padding: 9px;
                                 VerticalLayout {
                                     Text { text: peer.title; font-size: 15px; font-weight: 600; color: #202523; }
                                     Text { text: peer.subtitle; color: #666c68; font-size: 11px; wrap: word-wrap; }
@@ -268,13 +370,20 @@ export component AppWindow inherits Window {
 
             if root.selected-page == 2: ScrollView {
                 VerticalLayout {
-                    padding: 24px;
-                    spacing: 14px;
-                    Text { text: "同步设置"; font-size: 24px; font-weight: 650; color: #202523; }
-                    GroupBox {
+                    padding: 18px;
+                    spacing: 10px;
+                    Text { text: "同步设置"; font-size: 22px; font-weight: 680; color: #202523; height: 34px; }
+                    HorizontalLayout {
+                        preferred-height: 286px;
+                        min-height: 286px;
+                        max-height: 286px;
+                        vertical-stretch: 0;
+                        spacing: 10px;
+                        Panel {
                         title: "文件";
+                        horizontal-stretch: 3;
                         VerticalLayout {
-                            spacing: 8px;
+                            spacing: 6px;
                             ComboBox { model: ["关闭", "发送", "接收", "双向", "自动"]; current-index <=> root.file-mode-index; }
                             HorizontalLayout {
                                 LineEdit { text <=> root.path-text; placeholder-text: "同步路径"; horizontal-stretch: 1; }
@@ -293,45 +402,64 @@ export component AppWindow inherits Window {
                                 Text { text: "-1 表示无限制"; vertical-alignment: center; color: #666c68; }
                             }
                         }
-                    }
-                    GroupBox {
+                        }
+                        Panel {
                         title: "输入";
+                        horizontal-stretch: 2;
                         VerticalLayout {
+                            spacing: 6px;
+                            Text { text: "控制方向"; color: #737b77; font-size: 11px; }
                             ComboBox { model: ["关闭", "发送控制", "接受控制"]; current-index <=> root.input-mode-index; }
+                            Text { text: "屏幕边缘"; color: #737b77; font-size: 11px; }
                             ComboBox { model: ["左侧", "右侧", "顶部", "底部"]; current-index <=> root.input-edge-index; }
+                            Text { text: "紧急收回热键"; color: #737b77; font-size: 11px; }
                             LineEdit { text <=> root.input-hotkey; placeholder-text: "紧急收回热键"; }
                         }
+                        }
                     }
-                    Button { text: root.session-active ? "应用并按需重连" : "保存设置"; clicked => { root.apply-settings(); } }
+                    HorizontalLayout {
+                        preferred-height: 34px;
+                        min-height: 34px;
+                        max-height: 34px;
+                        vertical-stretch: 0;
+                        Rectangle { horizontal-stretch: 1; }
+                        Button { text: root.session-active ? "应用并按需重连" : "保存设置"; clicked => { root.apply-settings(); } }
+                    }
+                    Rectangle { vertical-stretch: 1; }
                 }
             }
 
             if root.selected-page == 3: VerticalLayout {
-                padding: 24px;
-                spacing: 12px;
-                Text { text: "安全"; font-size: 24px; font-weight: 650; color: #202523; }
-                HorizontalLayout {
-                    CheckBox { text: "自动接受未信任设备"; checked <=> root.accept-untrusted; }
-                    CheckBox { text: "配对后建立信任"; checked <=> root.trust-device; }
-                    CheckBox { text: "仅允许可信设备"; checked <=> root.trusted-only; }
-                }
-                LineEdit {
-                    text <=> root.fixed-pin;
-                    placeholder-text: "本次进程使用的 6 位固定 PIN, 留空则随机生成";
-                    input-type: password;
+                padding: 18px;
+                spacing: 10px;
+                Text { text: "安全"; font-size: 22px; font-weight: 680; color: #202523; height: 34px; }
+                Panel {
+                    title: "配对策略";
+                    height: 112px;
+                    HorizontalLayout {
+                        spacing: 10px;
+                        CheckBox { text: "自动接受未信任设备"; checked <=> root.accept-untrusted; }
+                        CheckBox { text: "配对后建立信任"; checked <=> root.trust-device; }
+                        CheckBox { text: "仅允许可信设备"; checked <=> root.trusted-only; }
+                    }
+                    LineEdit {
+                        text <=> root.fixed-pin;
+                        placeholder-text: "本次进程使用的 6 位固定 PIN, 留空则随机生成";
+                        input-type: password;
+                    }
                 }
                 ScrollView {
                     vertical-stretch: 1;
                     VerticalLayout {
-                        spacing: 8px;
+                        spacing: 6px;
                         for device in root.trusted-devices: Rectangle {
-                            height: 66px;
+                            height: 58px;
                             background: #ffffff;
                             border-color: #d8dcda;
                             border-width: 1px;
-                            border-radius: 6px;
+                            border-radius: 5px;
                             HorizontalLayout {
-                                padding: 10px;
+                                padding: 8px;
                                 VerticalLayout {
                                     Text { text: device.title; font-weight: 600; }
                                     Text { text: device.subtitle; color: #666c68; font-size: 11px; }
@@ -341,70 +469,94 @@ export component AppWindow inherits Window {
                         }
                     }
                 }
-                Button { text: "保存安全设置"; clicked => { root.apply-settings(); } }
+                HorizontalLayout {
+                    Rectangle { horizontal-stretch: 1; }
+                    Button { text: "保存安全设置"; clicked => { root.apply-settings(); } }
+                }
             }
 
             if root.selected-page == 4: ScrollView {
                 VerticalLayout {
-                    padding: 24px;
-                    spacing: 14px;
-                    Text { text: "应用设置"; font-size: 24px; font-weight: 650; color: #202523; }
-                    GroupBox {
-                        title: "连接";
-                        VerticalLayout {
-                            ComboBox { model: ["监听连接", "连接设备"]; current-index <=> root.connection-index; }
-                            LineEdit { text <=> root.instance-name; placeholder-text: "实例名"; }
-                            LineEdit { text <=> root.peer-query; placeholder-text: "目标设备"; enabled: root.connection-index == 1; }
-                            LineEdit { text <=> root.port-text; placeholder-text: "监听端口, 留空自动分配"; enabled: root.connection-index == 0; input-type: number; }
+                    padding: 18px;
+                    spacing: 10px;
+                    Text { text: "应用设置"; font-size: 22px; font-weight: 680; color: #202523; height: 34px; }
+                    HorizontalLayout {
+                        height: 248px;
+                        spacing: 10px;
+                        Panel {
+                            title: "连接";
+                            horizontal-stretch: 1;
+                            VerticalLayout {
+                                spacing: 6px;
+                                ComboBox { model: ["监听连接", "连接设备"]; current-index <=> root.connection-index; }
+                                LineEdit { text <=> root.instance-name; placeholder-text: "实例名"; }
+                                LineEdit { text <=> root.peer-query; placeholder-text: "目标设备"; enabled: root.connection-index == 1; }
+                                LineEdit { text <=> root.port-text; placeholder-text: "监听端口, 留空自动分配"; enabled: root.connection-index == 0; input-type: number; }
+                            }
+                        }
+                        Panel {
+                            title: "设备与发现";
+                            horizontal-stretch: 1;
+                            VerticalLayout {
+                                spacing: 5px;
+                                LineEdit { text <=> root.device-name; placeholder-text: "设备名"; }
+                                HorizontalLayout {
+                                    CheckBox { text: "mDNS"; checked <=> root.mdns-enabled; }
+                                    CheckBox { text: "LND"; checked <=> root.lnd-enabled; }
+                                }
+                                LineEdit { text <=> root.lnd-server-url; placeholder-text: "LND 服务 URL"; enabled: root.lnd-enabled; }
+                                LineEdit { text <=> root.lnd-bearer-token; placeholder-text: "LND bearer token"; input-type: password; enabled: root.lnd-enabled; }
+                                LineEdit { text <=> root.lnd-discovery-domain; placeholder-text: "LND discovery domain, 可选"; enabled: root.lnd-enabled; }
+                            }
                         }
                     }
-                    GroupBox {
-                        title: "设备与发现";
-                        VerticalLayout {
-                            LineEdit { text <=> root.device-name; placeholder-text: "设备名"; }
-                            CheckBox { text: "启用 mDNS 发现"; checked <=> root.mdns-enabled; }
-                            CheckBox { text: "启用 LND 发现"; checked <=> root.lnd-enabled; }
-                            LineEdit { text <=> root.lnd-server-url; placeholder-text: "LND 服务 URL"; enabled: root.lnd-enabled; }
-                            LineEdit { text <=> root.lnd-bearer-token; placeholder-text: "LND bearer token"; input-type: password; enabled: root.lnd-enabled; }
-                            LineEdit { text <=> root.lnd-discovery-domain; placeholder-text: "LND discovery domain, 可选"; enabled: root.lnd-enabled; }
+                    HorizontalLayout {
+                        height: 274px;
+                        spacing: 10px;
+                        Panel {
+                            title: "剪贴板与传输限制";
+                            horizontal-stretch: 1;
+                            VerticalLayout {
+                                spacing: 5px;
+                                LineEdit { text <=> root.clipboard-max-file-text; placeholder-text: "剪贴板单文件上限, 字节"; input-type: number; }
+                                LineEdit { text <=> root.clipboard-max-cache-text; placeholder-text: "剪贴板缓存上限, 字节, 留空不限制"; input-type: number; }
+                                LineEdit { text <=> root.clipboard-cache-dir; placeholder-text: "剪贴板缓存目录, 可选"; }
+                                LineEdit { text <=> root.transfer-meta-text; placeholder-text: "元数据上限, 字节"; input-type: number; }
+                                LineEdit { text <=> root.transfer-frame-text; placeholder-text: "传输帧上限, 字节"; input-type: number; }
+                                LineEdit { text <=> root.transfer-clipboard-text; placeholder-text: "剪贴板帧上限, 字节"; input-type: number; }
+                            }
                         }
-                    }
-                    GroupBox {
-                        title: "剪贴板与传输限制";
-                        VerticalLayout {
-                            LineEdit { text <=> root.clipboard-max-file-text; placeholder-text: "剪贴板单文件上限, 字节"; input-type: number; }
-                            LineEdit { text <=> root.clipboard-max-cache-text; placeholder-text: "剪贴板缓存上限, 字节, 留空不限制"; input-type: number; }
-                            LineEdit { text <=> root.clipboard-cache-dir; placeholder-text: "剪贴板缓存目录, 可选"; }
-                            LineEdit { text <=> root.transfer-meta-text; placeholder-text: "元数据上限, 字节"; input-type: number; }
-                            LineEdit { text <=> root.transfer-frame-text; placeholder-text: "传输帧上限, 字节"; input-type: number; }
-                            LineEdit { text <=> root.transfer-clipboard-text; placeholder-text: "剪贴板帧上限, 字节"; input-type: number; }
-                        }
-                    }
-                    GroupBox {
-                        title: "后台运行";
-                        VerticalLayout {
-                            CheckBox { text: "启用系统通知"; checked <=> root.notifications-enabled; }
-                            CheckBox { text: "启动后隐藏到托盘"; checked <=> root.start-hidden; }
-                            CheckBox { text: "关闭窗口时隐藏到托盘"; checked <=> root.close-to-tray; }
-                            CheckBox { text: "登录时启动"; checked <=> root.launch-at-login; }
-                            CheckBox { text: "启动后恢复上次会话"; checked <=> root.resume-last-session; }
-                            HorizontalLayout {
-                                Text { text: "日志级别"; vertical-alignment: center; }
-                                ComboBox {
-                                    model: ["Error", "Warn", "Info", "Debug", "Trace"];
-                                    current-index <=> root.log-level-index;
+                        Panel {
+                            title: "后台运行";
+                            horizontal-stretch: 1;
+                            VerticalLayout {
+                                spacing: 4px;
+                                CheckBox { text: "启用系统通知"; checked <=> root.notifications-enabled; }
+                                CheckBox { text: "启动后隐藏到托盘"; checked <=> root.start-hidden; }
+                                CheckBox { text: "关闭窗口时隐藏到托盘"; checked <=> root.close-to-tray; }
+                                CheckBox { text: "登录时启动"; checked <=> root.launch-at-login; }
+                                CheckBox { text: "启动后恢复上次会话"; checked <=> root.resume-last-session; }
+                                HorizontalLayout {
+                                    Text { text: "日志级别"; vertical-alignment: center; width: 68px; }
+                                    ComboBox {
+                                        model: ["Error", "Warn", "Info", "Debug", "Trace"];
+                                        current-index <=> root.log-level-index;
+                                    }
                                 }
                             }
                         }
                     }
-                    Button { text: "保存设置"; clicked => { root.apply-settings(); } }
+                    HorizontalLayout {
+                        Rectangle { horizontal-stretch: 1; }
+                        Button { text: "保存设置"; clicked => { root.apply-settings(); } }
+                    }
                 }
             }
 
             if root.selected-page == 5: VerticalLayout {
-                padding: 24px;
-                spacing: 10px;
-                Text { text: "日志"; font-size: 24px; font-weight: 650; color: #202523; }
+                padding: 18px;
+                spacing: 8px;
+                Text { text: "日志"; font-size: 22px; font-weight: 680; color: #202523; height: 34px; }
                 TextEdit {
                     text: root.log-text;
                     read-only: true;
@@ -415,11 +567,11 @@ export component AppWindow inherits Window {
             }
 
             if root.selected-page == 6: VerticalLayout {
-                padding: 24px;
-                spacing: 16px;
-                Text { text: "Synly"; font-size: 26px; font-weight: 700; color: #202523; }
+                padding: 18px;
+                spacing: 10px;
+                Text { text: "Synly"; font-size: 24px; font-weight: 700; color: #202523; }
                 Text { text: "安全的局域网同步与跨设备控制"; color: #555b58; }
-                AboutSlint { height: 120px; }
+                AboutSlint { height: 104px; }
                 Rectangle { vertical-stretch: 1; }
             }
         }
@@ -428,15 +580,15 @@ export component AppWindow inherits Window {
     if root.interaction-visible: Rectangle {
         background: #00000088;
         Rectangle {
-            width: min(parent.width - 40px, 620px);
-            height: min(parent.height - 60px, 560px);
+            width: min(parent.width - 36px, 600px);
+            height: min(parent.height - 44px, 520px);
             x: (parent.width - self.width) / 2;
             y: (parent.height - self.height) / 2;
             background: #ffffff;
             border-radius: 6px;
             VerticalLayout {
-                padding: 18px;
-                spacing: 10px;
+                padding: 16px;
+                spacing: 8px;
                 Text { text: root.interaction-title; font-size: 20px; font-weight: 650; color: #202523; }
                 Text { text: root.interaction-detail; wrap: word-wrap; color: #555b58; }
                 TextEdit { text: root.interaction-art; read-only: true; vertical-stretch: 1; font-family: "monospace"; font-size: 10px; }
@@ -452,36 +604,5 @@ export component AppWindow inherits Window {
                 }
             }
         }
-    }
-}
-
-export component AppTray inherits SystemTrayIcon {
-    icon: @image-url("tray-icon.svg");
-    in property <string> status-text: "Synly 空闲";
-    in property <bool> connected: false;
-    in property <bool> clipboard-enabled: false;
-    in property <bool> audio-enabled: false;
-    in property <bool> input-enabled: false;
-    tooltip: status-text;
-
-    callback open-window();
-    callback connect-or-disconnect();
-    callback toggle-clipboard();
-    callback toggle-audio();
-    callback toggle-input();
-    callback quit();
-
-    clicked => { root.open-window(); }
-
-    Menu {
-        MenuItem { title: "打开 Synly"; activated => { root.open-window(); } }
-        MenuItem { title: root.status-text; enabled: false; }
-        MenuSeparator { }
-        MenuItem { title: root.connected ? "断开" : "开始"; activated => { root.connect-or-disconnect(); } }
-        MenuItem { title: "剪贴板"; checkable: true; checked: root.clipboard-enabled; activated => { root.toggle-clipboard(); } }
-        MenuItem { title: "音频"; checkable: true; checked: root.audio-enabled; activated => { root.toggle-audio(); } }
-        MenuItem { title: "输入"; checkable: true; checked: root.input-enabled; activated => { root.toggle-input(); } }
-        MenuSeparator { }
-        MenuItem { title: "退出"; activated => { root.quit(); } }
     }
 }
