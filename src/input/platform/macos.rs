@@ -365,13 +365,6 @@ unsafe extern "C" fn event_callback(
                 }
                 return ptr::null_mut();
             }
-            if active
-                && usage == 0x06
-                && modifiers == ModifierMask::CTRL
-                && matches!(event_type, EVENT_KEY_DOWN | EVENT_KEY_UP)
-            {
-                return event;
-            }
             if active && event_type == EVENT_FLAGS_CHANGED && usage_is_modifier(usage) {
                 state.context.emit_reliable(NativeEvent::Key {
                     usage,
