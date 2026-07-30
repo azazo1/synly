@@ -39,7 +39,7 @@ use windows_sys::Win32::System::Threading::{
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
-const IPC_VERSION: u16 = 1;
+const IPC_VERSION: u16 = 2;
 const IPC_MAX_FRAME: usize = 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
@@ -90,6 +90,18 @@ impl AgentRequest {
             Self::Ping => "Ping",
         }
     }
+
+    fn reports_diagnostic(&self) -> bool {
+        matches!(
+            self,
+            Self::Start { .. }
+                | Self::Stop
+                | Self::Layout
+                | Self::SetCapture(_)
+                | Self::WarpCursor(_)
+                | Self::ReleaseAll
+        )
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -100,6 +112,13 @@ enum AgentResponse {
     Point(Point),
     Snapshot(KeySnapshot),
     Error(String),
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+enum AgentDiagnosticPhase {
+    Started,
+    Completed,
+    Failed,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -123,6 +142,12 @@ enum AgentPacket {
         id: u64,
         response: AgentResponse,
     },
+    Diagnostic {
+        request: String,
+        phase: AgentDiagnosticPhase,
+        elapsed_ms: u64,
+        error: Option<String>,
+    },
     Event(NativeEvent),
     Motion {
         dx: i32,
@@ -135,7 +160,7 @@ enum AgentPacket {
 
 struct ClientCommand {
     request: AgentRequest,
-    response: std::sync::mpsc::SyncSender<Result<AgentResponse, String>>,
+    response: Option<std::sync::mpsc::SyncSender<Result<AgentResponse, String>>>,
 }
 
 struct AgentClient {
@@ -338,7 +363,7 @@ impl AgentClient {
         self.commands
             .try_send(ClientCommand {
                 request,
-                response: response_tx,
+                response: Some(response_tx),
             })
             .map_err(|error| {
                 if matches!(&error, mpsc::error::TrySendError::Closed(_)) {
@@ -350,8 +375,25 @@ impl AgentClient {
             Ok(Ok(AgentResponse::Error(message))) => Err(anyhow!(message)),
             Ok(Ok(response)) => Ok(response),
             Ok(Err(message)) => Err(anyhow!(message)),
-            Err(error) => Err(error)
-                .with_context(|| format!("Windows input agent {request_name} request timed out")),
+            Err(error) => {
+                self.alive.store(false, Ordering::Release);
+                Err(error).with_context(|| {
+                    format!("Windows input agent {request_name} request timed out")
+                })
+            }
+        }
+    }
+
+    fn notify(&self, request: AgentRequest) {
+        if !self.alive.load(Ordering::Acquire) {
+            return;
+        }
+        if let Err(error) = self.commands.try_send(ClientCommand {
+            request,
+            response: None,
+        }) && matches!(error, mpsc::error::TrySendError::Closed(_))
+        {
+            self.alive.store(false, Ordering::Release);
         }
     }
 
@@ -462,7 +504,11 @@ impl AgentBackend {
         if !self.is_current() {
             bail!("Windows input agent backend was superseded by a newer session");
         }
-        self.client.request(request)
+        let response = self.client.request(request);
+        if let Err(error) = &response {
+            self.client.emit_failure(error);
+        }
+        response
     }
 
     fn is_current(&self) -> bool {
@@ -483,9 +529,7 @@ impl Drop for AgentBackend {
         {
             return;
         }
-        let _ = self.client.request(AgentRequest::SetCapture(false));
-        let _ = self.client.request(AgentRequest::ReleaseAll);
-        let _ = self.client.request(AgentRequest::Stop);
+        self.client.notify(AgentRequest::Stop);
         if let Ok(mut context) = self.client.context.lock() {
             *context = None;
         }
@@ -574,7 +618,9 @@ async fn client_loop(
                         },
                     )
                     .await?;
-                    pending.insert(id, command.response);
+                    if let Some(response) = command.response {
+                        pending.insert(id, response);
+                    }
                 }
                 packet = packets.recv() => {
                     match packet.context("Windows input agent packet reader stopped")?? {
@@ -585,6 +631,37 @@ async fn client_loop(
                                 let _ = sender.send(Ok(response));
                             }
                         }
+                        AgentPacket::Diagnostic {
+                            request,
+                            phase,
+                            elapsed_ms,
+                            error,
+                        } => match phase {
+                            AgentDiagnosticPhase::Started => {
+                                tracing::info!(
+                                    target: "synly_input_agent",
+                                    %request,
+                                    "Windows 输入代理开始处理请求"
+                                );
+                            }
+                            AgentDiagnosticPhase::Completed => {
+                                tracing::info!(
+                                    target: "synly_input_agent",
+                                    %request,
+                                    elapsed_ms,
+                                    "Windows 输入代理完成请求"
+                                );
+                            }
+                            AgentDiagnosticPhase::Failed => {
+                                tracing::error!(
+                                    target: "synly_input_agent",
+                                    %request,
+                                    elapsed_ms,
+                                    error = error.as_deref().unwrap_or("unknown error"),
+                                    "Windows 输入代理请求失败"
+                                );
+                            }
+                        },
                         AgentPacket::Event(event) => {
                             if let Ok(context) = context.lock()
                                 && let Some(context) = context.as_ref()
@@ -674,7 +751,46 @@ async fn run_agent_loop(client: tokio::net::windows::named_pipe::NamedPipeClient
                         bail!("Windows input agent received an unexpected packet");
                     };
                     heartbeat = Instant::now();
+                    let request_name = request.name().to_string();
+                    let report_diagnostic = request.reports_diagnostic();
+                    if report_diagnostic {
+                        write_packet(
+                            &mut writer,
+                            &AgentPacket::Diagnostic {
+                                request: request_name.clone(),
+                                phase: AgentDiagnosticPhase::Started,
+                                elapsed_ms: 0,
+                                error: None,
+                            },
+                        )
+                        .await?;
+                    }
+                    let started = Instant::now();
                     let response = handle_agent_request(request, &mut runtime, outgoing_tx.clone()).await;
+                    if report_diagnostic {
+                        let elapsed_ms = started
+                            .elapsed()
+                            .as_millis()
+                            .try_into()
+                            .unwrap_or(u64::MAX);
+                        let (phase, error) = match &response {
+                            Ok(_) => (AgentDiagnosticPhase::Completed, None),
+                            Err(error) => (
+                                AgentDiagnosticPhase::Failed,
+                                Some(format!("{error:#}")),
+                            ),
+                        };
+                        write_packet(
+                            &mut writer,
+                            &AgentPacket::Diagnostic {
+                                request: request_name,
+                                phase,
+                                elapsed_ms,
+                                error,
+                            },
+                        )
+                        .await?;
+                    }
                     write_packet(
                         &mut writer,
                         &AgentPacket::Response {
@@ -1239,6 +1355,29 @@ mod tests {
         });
 
         assert_eq!(client.active_lease.load(Ordering::Acquire), 2);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn current_backend_drop_queues_one_nonblocking_stop() {
+        let (commands, mut receiver) = mpsc::channel(4);
+        let client = Arc::new(AgentClient {
+            commands,
+            context: Arc::new(Mutex::new(None)),
+            alive: Arc::new(AtomicBool::new(true)),
+            lifecycle: Mutex::new(()),
+            next_lease: AtomicU64::new(2),
+            active_lease: AtomicU64::new(1),
+        });
+        drop(AgentBackend {
+            client: Arc::clone(&client),
+            lease: 1,
+        });
+
+        let command = receiver.try_recv().unwrap();
+        assert!(matches!(command.request, AgentRequest::Stop));
+        assert!(command.response.is_none());
+        assert_eq!(client.active_lease.load(Ordering::Acquire), 0);
         assert!(receiver.try_recv().is_err());
     }
 

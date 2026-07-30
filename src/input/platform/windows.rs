@@ -275,6 +275,7 @@ unsafe extern "system" {
 
 struct WindowsState {
     context: CaptureContext,
+    layout: Mutex<Option<DesktopLayout>>,
     physical_pressed: Mutex<BTreeSet<u16>>,
     physical_buttons: Mutex<BTreeSet<u8>>,
     injected_pressed: Mutex<BTreeSet<u16>>,
@@ -302,6 +303,7 @@ pub fn start(context: CaptureContext) -> Result<Arc<dyn InputBackend>> {
 pub(in crate::input) fn start_native(context: CaptureContext) -> Result<Arc<dyn InputBackend>> {
     let state = Arc::new(WindowsState {
         context,
+        layout: Mutex::new(None),
         physical_pressed: Mutex::new(BTreeSet::new()),
         physical_buttons: Mutex::new(BTreeSet::new()),
         injected_pressed: Mutex::new(BTreeSet::new()),
@@ -333,6 +335,17 @@ fn run_message_loop(state: Arc<WindowsState>, ready: std::sync::mpsc::SyncSender
     if previous_dpi_context == 0 {
         tracing::warn!("Windows 输入线程无法启用 per-monitor DPI awareness");
     }
+    let layout = match DesktopLayout::new(collect_display_rects()) {
+        Ok(layout) => layout,
+        Err(error) => {
+            if previous_dpi_context != 0 {
+                unsafe { SetThreadDpiAwarenessContext(previous_dpi_context) };
+            }
+            let _ = ready.send(Err(error.context("无法读取 Windows 显示器布局")));
+            return;
+        }
+    };
+    *state.layout.lock().unwrap() = Some(layout);
     let thread_id = unsafe { GetCurrentThreadId() };
     state.thread_id.store(thread_id, Ordering::Release);
     let hider = match create_cursor_hider(thread_id) {
@@ -630,7 +643,12 @@ fn update_set<T: Ord + Copy>(set: &Mutex<BTreeSet<T>>, value: T, down: bool) {
 
 impl InputBackend for WindowsBackend {
     fn layout(&self) -> Result<DesktopLayout> {
-        with_per_monitor_dpi(|| DesktopLayout::new(collect_display_rects()))
+        self.state
+            .layout
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Windows display layout cache poisoned"))?
+            .clone()
+            .context("Windows display layout cache is empty")
     }
 
     fn cursor_position(&self) -> Result<Point> {
