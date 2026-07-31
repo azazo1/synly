@@ -89,6 +89,8 @@ export component AppWindow inherits Window {
     in property <string> current-peer: "未连接";
     in property <bool> session-active: false;
     in property <bool> input-elevation-ready: true;
+    in property <string> input-elevation-hint: "基础控制可用, 授权后可控制管理员窗口";
+    in property <string> input-elevation-button: "增强授权";
     in property <string> desired-summary: "";
     in property <string> applied-summary: "";
     in property <string> pending-summary: "";
@@ -329,8 +331,8 @@ export component AppWindow inherits Window {
                     border-radius: 5px;
                     HorizontalLayout {
                         padding: 8px;
-                        Text { text: "基础控制可用, 授权后可控制管理员窗口"; horizontal-stretch: 1; vertical-alignment: center; color: #315442; }
-                        Button { text: "增强授权"; clicked => { root.request-input-elevation(); } }
+                        Text { text: root.input-elevation-hint; horizontal-stretch: 1; vertical-alignment: center; color: #315442; }
+                        Button { text: root.input-elevation-button; clicked => { root.request-input-elevation(); } }
                     }
                 }
                 Rectangle { vertical-stretch: 1; }

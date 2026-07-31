@@ -340,11 +340,35 @@ impl AppSupervisor {
                     }
                     self.publish();
                 }
-                #[cfg(not(windows))]
+                #[cfg(target_os = "macos")]
+                {
+                    crate::input::request_accessibility();
+                    self.snapshot.input_elevation_ready = crate::input::is_accessibility_trusted();
+                    if self.snapshot.input_elevation_ready {
+                        self.restart_input_backend_if_active();
+                    }
+                    self.publish();
+                }
+                #[cfg(not(any(target_os = "macos", windows)))]
                 {
                     self.snapshot.input_elevation_ready = true;
                     self.publish();
                 }
+            }
+            AppCommand::RefreshInputPermission => {
+                #[cfg(target_os = "macos")]
+                {
+                    let ready = crate::input::is_accessibility_trusted();
+                    if self.snapshot.input_elevation_ready != ready {
+                        self.snapshot.input_elevation_ready = ready;
+                        if ready {
+                            self.restart_input_backend_if_active();
+                        }
+                        self.publish();
+                    }
+                }
+                #[cfg(not(target_os = "macos"))]
+                {}
             }
             AppCommand::SaveWindowState { width, height } => {
                 self.snapshot.settings.ui.window_width = width;

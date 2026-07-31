@@ -6,7 +6,7 @@ use tokio::sync::mpsc;
 use serde::{Deserialize, Serialize};
 
 #[cfg(target_os = "macos")]
-mod macos;
+pub(super) mod macos;
 #[cfg(not(any(target_os = "macos", windows)))]
 mod unsupported;
 #[cfg(windows)]

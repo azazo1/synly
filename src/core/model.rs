@@ -114,12 +114,27 @@ impl AppSnapshot {
             trusted_devices: Vec::new(),
             interaction: None,
             last_error: None,
-            input_elevation_ready: !cfg!(windows),
+            input_elevation_ready: initial_input_elevation_ready(),
             actual_capabilities: None,
             remote_capabilities: None,
             capability_epoch: None,
             capabilities_acknowledged: true,
         }
+    }
+}
+
+fn initial_input_elevation_ready() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        crate::input::is_accessibility_trusted()
+    }
+    #[cfg(windows)]
+    {
+        false
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        true
     }
 }
 
@@ -149,5 +164,6 @@ pub enum AppCommand {
         width: u32,
         height: u32,
     },
+    RefreshInputPermission,
     Shutdown,
 }

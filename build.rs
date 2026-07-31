@@ -398,6 +398,7 @@ fn build_macos_native() {
     let sources = [
         PathBuf::from("native/macos_audio.m"),
         PathBuf::from("native/macos_dock.m"),
+        PathBuf::from("native/macos_permissions.m"),
     ];
     let objects = sources
         .iter()
@@ -445,4 +446,5 @@ fn build_macos_native() {
     println!("cargo:rustc-link-lib=framework=CoreMedia");
     println!("cargo:rustc-link-lib=framework=CoreAudio");
     println!("cargo:rustc-link-lib=framework=AppKit");
+    println!("cargo:rustc-link-lib=framework=ApplicationServices");
 }

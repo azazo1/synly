@@ -16,6 +16,10 @@ mod protocol;
 mod runtime;
 #[cfg(windows)]
 pub use platform::windows as windows_agent;
+#[cfg(target_os = "macos")]
+pub use platform::macos::permissions::{
+    is_accessibility_trusted, request_accessibility, watch_accessibility_change,
+};
 
 pub use channel::{
     InputChannelOffer, InputChannelRole, InputHostChannel, read_preamble as read_input_preamble,

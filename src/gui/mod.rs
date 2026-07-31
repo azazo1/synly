@@ -61,6 +61,11 @@ pub fn run(config: SynlyConfig) -> Result<()> {
         &AppSettings::from_config(&config),
     );
     apply_snapshot(&window, &handle.snapshots().borrow(), None);
+    #[cfg(target_os = "macos")]
+    {
+        window.set_input_elevation_hint("鼠标键盘控制需要辅助功能权限".into());
+        window.set_input_elevation_button("授予权限".into());
+    }
 
     let current_interaction = Arc::new(Mutex::new(None::<Uuid>));
     wire_window_callbacks(&window, &handle, Arc::clone(&current_interaction));
@@ -74,6 +79,14 @@ pub fn run(config: SynlyConfig) -> Result<()> {
     );
     spawn_log_presenter(&runtime, &window);
     spawn_ctrl_c_handler(&runtime, handle.commands());
+    #[cfg(target_os = "macos")]
+    {
+        let commands = handle.commands();
+        crate::input::watch_accessibility_change(move |trusted| {
+            tracing::info!(trusted, "macOS 辅助功能权限状态变化");
+            send_command(&commands, AppCommand::RefreshInputPermission);
+        });
+    }
 
     tray.start();
     if !config.ui.first_run_completed || !config.ui.start_hidden {

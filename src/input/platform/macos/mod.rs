@@ -7,6 +7,8 @@ use std::ptr;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
+pub mod permissions;
+
 type CGEventRef = *mut c_void;
 type CGEventTapProxy = *mut c_void;
 type CFMachPortRef = *mut c_void;
@@ -76,7 +78,6 @@ const EVENT_TAG: i64 = 0x5359_4e4c_5949_4e50;
 
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
-    fn AXIsProcessTrusted() -> bool;
     fn CGEventTapCreate(
         tap: u32,
         place: u32,
@@ -179,7 +180,7 @@ impl Drop for MacBackend {
 }
 
 pub fn ensure_permissions(_mode: InputMode) -> Result<()> {
-    if !unsafe { AXIsProcessTrusted() } {
+    if !permissions::is_accessibility_trusted() {
         bail!("鼠标键盘同步需要在系统设置中授予 Synly 辅助功能权限")
     }
     if unsafe { IsSecureEventInputEnabled() } {
@@ -470,7 +471,7 @@ fn enable_background_cursor_updates() {
 
 impl InputBackend for MacBackend {
     fn health_check(&self) -> Result<()> {
-        let result = if !unsafe { AXIsProcessTrusted() } {
+        let result = if !permissions::is_accessibility_trusted() {
             Err(anyhow::anyhow!("macOS 辅助功能权限已撤销"))
         } else if unsafe { IsSecureEventInputEnabled() } {
             Err(anyhow::anyhow!("macOS Secure Input 已启用"))
