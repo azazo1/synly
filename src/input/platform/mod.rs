@@ -104,7 +104,7 @@ impl MotionAccumulator {
         MotionSample { dx, dy, position, position_updated }
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, test))]
     pub fn take_observed(&self) -> MotionSample {
         let position_updated = self.observed_position_updated.swap(false, Ordering::AcqRel);
         let position = self
