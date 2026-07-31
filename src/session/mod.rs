@@ -1,3 +1,1 @@
-mod capabilities;
-
-pub use capabilities::CapabilityState;
+pub use synly_core::capabilities::CapabilityState;

@@ -10,6 +10,10 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
+pub use synly_core::device::{
+    DeviceConfig, DiscoveryConfig, LndDiscoveryConfig, TrustedDeviceConfig,
+};
+
 const CLIPBOARD_CACHE_DIR_NAME: &str = "clipboard-cache";
 const DEFAULT_CLIPBOARD_MAX_FILE_BYTES: u64 = 100 * 1024 * 1024;
 
@@ -72,14 +76,6 @@ pub struct UiConfig {
     pub window_height: u32,
 }
 
-#[derive(Clone, Debug)]
-pub struct DeviceConfig {
-    pub device_id: Uuid,
-    pub device_name: String,
-    pub identity_private_key: String,
-    pub identity_public_key: String,
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ClipboardConfig {
@@ -100,44 +96,6 @@ pub struct TransferConfig {
 #[serde(deny_unknown_fields)]
 pub struct NotificationConfig {
     pub enabled: bool,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct DiscoveryConfig {
-    pub mdns_enabled: bool,
-    pub lnd: Option<LndDiscoveryConfig>,
-}
-
-#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct LndDiscoveryConfig {
-    pub server_url: String,
-    pub bearer_token: String,
-    pub discovery_domain: Option<String>,
-}
-
-impl std::fmt::Debug for LndDiscoveryConfig {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("LndDiscoveryConfig")
-            .field("server_url", &self.server_url)
-            .field("bearer_token", &"<redacted>")
-            .field("discovery_domain", &self.discovery_domain)
-            .finish()
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct TrustedDeviceConfig {
-    pub device_id: Uuid,
-    pub device_name: String,
-    pub public_key: String,
-    pub tls_root_certificate: String,
-    pub trusted_at_ms: u64,
-    pub last_seen_ms: u64,
-    pub successful_sessions: u64,
 }
 
 impl Default for InputConfig {
@@ -179,15 +137,6 @@ impl Default for TransferConfig {
 impl Default for NotificationConfig {
     fn default() -> Self {
         Self { enabled: true }
-    }
-}
-
-impl Default for DiscoveryConfig {
-    fn default() -> Self {
-        Self {
-            mdns_enabled: true,
-            lnd: None,
-        }
     }
 }
 
@@ -320,20 +269,6 @@ impl SynlyConfig {
     }
 }
 
-impl DeviceConfig {
-    pub fn short_id(&self) -> String {
-        self.device_id.to_string().chars().take(8).collect()
-    }
-
-    pub fn identity_public_key(&self) -> Result<&str> {
-        non_empty_key(&self.identity_public_key, "device identity public key is missing")
-    }
-
-    pub fn identity_private_key(&self) -> Result<&str> {
-        non_empty_key(&self.identity_private_key, "device identity private key is missing")
-    }
-}
-
 impl TransferConfig {
     pub fn to_limits(&self) -> Result<TransferLimits> {
         let max_meta_len = usize::try_from(self.max_meta_bytes)
@@ -373,10 +308,6 @@ fn clipboard_cache_base_dir() -> Result<PathBuf> {
     dirs::cache_dir()
         .map(|dir| dir.join("synly"))
         .context("unable to determine platform cache directory")
-}
-
-fn non_empty_key<'a>(value: &'a str, message: &'static str) -> Result<&'a str> {
-    (!value.trim().is_empty()).then_some(value).context(message)
 }
 
 fn unix_time_ms() -> u64 {

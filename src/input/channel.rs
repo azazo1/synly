@@ -11,6 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 use uuid::Uuid;
+pub use synly_core::input::InputChannelOffer;
 
 pub const INPUT_PREAMBLE_MAGIC: &[u8; 12] = b"SYNLY-INPUT\0";
 pub const INPUT_AUX_VERSION: u16 = 1;
@@ -32,12 +33,6 @@ impl InputChannelRole {
             Self::Client => b"client",
         }
     }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-pub struct InputChannelOffer {
-    pub session_id: Uuid,
-    pub certificate_der: Vec<u8>,
 }
 
 pub struct InputHostChannel {

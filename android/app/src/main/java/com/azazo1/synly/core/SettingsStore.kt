@@ -1,0 +1,83 @@
+package com.azazo1.synly.core
+
+import android.content.Context
+import org.json.JSONArray
+import org.json.JSONObject
+import uniffi.synly_core.FfiClipboardMode
+
+data class SynlySettings(
+    val clipboardMode: FfiClipboardMode = FfiClipboardMode.BOTH,
+    val mdnsEnabled: Boolean = true,
+    val lndServerUrl: String? = null,
+    val lndBearerToken: String? = null,
+    val lndDiscoveryDomain: String? = null,
+    val maxImageBytes: Long = 20L * 1024 * 1024,
+    val deviceName: String = "Android 手机",
+    val lastTarget: SynlyTarget? = null,
+)
+
+data class SynlyTarget(
+    val addresses: List<String>,
+    val port: Int,
+    val peerDeviceId: String? = null,
+)
+
+object SettingsStore {
+    private const val PREFS = "synly_settings"
+
+    fun load(context: Context): SynlySettings {
+        val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val targetJson = prefs.getString("last_target", null)
+        val lastTarget = targetJson?.let { raw ->
+            runCatching {
+                val obj = JSONObject(raw)
+                SynlyTarget(
+                    addresses = obj.getJSONArray("addresses").let { array ->
+                        (0 until array.length()).map { array.getString(it) }
+                    },
+                    port = obj.getInt("port"),
+                    peerDeviceId = obj.optString("peer_device_id").takeIf { it.isNotBlank() },
+                )
+            }.getOrNull()
+        }
+        return SynlySettings(
+            clipboardMode = parseMode(prefs.getString("clipboard_mode", null)),
+            mdnsEnabled = prefs.getBoolean("mdns_enabled", true),
+            lndServerUrl = prefs.getString("lnd_server_url", null)?.takeIf { it.isNotBlank() },
+            lndBearerToken = prefs.getString("lnd_bearer_token", null)?.takeIf { it.isNotBlank() },
+            lndDiscoveryDomain = prefs.getString("lnd_discovery_domain", null)?.takeIf { it.isNotBlank() },
+            maxImageBytes = prefs.getLong("max_image_bytes", 20L * 1024 * 1024),
+            deviceName = prefs.getString("device_name", null) ?: "Android 手机",
+            lastTarget = lastTarget,
+        )
+    }
+
+    fun save(context: Context, settings: SynlySettings) {
+        val target = settings.lastTarget?.let { target ->
+            val addresses = JSONArray()
+            target.addresses.forEach { addresses.put(it) }
+            JSONObject()
+                .put("addresses", addresses)
+                .put("port", target.port)
+                .put("peer_device_id", target.peerDeviceId.orEmpty())
+                .toString()
+        }
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putString("clipboard_mode", settings.clipboardMode.name)
+            .putBoolean("mdns_enabled", settings.mdnsEnabled)
+            .putString("lnd_server_url", settings.lndServerUrl.orEmpty())
+            .putString("lnd_bearer_token", settings.lndBearerToken.orEmpty())
+            .putString("lnd_discovery_domain", settings.lndDiscoveryDomain.orEmpty())
+            .putLong("max_image_bytes", settings.maxImageBytes)
+            .putString("device_name", settings.deviceName)
+            .putString("last_target", target.orEmpty())
+            .apply()
+    }
+
+    private fun parseMode(raw: String?): FfiClipboardMode {
+        return runCatching { FfiClipboardMode.valueOf(raw ?: return FfiClipboardMode.BOTH) }
+            .getOrDefault(FfiClipboardMode.BOTH)
+    }
+}
+

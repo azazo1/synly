@@ -215,6 +215,53 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  android:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: "platforms;android-36 build-tools;36.0.0 ndk;28.2.13676358"
+
+      - name: Install Rust Android target
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add aarch64-linux-android
+
+      - name: Install cargo-ndk and uniffi-bindgen
+        run: |
+          cargo install cargo-ndk --locked
+          cargo install uniffi --version 0.31.2 --features cli --locked
+
+      - name: Build core library
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/28.2.13676358
+        run: |
+          cargo ndk -t arm64-v8a -o android/app/src/main/jniLibs build --release --features uniffi -p synly-core
+
+      - name: Generate Kotlin bindings
+        run: |
+          uniffi-bindgen generate --library android/app/src/main/jniLibs/arm64-v8a/libsynly_core.so --language kotlin --out-dir android/app/src/main/java --no-format
+
+      - name: Build debug APK
+        working-directory: android
+        run: ./gradlew assembleDebug
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: synly-android
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+
   release:
     if: needs.version.outputs.is_release == 'true'
     needs:

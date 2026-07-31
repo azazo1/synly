@@ -9,6 +9,7 @@ Synly 支持 Windows, macOS 和 Linux. 文件与剪贴板同步可在三大平�
 - Slint 主窗口和原生系统托盘.
 - 状态, 设备, 同步, 安全, 设置, 日志和 About 页面.
 - mDNS 与 LND 设备发现聚合.
+- Android 客户端通过 mDNS/LND 发现桌面端, 使用同一套 PIN 配对与 mTLS 协议.
 - 未信任设备使用 bootstrap 指纹, SPAKE2 PIN 和临时 mTLS 完成配对.
 - 可信设备使用身份公钥和长期 mTLS 免 PIN 重连.
 - 文件同步支持 off, send, receive, both 和 auto.
@@ -107,6 +108,26 @@ cargo build --release
 ```
 
 Linux 音频和输入运行时目前不可用, 但文件与剪贴板同步不受影响.
+
+### Android
+
+Android 端是剪贴板同步客户端, 仅支持局域网内主动连接桌面 host. 它复用 `crates/synly-core` 的协议与加密实现, 通过 uniffi 生成 Kotlin 绑定, UI 使用 Jetpack Compose. 后台同步依赖无障碍服务与前台服务: 无障碍服务轮询系统剪贴板 (约 500ms, 哈希去重), 前台服务持有网络会话并负责重连.
+
+v1 同步范围为文本, HTML 与 PNG 图片, 不支持文件与 RTF. 图片写入剪贴板时通过 FileProvider 提供 content URI. Android 12 及以上每次读取剪贴板时系统可能显示提示, 这是平台行为.
+
+构建 Android 核心库与绑定:
+
+```shell
+just android-core
+```
+
+构建 debug APK:
+
+```shell
+just android-build
+```
+
+也可以使用 Android Studio 打开 `android/` 目录直接构建. 首次配对时, 在桌面端确认 PIN 与指纹, 手机端输入同一 PIN 并核对指纹; 配对成功后双方会保存长期 mTLS 信任, 之后免 PIN 重连.
 
 ## GUI 使用
 
