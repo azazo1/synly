@@ -288,22 +288,37 @@ async fn run_mock_peer(
                             dx,
                             dy,
                         ) {
-                            active = false;
+                            remote_cursor = mock_layout.move_within_layout(remote_cursor, dx, dy);
                             incoming
-                                .send(Ok(InputMessage::Return { generation, edge_position }))
+                                .send(Ok(InputMessage::ReturnRequest {
+                                    generation,
+                                    edge_position,
+                                }))
                                 .await
-                                .context("无法向正式 sender 返回控制")?;
+                                .context("无法向正式 sender 请求返回控制")?;
                             last_event = format!(
-                                "mock 已向正式 sender 返回控制, position={edge_position:.3}"
+                                "mock 已向正式 sender 请求返回, position={edge_position:.3}"
                             );
                             tracing::info!(
                                 generation,
                                 edge_position,
-                                "mock 向正式 sender 返回控制"
+                                "mock 向正式 sender 请求返回控制"
                             );
                         } else {
                             remote_cursor = mock_layout.move_within_layout(remote_cursor, dx, dy);
                         }
+                    }
+                    InputMessage::Return {
+                        generation: incoming_generation,
+                        edge_position,
+                    } if active && incoming_generation == generation => {
+                        active = false;
+                        keys.clear();
+                        buttons.clear();
+                        last_event = format!(
+                            "正式 sender 已批准 mock 返回, position={edge_position:.3}"
+                        );
+                        tracing::info!(generation, edge_position, "mock 收到正式 sender 的 Return");
                     }
                     InputMessage::Key {
                         generation: incoming_generation,
@@ -346,6 +361,7 @@ async fn run_mock_peer(
                     InputMessage::Heartbeat { .. } => {}
                     InputMessage::Hello { .. }
                     | InputMessage::Proof { .. }
+                    | InputMessage::ReturnRequest { .. }
                     | InputMessage::Return { .. }
                     | InputMessage::Deactivate { .. }
                     | InputMessage::Key { .. }
