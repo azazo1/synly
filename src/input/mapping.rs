@@ -1,7 +1,7 @@
 use super::{KeySnapshot, ModifierMask};
-use anyhow::{Result, bail};
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -190,7 +190,6 @@ fn compile_direction(
         _ => return Ok(BTreeMap::new()),
     };
     let mut compiled = BTreeMap::new();
-    let mut targets = BTreeSet::new();
     for (source_name, target_name) in entries {
         let source = parse_key_name(source_platform, source_name).ok_or_else(|| {
             anyhow::anyhow!(
@@ -202,11 +201,6 @@ fn compile_direction(
                 "input key mapping target `{target_name}` is not supported on {target_platform:?}"
             )
         })?;
-        if !targets.insert(target) {
-            bail!(
-                "input key mapping contains duplicate target `{target_name}` for {target_platform:?}"
-            );
-        }
         compiled.insert(source, target);
     }
     Ok(compiled)
@@ -381,18 +375,45 @@ mod tests {
     }
 
     #[test]
-    fn invalid_names_and_duplicate_targets_are_rejected() {
+    fn invalid_names_are_rejected() {
         let mut config = KeyMappingConfig::default();
         config
             .macos_to_windows
             .insert("unknown".to_string(), "a".to_string());
         assert!(validate_key_mapping(&config).is_err());
+    }
 
+    #[test]
+    fn duplicate_targets_are_allowed_and_collapsed() {
         let mut config = KeyMappingConfig::default();
+        config.macos_to_windows.clear();
         config
             .macos_to_windows
-            .insert("a".to_string(), "left_win".to_string());
-        assert!(validate_key_mapping(&config).is_err());
+            .insert("a".to_string(), "b".to_string());
+        config
+            .macos_to_windows
+            .insert("c".to_string(), "b".to_string());
+        assert!(validate_key_mapping(&config).is_ok());
+
+        let mut mapper = KeyMapper::new(
+            &config,
+            InputPlatform::Macos,
+            InputPlatform::Windows,
+        )
+        .unwrap();
+        // 先按下的来源键发出目标键, 第二个来源键在目标已按下时被压制.
+        assert_eq!(mapper.map_key(0x04, true, false).unwrap().usage, 0x05);
+        assert!(mapper.map_key(0x06, true, false).is_none());
+        // 仅松开其中一个来源键不会释放目标键, 全部松开后才释放.
+        assert!(mapper.map_key(0x04, false, false).is_none());
+        assert_eq!(mapper.map_key(0x06, false, false).unwrap().usage, 0x05);
+        // 快照按目标键去重.
+        let snapshot = mapper.map_snapshot(&KeySnapshot {
+            usages: vec![0x04, 0x06],
+            modifiers: ModifierMask::default(),
+            buttons: Vec::new(),
+        });
+        assert_eq!(snapshot.usages, vec![0x05]);
     }
 
     #[test]

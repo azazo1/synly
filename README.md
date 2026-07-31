@@ -167,7 +167,7 @@ Synly 使用固定的三文件配置目录:
 - `trusted-devices.toml` 使用 `[[devices]]` 保存可信设备和会话统计.
 - 配置采用严格 schema. 未知字段, 缺失必填字段和旧单文件格式都会导致启动失败, 不会自动迁移或覆盖.
 
-默认跨平台映射为 `Option <-> Win`, `Command <-> Alt`. 映射由发送端应用, 仅在 macOS 与 Windows 之间生效. 两张方向表均支持修改或清空, 但每个目标键只能出现一次.
+默认跨平台映射为 `Option <-> Win`, `Command <-> Alt`. 映射由发送端应用, 仅在 macOS 与 Windows 之间生效. 两张方向表均支持修改或清空; 多个来源键可以映射到同一个目标键, 同时按下时后按的来源键会被忽略, 直到最后一个来源键松开才释放目标键.
 
 普通键使用 `a` 到 `z`, `0` 到 `9`, `f1` 到 `f12`, `enter`, `escape`, `backspace`, `tab`, `space`, `minus`, `equal`, `left_bracket`, `right_bracket`, `backslash`, `semicolon`, `apostrophe`, `comma`, `period`, `slash`, `caps_lock`, `insert`, `home`, `page_up`, `delete`, `end`, `page_down` 和方向键名称. 修饰键按平台使用 `left_ctrl`, `left_shift`, `left_option`, `left_command`, `left_alt`, `left_win` 及对应的 `right_` 名称. 实际可用键位仍受源端捕获和目标端注入能力限制.
 

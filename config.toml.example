@@ -49,6 +49,8 @@ reverse_mouse_wheel = false
 reverse_trackpad = false
 block_switch_on_press = false
 
+# 映射由发送端应用, 仅在 macOS 与 Windows 之间生效. 清空两张表即可禁用映射;
+# 多个来源键可以映射到同一个目标键, 同时按下时后按的键会被忽略.
 [input.key_mapping.macos_to_windows]
 left_option = "left_win"
 right_option = "right_win"
