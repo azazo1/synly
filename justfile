@@ -56,20 +56,27 @@ input-receiver-mock *args:
     cargo run --features input-receiver-mock --bin input-receiver-mock -- {{ args }}
 
 # 构建 Android 核心动态库并生成 Kotlin 绑定, 产物进入 android/app/src/main.
+[windows]
 android-core:
-    rustup target add aarch64-linux-android
-    cargo ndk -t arm64-v8a -o android/app/src/main/jniLibs build --release --features uniffi -p synly-core
-    uniffi-bindgen generate --library android/app/src/main/jniLibs/arm64-v8a/libsynly_core.so --language kotlin --out-dir android/app/src/main/java --no-format
+    powershell -NoProfile -ExecutionPolicy Bypass -File scripts/android-build-core.ps1
+
+[linux]
+android-core:
+    bash scripts/android-build-core.sh
+
+[macos]
+android-core:
+    bash scripts/android-build-core.sh
 
 # 构建 Android debug APK, 自动先构建核心库.
 [windows]
 android-build: android-core
-    cd android && gradlew.bat assembleDebug
+    powershell -NoProfile -ExecutionPolicy Bypass -File scripts/android-build-apk.ps1
 
 [linux]
 android-build: android-core
-    cd android && ./gradlew assembleDebug
+    bash scripts/android-build-apk.sh
 
 [macos]
 android-build: android-core
-    cd android && ./gradlew assembleDebug
+    bash scripts/android-build-apk.sh
