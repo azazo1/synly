@@ -5,15 +5,20 @@ if [[ $# -eq 0 ]]; then
     version="$(cargo metadata --locked --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "synly") | .version')"
     target="$(rustc -vV | sed -n 's/^host: //p')"
     output_dir="dist"
+    if [[ -x "target/$target/release/synly" ]]; then
+        binary="target/$target/release/synly"
+    else
+        binary="target/release/synly"
+    fi
 elif [[ $# -eq 3 ]]; then
     version="$1"
     target="$2"
     output_dir="$3"
+    binary="target/$target/release/synly"
 else
     printf 'usage: %s [VERSION TARGET OUTPUT_DIR]\n' "$0" >&2
     exit 2
 fi
-binary="target/$target/release/synly"
 app_bundle="$output_dir/Synly.app"
 icon="assets/macos/synly.icns"
 dmg_root="$output_dir/dmg-root"

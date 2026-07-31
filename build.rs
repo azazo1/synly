@@ -395,7 +395,10 @@ fn is_opus_lib_name(lib_name: &str) -> bool {
 
 fn build_macos_native() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR is missing"));
-    let sources = [PathBuf::from("native/macos_audio.m")];
+    let sources = [
+        PathBuf::from("native/macos_audio.m"),
+        PathBuf::from("native/macos_dock.m"),
+    ];
     let objects = sources
         .iter()
         .map(|source| {
@@ -441,4 +444,5 @@ fn build_macos_native() {
     println!("cargo:rustc-link-lib=framework=AudioToolbox");
     println!("cargo:rustc-link-lib=framework=CoreMedia");
     println!("cargo:rustc-link-lib=framework=CoreAudio");
+    println!("cargo:rustc-link-lib=framework=AppKit");
 }

@@ -14,10 +14,12 @@ use anyhow::{Context, Result};
 use slint::{CloseRequestResponse, ComponentHandle, LogicalSize, ModelRc, VecModel};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use uuid::Uuid;
 
 mod single_instance;
 mod tray;
+mod macos_dock;
 
 slint::include_modules!();
 
@@ -76,6 +78,14 @@ pub fn run(config: SynlyConfig) -> Result<()> {
     tray.start();
     if !config.ui.first_run_completed || !config.ui.start_hidden {
         show_main_window(&window).context("failed to show Slint window")?;
+    } else {
+        let window = window.as_weak();
+        let hide_dock_timer = slint::Timer::default();
+        hide_dock_timer.start(slint::TimerMode::SingleShot, Duration::ZERO, move || {
+            if window.upgrade().is_some() {
+                macos_dock::set_dock_visible(false);
+            }
+        });
     }
 
     slint::run_event_loop_until_quit().context("Slint event loop failed")?;
@@ -123,6 +133,7 @@ fn spawn_ctrl_c_handler(
 pub(super) fn show_main_window(
     window: &AppWindow,
 ) -> std::result::Result<(), slint::PlatformError> {
+    macos_dock::set_dock_visible(true);
     window.show()?;
     window.invoke_bring_to_front();
     Ok(())
@@ -350,6 +361,7 @@ fn wire_close_to_tray(
         save_window_state(&window, &commands);
         if window.get_close_to_tray() {
             let _ = window.hide();
+            macos_dock::set_dock_visible(false);
             CloseRequestResponse::KeepWindowShown
         } else {
             send_command(&commands, AppCommand::Shutdown);
