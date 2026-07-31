@@ -8,6 +8,7 @@ import uniffi.synly_core.FfiClipboardMode
 data class SynlySettings(
     val clipboardMode: FfiClipboardMode = FfiClipboardMode.BOTH,
     val mdnsEnabled: Boolean = true,
+    val lndEnabled: Boolean = false,
     val lndServerUrl: String? = null,
     val lndBearerToken: String? = null,
     val lndDiscoveryDomain: String? = null,
@@ -43,6 +44,10 @@ object SettingsStore {
         return SynlySettings(
             clipboardMode = parseMode(prefs.getString("clipboard_mode", null)),
             mdnsEnabled = prefs.getBoolean("mdns_enabled", true),
+            lndEnabled = prefs.getBoolean(
+                "lnd_enabled",
+                prefs.getString("lnd_server_url", null) != null,
+            ),
             lndServerUrl = prefs.getString("lnd_server_url", null)?.takeIf { it.isNotBlank() },
             lndBearerToken = prefs.getString("lnd_bearer_token", null)?.takeIf { it.isNotBlank() },
             lndDiscoveryDomain = prefs.getString("lnd_discovery_domain", null)?.takeIf { it.isNotBlank() },
@@ -66,6 +71,7 @@ object SettingsStore {
             .edit()
             .putString("clipboard_mode", settings.clipboardMode.name)
             .putBoolean("mdns_enabled", settings.mdnsEnabled)
+            .putBoolean("lnd_enabled", settings.lndEnabled)
             .putString("lnd_server_url", settings.lndServerUrl.orEmpty())
             .putString("lnd_bearer_token", settings.lndBearerToken.orEmpty())
             .putString("lnd_discovery_domain", settings.lndDiscoveryDomain.orEmpty())
@@ -80,4 +86,3 @@ object SettingsStore {
             .getOrDefault(FfiClipboardMode.BOTH)
     }
 }
-

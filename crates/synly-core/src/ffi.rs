@@ -280,6 +280,24 @@ pub struct FfiDiscoveredPeer {
     pub clipboard_mode: FfiClipboardMode,
     pub port: u16,
     pub addresses: Vec<String>,
+    pub source: FfiDiscoverySource,
+}
+
+#[derive(uniffi::Enum)]
+pub enum FfiDiscoverySource {
+    Mdns,
+    Lnd,
+    MdnsAndLnd,
+}
+
+impl From<crate::discovery::DiscoverySource> for FfiDiscoverySource {
+    fn from(source: crate::discovery::DiscoverySource) -> Self {
+        match source {
+            crate::discovery::DiscoverySource::Mdns => Self::Mdns,
+            crate::discovery::DiscoverySource::Lnd => Self::Lnd,
+            crate::discovery::DiscoverySource::MdnsAndLnd => Self::MdnsAndLnd,
+        }
+    }
 }
 
 impl From<crate::discovery::DiscoveredPeer> for FfiDiscoveredPeer {
@@ -292,6 +310,7 @@ impl From<crate::discovery::DiscoveredPeer> for FfiDiscoveredPeer {
             clipboard_mode: peer.clipboard_mode.into(),
             port: peer.port,
             addresses: peer.addresses.into_iter().map(|address| address.to_string()).collect(),
+            source: peer.source.into(),
         }
     }
 }

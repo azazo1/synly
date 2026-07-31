@@ -8,7 +8,6 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
@@ -41,21 +40,32 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.azazo1.synly.core.SettingsStore
 import com.azazo1.synly.core.SynlyEngine
 import com.azazo1.synly.core.SynlyTarget
-import com.azazo1.synly.core.TrustedDeviceStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import uniffi.synly_core.FfiClientState
 import uniffi.synly_core.FfiClipboardMode
+import uniffi.synly_core.FfiDiscoverySource
 import uniffi.synly_core.FfiDiscoveredPeer
 
 @Composable
 fun MainScreen() {
+    var showSettings by remember { mutableStateOf(false) }
+    if (showSettings) {
+        SettingsScreen(onBack = { showSettings = false })
+    } else {
+        HomeScreen(onOpenSettings = { showSettings = true })
+    }
+}
+
+@Composable
+private fun HomeScreen(onOpenSettings: () -> Unit) {
     val context = LocalContext.current
     val uiState by SynlyEngine.uiState.collectAsStateWithLifecycle()
     var peers by remember { mutableStateOf<List<FfiDiscoveredPeer>>(emptyList()) }
     var scanning by remember { mutableStateOf(false) }
     var manualAddress by remember { mutableStateOf("") }
     var pin by remember { mutableStateOf("") }
+    var settings by remember { mutableStateOf(SettingsStore.load(context)) }
     val scope = rememberCoroutineScope()
 
     Scaffold { padding ->
@@ -66,6 +76,18 @@ fun MainScreen() {
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
+            item {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text("Synly", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.weight(1f))
+                    TextButton(onClick = onOpenSettings) {
+                        Text("设置")
+                    }
+                }
+            }
+
             item { StatusCard(uiState.state, uiState.connectedDevice) }
 
             uiState.lastMessage?.let { message ->
@@ -135,7 +157,65 @@ fun MainScreen() {
             }
 
             item { HorizontalDivider() }
-            item { SettingsSection() }
+
+            item {
+                Card {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("剪贴板同步方向", style = MaterialTheme.typography.titleSmall)
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            FfiClipboardMode.entries.forEach { mode ->
+                                FilterChip(
+                                    selected = settings.clipboardMode == mode,
+                                    onClick = {
+                                        settings = settings.copy(clipboardMode = mode)
+                                        SettingsStore.save(context, settings)
+                                        SynlyEngine.setClipboardMode(mode)
+                                    },
+                                    label = { Text(mode.homeLabel()) },
+                                )
+                            }
+                        }
+                        OutlinedTextField(
+                            value = settings.deviceName,
+                            onValueChange = {
+                                settings = settings.copy(deviceName = it)
+                                SettingsStore.save(context, settings)
+                            },
+                            label = { Text("设备名称") },
+                            singleLine = true,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
+                }
+            }
+
+            item {
+                Card {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("权限与后台", style = MaterialTheme.typography.titleSmall)
+                        OutlinedButton(
+                            onClick = {
+                                context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text("开启无障碍服务")
+                        }
+                        OutlinedButton(
+                            onClick = {
+                                val intent = Intent(
+                                    Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                                    android.net.Uri.parse("package:${context.packageName}"),
+                                )
+                                runCatching { context.startActivity(intent) }
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text("忽略电池优化")
+                        }
+                    }
+                }
+            }
 
             uiState.lastReceivedText?.let { text ->
                 item {
@@ -225,141 +305,26 @@ private fun PeerCard(peer: FfiDiscoveredPeer, onClick: () -> Unit) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text(peer.deviceName, style = MaterialTheme.typography.titleSmall)
             Text(
-                "${peer.addresses.joinToString()}:${peer.port}  剪贴板:${peer.clipboardMode.name}",
+                "${peer.addresses.joinToString()}:${peer.port}  剪贴板:${peer.clipboardMode.name}  来源:${peer.source.label()}",
                 style = MaterialTheme.typography.bodySmall,
             )
         }
     }
 }
 
-@Composable
-private fun SettingsSection() {
-    val context = LocalContext.current
-    var settings by remember { mutableStateOf(SettingsStore.load(context)) }
-
-    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Text("设置", style = MaterialTheme.typography.titleMedium)
-
-        Card {
-            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("剪贴板同步方向")
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    FfiClipboardMode.entries.forEach { mode ->
-                        FilterChip(
-                            selected = settings.clipboardMode == mode,
-                            onClick = {
-                                settings = settings.copy(clipboardMode = mode)
-                                SettingsStore.save(context, settings)
-                                SynlyEngine.setClipboardMode(mode)
-                            },
-                            label = { Text(mode.label()) },
-                        )
-                    }
-                }
-                OutlinedTextField(
-                    value = settings.deviceName,
-                    onValueChange = {
-                        settings = settings.copy(deviceName = it)
-                        SettingsStore.save(context, settings)
-                    },
-                    label = { Text("设备名称") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                OutlinedTextField(
-                    value = settings.lndServerUrl.orEmpty(),
-                    onValueChange = {
-                        settings = settings.copy(lndServerUrl = it.takeIf(String::isNotBlank))
-                        SettingsStore.save(context, settings)
-                    },
-                    label = { Text("LND 服务器地址") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                OutlinedTextField(
-                    value = settings.lndBearerToken.orEmpty(),
-                    onValueChange = {
-                        settings = settings.copy(lndBearerToken = it.takeIf(String::isNotBlank))
-                        SettingsStore.save(context, settings)
-                    },
-                    label = { Text("LND Bearer Token") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                OutlinedTextField(
-                    value = (settings.maxImageBytes / 1024 / 1024).toString(),
-                    onValueChange = {
-                        val mb = it.toLongOrNull()?.coerceIn(1, 100) ?: return@OutlinedTextField
-                        settings = settings.copy(maxImageBytes = mb * 1024 * 1024)
-                        SettingsStore.save(context, settings)
-                    },
-                    label = { Text("图片大小上限 (MB)") },
-                    singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                    modifier = Modifier.fillMaxWidth(),
-                )
-            }
-        }
-
-        Card {
-            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("权限与后台")
-                OutlinedButton(
-                    onClick = {
-                        context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Text("开启无障碍服务")
-                }
-                OutlinedButton(
-                    onClick = {
-                        val intent = Intent(
-                            Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
-                            android.net.Uri.parse("package:${context.packageName}"),
-                        )
-                        runCatching { context.startActivity(intent) }
-                    },
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Text("忽略电池优化")
-                }
-            }
-        }
-
-        val trusted = TrustedDeviceStore.list(context)
-        if (trusted.isNotEmpty()) {
-            Card {
-                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("可信设备")
-                    trusted.forEach { device ->
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Text(
-                                device.deviceName,
-                                modifier = Modifier.weight(1f),
-                            )
-                            TextButton(onClick = {
-                                TrustedDeviceStore.remove(context, device.deviceId)
-                                SynlyEngine.refreshTrustedDevices(context)
-                            }) {
-                                Text("撤销")
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-private fun FfiClipboardMode.label(): String {
+private fun FfiClipboardMode.homeLabel(): String {
     return when (this) {
         FfiClipboardMode.OFF -> "关闭"
         FfiClipboardMode.SEND -> "发送"
         FfiClipboardMode.RECEIVE -> "接收"
         FfiClipboardMode.BOTH -> "双向"
+    }
+}
+
+private fun FfiDiscoverySource.label(): String {
+    return when (this) {
+        FfiDiscoverySource.MDNS -> "mDNS"
+        FfiDiscoverySource.LND -> "LND"
+        FfiDiscoverySource.MDNS_AND_LND -> "mDNS+LND"
     }
 }

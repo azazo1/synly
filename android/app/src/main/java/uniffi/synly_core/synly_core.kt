@@ -1849,6 +1849,8 @@ data class FfiDiscoveredPeer (
     var `port`: kotlin.UShort
     , 
     var `addresses`: List<kotlin.String>
+    , 
+    var `source`: FfiDiscoverySource
     
 ){
     
@@ -1872,6 +1874,7 @@ public object FfiConverterTypeFfiDiscoveredPeer: FfiConverterRustBuffer<FfiDisco
             FfiConverterTypeFfiClipboardMode.read(buf),
             FfiConverterUShort.read(buf),
             FfiConverterSequenceString.read(buf),
+            FfiConverterTypeFfiDiscoverySource.read(buf),
         )
     }
 
@@ -1882,7 +1885,8 @@ public object FfiConverterTypeFfiDiscoveredPeer: FfiConverterRustBuffer<FfiDisco
             FfiConverterUShort.allocationSize(value.`protocolVersion`) +
             FfiConverterTypeFfiClipboardMode.allocationSize(value.`clipboardMode`) +
             FfiConverterUShort.allocationSize(value.`port`) +
-            FfiConverterSequenceString.allocationSize(value.`addresses`)
+            FfiConverterSequenceString.allocationSize(value.`addresses`) +
+            FfiConverterTypeFfiDiscoverySource.allocationSize(value.`source`)
     )
 
     override fun write(value: FfiDiscoveredPeer, buf: ByteBuffer) {
@@ -1893,6 +1897,7 @@ public object FfiConverterTypeFfiDiscoveredPeer: FfiConverterRustBuffer<FfiDisco
             FfiConverterTypeFfiClipboardMode.write(value.`clipboardMode`, buf)
             FfiConverterUShort.write(value.`port`, buf)
             FfiConverterSequenceString.write(value.`addresses`, buf)
+            FfiConverterTypeFfiDiscoverySource.write(value.`source`, buf)
     }
 }
 
@@ -2312,6 +2317,41 @@ public object FfiConverterTypeFfiClipboardMode: FfiConverterRustBuffer<FfiClipbo
     override fun allocationSize(value: FfiClipboardMode) = 4UL
 
     override fun write(value: FfiClipboardMode, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+
+enum class FfiDiscoverySource {
+    
+    MDNS,
+    LND,
+    MDNS_AND_LND;
+
+    
+
+
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiDiscoverySource: FfiConverterRustBuffer<FfiDiscoverySource> {
+    override fun read(buf: ByteBuffer) = try {
+        FfiDiscoverySource.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: FfiDiscoverySource) = 4UL
+
+    override fun write(value: FfiDiscoverySource, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }

@@ -147,11 +147,13 @@ object SynlyEngine {
 
     fun browseDevices(context: Context, timeoutMs: Long): List<FfiDiscoveredPeer> {
         val settings = SettingsStore.load(context)
+        val lndServerUrl = if (settings.lndEnabled) settings.lndServerUrl else null
+        val lndBearerToken = if (settings.lndEnabled) settings.lndBearerToken else null
         val config = FfiDiscoveryConfig(
             mdnsEnabled = settings.mdnsEnabled,
-            lndServerUrl = settings.lndServerUrl,
-            lndBearerToken = settings.lndBearerToken,
-            lndDiscoveryDomain = settings.lndDiscoveryDomain,
+            lndServerUrl = lndServerUrl,
+            lndBearerToken = lndBearerToken,
+            lndDiscoveryDomain = if (settings.lndEnabled) settings.lndDiscoveryDomain else null,
         )
         return browseDevices(config, timeoutMs.toULong())
     }

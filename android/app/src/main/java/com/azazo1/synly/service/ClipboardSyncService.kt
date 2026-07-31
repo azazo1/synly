@@ -74,7 +74,7 @@ class ClipboardSyncService : android.app.Service() {
             PendingIntent.FLAG_IMMUTABLE,
         )
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(R.drawable.ic_launcher)
+            .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(getString(R.string.sync_notification_title))
             .setContentText(getString(R.string.sync_notification_text))
             .setContentIntent(pending)
@@ -96,4 +96,3 @@ class ClipboardSyncService : android.app.Service() {
         multicastLock = null
     }
 }
-
