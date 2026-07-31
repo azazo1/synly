@@ -177,6 +177,7 @@ async fn run_mock_worker(
         hotkey: options.hotkey,
         reverse_mouse_wheel: false,
         reverse_trackpad: false,
+        block_switch_on_press: false,
         key_mapping: KeyMappingConfig::default(),
     };
     let sender = super::runtime::run_sender(

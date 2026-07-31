@@ -2154,6 +2154,7 @@ fn input_task_restart_required(
         || previous.hotkey != next.hotkey
         || previous.reverse_mouse_wheel != next.reverse_mouse_wheel
         || previous.reverse_trackpad != next.reverse_trackpad
+        || previous.block_switch_on_press != next.block_switch_on_press
         || previous.key_mapping != next.key_mapping
         || previous_backend_generation != next_backend_generation
 }
@@ -4669,6 +4670,7 @@ mod tests {
             hotkey: Hotkey::DEFAULT.parse().unwrap(),
             reverse_mouse_wheel: false,
             reverse_trackpad: false,
+            block_switch_on_press: false,
             key_mapping: crate::input::KeyMappingConfig::default(),
         };
 

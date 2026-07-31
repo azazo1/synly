@@ -60,6 +60,7 @@ pub fn runtime_options_from_config(
         hotkey: runtime.input.hotkey.parse()?,
         reverse_mouse_wheel: runtime.input.reverse_mouse_wheel,
         reverse_trackpad: runtime.input.reverse_trackpad,
+        block_switch_on_press: runtime.input.block_switch_on_press,
         key_mapping: runtime.input.key_mapping.clone(),
     };
     let clipboard = ClipboardRuntimeOptions {

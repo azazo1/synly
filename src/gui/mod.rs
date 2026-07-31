@@ -758,6 +758,7 @@ fn apply_settings_to_window(
     window.set_input_mode_index(input_mode_index(runtime.input.mode));
     window.set_input_edge_index(input_edge_index(runtime.input.edge));
     window.set_input_hotkey(runtime.input.hotkey.clone().into());
+    window.set_block_switch_on_press(runtime.input.block_switch_on_press);
     window.set_accept_untrusted(runtime.accept);
     window.set_trust_device(runtime.trust_device);
     window.set_trusted_only(runtime.trusted_only);
@@ -869,6 +870,7 @@ fn settings_from_window(
             elevate_on_start: current_input.elevate_on_start,
             reverse_mouse_wheel: current_input.reverse_mouse_wheel,
             reverse_trackpad: current_input.reverse_trackpad,
+            block_switch_on_press: window.get_block_switch_on_press(),
             key_mapping: current_input.key_mapping.clone(),
         },
         interval_secs: window.get_interval_secs().max(1) as u64,

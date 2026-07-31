@@ -47,6 +47,7 @@ hotkey = "ctrl+alt+shift+esc"
 elevate_on_start = false
 reverse_mouse_wheel = false
 reverse_trackpad = false
+block_switch_on_press = false
 
 [input.key_mapping.macos_to_windows]
 left_option = "left_win"

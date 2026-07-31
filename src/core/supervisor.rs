@@ -956,6 +956,7 @@ mod tests {
                 hotkey: crate::input::Hotkey::DEFAULT.parse().unwrap(),
                 reverse_mouse_wheel: false,
                 reverse_trackpad: false,
+                block_switch_on_press: false,
                 key_mapping: crate::input::KeyMappingConfig::default(),
             },
             clipboard: crate::clipboard::ClipboardRuntimeOptions {

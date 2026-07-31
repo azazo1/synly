@@ -153,7 +153,7 @@ Synly 使用固定的三文件配置目录:
 └── trusted-devices.toml
 ```
 
-- `config.toml` 保存用户设置和运行参数. 输入方向, 屏幕边缘, 热键, 启动提权, 按键映射和滚动反向都位于 `[input]`.
+- `config.toml` 保存用户设置和运行参数. 输入方向, 屏幕边缘, 热键, 启动提权, 按键映射, 滚动反向和按住拦截开关都位于 `[input]`.
 - `identity.toml` 保存 `device_id`, `private_key`, `public_key`. 文件缺失时自动生成, 已存在但密钥无效时启动失败.
 - `trusted-devices.toml` 使用 `[[devices]]` 保存可信设备和会话统计.
 - 配置采用严格 schema. 未知字段, 缺失必填字段和旧单文件格式都会导致启动失败, 不会自动迁移或覆盖.

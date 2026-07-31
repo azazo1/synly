@@ -405,9 +405,35 @@ mod tests {
             crate::input::KeyMappingConfig::default()
         );
         assert!(!config.runtime.input.elevate_on_start);
+        assert!(!config.runtime.input.block_switch_on_press);
         let reloaded = load_or_create_in_dir(&dir).unwrap();
         assert_eq!(reloaded.device.device_id, config.device.device_id);
         assert_eq!(reloaded.runtime, config.runtime);
+        cleanup_dir(&dir);
+    }
+
+    #[test]
+    fn block_switch_on_press_round_trips_and_missing_field_defaults_to_false() {
+        let dir = unique_test_dir("block-switch-on-press");
+        let mut config = load_or_create_in_dir(&dir).unwrap();
+        assert!(!config.runtime.input.block_switch_on_press);
+        config.runtime.input.block_switch_on_press = true;
+        write_toml_atomic(
+            &dir.join(CONFIG_FILE_NAME),
+            &MainConfigFile::from(&config),
+        )
+        .unwrap();
+        let path = dir.join(CONFIG_FILE_NAME);
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("block_switch_on_press = true"));
+        let without_field = text
+            .lines()
+            .filter(|line| !line.contains("block_switch_on_press"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&path, without_field).unwrap();
+        let reloaded = load_or_create_in_dir(&dir).unwrap();
+        assert!(!reloaded.runtime.input.block_switch_on_press);
         cleanup_dir(&dir);
     }
 
@@ -515,6 +541,7 @@ mod tests {
             toml::from_str(include_str!("../../config.toml.example")).unwrap();
         assert_eq!(config.input.key_mapping, crate::input::KeyMappingConfig::default());
         assert!(!config.input.elevate_on_start);
+        assert!(!config.input.block_switch_on_press);
     }
 
     fn unique_test_dir(label: &str) -> PathBuf {
