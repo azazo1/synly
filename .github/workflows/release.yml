@@ -19,7 +19,7 @@ permissions:
 
 concurrency:
   group: synly-${{ inputs.tag != '' && format('refs/tags/{0}', inputs.tag) || github.ref }}
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   version:
