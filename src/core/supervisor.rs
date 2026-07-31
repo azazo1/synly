@@ -54,6 +54,7 @@ pub struct AppSupervisor {
     internal_rx: mpsc::UnboundedReceiver<InternalEvent>,
     session: Option<SessionHandle>,
     session_pin: Option<String>,
+    force_start: bool,
     discovery_task: Option<JoinHandle<()>>,
     discovery_epoch: u64,
     input_backend_generation: u64,
@@ -86,7 +87,7 @@ enum InternalEvent {
 }
 
 impl AppSupervisor {
-    pub fn new(mut config: SynlyConfig) -> (Self, AppSupervisorHandle) {
+    pub fn new(mut config: SynlyConfig, force_start: bool) -> (Self, AppSupervisorHandle) {
         config.runtime.normalize_file_sync_options();
         let mut snapshot = AppSnapshot::idle(
             config.runtime.clone(),
@@ -106,6 +107,7 @@ impl AppSupervisor {
                 internal_rx,
                 session: None,
                 session_pin: None,
+                force_start,
                 discovery_task: None,
                 discovery_epoch: 0,
                 input_backend_generation: 0,
@@ -127,9 +129,9 @@ impl AppSupervisor {
         }
         self.spawn_discovery_loop();
         self.spawn_input_permission_monitor();
-        if self.snapshot.settings.ui.resume_last_session
-            && self.snapshot.desired.connection.is_some()
-        {
+        let should_start = self.snapshot.desired.connection.is_some()
+            && (self.force_start || self.snapshot.settings.ui.resume_last_session);
+        if should_start {
             self.start_session().await;
         }
 
@@ -871,7 +873,7 @@ mod tests {
 
     #[test]
     fn acknowledged_capabilities_promote_pending_settings() {
-        let (mut supervisor, _) = AppSupervisor::new(test_config());
+        let (mut supervisor, _) = AppSupervisor::new(test_config(), false);
         let mut desired = supervisor.snapshot.desired.clone();
         desired.clipboard_mode = ClipboardMode::Both;
         supervisor.snapshot.desired = desired.clone();
@@ -903,7 +905,7 @@ mod tests {
 
     #[test]
     fn connected_event_preserves_peer_display_name_without_discovery_match() {
-        let (mut supervisor, _) = AppSupervisor::new(test_config());
+        let (mut supervisor, _) = AppSupervisor::new(test_config(), false);
         let peer = crate::runtime_control::RuntimePeerSummary {
             device_id: Uuid::new_v4(),
             display_name: "direct-peer".to_string(),
@@ -916,7 +918,7 @@ mod tests {
 
     #[test]
     fn unavailable_elevated_agent_does_not_disable_base_input() {
-        let (mut supervisor, _) = AppSupervisor::new(test_config());
+        let (mut supervisor, _) = AppSupervisor::new(test_config(), false);
         supervisor.snapshot.input_elevation_ready = false;
         supervisor.snapshot.desired.input.mode = InputMode::Receive;
 
@@ -928,7 +930,7 @@ mod tests {
 
     #[tokio::test]
     async fn stale_session_finish_does_not_clear_current_session() {
-        let (mut supervisor, _) = AppSupervisor::new(test_config());
+        let (mut supervisor, _) = AppSupervisor::new(test_config(), false);
         let current_session_id = Uuid::new_v4();
         let stale_session_id = Uuid::new_v4();
         let shutdown = tokio_util::sync::CancellationToken::new();

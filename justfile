@@ -6,8 +6,8 @@ default:
 run:
     cargo run --
 
-# just headless --host --fs off --trusted-only
-# 使用显式参数启动无界面模式.
+# just headless host
+# 以无界面模式启动会话, 子命令可选 host/join, 例如 just headless connect demo-device.
 headless *args:
     cargo run -- --headless {{ args }}
 

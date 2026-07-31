@@ -30,7 +30,7 @@ const MIN_WINDOW_HEIGHT: f32 = 560.0;
 const MAX_WINDOW_WIDTH: f32 = 1180.0;
 const MAX_WINDOW_HEIGHT: f32 = 760.0;
 
-pub fn run(config: SynlyConfig) -> Result<()> {
+pub fn run(config: SynlyConfig, force_start: bool) -> Result<()> {
     let single_instance = single_instance::SingleInstance::acquire(config.device.device_id)?;
     let listener = match single_instance {
         single_instance::SingleInstance::Primary(listener) => listener,
@@ -46,7 +46,7 @@ pub fn run(config: SynlyConfig) -> Result<()> {
         .thread_name("synly-runtime")
         .build()
         .context("failed to create Tokio runtime")?;
-    let (supervisor, handle) = AppSupervisor::new(config.clone());
+    let (supervisor, handle) = AppSupervisor::new(config.clone(), force_start);
     runtime.spawn(supervisor.run());
 
     let window = AppWindow::new().context("failed to create Slint main window")?;

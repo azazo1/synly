@@ -27,11 +27,17 @@ use synly::input;
 
 fn main() -> Result<()> {
     let cli = cli::Cli::parse();
-    if let Some(command) = cli.internal_command.as_ref() {
+    if let Some(command) = &cli.command
+        && matches!(command, cli::Command::InputAgent { .. })
+    {
         return run_internal_command(command);
     }
     let mut config = config::SynlyConfig::load_or_create()?;
     let _tracing_guard = tracing_utils::init_tracing(config.ui.log_level.as_filter())?;
+    let session_override = cli.session_override();
+    if let Some(session) = &session_override {
+        session.apply_to(&mut config.runtime, cli.headless);
+    }
     if cli.headless {
         let options = runtime_options::runtime_options_from_config(&config, None, true)?;
         #[cfg(windows)]
@@ -46,12 +52,12 @@ fn main() -> Result<()> {
             .build()?;
         return runtime.block_on(app::run(&mut config, options));
     }
-    gui::run(config)
+    gui::run(config, session_override.is_some())
 }
 
-fn run_internal_command(command: &cli::InternalCommand) -> Result<()> {
+fn run_internal_command(command: &cli::Command) -> Result<()> {
     match command {
-        cli::InternalCommand::InputAgent {
+        cli::Command::InputAgent {
             command_pipe,
             event_pipe,
             token,
@@ -77,6 +83,9 @@ fn run_internal_command(command: &cli::InternalCommand) -> Result<()> {
                 let _ = (command_pipe, event_pipe, token, parent_pid);
                 anyhow::bail!("Windows input agent internal command is only available on Windows");
             }
+        }
+        cli::Command::Host | cli::Command::Join { .. } => {
+            anyhow::bail!("host/join 子命令不是内部命令")
         }
     }
 }

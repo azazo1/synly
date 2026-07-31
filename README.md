@@ -130,17 +130,26 @@ synly
 
 启用删除同步前会显示确认对话框. 确认后更新当前策略, 并请求对侧强制发布一次文件快照.
 
-## Headless
+## 命令行启动
 
-只有显式传入 `--headless` 才会进入无界面模式. Headless 从 `config.toml` 读取全部会话参数, 不接受 host, peer, fs, pin 等会话 CLI 参数, 也不进行任何终端询问.
-
-Headless 只支持已经建立长期 mTLS 信任的设备. 请先在 GUI 中完成 PIN 配对, 保存双方信任, 再将 `[runtime]` 中的 `trusted_only` 设置为 `true`. Join 模式还必须配置非空 `peer_query`.
+`host` (别名 `listen`) 和 `join` (别名 `connect`) 子命令可以一行指定会话角色, 不需要修改配置中的角色字段:
 
 ```shell
-synly --headless
+synly host
+synly join demo-device
+synly connect 192.168.1.20:8080
 ```
 
-配置缺少角色, 工作区, 初始来源或可信策略时, Headless 会在启动会话前直接失败.
+未搭配 `--headless` 时, 子命令启动 GUI 并自动执行对应操作: host 开始监听, join 开始连接. `join` 的对端参数 `peer` 可以省略, 缺省时使用配置中的 `peer_query`. CLI 指定的角色和对端只对本次启动生效, 不会写入配置文件.
+
+`--headless` 可以放在子命令之前或之后. 搭配 `--headless` 时进入静默模式, 不进行任何终端询问, 并只允许已建立长期 mTLS 信任的设备连接 (CLI 会自动把 `trusted_only` 视为 true). 请先在 GUI 中完成 PIN 配对并保存双方信任.
+
+```shell
+synly --headless host
+synly --headless join demo-device
+```
+
+仅使用 `--headless` 而不带子命令时, 全部会话参数仍从 `config.toml` 读取. 配置缺少角色, 工作区, 初始来源或可信策略时, 会在启动会话前直接失败.
 
 ## 配置文件
 
