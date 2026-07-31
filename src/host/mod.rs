@@ -13,7 +13,9 @@ use crate::app::{
 use crate::config::SynlyConfig;
 use crate::discovery::{self, Advertisement};
 use crate::input;
-use crate::protocol::{PROTOCOL_VERSION, RuntimeCapabilities};
+use crate::protocol::{
+    ControlMessage, Frame, FrameWriter, PROTOCOL_VERSION, RuntimeCapabilities, TransferLimits,
+};
 use crate::runtime_control::{RuntimeCommand, RuntimeEvent, RuntimeLifecycle, RuntimePeerSummary};
 use crate::runtime_options::RuntimeOptions;
 use crate::settings::AudioMode;
@@ -50,6 +52,17 @@ impl SessionCapabilityProfile {
             },
         }
     }
+}
+
+async fn write_pairing_busy_error(
+    socket: &mut tokio::net::TcpStream,
+    transfer_limits: TransferLimits,
+) -> Result<()> {
+    FrameWriter::with_limits(socket, transfer_limits)
+        .write_frame(Frame::Control(ControlMessage::Error {
+            message: "host 正在处理其他配对请求, 请稍后再试".to_string(),
+        }))
+        .await
 }
 
 pub(crate) fn runtime_options_for_profile(
@@ -206,8 +219,37 @@ pub(crate) async fn run_host_runtime(
                         let permit = Arc::clone(&pairing_slot);
                         let events_tx = host_events_tx.clone();
                         tokio::spawn(async move {
-                            let Ok(_permit) = permit.acquire().await else {
-                                return;
+                            let mut first_byte = [0u8; 1];
+                            let is_tls =
+                                match time::timeout(Duration::from_secs(1), socket.peek(&mut first_byte)).await {
+                                    Ok(Ok(read)) if read >= 1 => first_byte[0] == 0x16,
+                                    Ok(Ok(_)) => return,
+                                    Ok(Err(error)) => {
+                                        tracing::warn!(%address, error = %error, "读取连接首字节失败");
+                                        return;
+                                    }
+                                    // 首字节未在超时内到达, 按可信 mTLS 连接排队处理, 避免误拒.
+                                    Err(_) => true,
+                                };
+                            let _permit = if is_tls {
+                                match permit.acquire_owned().await {
+                                    Ok(permit) => permit,
+                                    Err(_) => return,
+                                }
+                            } else {
+                                match permit.try_acquire_owned() {
+                                    Ok(permit) => permit,
+                                    Err(tokio::sync::TryAcquireError::Closed) => return,
+                                    Err(tokio::sync::TryAcquireError::NoPermits) => {
+                                        tracing::info!(%address, "已有配对或连接处理中, 拒绝新的配对请求");
+                                        let _ = write_pairing_busy_error(
+                                            &mut socket,
+                                            pairing_options.transfer_limits,
+                                        )
+                                        .await;
+                                        return;
+                                    }
+                                }
                             };
                             let reserver = ActiveSlotReserver::new(slot_shared);
                             let mut config_guard = config_shared.lock().await;

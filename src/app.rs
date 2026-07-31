@@ -188,6 +188,21 @@ enum InitialSnapshotPolicy {
     WaitForRemoteSeed,
 }
 
+#[derive(Debug)]
+struct PairingTerminal(anyhow::Error);
+
+impl std::fmt::Display for PairingTerminal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for PairingTerminal {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct PairingThrottle {
     peers: HashMap<String, PairingPeerState>,
@@ -422,6 +437,10 @@ pub(crate) async fn run_client(mut config: SynlyConfig, mut options: RuntimeOpti
                         reconnect_delay = next_reconnect_delay(reconnect_delay);
                     }
                     Err(err) => {
+                        if err.downcast_ref::<PairingTerminal>().is_some() {
+                            tracing::warn!(error = %err, "配对流程已终止, 不再自动重连");
+                            return Err(err);
+                        }
                         tracing::warn!(error = %err, "连接失败");
                         options
                             .control
@@ -566,7 +585,11 @@ async fn connect_to_peer(
                     )
                     .await
                 }
-                None => connect_to_untrusted_peer(socket, &device, config, options).await,
+                None => {
+                    connect_to_untrusted_peer(socket, &device, config, options)
+                        .await
+                        .map_err(|err| anyhow!(PairingTerminal(err)))
+                }
             }
         }
         PeerTarget::Direct(address) => {
@@ -588,7 +611,9 @@ async fn connect_to_peer(
                 }
             }
             let socket = connect_tcp(*address.ip(), address.port()).await?;
-            connect_to_untrusted_peer(socket, &device, config, options).await
+            connect_to_untrusted_peer(socket, &device, config, options)
+                .await
+                .map_err(|err| anyhow!(PairingTerminal(err)))
         }
     }
 }

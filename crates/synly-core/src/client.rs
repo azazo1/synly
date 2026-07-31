@@ -25,6 +25,21 @@ const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RECONNECT_BASE_DELAY: Duration = Duration::from_secs(2);
 const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(20);
 
+#[derive(Debug)]
+struct PairingTerminal(anyhow::Error);
+
+impl std::fmt::Display for PairingTerminal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::error::Error for PairingTerminal {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.0.as_ref())
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ClientConfig {
     pub device: DeviceConfig,
@@ -159,6 +174,17 @@ async fn run_client_loop(
     let mut reconnect_delay = RECONNECT_BASE_DELAY;
     loop {
         let result = connect_and_run(&mut config, &target, &listener, &mut commands, &state).await;
+        if let Err(err) = &result
+            && err.downcast_ref::<PairingTerminal>().is_some()
+        {
+            let message = format!("{err:#}");
+            tracing::warn!(error = %message, "配对流程已终止, 不再自动重连");
+            listener.on_event(ClientEvent::Disconnected {
+                message: message.clone(),
+            });
+            listener.on_event(ClientEvent::PairingFailed { message });
+            return;
+        }
         if let Err(err) = result {
             listener.on_event(ClientEvent::Disconnected {
                 message: format!("{err:#}"),
@@ -388,6 +414,18 @@ async fn complete_trusted_pairing(
 
 async fn connect_bootstrap(
     config: &mut ClientConfig,
+    socket: TcpStream,
+    target: &ClientTarget,
+    listener: &Arc<dyn ClientListener>,
+    commands: &mut mpsc::UnboundedReceiver<ClientCommand>,
+) -> Result<AuthenticatedSession> {
+    connect_bootstrap_inner(config, socket, target, listener, commands)
+        .await
+        .map_err(|err| anyhow!(PairingTerminal(err)))
+}
+
+async fn connect_bootstrap_inner(
+    config: &mut ClientConfig,
     mut socket: TcpStream,
     _target: &ClientTarget,
     listener: &Arc<dyn ClientListener>,
@@ -434,21 +472,29 @@ async fn connect_bootstrap(
         session_short: session_display.short.clone(),
         session_randomart: session_display.randomart.clone(),
     });
-    let pin = loop {
-        match commands.recv().await {
-            Some(ClientCommand::SubmitPin(pin)) => break normalize_pin(&pin)?,
-            Some(ClientCommand::CancelPin) => bail!("用户取消了 PIN 配对"),
-            Some(ClientCommand::Stop) | None => bail!("客户端已停止"),
-            Some(ClientCommand::UpdateTrustedDevices(devices)) => {
-                config.trusted_devices = devices;
-            }
-            Some(ClientCommand::SetClipboardMode(mode)) => {
-                config.clipboard_mode = mode;
-            }
-            Some(command) => {
-                tracing::debug!(?command, "配对阶段忽略剪贴板命令");
+    let pin = match tokio::time::timeout(PAIRING_TIMEOUT, async {
+        loop {
+            match commands.recv().await {
+                Some(ClientCommand::SubmitPin(pin)) => return normalize_pin(&pin),
+                Some(ClientCommand::CancelPin) => bail!("用户取消了 PIN 配对"),
+                Some(ClientCommand::Stop) | None => bail!("客户端已停止"),
+                Some(ClientCommand::UpdateTrustedDevices(devices)) => {
+                    config.trusted_devices = devices;
+                }
+                Some(ClientCommand::SetClipboardMode(mode)) => {
+                    config.clipboard_mode = mode;
+                }
+                Some(command) => {
+                    tracing::debug!(?command, "配对阶段忽略剪贴板命令");
+                }
             }
         }
+    })
+    .await
+    {
+        Ok(Ok(pin)) => pin,
+        Ok(Err(err)) => return Err(err),
+        Err(_) => bail!("等待用户输入 PIN 超时, 配对已终止"),
     };
 
     let (pake_state, client_pake_message) = crypto::start_bootstrap_pake_client(
