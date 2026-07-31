@@ -166,7 +166,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config libgtk-3-dev libopus-dev
+          sudo apt-get install -y build-essential pkg-config libgtk-3-dev libopus-dev libxdo-dev
 
       - name: Build release binary
         shell: bash
