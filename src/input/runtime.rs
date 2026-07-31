@@ -243,7 +243,6 @@ async fn run_established(
                 &tx,
                 platform,
                 local_layout,
-                options.block_switch_on_press,
             )
             .await
         }
@@ -359,12 +358,12 @@ impl IncomingMotion {
 }
 
 #[derive(Default)]
-struct RemotePressed {
+struct PressedState {
     keys: BTreeSet<u16>,
     buttons: BTreeSet<u8>,
 }
 
-impl RemotePressed {
+impl PressedState {
     fn from_snapshot(snapshot: &KeySnapshot) -> Self {
         Self {
             keys: snapshot.usages.iter().copied().collect(),
@@ -393,24 +392,38 @@ impl RemotePressed {
     }
 }
 
-struct ReceiverMotionState {
-    cursor: Option<super::Point>,
-    remote_pressed: RemotePressed,
-    pending_return: Option<f32>,
+struct SenderControl {
+    generation: u64,
+    active: bool,
+    activation_confirmed: bool,
+    recovery: SenderRecoveryGuard,
+    cooldown_until: Instant,
+    local_pressed: PressedState,
+    pending_return_request: Option<(u64, f32)>,
 }
 
-impl ReceiverMotionState {
-    fn new() -> Self {
+impl SenderControl {
+    fn new(
+        platform: &platform::PlatformHandle,
+        layout: super::DesktopLayout,
+        edge: ScreenEdge,
+    ) -> Self {
         Self {
-            cursor: None,
-            remote_pressed: RemotePressed::default(),
-            pending_return: None,
+            generation: 0,
+            active: false,
+            activation_confirmed: false,
+            recovery: SenderRecoveryGuard::new(Arc::clone(&platform.backend), layout, edge),
+            cooldown_until: Instant::now(),
+            local_pressed: PressedState::default(),
+            pending_return_request: None,
         }
     }
 
-    fn reset_pressed(&mut self) {
-        self.remote_pressed = RemotePressed::default();
-        self.pending_return = None;
+    fn deactivate(&mut self) {
+        self.active = false;
+        self.activation_confirmed = false;
+        self.cooldown_until = Instant::now() + RETURN_COOLDOWN;
+        self.pending_return_request = None;
     }
 }
 
@@ -428,15 +441,7 @@ pub(super) async fn run_sender(
         InputPlatform::current(),
         remote_platform,
     )?;
-    let mut generation = 0u64;
-    let mut active = false;
-    let mut activation_confirmed = false;
-    let mut recovery = SenderRecoveryGuard::new(
-        Arc::clone(&platform.backend),
-        local_layout.clone(),
-        source_edge,
-    );
-    let mut cooldown_until = Instant::now();
+    let mut control = SenderControl::new(platform, local_layout.clone(), source_edge);
     let mut last_heartbeat = Instant::now();
     let mut motion_tick = time::interval(MOTION_INTERVAL);
     motion_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -460,35 +465,46 @@ pub(super) async fn run_sender(
             message = incoming.recv() => {
                 let message = message.context("输入辅助读取任务已停止")??;
                 match message {
-                    InputMessage::Return { generation: remote_generation, edge_position }
-                        if active && remote_generation == generation => {
-                            deactivate_sender(platform, &local_layout, source_edge, edge_position)?;
-                            active = false;
-                            activation_confirmed = false;
-                            key_mapper.clear();
-                            recovery.disarm();
-                            cooldown_until = Instant::now() + RETURN_COOLDOWN;
-                            tracing::info!(generation, "控制已从对端返回本机");
+                    InputMessage::ReturnRequest { generation: remote_generation, edge_position }
+                        if control.active && remote_generation == control.generation => {
+                            if options.block_switch_on_press && !control.local_pressed.is_empty() {
+                                control.pending_return_request =
+                                    Some((control.generation, edge_position));
+                                tracing::info!(
+                                    generation = control.generation,
+                                    "对端请求返回但本机按键/鼠标处于按下状态, 等待松开"
+                                );
+                            } else {
+                                sender_return_now(
+                                    tx,
+                                    platform,
+                                    &local_layout,
+                                    source_edge,
+                                    edge_position,
+                                    &mut control,
+                                )?;
+                            }
                         }
                     InputMessage::Deactivate { generation: remote_generation }
-                        if active && remote_generation == generation => {
-                            recovery.recover();
-                            active = false;
-                            activation_confirmed = false;
+                        if control.active && remote_generation == control.generation => {
+                            control.recovery.recover();
+                            control.deactivate();
                             key_mapper.clear();
-                            cooldown_until = Instant::now() + RETURN_COOLDOWN;
                         }
                     InputMessage::Heartbeat { generation: remote_generation }
-                        if !active || remote_generation == generation => {
+                        if !control.active || remote_generation == control.generation => {
                         last_heartbeat = Instant::now();
-                        if active && remote_generation == generation && !activation_confirmed {
-                            activation_confirmed = true;
-                            tracing::info!(generation, "对端已确认接管输入控制");
+                        if control.active
+                            && remote_generation == control.generation
+                            && !control.activation_confirmed
+                        {
+                            control.activation_confirmed = true;
+                            tracing::info!(generation = control.generation, "对端已确认接管输入控制");
                         }
                     }
                     InputMessage::Heartbeat { .. }
-                    | InputMessage::Return { .. }
                     | InputMessage::Deactivate { .. } => {}
+                    InputMessage::Return { .. } => {}
                     InputMessage::Hello { .. } => {}
                     InputMessage::Proof { .. } => bail!("输入通道收到重复认证消息"),
                     _ => {}
@@ -497,31 +513,50 @@ pub(super) async fn run_sender(
             Some(event) = platform.events.recv() => {
                 match event {
                     NativeEvent::Emergency => {
-                        if active {
-                            recovery.recover();
-                            active = false;
-                            activation_confirmed = false;
+                        if control.active {
+                            control.recovery.recover();
+                            control.deactivate();
                             key_mapper.clear();
-                            cooldown_until = Instant::now() + RETURN_COOLDOWN;
-                            let _ = tx.try_send(InputMessage::Deactivate { generation });
-                            tracing::info!(generation, "紧急热键已收回本机控制");
+                            let _ =
+                                tx.try_send(InputMessage::Deactivate { generation: control.generation });
+                            tracing::info!(generation = control.generation, "紧急热键已收回本机控制");
                         }
                     }
-                    NativeEvent::Key { usage, modifiers: _, down, repeat } if active => {
+                    NativeEvent::Key { usage, modifiers: _, down, repeat } if control.active => {
+                        control.local_pressed.key(usage, down, repeat);
                         if let Some(mapped) = key_mapper.map_key(usage, down, repeat) {
                             enqueue_message(tx, InputMessage::Key {
-                                generation,
+                                generation: control.generation,
                                 usage: mapped.usage,
                                 modifiers: mapped.modifiers,
                                 down: mapped.down,
                                 repeat: mapped.repeat,
                             })?;
                         }
+                        finish_pending_sender_return(
+                            tx,
+                            platform,
+                            &local_layout,
+                            source_edge,
+                            &mut control,
+                        )?;
                     }
-                    NativeEvent::Button { button, down } if active => {
-                        enqueue_message(tx, InputMessage::Button { generation, button, down })?;
+                    NativeEvent::Button { button, down } if control.active => {
+                        control.local_pressed.button(button, down);
+                        enqueue_message(tx, InputMessage::Button {
+                            generation: control.generation,
+                            button,
+                            down,
+                        })?;
+                        finish_pending_sender_return(
+                            tx,
+                            platform,
+                            &local_layout,
+                            source_edge,
+                            &mut control,
+                        )?;
                     }
-                    NativeEvent::Wheel { x, y, source } if active => {
+                    NativeEvent::Wheel { x, y, source } if control.active => {
                         let (x, y) = transform_scroll(
                             x,
                             y,
@@ -529,12 +564,17 @@ pub(super) async fn run_sender(
                             options.reverse_mouse_wheel,
                             options.reverse_trackpad,
                         );
-                        enqueue_message(tx, InputMessage::Wheel { generation, x, y })?;
+                        enqueue_message(tx, InputMessage::Wheel {
+                            generation: control.generation,
+                            x,
+                            y,
+                        })?;
                     }
                     NativeEvent::ReliableQueueOverflow => {
-                        if active {
-                            recovery.recover();
-                            let _ = tx.try_send(InputMessage::Deactivate { generation });
+                        if control.active {
+                            control.recovery.recover();
+                            let _ =
+                                tx.try_send(InputMessage::Deactivate { generation: control.generation });
                         }
                         bail!("本机输入可靠事件队列已满, 已停止远程控制");
                     }
@@ -546,16 +586,16 @@ pub(super) async fn run_sender(
             }
             _ = motion_tick.tick() => {
                 let sample = platform.motion.take();
-                if active {
+                if control.active {
                     if sample.dx == 0 && sample.dy == 0 {
                         continue;
                     }
                     enqueue_message(tx, InputMessage::Motion {
-                        generation,
+                        generation: control.generation,
                         dx: sample.dx,
                         dy: sample.dy,
                     })?;
-                } else if Instant::now() >= cooldown_until {
+                } else if Instant::now() >= control.cooldown_until {
                     let point = match (sample.position_updated, sample.position) {
                         (true, Some(point)) => point,
                         _ if sample.dx != 0 || sample.dy != 0 => {
@@ -611,16 +651,24 @@ pub(super) async fn run_sender(
                                 continue;
                             }
                         }
-                        generation = generation.wrapping_add(1).max(1);
-                        let pressed = key_mapper.map_snapshot(&platform.backend.snapshot());
-                        enqueue_message(tx, InputMessage::Activate { generation, source_edge, edge_position, pressed })?;
+                        control.generation = control.generation.wrapping_add(1).max(1);
+                        let snapshot = platform.backend.snapshot();
+                        let pressed = key_mapper.map_snapshot(&snapshot);
+                        control.local_pressed = PressedState::from_snapshot(&snapshot);
+                        control.pending_return_request = None;
+                        enqueue_message(tx, InputMessage::Activate {
+                            generation: control.generation,
+                            source_edge,
+                            edge_position,
+                            pressed,
+                        })?;
                         platform.backend.set_capture(true)?;
-                        active = true;
-                        activation_confirmed = false;
+                        control.active = true;
+                        control.activation_confirmed = false;
                         last_heartbeat = Instant::now();
-                        recovery.arm(edge_position);
+                        control.recovery.arm(edge_position);
                         tracing::info!(
-                            generation,
+                            generation = control.generation,
                             edge = ?source_edge,
                             point = ?point,
                             edge_position,
@@ -630,22 +678,24 @@ pub(super) async fn run_sender(
                 }
             }
             _ = heartbeat.tick() => {
-                enqueue_message(tx, InputMessage::Heartbeat { generation })?;
+                enqueue_message(tx, InputMessage::Heartbeat { generation: control.generation })?;
             }
             _ = overflow_poll.tick() => {
                 platform.backend.health_check()?;
                 if platform.overflowed.load(std::sync::atomic::Ordering::Acquire) {
-                    if active {
-                        recovery.recover();
-                        let _ = tx.try_send(InputMessage::Deactivate { generation });
+                    if control.active {
+                        control.recovery.recover();
+                        let _ = tx.try_send(InputMessage::Deactivate {
+                            generation: control.generation,
+                        });
                     }
                     bail!("本机输入可靠事件队列已满, 已停止远程控制");
                 }
             }
             _ = timeout_tick.tick() => {
-                if active
+                if control.active
                     && Instant::now().duration_since(last_heartbeat)
-                        >= sender_heartbeat_timeout(activation_confirmed)
+                        >= sender_heartbeat_timeout(control.activation_confirmed)
                 {
                     let _ = platform.backend.set_capture(false);
                     bail!("输入辅助通道心跳超时");
@@ -734,6 +784,40 @@ fn deactivate_sender(
     restore_sender(&*platform.backend, layout, edge, edge_position)
 }
 
+fn sender_return_now(
+    tx: &mpsc::Sender<InputMessage>,
+    platform: &platform::PlatformHandle,
+    layout: &super::DesktopLayout,
+    edge: ScreenEdge,
+    edge_position: f32,
+    control: &mut SenderControl,
+) -> Result<()> {
+    enqueue_message(tx, InputMessage::Return {
+        generation: control.generation,
+        edge_position,
+    })?;
+    deactivate_sender(platform, layout, edge, edge_position)?;
+    control.recovery.disarm();
+    control.deactivate();
+    tracing::info!(generation = control.generation, "控制已从对端返回本机");
+    Ok(())
+}
+
+fn finish_pending_sender_return(
+    tx: &mpsc::Sender<InputMessage>,
+    platform: &platform::PlatformHandle,
+    layout: &super::DesktopLayout,
+    edge: ScreenEdge,
+    control: &mut SenderControl,
+) -> Result<()> {
+    if control.local_pressed.is_empty()
+        && let Some((_, edge_position)) = control.pending_return_request
+    {
+        sender_return_now(tx, platform, layout, edge, edge_position, control)?;
+    }
+    Ok(())
+}
+
 fn restore_sender(
     backend: &dyn platform::InputBackend,
     layout: &super::DesktopLayout,
@@ -761,12 +845,11 @@ pub(super) async fn run_receiver(
     tx: &mpsc::Sender<InputMessage>,
     platform: &mut platform::PlatformHandle,
     local_layout: super::DesktopLayout,
-    block_switch_on_press: bool,
 ) -> Result<()> {
     let mut generation = 0u64;
     let mut active = false;
     let mut return_edge = ScreenEdge::Left;
-    let mut motion_state = ReceiverMotionState::new();
+    let mut cursor = None;
     let mut last_heartbeat = Instant::now();
     let mut timeout_tick = time::interval(HEARTBEAT_INTERVAL);
     timeout_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -809,46 +892,34 @@ pub(super) async fn run_receiver(
                         last_heartbeat = Instant::now();
                         let entry = local_layout.point_inside_edge(return_edge, edge_position, EDGE_INSET);
                         platform.backend.warp_cursor(entry)?;
-                        motion_state.cursor = Some(entry);
+                        cursor = Some(entry);
                         apply_snapshot(&*platform.backend, &pressed)?;
-                        motion_state.remote_pressed = RemotePressed::from_snapshot(&pressed);
-                        motion_state.pending_return = None;
                         enqueue_message(tx, InputMessage::Heartbeat { generation })?;
                         tracing::info!(generation, edge = ?return_edge, "开始接受对端控制");
                     }
                     InputMessage::Deactivate { generation: incoming_generation } if incoming_generation == generation => {
                         platform.backend.release_all()?;
                         active = false;
-                        motion_state.reset_pressed();
-                        motion_state.cursor = None;
+                        cursor = None;
                     }
                     InputMessage::Heartbeat { generation: incoming_generation } if incoming_generation == generation => {
                         last_heartbeat = Instant::now();
                     }
                     InputMessage::Heartbeat { .. } => {}
+                    InputMessage::Return { generation: incoming_generation, .. }
+                        if active && incoming_generation == generation => {
+                            platform.backend.release_all()?;
+                            active = false;
+                            cursor = None;
+                            tracing::info!(generation, "对端已批准返回, 控制已归还本机");
+                    }
                     InputMessage::Key { generation: incoming_generation, usage, modifiers, down, repeat }
                         if active && incoming_generation == generation => {
                             platform.backend.inject_key(usage, modifiers, down, repeat)?;
-                            motion_state.remote_pressed.key(usage, down, repeat);
-                            finish_pending_return(
-                                &*platform.backend,
-                                tx,
-                                generation,
-                                &mut active,
-                                &mut motion_state,
-                            )?;
                         }
                     InputMessage::Button { generation: incoming_generation, button, down }
                         if active && incoming_generation == generation => {
                             platform.backend.inject_button(button, down)?;
-                            motion_state.remote_pressed.button(button, down);
-                            finish_pending_return(
-                                &*platform.backend,
-                                tx,
-                                generation,
-                                &mut active,
-                                &mut motion_state,
-                            )?;
                         }
                     InputMessage::Wheel { generation: incoming_generation, x, y }
                         if active && incoming_generation == generation => {
@@ -860,13 +931,11 @@ pub(super) async fn run_receiver(
                                 &*platform.backend,
                                 &local_layout,
                                 return_edge,
-                                &mut motion_state,
-                                block_switch_on_press,
+                                &mut cursor,
                                 dx,
                                 dy,
                             )? {
-                                active = false;
-                                enqueue_message(tx, InputMessage::Return { generation, edge_position })?;
+                                enqueue_message(tx, InputMessage::ReturnRequest { generation, edge_position })?;
                             }
                     }
                     InputMessage::Proof { .. } => bail!("输入通道收到重复认证消息"),
@@ -882,14 +951,12 @@ pub(super) async fn run_receiver(
                         &*platform.backend,
                         &local_layout,
                         return_edge,
-                        &mut motion_state,
-                        block_switch_on_press,
+                        &mut cursor,
                         motion.dx,
                         motion.dy,
                     )?
                 {
-                    active = false;
-                    enqueue_message(tx, InputMessage::Return { generation, edge_position })?;
+                    enqueue_message(tx, InputMessage::ReturnRequest { generation, edge_position })?;
                 }
             }
             Some(event) = platform.events.recv() => {
@@ -898,8 +965,7 @@ pub(super) async fn run_receiver(
                         if active {
                             platform.backend.release_all()?;
                             active = false;
-                            motion_state.reset_pressed();
-                            motion_state.cursor = None;
+                            cursor = None;
                             let _ = tx.try_send(InputMessage::Deactivate { generation });
                             tracing::info!(generation, "接收端紧急热键已停止远程控制");
                         }
@@ -939,53 +1005,24 @@ fn apply_receiver_motion(
     backend: &dyn platform::InputBackend,
     layout: &super::DesktopLayout,
     return_edge: ScreenEdge,
-    state: &mut ReceiverMotionState,
-    block_switch_on_press: bool,
+    cursor: &mut Option<super::Point>,
     dx: i32,
     dy: i32,
 ) -> Result<Option<f32>> {
-    let point = state.cursor.context("输入接收端缺少逻辑光标位置")?;
+    let point = cursor.context("输入接收端缺少逻辑光标位置")?;
     match receiver_motion(layout, return_edge, point, dx, dy) {
-        ReceiverMotion::Return(edge_position)
-            if block_switch_on_press && !state.remote_pressed.is_empty() =>
-        {
-            state.pending_return = Some(edge_position);
+        ReceiverMotion::Return(edge_position) => {
             let target = layout.move_within_layout(point, dx, dy);
             backend.inject_cursor(target)?;
-            state.cursor = Some(target);
-            Ok(None)
-        }
-        ReceiverMotion::Return(edge_position) => {
-            backend.release_all()?;
-            state.cursor = None;
-            state.pending_return = None;
+            *cursor = Some(target);
             Ok(Some(edge_position))
         }
         ReceiverMotion::Move(target) => {
             backend.inject_cursor(target)?;
-            state.cursor = Some(target);
+            *cursor = Some(target);
             Ok(None)
         }
     }
-}
-
-fn finish_pending_return(
-    backend: &dyn platform::InputBackend,
-    tx: &mpsc::Sender<InputMessage>,
-    generation: u64,
-    active: &mut bool,
-    state: &mut ReceiverMotionState,
-) -> Result<()> {
-    if state.remote_pressed.is_empty()
-        && let Some(edge_position) = state.pending_return
-    {
-        state.pending_return = None;
-        backend.release_all()?;
-        *active = false;
-        state.cursor = None;
-        enqueue_message(tx, InputMessage::Return { generation, edge_position })?;
-    }
-    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1022,11 +1059,11 @@ fn apply_snapshot(backend: &dyn platform::InputBackend, snapshot: &KeySnapshot) 
 mod tests {
     use super::{
         ACTIVATION_TIMEOUT, AbortOnDrop, EDGE_INSET, HEARTBEAT_TIMEOUT, ReceiverMotion,
-        IncomingMotion, RemotePressed, SenderRecoveryGuard, enqueue_message, receiver_motion,
+        IncomingMotion, PressedState, SenderRecoveryGuard, enqueue_message, receiver_motion,
         run_receiver, run_sender, sender_activation_edge_position, sender_heartbeat_timeout,
         spawn_input_reader, transform_scroll,
     };
-    use crate::input::platform::{InputBackend, MotionAccumulator, PlatformHandle};
+    use crate::input::platform::{InputBackend, MotionAccumulator, NativeEvent, PlatformHandle};
     use crate::input::platform::ScrollSource;
     use crate::input::protocol::{InputMessage, write_message};
     use crate::input::{
@@ -1328,8 +1365,8 @@ mod tests {
     }
 
     #[test]
-    fn remote_pressed_tracks_down_up_and_ignores_repeats() {
-        let mut pressed = RemotePressed::default();
+    fn pressed_state_tracks_down_up_and_ignores_repeats() {
+        let mut pressed = PressedState::default();
         pressed.key(0x04, true, true);
         assert!(pressed.is_empty());
         pressed.key(0x04, true, false);
@@ -1340,7 +1377,7 @@ mod tests {
         assert!(!pressed.is_empty());
         pressed.button(1, false);
         assert!(pressed.is_empty());
-        let from_snapshot = RemotePressed::from_snapshot(&KeySnapshot {
+        let from_snapshot = PressedState::from_snapshot(&KeySnapshot {
             usages: vec![0x04],
             modifiers: ModifierMask::default(),
             buttons: vec![1],
@@ -1388,7 +1425,6 @@ mod tests {
                 &outgoing,
                 &mut platform,
                 layout,
-                false,
             )
             .await
         });
@@ -1410,7 +1446,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn receiver_blocks_return_while_remote_pressed_and_finishes_on_release() {
+    async fn receiver_requests_return_at_edge_and_waits_for_approval() {
         let backend = Arc::new(FakeBackend::default());
         let layout = backend.layout().unwrap();
         let motion = Arc::new(MotionAccumulator::default());
@@ -1433,7 +1469,7 @@ mod tests {
                 pressed: KeySnapshot {
                     usages: Vec::new(),
                     modifiers: ModifierMask::default(),
-                    buttons: vec![1],
+                    buttons: Vec::new(),
                 },
             }))
             .await
@@ -1447,7 +1483,6 @@ mod tests {
                 &outgoing,
                 &mut platform,
                 layout,
-                true,
             )
             .await
         });
@@ -1466,15 +1501,58 @@ mod tests {
         .await
         .expect("接收端应确认激活");
 
-        // 按住按钮持续向返回边缘(左侧)运动: 不应返回.
+        // 到达返回边缘: 应发送 ReturnRequest 而非自行返回.
         for _ in 0..200 {
             incoming_motion.push(7, -1, 0);
         }
-        let blocked = timeout(Duration::from_millis(300), async {
+        let edge_position = timeout(Duration::from_secs(1), async {
             loop {
                 match messages.recv().await {
-                    Some(InputMessage::Return { .. }) => {
-                        panic!("按住状态下不应返回")
+                    Some(InputMessage::ReturnRequest { generation: 7, edge_position }) => {
+                        break edge_position
+                    }
+                    Some(InputMessage::Return { .. }) => panic!("接收端不应自行返回"),
+                    Some(_) => {}
+                    None => panic!("接收端不应提前停止"),
+                }
+            }
+        })
+        .await
+        .expect("接收端应请求返回");
+        assert_eq!(edge_position, 0.5);
+
+        // 未获批准前保持接受控制: 不应出现 Return.
+        for _ in 0..200 {
+            incoming_motion.push(7, -1, 0);
+        }
+        let not_returned = timeout(Duration::from_millis(300), async {
+            loop {
+                match messages.recv().await {
+                    Some(InputMessage::Return { .. }) => panic!("未获批准前不应返回"),
+                    Some(_) => {}
+                    None => panic!("接收端不应提前停止"),
+                }
+            }
+        })
+        .await;
+        assert!(not_returned.is_err(), "未获批准前应保持接受控制");
+
+        // 对端批准返回后释放控制, 不再处理对端运动.
+        incoming_tx
+            .send(Ok(InputMessage::Return {
+                generation: 7,
+                edge_position: 0.5,
+            }))
+            .await
+            .unwrap();
+        for _ in 0..200 {
+            incoming_motion.push(7, -1, 0);
+        }
+        let released = timeout(Duration::from_millis(300), async {
+            loop {
+                match messages.recv().await {
+                    Some(InputMessage::ReturnRequest { .. }) => {
+                        panic!("返回后不应再处理对端运动")
                     }
                     Some(_) => {}
                     None => panic!("接收端不应提前停止"),
@@ -1482,105 +1560,182 @@ mod tests {
             }
         })
         .await;
-        assert!(blocked.is_err(), "按住状态下不应返回");
-
-        // 松开按钮: 应立即使控制返回.
-        incoming_tx
-            .send(Ok(InputMessage::Button {
-                generation: 7,
-                button: 1,
-                down: false,
-            }))
-            .await
-            .unwrap();
-        let edge_position = timeout(Duration::from_secs(1), async {
-            loop {
-                match messages.recv().await {
-                    Some(InputMessage::Return { edge_position, .. }) => break edge_position,
-                    Some(_) => {}
-                    None => panic!("接收端不应提前停止"),
-                }
-            }
-        })
-        .await
-        .expect("松开后应立即返回");
-        assert_eq!(edge_position, 0.5);
+        assert!(released.is_err(), "返回后应停止接受控制");
 
         task.abort();
         let _ = task.await;
     }
 
     #[tokio::test]
-    async fn receiver_returns_immediately_when_option_disabled() {
+    async fn sender_returns_immediately_when_requested_and_option_disabled() {
         let backend = Arc::new(FakeBackend::default());
         let layout = backend.layout().unwrap();
         let motion = Arc::new(MotionAccumulator::default());
-        let (_events_tx, events) = mpsc::channel(1);
+        let (_events_tx, events) = mpsc::channel(8);
         let mut platform = PlatformHandle {
             backend: Arc::clone(&backend) as Arc<dyn InputBackend>,
             events,
-            motion,
+            motion: Arc::clone(&motion),
             overflowed: Arc::new(AtomicBool::new(false)),
             failed: Arc::new(AtomicBool::new(false)),
         };
-        let (incoming_tx, mut incoming) = mpsc::channel(256);
-        let incoming_motion = Arc::new(IncomingMotion::default());
+        let (incoming_tx, mut incoming) = mpsc::channel(8);
         let (outgoing, mut messages) = mpsc::channel(16);
-        incoming_tx
-            .send(Ok(InputMessage::Activate {
-                generation: 7,
-                source_edge: ScreenEdge::Right,
-                edge_position: 0.5,
-                pressed: KeySnapshot {
-                    usages: Vec::new(),
-                    modifiers: ModifierMask::default(),
-                    buttons: vec![1],
-                },
-            }))
-            .await
-            .unwrap();
+        motion.add_at(4, 0, Point { x: 97, y: 50 });
+        let input_options = test_input_options(ScreenEdge::Right);
 
-        let incoming_motion_for_task = Arc::clone(&incoming_motion);
         let task = tokio::spawn(async move {
-            run_receiver(
+            run_sender(
                 &mut incoming,
-                &incoming_motion_for_task,
                 &outgoing,
                 &mut platform,
-                layout,
-                false,
+                layout.clone(),
+                ScreenEdge::Right,
+                InputPlatform::current(),
+                &input_options,
             )
             .await
         });
 
         timeout(Duration::from_secs(1), async {
             loop {
-                if matches!(
-                    messages.recv().await,
-                    Some(InputMessage::Heartbeat { generation: 7 })
-                ) {
+                if let InputMessage::Activate { generation, .. } =
+                    messages.recv().await.expect("sender 不应提前停止")
+                {
+                    assert_eq!(generation, 1);
                     break;
                 }
             }
         })
         .await
-        .expect("接收端应确认激活");
+        .expect("sender 应激活");
 
-        for _ in 0..200 {
-            incoming_motion.push(7, -1, 0);
-        }
+        // 对端请求返回: 选项关闭时应立即批准并恢复本机.
+        incoming_tx
+            .send(Ok(InputMessage::ReturnRequest {
+                generation: 1,
+                edge_position: 0.5,
+            }))
+            .await
+            .unwrap();
         let edge_position = timeout(Duration::from_secs(1), async {
             loop {
-                match messages.recv().await {
-                    Some(InputMessage::Return { edge_position, .. }) => break edge_position,
-                    Some(_) => {}
-                    None => panic!("接收端不应提前停止"),
+                if let InputMessage::Return { edge_position, .. } =
+                    messages.recv().await.expect("sender 不应提前停止")
+                {
+                    break edge_position;
                 }
             }
         })
         .await
-        .expect("选项关闭时应立即返回");
+        .expect("应批准对端返回");
         assert_eq!(edge_position, 0.5);
+        assert!(!*backend.capture.lock().unwrap());
+
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn sender_blocks_return_until_local_release_when_option_enabled() {
+        let backend = Arc::new(FakeBackend::default());
+        let layout = backend.layout().unwrap();
+        let motion = Arc::new(MotionAccumulator::default());
+        let (events_tx, events) = mpsc::channel(8);
+        let mut platform = PlatformHandle {
+            backend: Arc::clone(&backend) as Arc<dyn InputBackend>,
+            events,
+            motion: Arc::clone(&motion),
+            overflowed: Arc::new(AtomicBool::new(false)),
+            failed: Arc::new(AtomicBool::new(false)),
+        };
+        let (incoming_tx, mut incoming) = mpsc::channel(8);
+        let (outgoing, mut messages) = mpsc::channel(16);
+        motion.add_at(4, 0, Point { x: 97, y: 50 });
+        let mut input_options = test_input_options(ScreenEdge::Right);
+        input_options.block_switch_on_press = true;
+
+        let task = tokio::spawn(async move {
+            run_sender(
+                &mut incoming,
+                &outgoing,
+                &mut platform,
+                layout.clone(),
+                ScreenEdge::Right,
+                InputPlatform::current(),
+                &input_options,
+            )
+            .await
+        });
+
+        // 快照为空, 允许激活.
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if let InputMessage::Activate { generation, .. } =
+                    messages.recv().await.expect("sender 不应提前停止")
+                {
+                    assert_eq!(generation, 1);
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("sender 应激活");
+
+        // 本机按下按钮, 对端请求返回: 应被拦截.
+        events_tx
+            .send(NativeEvent::Button { button: 1, down: true })
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if let InputMessage::Button { button: 1, down: true, .. } =
+                    messages.recv().await.expect("sender 不应提前停止")
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("sender 应转发本机按钮按下");
+        incoming_tx
+            .send(Ok(InputMessage::ReturnRequest {
+                generation: 1,
+                edge_position: 0.5,
+            }))
+            .await
+            .unwrap();
+        let blocked = timeout(Duration::from_millis(300), async {
+            loop {
+                match messages.recv().await {
+                    Some(InputMessage::Return { .. }) => panic!("按住状态下不应批准返回"),
+                    Some(_) => {}
+                    None => panic!("sender 不应提前停止"),
+                }
+            }
+        })
+        .await;
+        assert!(blocked.is_err(), "按住状态下不应批准返回");
+        assert!(*backend.capture.lock().unwrap());
+
+        // 松开按钮: 应批准返回并恢复本机.
+        events_tx
+            .send(NativeEvent::Button { button: 1, down: false })
+            .await
+            .unwrap();
+        let edge_position = timeout(Duration::from_secs(1), async {
+            loop {
+                if let InputMessage::Return { edge_position, .. } =
+                    messages.recv().await.expect("sender 不应提前停止")
+                {
+                    break edge_position;
+                }
+            }
+        })
+        .await
+        .expect("松开后应批准返回");
+        assert_eq!(edge_position, 0.5);
+        assert!(!*backend.capture.lock().unwrap());
 
         task.abort();
         let _ = task.await;
