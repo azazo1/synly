@@ -40,6 +40,12 @@ pub struct RuntimePeerSummary {
     pub display_name: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RuntimeCommand {
+    DisconnectPeer(Uuid),
+    SwitchActiveSession(Uuid),
+}
+
 #[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InteractionRequest {
@@ -109,9 +115,13 @@ pub struct InteractionEnvelope {
 pub enum RuntimeEvent {
     Lifecycle(RuntimeLifecycle),
     Connected(RuntimePeerSummary),
-    Disconnected,
+    Disconnected(RuntimePeerSummary),
+    ActiveSession {
+        device_id: Uuid,
+    },
     Interaction(InteractionEnvelope),
     Capabilities {
+        peer: RuntimePeerSummary,
         local: RuntimeCapabilities,
         remote: RuntimeCapabilities,
         epoch: CapabilityEpoch,
@@ -126,6 +136,7 @@ pub struct RuntimeControl {
     capabilities: watch::Receiver<RuntimeCapabilities>,
     tuning: watch::Receiver<RuntimeTuning>,
     events: mpsc::UnboundedSender<RuntimeEvent>,
+    commands: mpsc::UnboundedSender<RuntimeCommand>,
 }
 
 pub struct RuntimeControlHandle {
@@ -133,6 +144,7 @@ pub struct RuntimeControlHandle {
     pub capabilities: watch::Sender<RuntimeCapabilities>,
     pub tuning: watch::Sender<RuntimeTuning>,
     pub events: mpsc::UnboundedReceiver<RuntimeEvent>,
+    pub commands: mpsc::UnboundedReceiver<RuntimeCommand>,
 }
 
 impl std::fmt::Debug for RuntimeControl {
@@ -155,18 +167,21 @@ impl RuntimeControl {
         let (capabilities_tx, capabilities) = watch::channel(initial);
         let (tuning_tx, tuning) = watch::channel(initial_tuning);
         let (events, events_rx) = mpsc::unbounded_channel();
+        let (commands, commands_rx) = mpsc::unbounded_channel();
         (
             Self {
                 shutdown: shutdown.clone(),
                 capabilities,
                 tuning,
                 events,
+                commands,
             },
             RuntimeControlHandle {
                 shutdown,
                 capabilities: capabilities_tx,
                 tuning: tuning_tx,
                 events: events_rx,
+                commands: commands_rx,
             },
         )
     }
@@ -189,6 +204,10 @@ impl RuntimeControl {
 
     pub fn report(&self, event: RuntimeEvent) {
         let _ = self.events.send(event);
+    }
+
+    pub fn commands(&self) -> mpsc::UnboundedSender<RuntimeCommand> {
+        self.commands.clone()
     }
 
     pub fn notify_interaction(&self, request: InteractionRequest) {

@@ -158,7 +158,7 @@ impl ClipboardSync {
         Ok(())
     }
 
-    fn note_local_payload(&self, payload: &ClipboardPayload) -> Result<bool> {
+    pub(crate) fn note_local_payload(&self, payload: &ClipboardPayload) -> Result<bool> {
         let mut guard = self
             .state
             .lock()
@@ -166,7 +166,7 @@ impl ClipboardSync {
         Ok(guard.note_local_payload(payload))
     }
 
-    async fn read_local_payload(&self) -> Result<Option<ClipboardPayload>> {
+    pub(crate) async fn read_local_payload(&self) -> Result<Option<ClipboardPayload>> {
         let max_file_bytes = self
             .options
             .lock()
@@ -839,7 +839,7 @@ fn clipboard_error(err: Box<dyn std::error::Error + Send + Sync + 'static>) -> a
     anyhow!(err.to_string())
 }
 
-fn payload_signature(payload: &ClipboardPayload) -> String {
+pub(crate) fn payload_signature(payload: &ClipboardPayload) -> String {
     let mut hasher = Sha256::new();
     hash_optional_string(&mut hasher, "text", payload.text.as_deref());
     hash_optional_string(&mut hasher, "rtf", payload.rich_text.as_deref());

@@ -2,7 +2,7 @@ use crate::config::{
     ClipboardConfig, DiscoveryConfig, RuntimeConfig, SynlyConfig, TransferConfig,
     TrustedDeviceConfig, UiConfig,
 };
-use crate::runtime_control::{InteractionRequest, RuntimePeerSummary};
+use crate::runtime_control::InteractionRequest;
 use crate::protocol::{CapabilityEpoch, RuntimeCapabilities};
 use crate::settings::{AudioMode, ClipboardMode};
 use crate::input::InputMode;
@@ -60,6 +60,16 @@ pub struct PendingInteraction {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionView {
+    pub device_id: Uuid,
+    pub display_name: String,
+    pub active: bool,
+    pub remote_capabilities: Option<RuntimeCapabilities>,
+    pub capability_epoch: Option<CapabilityEpoch>,
+    pub capabilities_acknowledged: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AppSettings {
     pub device_name: String,
     pub clipboard: ClipboardConfig,
@@ -89,7 +99,7 @@ pub struct AppSnapshot {
     pub pending: Option<RuntimeConfig>,
     pub applied: Option<RuntimeConfig>,
     pub settings: AppSettings,
-    pub current_peer: Option<RuntimePeerSummary>,
+    pub sessions: Vec<SessionView>,
     pub discovered_peers: Vec<DiscoveredPeerView>,
     pub trusted_devices: Vec<TrustedDeviceConfig>,
     pub interaction: Option<PendingInteraction>,
@@ -109,7 +119,7 @@ impl AppSnapshot {
             pending: None,
             applied: None,
             settings,
-            current_peer: None,
+            sessions: Vec::new(),
             discovered_peers: Vec::new(),
             trusted_devices: Vec::new(),
             interaction: None,
@@ -154,6 +164,8 @@ pub enum AppCommand {
     SetInputMode(InputMode),
     SelectPaths(Vec<PathBuf>),
     Disconnect,
+    DisconnectPeer(Uuid),
+    SwitchActiveSession(Uuid),
     RespondInteraction {
         request_id: Uuid,
         response: crate::runtime_control::InteractionResponse,

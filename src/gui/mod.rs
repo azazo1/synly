@@ -186,6 +186,22 @@ fn wire_window_callbacks(
     window.on_disconnect(move || send_command(&commands, AppCommand::Disconnect));
 
     let commands = handle.commands();
+    window.on_disconnect_session(move |device_id| {
+        match Uuid::parse_str(device_id.as_str()) {
+            Ok(device_id) => send_command(&commands, AppCommand::DisconnectPeer(device_id)),
+            Err(error) => tracing::warn!(error = %error, "忽略无效的会话设备 ID"),
+        }
+    });
+
+    let commands = handle.commands();
+    window.on_switch_active_session(move |device_id| {
+        match Uuid::parse_str(device_id.as_str()) {
+            Ok(device_id) => send_command(&commands, AppCommand::SwitchActiveSession(device_id)),
+            Err(error) => tracing::warn!(error = %error, "忽略无效的活跃会话设备 ID"),
+        }
+    });
+
+    let commands = handle.commands();
     let weak = window.as_weak();
     window.on_quit_application(move || {
         if let Some(window) = weak.upgrade() {
@@ -508,8 +524,10 @@ fn apply_snapshot(
 ) {
     let active = snapshot.applied.is_some();
     let peer_label = snapshot
-        .current_peer
-        .as_ref()
+        .sessions
+        .iter()
+        .find(|session| session.active)
+        .or_else(|| snapshot.sessions.first())
         .map(|peer| peer.display_name.as_str())
         .unwrap_or("未连接");
     window.set_lifecycle_text(snapshot.lifecycle.label().into());
@@ -590,6 +608,29 @@ fn apply_snapshot(
         })
         .collect::<Vec<_>>();
     window.set_peers(ModelRc::new(VecModel::from(peers)));
+    let sessions = snapshot
+        .sessions
+        .iter()
+        .map(|session| SessionRow {
+            device_id: session.device_id.to_string().into(),
+            title: session.display_name.clone().into(),
+            active: session.active,
+            subtitle: format!(
+                "{} | {}",
+                if session.active {
+                    "活跃会话"
+                } else {
+                    "仅剪贴板"
+                },
+                session
+                    .remote_capabilities
+                    .map(capability_summary)
+                    .unwrap_or_else(|| "未协商".to_string())
+            )
+            .into(),
+        })
+        .collect::<Vec<_>>();
+    window.set_sessions(ModelRc::new(VecModel::from(sessions)));
     let trusted = snapshot
         .trusted_devices
         .iter()

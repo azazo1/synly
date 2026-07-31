@@ -18,6 +18,13 @@ export struct TrustedRow {
     subtitle: string,
 }
 
+export struct SessionRow {
+    device-id: string,
+    title: string,
+    active: bool,
+    subtitle: string,
+}
+
 component NavButton inherits Rectangle {
     in property <string> text;
     in property <bool> active;
@@ -97,6 +104,7 @@ export component AppWindow inherits Window {
     in property <string> remote-summary: "";
     in property <string> epoch-summary: "";
     in property <[PeerRow]> peers;
+    in property <[SessionRow]> sessions;
     in property <[TrustedRow]> trusted-devices;
     in property <string> log-text;
     in property <string> about-version: "";
@@ -155,6 +163,8 @@ export component AppWindow inherits Window {
     callback connect-peer(string);
     callback connect-query();
     callback disconnect();
+    callback disconnect-session(string);
+    callback switch-active-session(string);
     callback quit-application();
     callback apply-settings();
     callback choose-path();
@@ -251,24 +261,49 @@ export component AppWindow inherits Window {
                     height: 184px;
                     spacing: 10px;
                     Panel {
-                        title: "当前会话";
+                        title: "已连接设备";
                         horizontal-stretch: 3;
                         VerticalLayout {
                             spacing: 6px;
-                            HorizontalLayout {
-                                Text { text: "状态"; color: #737b77; width: 58px; }
-                                Text { text: root.lifecycle-text; color: root.session-active ? #247554 : #343a37; font-weight: 600; }
+                            ScrollView {
+                                vertical-stretch: 1;
+                                VerticalLayout {
+                                    spacing: 6px;
+                                    for session in root.sessions: Rectangle {
+                                        height: 56px;
+                                        background: #ffffff;
+                                        border-color: session.active ? #93c6ad : #d8dcda;
+                                        border-width: 1px;
+                                        border-radius: 5px;
+                                        HorizontalLayout {
+                                            padding: 8px;
+                                            spacing: 8px;
+                                            VerticalLayout {
+                                                Text {
+                                                    text: session.active ? session.title + " (活跃)" : session.title;
+                                                    font-size: 13px;
+                                                    font-weight: 600;
+                                                    color: #202523;
+                                                }
+                                                Text { text: session.subtitle; color: #666c68; font-size: 11px; wrap: word-wrap; }
+                                            }
+                                            Rectangle { horizontal-stretch: 1; }
+                                            Button { text: "设为活跃"; enabled: !session.active; clicked => { root.switch-active-session(session.device-id); } }
+                                            Button { text: "断开"; clicked => { root.disconnect-session(session.device-id); } }
+                                        }
+                                    }
+                                    if root.sessions.length == 0: Text {
+                                        text: root.session-active ? "等待会话信息..." : "暂无已连接设备";
+                                        color: #737b77;
+                                        font-size: 12px;
+                                    }
+                                }
                             }
-                            HorizontalLayout {
-                                Text { text: "对侧"; color: #737b77; width: 58px; }
-                                Text { text: root.current-peer; color: #343a37; overflow: elide; }
-                            }
-                            Rectangle { vertical-stretch: 1; }
                             HorizontalLayout {
                                 spacing: 6px;
                                 Button { text: "监听"; enabled: !root.session-active; clicked => { root.start-hosting(); } }
                                 Button { text: "连接"; enabled: !root.session-active; clicked => { root.selected-page = 1; } }
-                                Button { text: "断开"; enabled: root.session-active; clicked => { root.disconnect(); } }
+                                Button { text: "断开全部"; enabled: root.session-active; clicked => { root.disconnect(); } }
                             }
                         }
                     }

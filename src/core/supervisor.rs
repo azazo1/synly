@@ -1,13 +1,13 @@
 use super::model::{
-    AppCommand, AppLifecycle, AppSettings, AppSnapshot, DiscoveredPeerView,
-    PendingInteraction,
+    AppCommand, AppLifecycle, AppSettings, AppSnapshot, DiscoveredPeerView, PendingInteraction,
+    SessionView,
 };
 use crate::config::{RuntimeConfig, SynlyConfig};
 use crate::discovery::{self, DiscoveredPeer};
 use crate::protocol::{PROTOCOL_VERSION, RuntimeCapabilities};
 use crate::runtime_control::{
-    InteractionEnvelope, RuntimeControl, RuntimeControlHandle, RuntimeEvent, RuntimeLifecycle,
-    RuntimeTuning,
+    InteractionEnvelope, RuntimeCommand, RuntimeControl, RuntimeControlHandle, RuntimeEvent,
+    RuntimeLifecycle, RuntimeTuning,
 };
 use crate::runtime_options::{RuntimeOptions, runtime_options_from_config};
 use crate::settings::ConnectionPreference;
@@ -59,6 +59,7 @@ pub struct AppSupervisor {
     discovery_epoch: u64,
     input_backend_generation: u64,
     pending_responses: HashMap<Uuid, oneshot::Sender<crate::runtime_control::InteractionResponse>>,
+    runtime_active_session: Option<Uuid>,
 }
 
 struct SessionHandle {
@@ -66,6 +67,7 @@ struct SessionHandle {
     shutdown: tokio_util::sync::CancellationToken,
     capabilities: watch::Sender<RuntimeCapabilities>,
     tuning: watch::Sender<RuntimeTuning>,
+    commands: mpsc::UnboundedSender<RuntimeCommand>,
     task: JoinHandle<()>,
 }
 
@@ -112,6 +114,7 @@ impl AppSupervisor {
                 discovery_epoch: 0,
                 input_backend_generation: 0,
                 pending_responses: HashMap::new(),
+                runtime_active_session: None,
             },
             AppSupervisorHandle {
                 commands,
@@ -301,6 +304,20 @@ impl AppSupervisor {
                 }
             }
             AppCommand::Disconnect => self.stop_session().await,
+            AppCommand::DisconnectPeer(device_id) => {
+                if let Some(session) = &self.session {
+                    let _ = session
+                        .commands
+                        .send(RuntimeCommand::DisconnectPeer(device_id));
+                }
+            }
+            AppCommand::SwitchActiveSession(device_id) => {
+                if let Some(session) = &self.session {
+                    let _ = session
+                        .commands
+                        .send(RuntimeCommand::SwitchActiveSession(device_id));
+                }
+            }
             AppCommand::RespondInteraction { request_id, response } => {
                 if let Some(sender) = self.pending_responses.remove(&request_id) {
                     let _ = sender.send(response);
@@ -321,11 +338,14 @@ impl AppSupervisor {
                     self.snapshot.trusted_devices = self.config.trusted_devices.clone();
                     if self
                         .snapshot
-                        .current_peer
-                        .as_ref()
-                        .is_some_and(|peer| peer.device_id == device_id)
+                        .sessions
+                        .iter()
+                        .any(|session| session.device_id == device_id)
+                        && let Some(session) = &self.session
                     {
-                        self.stop_session().await;
+                        let _ = session
+                            .commands
+                            .send(RuntimeCommand::DisconnectPeer(device_id));
                     }
                     self.publish();
                 }
@@ -433,8 +453,9 @@ impl AppSupervisor {
                 self.session = None;
                 self.snapshot.applied = None;
                 self.snapshot.pending = None;
-                self.snapshot.current_peer = None;
                 self.snapshot.interaction = None;
+                self.snapshot.sessions.clear();
+                self.runtime_active_session = None;
                 self.snapshot.actual_capabilities = None;
                 self.snapshot.remote_capabilities = None;
                 self.snapshot.capability_epoch = None;
@@ -459,40 +480,124 @@ impl AppSupervisor {
                 self.snapshot.lifecycle = map_lifecycle(lifecycle);
             }
             RuntimeEvent::Connected(peer) => {
+                if !self
+                    .snapshot
+                    .sessions
+                    .iter()
+                    .any(|session| session.device_id == peer.device_id)
+                {
+                    self.snapshot.sessions.push(SessionView {
+                        device_id: peer.device_id,
+                        display_name: peer.display_name,
+                        active: false,
+                        remote_capabilities: None,
+                        capability_epoch: None,
+                        capabilities_acknowledged: true,
+                    });
+                }
                 self.snapshot.lifecycle = AppLifecycle::Connected;
-                self.snapshot.current_peer = Some(peer);
+                self.sync_active_flags();
+                self.refresh_aggregate_capabilities();
             }
-            RuntimeEvent::Disconnected => {
-                self.snapshot.lifecycle = AppLifecycle::Idle;
-                self.snapshot.current_peer = None;
+            RuntimeEvent::Disconnected(peer) => {
+                self.snapshot
+                    .sessions
+                    .retain(|session| session.device_id != peer.device_id);
+                if self.snapshot.sessions.is_empty() {
+                    self.snapshot.lifecycle = match self.snapshot.desired.connection {
+                        Some(ConnectionPreference::Host) => AppLifecycle::Hosting,
+                        _ => AppLifecycle::Idle,
+                    };
+                    self.runtime_active_session = None;
+                }
+                self.sync_active_flags();
+                self.refresh_aggregate_capabilities();
+            }
+            RuntimeEvent::ActiveSession { device_id } => {
+                self.runtime_active_session = Some(device_id);
+                self.snapshot.lifecycle = AppLifecycle::Connected;
+                self.sync_active_flags();
+                self.refresh_aggregate_capabilities();
             }
             RuntimeEvent::Interaction(envelope) => self.handle_interaction(envelope),
             RuntimeEvent::Capabilities {
+                peer,
                 local,
                 remote,
                 epoch,
                 acknowledged,
             } => {
-                self.snapshot.actual_capabilities = Some(local);
-                self.snapshot.remote_capabilities = Some(remote);
-                self.snapshot.capability_epoch = Some(epoch);
-                self.snapshot.capabilities_acknowledged = acknowledged;
-                if let Some(applied) = self.snapshot.applied.as_mut() {
-                    applied.clipboard_mode = local.clipboard_mode;
-                    applied.audio_mode = local.audio_mode;
-                    applied.input.mode = local.input_mode;
-                }
-                if acknowledged
-                    && local.clipboard_mode == self.snapshot.desired.clipboard_mode
-                    && local.audio_mode == self.snapshot.desired.audio_mode
-                    && local.input_mode == self.snapshot.desired.input.mode
+                if let Some(session) = self
+                    .snapshot
+                    .sessions
+                    .iter_mut()
+                    .find(|session| session.device_id == peer.device_id)
                 {
-                    self.snapshot.pending = None;
+                    session.remote_capabilities = Some(remote);
+                    session.capability_epoch = Some(epoch);
+                    session.capabilities_acknowledged = acknowledged;
                 }
+                let is_active = self.active_session_id() == Some(peer.device_id);
+                if is_active {
+                    self.snapshot.actual_capabilities = Some(local);
+                    if let Some(applied) = self.snapshot.applied.as_mut() {
+                        applied.clipboard_mode = local.clipboard_mode;
+                        applied.audio_mode = local.audio_mode;
+                        applied.input.mode = local.input_mode;
+                    }
+                    if acknowledged
+                        && local.clipboard_mode == self.snapshot.desired.clipboard_mode
+                        && local.audio_mode == self.snapshot.desired.audio_mode
+                        && local.input_mode == self.snapshot.desired.input.mode
+                    {
+                        self.snapshot.pending = None;
+                    }
+                }
+                self.sync_active_flags();
+                self.refresh_aggregate_capabilities();
             }
             RuntimeEvent::Error(error) => self.set_error(error),
         }
         self.publish();
+    }
+
+    fn active_session_id(&self) -> Option<Uuid> {
+        self.snapshot
+            .sessions
+            .iter()
+            .find(|session| session.active)
+            .map(|session| session.device_id)
+            .or_else(|| self.snapshot.sessions.first().map(|session| session.device_id))
+    }
+
+    fn sync_active_flags(&mut self) {
+        let active = match self.snapshot.desired.connection {
+            Some(ConnectionPreference::Join) => {
+                self.snapshot.sessions.first().map(|session| session.device_id)
+            }
+            _ => self.runtime_active_session,
+        };
+        for session in &mut self.snapshot.sessions {
+            session.active = Some(session.device_id) == active;
+        }
+    }
+
+    fn refresh_aggregate_capabilities(&mut self) {
+        let Some(session) = self
+            .snapshot
+            .sessions
+            .iter()
+            .find(|session| session.active)
+            .or_else(|| self.snapshot.sessions.first())
+        else {
+            self.snapshot.remote_capabilities = None;
+            self.snapshot.capability_epoch = None;
+            self.snapshot.capabilities_acknowledged = true;
+            return;
+        };
+        self.snapshot.remote_capabilities = session.remote_capabilities;
+        self.snapshot.capability_epoch = session.capability_epoch;
+        self.snapshot.capabilities_acknowledged = session.capabilities_acknowledged;
     }
 
     fn handle_interaction(&mut self, envelope: InteractionEnvelope) {
@@ -534,6 +639,7 @@ impl AppSupervisor {
         let capabilities = self.current_capabilities();
         let tuning = tuning_from_options(&options, self.input_backend_generation);
         let (control, control_handle) = RuntimeControl::new(capabilities, tuning);
+        let commands = control.commands();
         if let Err(error) = crate::input::ensure_platform_supported(options.input_mode) {
             self.set_error(error.to_string());
             self.publish();
@@ -550,10 +656,17 @@ impl AppSupervisor {
         self.publish();
 
         let session_id = Uuid::new_v4();
-        let mut session_config = self.config.clone();
+        let session_config = self.config.clone();
         let internal = self.internal_tx.clone();
+        let RuntimeControlHandle {
+            shutdown,
+            capabilities,
+            tuning,
+            events,
+            commands: commands_rx,
+        } = control_handle;
         let task = tokio::spawn(async move {
-            let result = crate::app::run(&mut session_config, options)
+            let result = crate::app::run(session_config, options, commands_rx)
                 .await
                 .map_err(|error| format!("{error:#}"));
             let _ = internal.send(InternalEvent::SessionFinished {
@@ -561,17 +674,12 @@ impl AppSupervisor {
                 result,
             });
         });
-        let RuntimeControlHandle {
-            shutdown,
-            capabilities,
-            tuning,
-            events,
-        } = control_handle;
         self.session = Some(SessionHandle {
             id: session_id,
             shutdown,
             capabilities,
             tuning,
+            commands,
             task,
         });
         self.spawn_runtime_event_forwarder(session_id, events, self.internal_tx.clone());
@@ -596,8 +704,9 @@ impl AppSupervisor {
         }
         self.snapshot.lifecycle = AppLifecycle::Idle;
         self.snapshot.applied = None;
-        self.snapshot.current_peer = None;
         self.snapshot.interaction = None;
+        self.snapshot.sessions.clear();
+        self.runtime_active_session = None;
         self.snapshot.actual_capabilities = None;
         self.snapshot.remote_capabilities = None;
         self.snapshot.capability_epoch = None;
@@ -879,6 +988,11 @@ mod tests {
         supervisor.snapshot.desired = desired.clone();
         supervisor.snapshot.applied = Some(RuntimeConfig::default());
         supervisor.snapshot.pending = Some(desired);
+        let peer = crate::runtime_control::RuntimePeerSummary {
+            device_id: Uuid::new_v4(),
+            display_name: "peer".to_string(),
+        };
+        supervisor.handle_runtime_event(RuntimeEvent::Connected(peer.clone()));
 
         let capabilities = RuntimeCapabilities {
             clipboard_mode: ClipboardMode::Both,
@@ -886,6 +1000,7 @@ mod tests {
             input_mode: InputMode::Off,
         };
         supervisor.handle_runtime_event(RuntimeEvent::Capabilities {
+            peer,
             local: capabilities,
             remote: capabilities,
             epoch: CapabilityEpoch {
@@ -913,7 +1028,9 @@ mod tests {
 
         supervisor.handle_runtime_event(RuntimeEvent::Connected(peer.clone()));
 
-        assert_eq!(supervisor.snapshot.current_peer, Some(peer));
+        assert_eq!(supervisor.snapshot.sessions.len(), 1);
+        assert_eq!(supervisor.snapshot.sessions[0].device_id, peer.device_id);
+        assert_eq!(supervisor.snapshot.sessions[0].display_name, peer.display_name);
     }
 
     #[test]
@@ -972,6 +1089,7 @@ mod tests {
             shutdown: shutdown.clone(),
             capabilities,
             tuning,
+            commands: mpsc::unbounded_channel().0,
             task,
         });
         supervisor.snapshot.applied = Some(RuntimeConfig::default());

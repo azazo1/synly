@@ -8,6 +8,7 @@ mod core;
 mod crypto;
 mod discovery;
 mod gui;
+mod host;
 mod path_expand;
 mod protocol;
 mod runtime_control;
@@ -53,7 +54,8 @@ fn main() -> Result<()> {
             .enable_all()
             .thread_name("synly-headless")
             .build()?;
-        return runtime.block_on(app::run(&mut config, options));
+        let (_, commands) = tokio::sync::mpsc::unbounded_channel();
+        return runtime.block_on(app::run(config, options, commands));
     }
     gui::run(config, session_override.is_some())
 }

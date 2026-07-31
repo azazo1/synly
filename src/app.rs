@@ -1,20 +1,25 @@
 use crate::audio::{self, AudioChannelDirection};
 use crate::input::{
-    self, InputHostChannel, InputMode, InputRuntimeOptions, InputSessionContext, InputSocketInbox,
-    LocalInputRole, negotiate_input,
+    self, InputHostChannel, InputMode, InputRuntimeOptions, InputSessionContext,
+    InputSocketConnection, InputSocketInbox, LocalInputRole, negotiate_input,
 };
 use crate::clipboard::{ClipboardSync, ClipboardWatcherHandle};
 use crate::config::{DeviceConfig, SynlyConfig, TrustedDeviceConfig};
 use crate::crypto;
 use crate::discovery::{self, Advertisement, DiscoveredPeer, format_display_name};
+use crate::host::clipboard_hub::ClipboardHubHandle;
+use crate::host::session::InputRouteRegistry;
+use crate::host::{
+    ActiveSlotReserver, SessionCapabilityProfile, SlotReservation, runtime_options_for_profile,
+};
 use crate::protocol::{
     CapabilityEpoch, ClipboardPayload, ControlMessage, DeviceIdentity, FileChunkHeader, Frame,
     FrameReader, FrameWriter, PROTOCOL_VERSION, PairAuthMethod, PairRequestPayload,
     RuntimeCapabilities, SessionAgreement, TransferLimits, frame_size_limit_message,
 };
 use crate::runtime_control::{
-    InteractionRequest, InteractionResponse, RuntimeControl, RuntimeEvent, RuntimeLifecycle,
-    RuntimePeerSummary, RuntimeTuning,
+    InteractionRequest, InteractionResponse, RuntimeCommand, RuntimeControl, RuntimeEvent,
+    RuntimeLifecycle, RuntimePeerSummary, RuntimeTuning,
 };
 use crate::runtime_options::{
     PairingRuntimeOptions, RuntimeOptions, normalize_pin, require_peer_query, sync_delete_label,
@@ -41,13 +46,15 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
 use tokio::time::{self, Instant};
 use tokio_rustls::{TlsStream, client::TlsStream as ClientTlsStream};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const FILE_STREAM_CHUNK_SIZE: usize = 256 * 1024;
@@ -68,21 +75,22 @@ const ADVERTISED_SNAPSHOT_CACHE_LIMIT: usize = 8;
 const CAPABILITY_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug)]
-enum SessionRole {
+pub(crate) enum SessionRole {
     Host,
     Client,
 }
 
 #[derive(Debug)]
-struct AuthenticatedSession {
-    role: SessionRole,
-    stream: TlsStream<TcpStream>,
-    remote: DeviceIdentity,
-    agreement: SessionAgreement,
-    remote_workspace: crate::sync::WorkspaceSummary,
-    remote_socket_addr: SocketAddr,
-    audio_master_secret: [u8; 32],
-    input_master_secret: [u8; 32],
+pub(crate) struct AuthenticatedSession {
+    pub(crate) role: SessionRole,
+    pub(crate) stream: TlsStream<TcpStream>,
+    pub(crate) remote: DeviceIdentity,
+    pub(crate) agreement: SessionAgreement,
+    pub(crate) remote_workspace: crate::sync::WorkspaceSummary,
+    pub(crate) remote_socket_addr: SocketAddr,
+    pub(crate) audio_master_secret: [u8; 32],
+    pub(crate) input_master_secret: [u8; 32],
+    pub(crate) capability_profile: SessionCapabilityProfile,
 }
 
 #[derive(Debug)]
@@ -181,7 +189,7 @@ enum InitialSnapshotPolicy {
 }
 
 #[derive(Default)]
-struct PairingThrottle {
+pub(crate) struct PairingThrottle {
     peers: HashMap<String, PairingPeerState>,
 }
 
@@ -206,9 +214,13 @@ impl PeerTarget {
     }
 }
 
-pub async fn run(config: &mut SynlyConfig, options: RuntimeOptions) -> Result<()> {
+pub async fn run(
+    config: SynlyConfig,
+    options: RuntimeOptions,
+    commands: mpsc::UnboundedReceiver<RuntimeCommand>,
+) -> Result<()> {
     match options.connection {
-        ConnectionPreference::Host => run_host(config, options).await,
+        ConnectionPreference::Host => crate::host::run_host_runtime(config, options, commands).await,
         ConnectionPreference::Join => run_client(config, options).await,
     }
 }
@@ -228,129 +240,7 @@ fn accept_policy_label(pairing: &PairingRuntimeOptions) -> &'static str {
     }
 }
 
-async fn run_host(config: &mut SynlyConfig, mut options: RuntimeOptions) -> Result<()> {
-    let device = config.device.clone();
-    let mut pairing_throttle = PairingThrottle::default();
-    let notifier = SystemNotifier::new(options.control.tuning());
-    let shutdown = options.control.shutdown().clone();
-    let mut runtime_capabilities = options.control.capabilities();
-    let mut runtime_tuning = options.control.tuning();
-    options
-        .control
-        .report(RuntimeEvent::Lifecycle(RuntimeLifecycle::Hosting));
-    let ctrl_c = tokio::signal::ctrl_c();
-    tokio::pin!(ctrl_c);
-    let listener = tokio::select! {
-        result = TcpListener::bind(("0.0.0.0", options.pairing.port.unwrap_or(0))) => {
-            result.context("failed to bind TCP listener")?
-        }
-        signal_result = &mut ctrl_c => return finish_ctrl_c(signal_result),
-        _ = shutdown.cancelled() => return Ok(()),
-    };
-    let port = listener.local_addr()?.port();
-    let mut advertised_capabilities = options.control.capabilities();
-    let initial_capabilities = *advertised_capabilities.borrow_and_update();
-    let advertisement_details = Advertisement {
-        protocol_version: PROTOCOL_VERSION,
-        port,
-        device: device.clone(),
-        file_sync_mode: options.file_sync_mode,
-        clipboard_mode: initial_capabilities.clipboard_mode,
-        audio_mode: initial_capabilities.audio_mode,
-        input_mode: initial_capabilities.input_mode,
-        instance_name: options.instance_name.clone(),
-    };
-    let advertisement = tokio::select! {
-        result = discovery::advertise(&advertisement_details, &options.discovery) => result?,
-        signal_result = &mut ctrl_c => return finish_ctrl_c(signal_result),
-        _ = shutdown.cancelled() => return Ok(()),
-    };
-    let advertisement_shutdown = tokio_util::sync::CancellationToken::new();
-    let mut advertisement_task = tokio::spawn(run_advertisement_updates(
-        advertisement_details,
-        options.discovery.clone(),
-        advertised_capabilities,
-        options.control.tuning(),
-        advertisement,
-        advertisement_shutdown.clone(),
-    ));
-
-    print_host_ready(&device, &options, port);
-
-    let result = tokio::select! {
-        result = async {
-            loop {
-                let (socket, address) = listener.accept().await?;
-                configure_session_socket(&socket)?;
-                refresh_runtime_options(
-                    config,
-                    &mut options,
-                    &mut runtime_capabilities,
-                    &mut runtime_tuning,
-                );
-                match handle_incoming_connection(
-                    socket,
-                    address,
-                    &mut pairing_throttle,
-                    config,
-                    &options,
-                )
-                .await
-                {
-                    Ok(Some(session)) => {
-                        let remote_label = format!(
-                            "{} ({})",
-                            identity_display_name(&session.remote),
-                            short_uuid(&session.remote.device_id)
-                        );
-                        let peer = notification_peer(&session.remote);
-                        match run_with_session_notifications(
-                            &notifier,
-                            peer,
-                            run_host_session_with_aux(&listener, session, &options),
-                        )
-                        .await
-                        {
-                            Ok(()) => {
-                                tracing::info!(peer = %remote_label, "连接已断开, 继续等待重连");
-                            }
-                            Err(err) => {
-                                tracing::warn!(peer = %remote_label, error = %err, "同步会话中断");
-                            }
-                        }
-                        options.control.report(RuntimeEvent::Disconnected);
-                    }
-                    Ok(None) => continue,
-                    Err(err) => {
-                        tracing::warn!(error = %err, "处理传入连接失败");
-                    }
-                }
-            }
-        } => result,
-        result = &mut advertisement_task => {
-            result
-                .context("发现信息更新任务异常结束")?
-                .context("发现信息更新失败")
-        },
-        signal_result = &mut ctrl_c => finish_ctrl_c(signal_result),
-        _ = shutdown.cancelled() => Ok(()),
-    };
-    advertisement_shutdown.cancel();
-    if !advertisement_task.is_finished()
-        && tokio::time::timeout(Duration::from_secs(3), &mut advertisement_task)
-            .await
-            .is_err()
-    {
-        advertisement_task.abort();
-        let _ = advertisement_task.await;
-    }
-    options
-        .control
-        .report(RuntimeEvent::Lifecycle(RuntimeLifecycle::Idle));
-    result
-}
-
-async fn run_advertisement_updates(
+pub(crate) async fn run_advertisement_updates(
     mut advertisement: Advertisement,
     mut discovery: crate::config::DiscoveryConfig,
     mut capabilities: watch::Receiver<RuntimeCapabilities>,
@@ -420,88 +310,7 @@ async fn run_advertisement_updates(
     Ok(())
 }
 
-async fn run_host_session_with_aux(
-    listener: &TcpListener,
-    session: AuthenticatedSession,
-    options: &RuntimeOptions,
-) -> Result<()> {
-    let (input_socket_tx, input_socket_rx) = mpsc::channel(4);
-    let input_inbox = InputSocketInbox::new(input_socket_rx);
-    let (input_session_id_tx, input_session_id) = watch::channel(None);
-    let mut session_future = Box::pin(run_sync_session(
-        session,
-        &options.workspace,
-        SyncSessionOptions {
-            clipboard_mode: options.clipboard_mode,
-            audio_mode: options.audio_mode,
-            input_mode: options.input_mode,
-            input_options: options.input.clone(),
-            input_inbox: Some(input_inbox),
-            input_session_id: Some(input_session_id_tx),
-            clipboard_options: &options.clipboard,
-            transfer_limits: options.transfer_limits,
-            control: options.control.clone(),
-        },
-    ));
-
-    loop {
-        tokio::select! {
-            result = &mut session_future => return result,
-            accepted = listener.accept() => {
-                let (mut socket, address) = accepted?;
-                configure_session_socket(&socket)?;
-                let mut first_byte = [0u8; 1];
-                let is_input = matches!(
-                    time::timeout(Duration::from_millis(100), socket.peek(&mut first_byte)).await,
-                    Ok(Ok(1)) if first_byte[0] == b'S'
-                );
-                if is_input {
-                    match time::timeout(
-                        Duration::from_secs(1),
-                        input::read_input_preamble(&mut socket),
-                    )
-                    .await
-                    {
-                        Ok(Ok(incoming_session_id)) => {
-                            let expected_session_id = *input_session_id.borrow();
-                            if expected_session_id == Some(incoming_session_id) {
-                                tracing::debug!(%address, session_id = %incoming_session_id, "收到输入辅助连接");
-                                let connection = input::InputSocketConnection::new(
-                                    incoming_session_id,
-                                    socket,
-                                );
-                                match input_socket_tx.try_send(connection) {
-                                    Ok(()) => {
-                                    }
-                                    Err(_) => {
-                                        tracing::warn!(%address, "输入辅助连接队列忙, 已拒绝额外连接");
-                                    }
-                                }
-                            } else {
-                                tracing::warn!(
-                                    %address,
-                                    %incoming_session_id,
-                                    ?expected_session_id,
-                                    "已拒绝过期的输入辅助连接",
-                                );
-                            }
-                        }
-                        Ok(Err(err)) => {
-                            tracing::warn!(%address, error = %err, "输入辅助连接前导验证失败");
-                        }
-                        Err(_) => {
-                            tracing::warn!(%address, "输入辅助连接前导读取超时");
-                        }
-                    }
-                } else {
-                    tracing::debug!(%address, "主会话运行期间拒绝新的主连接");
-                }
-            }
-        }
-    }
-}
-
-async fn run_client(config: &mut SynlyConfig, mut options: RuntimeOptions) -> Result<()> {
+pub(crate) async fn run_client(mut config: SynlyConfig, mut options: RuntimeOptions) -> Result<()> {
     let discovery_timeout = Duration::from_secs(options.pairing.discovery_secs);
     let mut reconnect_query = options.pairing.peer_query.clone();
     let mut reconnect_delay = RECONNECT_BASE_DELAY;
@@ -519,7 +328,7 @@ async fn run_client(config: &mut SynlyConfig, mut options: RuntimeOptions) -> Re
         result = async {
             loop {
                 refresh_runtime_options(
-                    config,
+                    &mut config,
                     &mut options,
                     &mut runtime_capabilities,
                     &mut runtime_tuning,
@@ -562,13 +371,17 @@ async fn run_client(config: &mut SynlyConfig, mut options: RuntimeOptions) -> Re
                     .control
                     .report(RuntimeEvent::Lifecycle(RuntimeLifecycle::Connecting));
 
-                match connect_to_peer(&peer_target, config, &options).await {
+                match connect_to_peer(&peer_target, &mut config, &options).await {
                     Ok(session) => {
                         let remote_label = format!(
                             "{} ({})",
                             identity_display_name(&session.remote),
                             short_uuid(&session.remote.device_id)
                         );
+                        let peer_summary = RuntimePeerSummary {
+                            device_id: session.remote.device_id,
+                            display_name: identity_display_name(&session.remote),
+                        };
                         reconnect_delay = RECONNECT_BASE_DELAY;
                         let peer = notification_peer(&session.remote);
                         if let Err(err) = run_with_session_notifications(
@@ -584,9 +397,14 @@ async fn run_client(config: &mut SynlyConfig, mut options: RuntimeOptions) -> Re
                                     input_options: options.input.clone(),
                                     input_inbox: None,
                                     input_session_id: None,
+                                    input_socket_tx: None,
+                                    input_routes: None,
                                     clipboard_options: &options.clipboard,
                                     transfer_limits: options.transfer_limits,
                                     control: options.control.clone(),
+                                    clipboard_hub: None,
+                                    capability_profile: SessionCapabilityProfile::Full,
+                                    session_shutdown: None,
                                 },
                             ),
                         )
@@ -596,7 +414,7 @@ async fn run_client(config: &mut SynlyConfig, mut options: RuntimeOptions) -> Re
                         } else {
                             tracing::info!(peer = %remote_label, "连接已断开");
                         }
-                        options.control.report(RuntimeEvent::Disconnected);
+                        options.control.report(RuntimeEvent::Disconnected(peer_summary));
                         options
                             .control
                             .report(RuntimeEvent::Lifecycle(RuntimeLifecycle::Discovering));
@@ -619,7 +437,7 @@ async fn run_client(config: &mut SynlyConfig, mut options: RuntimeOptions) -> Re
     }
 }
 
-fn refresh_runtime_options(
+pub(crate) fn refresh_runtime_options(
     config: &mut SynlyConfig,
     options: &mut RuntimeOptions,
     capabilities: &mut watch::Receiver<RuntimeCapabilities>,
@@ -641,13 +459,13 @@ fn refresh_runtime_options(
     options.input_mode = capabilities.input_mode;
 }
 
-fn finish_ctrl_c(signal_result: std::io::Result<()>) -> Result<()> {
+pub(crate) fn finish_ctrl_c(signal_result: std::io::Result<()>) -> Result<()> {
     signal_result.context("failed to listen for Ctrl-C")?;
     tracing::info!("收到 Ctrl-C, 正在安全退出");
     Ok(())
 }
 
-fn notification_peer(identity: &DeviceIdentity) -> NotificationPeer {
+pub(crate) fn notification_peer(identity: &DeviceIdentity) -> NotificationPeer {
     NotificationPeer {
         display_name: identity_display_name(identity),
         short_device_id: short_uuid(&identity.device_id),
@@ -667,7 +485,7 @@ fn bootstrap_device_name_matches(declared: &str, authenticated: &str) -> bool {
     declared.trim() == authenticated.trim()
 }
 
-async fn run_with_session_notifications<N, F, T>(
+pub(crate) async fn run_with_session_notifications<N, F, T>(
     notifier: &N,
     peer: NotificationPeer,
     session: F,
@@ -693,13 +511,14 @@ impl<N: SessionNotifier> Drop for SessionNotificationGuard<'_, N> {
     }
 }
 
-async fn handle_incoming_connection(
+pub(crate) async fn handle_incoming_connection(
     socket: TcpStream,
     remote_addr: SocketAddr,
     pairing_throttle: &mut PairingThrottle,
     config: &mut SynlyConfig,
     options: &RuntimeOptions,
-) -> Result<Option<AuthenticatedSession>> {
+    reserver: &ActiveSlotReserver,
+) -> Result<Option<(AuthenticatedSession, SlotReservation)>> {
     let mut first_byte = [0u8; 1];
     let peeked = socket.peek(&mut first_byte).await?;
     if peeked == 0 {
@@ -707,10 +526,17 @@ async fn handle_incoming_connection(
     }
 
     if first_byte[0] == 0x16 {
-        handle_trusted_incoming_connection(socket, remote_addr, config, options).await
+        handle_trusted_incoming_connection(socket, remote_addr, config, options, reserver).await
     } else {
-        handle_bootstrap_incoming_connection(socket, remote_addr, pairing_throttle, config, options)
-            .await
+        handle_bootstrap_incoming_connection(
+            socket,
+            remote_addr,
+            pairing_throttle,
+            config,
+            options,
+            reserver,
+        )
+        .await
     }
 }
 
@@ -862,7 +688,7 @@ async fn connect_tcp(address: Ipv4Addr, port: u16) -> Result<TcpStream> {
     }
 }
 
-fn configure_session_socket(socket: &TcpStream) -> Result<()> {
+pub(crate) fn configure_session_socket(socket: &TcpStream) -> Result<()> {
     let keepalive = TcpKeepalive::new()
         .with_time(Duration::from_secs(3))
         .with_interval(Duration::from_secs(1))
@@ -877,7 +703,8 @@ async fn handle_trusted_incoming_connection(
     remote_addr: SocketAddr,
     config: &mut SynlyConfig,
     options: &RuntimeOptions,
-) -> Result<Option<AuthenticatedSession>> {
+    reserver: &ActiveSlotReserver,
+) -> Result<Option<(AuthenticatedSession, SlotReservation)>> {
     let transfer_limits = options.transfer_limits;
     let device = config.device.clone();
     let remote_label = remote_addr.to_string();
@@ -984,13 +811,17 @@ async fn handle_trusted_incoming_connection(
         return Ok(None);
     }
 
+    let reservation = reserver.reserve(payload.client.device_id);
+    let session_options = runtime_options_for_profile(options, reservation.profile());
     let agreement =
-        negotiate_file_sync_modes(options.file_sync_mode, payload.workspace.file_sync_mode);
+        negotiate_file_sync_modes(session_options.file_sync_mode, payload.workspace.file_sync_mode);
     let clipboard_agreement =
-        negotiate_clipboard(options.clipboard_mode, payload.workspace.clipboard_mode);
-    let audio_compatible = audio_modes_compatible(options.audio_mode, payload.workspace.audio_mode);
-    let input_compatible = negotiate_input(options.input_mode, payload.workspace.input_mode).is_some();
-    print_pair_request_overview(&payload, options, &agreement, &remote_label)?;
+        negotiate_clipboard(session_options.clipboard_mode, payload.workspace.clipboard_mode);
+    let audio_compatible =
+        audio_modes_compatible(session_options.audio_mode, payload.workspace.audio_mode);
+    let input_compatible =
+        negotiate_input(session_options.input_mode, payload.workspace.input_mode).is_some();
+    print_pair_request_overview(&payload, &session_options, &agreement, &remote_label)?;
     if !agreement.any_direction() && !clipboard_agreement.any_direction() && !audio_compatible && !input_compatible {
         write_frame(
             &mut server_stream,
@@ -1016,11 +847,11 @@ async fn handle_trusted_incoming_connection(
         accepted,
         message,
         device: &device,
-        instance_name: options.instance_name.as_deref(),
-        workspace: &options.workspace,
-        clipboard_mode: options.clipboard_mode,
-        audio_mode: options.audio_mode,
-        input_mode: options.input_mode,
+        instance_name: session_options.instance_name.as_deref(),
+        workspace: &session_options.workspace,
+        clipboard_mode: session_options.clipboard_mode,
+        audio_mode: session_options.audio_mode,
+        input_mode: session_options.input_mode,
         agreement: &agreement,
         auth_method: PairAuthMethod::TrustedDevice,
         pin: None,
@@ -1037,16 +868,20 @@ async fn handle_trusted_incoming_connection(
     config.save_trusted_devices()?;
 
     let tls_stream: TlsStream<TcpStream> = server_stream.into();
-    Ok(Some(AuthenticatedSession {
-        role: SessionRole::Host,
-        stream: tls_stream,
-        remote: payload.client,
-        agreement,
-        remote_workspace: payload.workspace,
-        remote_socket_addr: remote_addr,
-        audio_master_secret,
-        input_master_secret,
-    }))
+    Ok(Some((
+        AuthenticatedSession {
+            role: SessionRole::Host,
+            stream: tls_stream,
+            remote: payload.client,
+            agreement,
+            remote_workspace: payload.workspace,
+            remote_socket_addr: remote_addr,
+            audio_master_secret,
+            input_master_secret,
+            capability_profile: reservation.profile(),
+        },
+        reservation,
+    )))
 }
 
 async fn handle_bootstrap_incoming_connection(
@@ -1055,7 +890,8 @@ async fn handle_bootstrap_incoming_connection(
     pairing_throttle: &mut PairingThrottle,
     config: &mut SynlyConfig,
     options: &RuntimeOptions,
-) -> Result<Option<AuthenticatedSession>> {
+    reserver: &ActiveSlotReserver,
+) -> Result<Option<(AuthenticatedSession, SlotReservation)>> {
     let transfer_limits = options.transfer_limits;
     let remote_addr_text = remote_addr.to_string();
     let remote_peer_key = remote_addr.ip().to_string();
@@ -1348,12 +1184,16 @@ async fn handle_bootstrap_incoming_connection(
         crypto::export_audio_master_secret_from_server(&server_stream, &request_id)?;
     let input_master_secret =
         crypto::export_input_master_secret_from_server(&server_stream, &request_id)?;
+    let reservation = reserver.reserve(payload.client.device_id);
+    let session_options = runtime_options_for_profile(options, reservation.profile());
     let agreement =
-        negotiate_file_sync_modes(options.file_sync_mode, payload.workspace.file_sync_mode);
+        negotiate_file_sync_modes(session_options.file_sync_mode, payload.workspace.file_sync_mode);
     let clipboard_agreement =
-        negotiate_clipboard(options.clipboard_mode, payload.workspace.clipboard_mode);
-    let audio_compatible = audio_modes_compatible(options.audio_mode, payload.workspace.audio_mode);
-    let input_compatible = negotiate_input(options.input_mode, payload.workspace.input_mode).is_some();
+        negotiate_clipboard(session_options.clipboard_mode, payload.workspace.clipboard_mode);
+    let audio_compatible =
+        audio_modes_compatible(session_options.audio_mode, payload.workspace.audio_mode);
+    let input_compatible =
+        negotiate_input(session_options.input_mode, payload.workspace.input_mode).is_some();
     if !bootstrap_device_name_matches(&client_device_name, &payload.client.device_name) {
         write_frame(
             &mut server_stream,
@@ -1365,7 +1205,7 @@ async fn handle_bootstrap_incoming_connection(
         .await?;
         return Ok(None);
     }
-    print_pair_request_overview(&payload, options, &agreement, &remote_addr_text)?;
+    print_pair_request_overview(&payload, &session_options, &agreement, &remote_addr_text)?;
     if !agreement.any_direction() && !clipboard_agreement.any_direction() && !audio_compatible && !input_compatible {
         write_frame(
             &mut server_stream,
@@ -1420,11 +1260,11 @@ async fn handle_bootstrap_incoming_connection(
         accepted,
         message,
         device: &device,
-        instance_name: options.instance_name.as_deref(),
-        workspace: &options.workspace,
-        clipboard_mode: options.clipboard_mode,
-        audio_mode: options.audio_mode,
-        input_mode: options.input_mode,
+        instance_name: session_options.instance_name.as_deref(),
+        workspace: &session_options.workspace,
+        clipboard_mode: session_options.clipboard_mode,
+        audio_mode: session_options.audio_mode,
+        input_mode: session_options.input_mode,
         agreement: &agreement,
         auth_method: PairAuthMethod::Pin,
         pin: Some(&pin),
@@ -1453,16 +1293,20 @@ async fn handle_bootstrap_incoming_connection(
     }
 
     let tls_stream: TlsStream<TcpStream> = server_stream.into();
-    Ok(Some(AuthenticatedSession {
-        role: SessionRole::Host,
-        stream: tls_stream,
-        remote: payload.client,
-        agreement,
-        remote_workspace: payload.workspace,
-        remote_socket_addr: remote_addr,
-        audio_master_secret,
-        input_master_secret,
-    }))
+    Ok(Some((
+        AuthenticatedSession {
+            role: SessionRole::Host,
+            stream: tls_stream,
+            remote: payload.client,
+            agreement,
+            remote_workspace: payload.workspace,
+            remote_socket_addr: remote_addr,
+            audio_master_secret,
+            input_master_secret,
+            capability_profile: reservation.profile(),
+        },
+        reservation,
+    )))
 }
 
 async fn connect_to_trusted_peer(
@@ -1627,6 +1471,7 @@ where
         remote_socket_addr,
         audio_master_secret,
         input_master_secret,
+        capability_profile: SessionCapabilityProfile::Full,
     })
 }
 
@@ -1868,19 +1713,25 @@ async fn connect_to_untrusted_peer(
         remote_socket_addr,
         audio_master_secret,
         input_master_secret,
+        capability_profile: SessionCapabilityProfile::Full,
     })
 }
 
-struct SyncSessionOptions<'a> {
-    clipboard_mode: ClipboardMode,
-    audio_mode: AudioMode,
-    input_mode: InputMode,
-    input_options: InputRuntimeOptions,
-    input_inbox: Option<InputSocketInbox>,
-    input_session_id: Option<watch::Sender<Option<Uuid>>>,
-    clipboard_options: &'a crate::clipboard::ClipboardRuntimeOptions,
-    transfer_limits: TransferLimits,
-    control: RuntimeControl,
+pub(crate) struct SyncSessionOptions<'a> {
+    pub(crate) clipboard_mode: ClipboardMode,
+    pub(crate) audio_mode: AudioMode,
+    pub(crate) input_mode: InputMode,
+    pub(crate) input_options: InputRuntimeOptions,
+    pub(crate) input_inbox: Option<InputSocketInbox>,
+    pub(crate) input_session_id: Option<watch::Sender<Option<Uuid>>>,
+    pub(crate) input_socket_tx: Option<mpsc::Sender<InputSocketConnection>>,
+    pub(crate) input_routes: Option<Arc<InputRouteRegistry>>,
+    pub(crate) clipboard_options: &'a crate::clipboard::ClipboardRuntimeOptions,
+    pub(crate) transfer_limits: TransferLimits,
+    pub(crate) control: RuntimeControl,
+    pub(crate) clipboard_hub: Option<ClipboardHubHandle>,
+    pub(crate) capability_profile: SessionCapabilityProfile,
+    pub(crate) session_shutdown: Option<CancellationToken>,
 }
 
 #[derive(Default)]
@@ -1963,8 +1814,17 @@ impl CapabilityTaskRuntime {
         self.audio_plan = None;
     }
 
-    async fn stop_input(&mut self, input_session_id: Option<&watch::Sender<Option<Uuid>>>) {
+    async fn stop_input(
+        &mut self,
+        input_session_id: Option<&watch::Sender<Option<Uuid>>>,
+        input_routes: Option<&Arc<InputRouteRegistry>>,
+    ) {
         if let Some(session_id) = input_session_id {
+            if let Some(route_id) = *session_id.borrow()
+                && let Some(routes) = input_routes
+            {
+                routes.remove(&route_id);
+            }
             session_id.send_replace(None);
         }
         if let Some(task) = self.input_task.take() {
@@ -1975,8 +1835,12 @@ impl CapabilityTaskRuntime {
         self.input_role = None;
     }
 
-    async fn stop_all(&mut self, input_session_id: Option<&watch::Sender<Option<Uuid>>>) {
-        self.stop_input(input_session_id).await;
+    async fn stop_all(
+        &mut self,
+        input_session_id: Option<&watch::Sender<Option<Uuid>>>,
+        input_routes: Option<&Arc<InputRouteRegistry>>,
+    ) {
+        self.stop_input(input_session_id, input_routes).await;
         self.stop_audio().await;
         self.clipboard.stop_sender();
         self.clipboard.can_receive = false;
@@ -1984,14 +1848,18 @@ impl CapabilityTaskRuntime {
 }
 
 struct CapabilityRefreshContext<'a> {
-    session_role: SessionRole,
-    remote_socket_addr: SocketAddr,
-    audio_master_secret: [u8; 32],
-    input_master_secret: [u8; 32],
-    input_options: &'a InputRuntimeOptions,
-    input_inbox: Option<&'a InputSocketInbox>,
-    input_session_id: Option<&'a watch::Sender<Option<Uuid>>>,
-    tx: &'a mpsc::Sender<Frame>,
+    pub(crate) session_role: SessionRole,
+    pub(crate) peer_device_id: Uuid,
+    pub(crate) remote_socket_addr: SocketAddr,
+    pub(crate) audio_master_secret: [u8; 32],
+    pub(crate) input_master_secret: [u8; 32],
+    pub(crate) input_options: &'a InputRuntimeOptions,
+    pub(crate) input_inbox: Option<&'a InputSocketInbox>,
+    pub(crate) input_session_id: Option<&'a watch::Sender<Option<Uuid>>>,
+    pub(crate) input_socket_tx: Option<&'a mpsc::Sender<InputSocketConnection>>,
+    pub(crate) input_routes: Option<&'a Arc<InputRouteRegistry>>,
+    pub(crate) clipboard_hub: Option<&'a ClipboardHubHandle>,
+    pub(crate) tx: &'a mpsc::Sender<Frame>,
 }
 
 async fn refresh_capability_tasks(
@@ -2009,36 +1877,40 @@ async fn refresh_capability_tasks(
     );
     let clipboard_can_send = allows_local_send(context.session_role, &clipboard_agreement);
     let clipboard_can_receive = allows_local_receive(context.session_role, &clipboard_agreement);
-    if runtime.clipboard.can_send && !clipboard_can_send {
-        runtime.clipboard.stop_sender();
-    }
-    if !runtime.clipboard.can_send && clipboard_can_send {
-        let (clipboard_tx, clipboard_rx) = mpsc::unbounded_channel();
-        let watcher = match runtime.clipboard.sync.start_local_watcher(clipboard_tx.clone()) {
-            Ok(watcher) => Some(watcher),
-            Err(err) => {
-                tracing::warn!(error = %err, "无法启动剪贴板监听, 本次仅接收远端更新");
-                None
-            }
-        };
-        if watcher.is_some()
-            && let Err(err) = runtime
-                .clipboard
-                .sync
-                .publish_initial_payload(&clipboard_tx)
-                .await
-        {
-            tracing::warn!(error = %err, "无法读取当前剪贴板内容, 已跳过初始同步");
+    if let Some(hub) = context.clipboard_hub {
+        hub.set_receive_enabled(context.peer_device_id, clipboard_can_receive);
+    } else {
+        if runtime.clipboard.can_send && !clipboard_can_send {
+            runtime.clipboard.stop_sender();
         }
-        if watcher.is_some() {
-            let task = tokio::spawn(clipboard_sender_loop(
-                clipboard_rx,
-                context.tx.clone(),
-            ));
-            tasks.track(&task);
-            runtime.clipboard.sender_task = Some(task);
-            runtime.clipboard.watcher = watcher;
-            runtime.clipboard.can_send = true;
+        if !runtime.clipboard.can_send && clipboard_can_send {
+            let (clipboard_tx, clipboard_rx) = mpsc::unbounded_channel();
+            let watcher = match runtime.clipboard.sync.start_local_watcher(clipboard_tx.clone()) {
+                Ok(watcher) => Some(watcher),
+                Err(err) => {
+                    tracing::warn!(error = %err, "无法启动剪贴板监听, 本次仅接收远端更新");
+                    None
+                }
+            };
+            if watcher.is_some()
+                && let Err(err) = runtime
+                    .clipboard
+                    .sync
+                    .publish_initial_payload(&clipboard_tx)
+                    .await
+            {
+                tracing::warn!(error = %err, "无法读取当前剪贴板内容, 已跳过初始同步");
+            }
+            if watcher.is_some() {
+                let task = tokio::spawn(clipboard_sender_loop(
+                    clipboard_rx,
+                    context.tx.clone(),
+                ));
+                tasks.track(&task);
+                runtime.clipboard.sender_task = Some(task);
+                runtime.clipboard.watcher = watcher;
+                runtime.clipboard.can_send = true;
+            }
         }
     }
     runtime.clipboard.can_receive = clipboard_can_receive;
@@ -2088,7 +1960,9 @@ async fn refresh_capability_tasks(
         .then(|| negotiate_input(local.input_mode, remote.input_mode))
         .flatten();
     if runtime.input_epoch != Some(epoch) || runtime.input_role != input_role {
-        runtime.stop_input(context.input_session_id).await;
+        runtime
+            .stop_input(context.input_session_id, context.input_routes)
+            .await;
         runtime.input_epoch = Some(epoch);
         runtime.input_role = input_role;
         if let Some(local_role) = input_role
@@ -2105,6 +1979,10 @@ async fn refresh_capability_tasks(
                 .input_session_id
                 .context("输入协商成功但 host 未提供会话路由")?;
             session_id_tx.send_replace(Some(session_id));
+            if let (Some(routes), Some(socket_tx)) = (context.input_routes, context.input_socket_tx)
+            {
+                routes.insert(session_id, socket_tx.clone());
+            }
             context
                 .tx
                 .send(Frame::Control(ControlMessage::InputChannelOffer {
@@ -2141,8 +2019,13 @@ async fn wait_for_capability_ack(deadline: Option<Instant>) {
     }
 }
 
-fn report_capability_state(control: &RuntimeControl, state: &CapabilityState) {
+fn report_capability_state(
+    control: &RuntimeControl,
+    peer: &RuntimePeerSummary,
+    state: &CapabilityState,
+) {
     control.report(RuntimeEvent::Capabilities {
+        peer: peer.clone(),
         local: state.effective_local(),
         remote: state.effective_remote(),
         epoch: state.epoch(),
@@ -2192,7 +2075,7 @@ where
     (rx, task)
 }
 
-async fn run_sync_session(
+pub(crate) async fn run_sync_session(
     session: AuthenticatedSession,
     workspace: &WorkspaceSpec,
     options: SyncSessionOptions<'_>,
@@ -2219,11 +2102,13 @@ async fn run_sync_session(
         file_can_send,
         file_can_receive,
     )?;
-    let initial_local_capabilities = RuntimeCapabilities {
-        clipboard_mode: options.clipboard_mode,
-        audio_mode: options.audio_mode,
-        input_mode: options.input_mode,
-    };
+    let initial_local_capabilities = options
+        .capability_profile
+        .apply(RuntimeCapabilities {
+            clipboard_mode: options.clipboard_mode,
+            audio_mode: options.audio_mode,
+            input_mode: options.input_mode,
+        });
     let initial_remote_capabilities = RuntimeCapabilities {
         clipboard_mode: session.remote_workspace.clipboard_mode,
         audio_mode: session.remote_workspace.audio_mode,
@@ -2247,6 +2132,7 @@ async fn run_sync_session(
     let mut input_backend_generation = current_tuning.input_backend_generation;
     let mut sync_delete = current_tuning.sync_delete;
     let shutdown = options.control.shutdown().clone();
+    let session_shutdown = options.session_shutdown.clone();
     let mut capability_ack_deadline = None;
     let mut capabilities_open = true;
     let mut tuning_open = true;
@@ -2278,6 +2164,19 @@ async fn run_sync_session(
     let (mut incoming_frames, reader_task) =
         spawn_frame_reader(read_half, options.transfer_limits);
     session_tasks.track(&reader_task);
+    if let Some(hub) = options.clipboard_hub.clone() {
+        let rx = hub.subscribe(session.remote.device_id);
+        let forward_tx = tx.clone();
+        let task = tokio::spawn(async move {
+            let mut rx = rx;
+            while let Some(payload) = rx.recv().await {
+                if forward_tx.send(Frame::Clipboard(payload)).await.is_err() {
+                    break;
+                }
+            }
+        });
+        session_tasks.track(&task);
+    }
 
     let (snapshot_control_tx, snapshot_control_rx) = mpsc::unbounded_channel();
     let (advertised_snapshot_tx, mut advertised_snapshot_rx) =
@@ -2311,20 +2210,28 @@ async fn run_sync_session(
         &mut session_tasks,
         CapabilityRefreshContext {
             session_role: session.role,
+            peer_device_id: session.remote.device_id,
             remote_socket_addr,
             audio_master_secret,
             input_master_secret,
             input_options: &input_options,
             input_inbox: options.input_inbox.as_ref(),
             input_session_id: options.input_session_id.as_ref(),
+            input_socket_tx: options.input_socket_tx.as_ref(),
+            input_routes: options.input_routes.as_ref(),
+            clipboard_hub: options.clipboard_hub.as_ref(),
             tx: &tx,
         },
     )
     .await?;
-    report_capability_state(&options.control, &capability_state);
+    let peer_summary = RuntimePeerSummary {
+        device_id: session.remote.device_id,
+        display_name: identity_display_name(&session.remote),
+    };
+    report_capability_state(&options.control, &peer_summary, &capability_state);
     let current_capabilities = *capabilities.borrow_and_update();
     let initial_update = capability_state
-        .set_local(current_capabilities)
+        .set_local(options.capability_profile.apply(current_capabilities))
         .or_else(|| initial_input_tuning_changed.then(|| capability_state.bump_local()));
     if let Some((generation, capabilities)) = initial_update {
         tx.send(Frame::Control(ControlMessage::CapabilitiesUpdate {
@@ -2339,17 +2246,21 @@ async fn run_sync_session(
             &mut session_tasks,
             CapabilityRefreshContext {
                 session_role: session.role,
+                peer_device_id: session.remote.device_id,
                 remote_socket_addr,
                 audio_master_secret,
                 input_master_secret,
                 input_options: &input_options,
                 input_inbox: options.input_inbox.as_ref(),
                 input_session_id: options.input_session_id.as_ref(),
+                input_socket_tx: options.input_socket_tx.as_ref(),
+                input_routes: options.input_routes.as_ref(),
+                clipboard_hub: options.clipboard_hub.as_ref(),
                 tx: &tx,
             },
         )
         .await?;
-        report_capability_state(&options.control, &capability_state);
+        report_capability_state(&options.control, &peer_summary, &capability_state);
     }
 
     let incoming_root = workspace.incoming_root.clone();
@@ -2372,7 +2283,24 @@ async fn run_sync_session(
             biased;
             _ = shutdown.cancelled() => {
                 capability_runtime
-                    .stop_all(options.input_session_id.as_ref())
+                    .stop_all(
+                        options.input_session_id.as_ref(),
+                        options.input_routes.as_ref(),
+                    )
+                    .await;
+                tx.send(Frame::Control(ControlMessage::Goodbye)).await?;
+                break false;
+            }
+            _ = async {
+                if let Some(token) = &session_shutdown {
+                    token.cancelled().await;
+                }
+            }, if session_shutdown.is_some() => {
+                capability_runtime
+                    .stop_all(
+                        options.input_session_id.as_ref(),
+                        options.input_routes.as_ref(),
+                    )
                     .await;
                 tx.send(Frame::Control(ControlMessage::Goodbye)).await?;
                 break false;
@@ -2390,24 +2318,30 @@ async fn run_sync_session(
                     continue;
                 }
                 let next = *capabilities.borrow_and_update();
-                if let Some((generation, capabilities)) = capability_state.set_local(next) {
+                if let Some((generation, capabilities)) = capability_state
+                    .set_local(options.capability_profile.apply(next))
+                {
                     refresh_capability_tasks(
                         &capability_state,
                         &mut capability_runtime,
                         &mut session_tasks,
                         CapabilityRefreshContext {
                             session_role: session.role,
+                            peer_device_id: session.remote.device_id,
                             remote_socket_addr,
                             audio_master_secret,
                             input_master_secret,
                             input_options: &input_options,
                             input_inbox: options.input_inbox.as_ref(),
                             input_session_id: options.input_session_id.as_ref(),
+                            input_socket_tx: options.input_socket_tx.as_ref(),
+                            input_routes: options.input_routes.as_ref(),
+                            clipboard_hub: options.clipboard_hub.as_ref(),
                             tx: &tx,
                         },
                     )
                     .await?;
-                    report_capability_state(&options.control, &capability_state);
+                    report_capability_state(&options.control, &peer_summary, &capability_state);
                     tx.send(Frame::Control(ControlMessage::CapabilitiesUpdate {
                         generation,
                         capabilities,
@@ -2430,10 +2364,14 @@ async fn run_sync_session(
                     next.input_backend_generation,
                 );
                 let enable_delete = !sync_delete && next.sync_delete;
-                capability_runtime
-                    .clipboard
-                    .sync
-                    .update_options(next.clipboard)?;
+                if let Some(hub) = &options.clipboard_hub {
+                    hub.update_options(next.clipboard.clone());
+                } else {
+                    capability_runtime
+                        .clipboard
+                        .sync
+                        .update_options(next.clipboard)?;
+                }
                 input_options = next.input;
                 input_backend_generation = next.input_backend_generation;
                 sync_delete = next.sync_delete;
@@ -2448,17 +2386,21 @@ async fn run_sync_session(
                         &mut session_tasks,
                         CapabilityRefreshContext {
                             session_role: session.role,
+                            peer_device_id: session.remote.device_id,
                             remote_socket_addr,
                             audio_master_secret,
                             input_master_secret,
                             input_options: &input_options,
                             input_inbox: options.input_inbox.as_ref(),
                             input_session_id: options.input_session_id.as_ref(),
+                            input_socket_tx: options.input_socket_tx.as_ref(),
+                            input_routes: options.input_routes.as_ref(),
+                            clipboard_hub: options.clipboard_hub.as_ref(),
                             tx: &tx,
                         },
                     )
                     .await?;
-                    report_capability_state(&options.control, &capability_state);
+                    report_capability_state(&options.control, &peer_summary, &capability_state);
                     tx.send(Frame::Control(ControlMessage::CapabilitiesUpdate {
                         generation,
                         capabilities,
@@ -2494,17 +2436,21 @@ async fn run_sync_session(
                         &mut session_tasks,
                         CapabilityRefreshContext {
                             session_role: session.role,
+                            peer_device_id: session.remote.device_id,
                             remote_socket_addr,
                             audio_master_secret,
                             input_master_secret,
                             input_options: &input_options,
                             input_inbox: options.input_inbox.as_ref(),
                             input_session_id: options.input_session_id.as_ref(),
+                            input_socket_tx: options.input_socket_tx.as_ref(),
+                            input_routes: options.input_routes.as_ref(),
+                            clipboard_hub: options.clipboard_hub.as_ref(),
                             tx: &tx,
                         },
                     )
                     .await?;
-                    report_capability_state(&options.control, &capability_state);
+                    report_capability_state(&options.control, &peer_summary, &capability_state);
                 }
             }
             Frame::Control(ControlMessage::CapabilitiesAck { generation }) => {
@@ -2516,17 +2462,21 @@ async fn run_sync_session(
                         &mut session_tasks,
                         CapabilityRefreshContext {
                             session_role: session.role,
+                            peer_device_id: session.remote.device_id,
                             remote_socket_addr,
                             audio_master_secret,
                             input_master_secret,
                             input_options: &input_options,
                             input_inbox: options.input_inbox.as_ref(),
                             input_session_id: options.input_session_id.as_ref(),
+                            input_socket_tx: options.input_socket_tx.as_ref(),
+                            input_routes: options.input_routes.as_ref(),
+                            clipboard_hub: options.clipboard_hub.as_ref(),
                             tx: &tx,
                         },
                     )
                     .await?;
-                    report_capability_state(&options.control, &capability_state);
+                    report_capability_state(&options.control, &peer_summary, &capability_state);
                 }
             }
             Frame::Control(ControlMessage::InputChannelOffer { epoch, offer }) => {
@@ -2793,7 +2743,9 @@ async fn run_sync_session(
                 if !capability_runtime.clipboard.can_receive {
                     continue;
                 }
-                if let Err(err) = capability_runtime
+                if let Some(hub) = &options.clipboard_hub {
+                    hub.ingest(session.remote.device_id, payload);
+                } else if let Err(err) = capability_runtime
                     .clipboard
                     .sync
                     .apply_remote_payload(payload)
@@ -2824,8 +2776,15 @@ async fn run_sync_session(
         }
     };
 
+    if let Some(hub) = &options.clipboard_hub {
+        hub.set_receive_enabled(session.remote.device_id, false);
+        hub.unsubscribe(session.remote.device_id);
+    }
     capability_runtime
-        .stop_all(options.input_session_id.as_ref())
+        .stop_all(
+            options.input_session_id.as_ref(),
+            options.input_routes.as_ref(),
+        )
         .await;
     if let Some(task) = snapshot_task {
         task.abort();
@@ -4086,7 +4045,7 @@ fn ensure_discovered_peer_modes_match(
     Ok(())
 }
 
-fn identity_display_name(identity: &DeviceIdentity) -> String {
+pub(crate) fn identity_display_name(identity: &DeviceIdentity) -> String {
     format_display_name(identity.instance_name.as_deref(), &identity.device_name)
 }
 
@@ -4452,7 +4411,7 @@ fn device_identity(device: &DeviceConfig, instance_name: Option<&str>) -> Device
     }
 }
 
-fn print_host_ready(device: &DeviceConfig, options: &RuntimeOptions, port: u16) {
+pub(crate) fn print_host_ready(device: &DeviceConfig, options: &RuntimeOptions, port: u16) {
     let fingerprint = crypto::short_identity_fingerprint(
         device
             .identity_public_key()
