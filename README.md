@@ -73,7 +73,7 @@ $env:VCPKG_ROOT="C:\path\to\vcpkg"
 just dist
 ```
 
-Windows 主 GUI 使用 `asInvoker` manifest 以普通权限运行. 需要管理员输入能力时, GUI 通过 `ShellExecuteW("runas")` 启动当前 `synly.exe` 的隐藏输入代理子进程, 并使用命名管道完成握手. 主进程与子进程来自同一个构建产物, 避免 IPC 协议版本错配. 配置 `input.elevate_on_start = true` 后, 主实例会在恢复会话前请求 UAC, 授权失败时本次启动直接失败.
+Windows 主 GUI 使用 `asInvoker` manifest 以普通权限运行. 需要管理员输入能力时, 若主进程已持有提升令牌, GUI 会直接启动继承该令牌的隐藏输入代理, 不显示 UAC. 否则 GUI 通过 `ShellExecuteW("runas")` 启动当前 `synly.exe` 的隐藏输入代理子进程, 并使用命名管道完成握手. 主进程与子进程来自同一个构建产物, 避免 IPC 协议版本错配. 配置 `input.elevate_on_start = true` 后, 主实例会在恢复会话前请求 UAC, 授权失败时本次启动直接失败.
 
 GUI 和提权子进程通过随机命名管道与随机 token 通信. 管道 DACL 只允许当前用户和 SYSTEM, 双方校验 IPC 版本, PID, session ID, 映像路径和安装目录. Windows release 不要求 Authenticode 签名, 因此请仅从可信来源获取程序, 并避免在其他用户可写目录中运行. 管道断开, 心跳超时, 子进程退出或进入非 `Default` 输入桌面时会立即释放输入状态.
 

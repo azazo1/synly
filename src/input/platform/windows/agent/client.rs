@@ -3,7 +3,7 @@ use super::protocol::{
     AgentRequest, AgentResponse, AgentToGuiPacket, GuiToAgentPacket, read_packet, write_packet,
 };
 use super::security::{
-    PipeSecurity, process_session_id, validate_pipe_client, wide,
+    PipeSecurity, current_process_is_elevated, process_session_id, validate_pipe_client, wide,
 };
 use super::{
     AGENT_HEARTBEAT_TIMEOUT, CLIENT_HEARTBEAT_INTERVAL, CONNECT_TIMEOUT, DISPATCH_TIMEOUT,
@@ -13,12 +13,14 @@ use super::super::super::{CaptureContext, InputBackend, NativeEvent};
 use crate::input::{DesktopLayout, InputMode, KeySnapshot, ModifierMask, Point};
 use anyhow::{Context, Result, anyhow, bail};
 use std::collections::HashMap;
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
-use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, GetCurrentProcessId};
 use windows_sys::Win32::UI::Shell::ShellExecuteW;
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
@@ -125,13 +127,25 @@ pub fn request_elevation() -> Result<()> {
     transport.wait_until_created()?;
 
     let executable = agent_executable()?;
-    launch_elevated(
-        &executable,
-        &command_pipe_name,
-        &event_pipe_name,
-        &token,
-        parent_pid,
-    )?;
+    if current_process_is_elevated()? {
+        tracing::info!("当前 Synly 进程已提升, 直接启动隐藏输入代理");
+        launch_with_current_token(
+            &executable,
+            &command_pipe_name,
+            &event_pipe_name,
+            &token,
+            parent_pid,
+        )?;
+    } else {
+        tracing::info!("当前 Synly 进程未提升, 请求 UAC 启动输入代理");
+        launch_elevated(
+            &executable,
+            &command_pipe_name,
+            &event_pipe_name,
+            &token,
+            parent_pid,
+        )?;
+    }
 
     let client = transport.wait_until_ready()?;
     let slot = AGENT.get_or_init(|| Mutex::new(None));
@@ -951,5 +965,30 @@ fn launch_elevated(
     if result <= 32 {
         bail!("Windows UAC elevation request failed or was rejected: {result}");
     }
+    Ok(())
+}
+
+fn launch_with_current_token(
+    executable: &Path,
+    command_pipe_name: &str,
+    event_pipe_name: &str,
+    token: &str,
+    parent_pid: u32,
+) -> Result<()> {
+    let mut command = Command::new(executable);
+    command
+        .arg("__input-agent")
+        .arg("--command-pipe")
+        .arg(command_pipe_name)
+        .arg("--event-pipe")
+        .arg(event_pipe_name)
+        .arg("--token")
+        .arg(token)
+        .arg("--parent-pid")
+        .arg(parent_pid.to_string())
+        .creation_flags(CREATE_NO_WINDOW);
+    command
+        .spawn()
+        .context("failed to start Windows input agent with the current elevated token")?;
     Ok(())
 }

@@ -7,8 +7,8 @@ use windows_sys::Win32::Security::Authorization::{
     SDDL_REVISION_1,
 };
 use windows_sys::Win32::Security::{
-    GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
-    TokenUser,
+    GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_ELEVATION, TOKEN_QUERY,
+    TOKEN_USER, TokenElevation, TokenUser,
 };
 use windows_sys::Win32::System::Pipes::{
     GetNamedPipeClientProcessId, GetNamedPipeServerProcessId,
@@ -118,6 +118,37 @@ pub(super) fn process_session_id(process_id: u32) -> Result<u32> {
         bail!("failed to resolve Windows process session ID");
     }
     Ok(session_id)
+}
+
+pub(super) fn current_process_is_elevated() -> Result<bool> {
+    let mut token = std::ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to open current Windows process token for elevation check");
+    }
+
+    let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+    let mut returned = 0u32;
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            (&raw mut elevation).cast(),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned,
+        )
+    };
+    unsafe {
+        CloseHandle(token);
+    }
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to query current Windows process elevation");
+    }
+    if returned != std::mem::size_of::<TOKEN_ELEVATION>() as u32 {
+        bail!("unexpected Windows process elevation token size: {returned}");
+    }
+    Ok(elevation.TokenIsElevated != 0)
 }
 
 fn process_image_path(process_id: u32) -> Result<PathBuf> {

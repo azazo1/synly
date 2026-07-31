@@ -18,6 +18,7 @@ Windows 输入代理原先在 Tokio named pipe 上进行持续双向读写. 在�
 ## 行为保证
 
 - 已提权 agent 会跨 `Start/Stop` 和设备重连复用, 不会每次控制都重新弹出 UAC.
+- 当前 Synly 主进程已提升时, agent 会直接继承当前令牌启动, 不请求 UAC.
 - 未申请提权时仍可使用普通权限基础输入控制.
 - 已启用提权 receiver 后发生 IPC 故障会直接报告失败, 不会在当前会话中静默降级到普通权限.
 - pipe DACL, token, PID, session 和二进制路径校验继续保留.
