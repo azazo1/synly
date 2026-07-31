@@ -436,9 +436,10 @@ pub(super) async fn run_sender(
     remote_platform: InputPlatform,
     options: &InputRuntimeOptions,
 ) -> Result<()> {
+    let local_platform = InputPlatform::current();
     let mut key_mapper = KeyMapper::new(
         &options.key_mapping,
-        InputPlatform::current(),
+        local_platform,
         remote_platform,
     )?;
     let mut control = SenderControl::new(platform, local_layout.clone(), source_edge);
@@ -561,6 +562,8 @@ pub(super) async fn run_sender(
                             x,
                             y,
                             source,
+                            local_platform,
+                            remote_platform,
                             options.reverse_mouse_wheel,
                             options.reverse_trackpad,
                         );
@@ -987,9 +990,17 @@ fn transform_scroll(
     x: i32,
     y: i32,
     source: ScrollSource,
+    local_platform: InputPlatform,
+    remote_platform: InputPlatform,
     reverse_mouse_wheel: bool,
     reverse_trackpad: bool,
 ) -> (i32, i32) {
+    // macOS 和 Windows 的水平滚动 API 符号相反, 同平台传输保持原生值.
+    let x = if local_platform == remote_platform {
+        x
+    } else {
+        x.saturating_neg()
+    };
     let reverse = match source {
         ScrollSource::MouseWheel => reverse_mouse_wheel,
         ScrollSource::Trackpad => reverse_trackpad,
@@ -1339,16 +1350,92 @@ mod tests {
     #[test]
     fn scroll_reversal_is_selected_by_source() {
         assert_eq!(
-            transform_scroll(4, -7, ScrollSource::MouseWheel, true, false),
+            transform_scroll(
+                4,
+                -7,
+                ScrollSource::MouseWheel,
+                InputPlatform::Macos,
+                InputPlatform::Macos,
+                true,
+                false,
+            ),
             (-4, 7)
         );
         assert_eq!(
-            transform_scroll(4, -7, ScrollSource::Trackpad, true, false),
+            transform_scroll(
+                4,
+                -7,
+                ScrollSource::Trackpad,
+                InputPlatform::Macos,
+                InputPlatform::Macos,
+                true,
+                false,
+            ),
             (4, -7)
         );
         assert_eq!(
-            transform_scroll(i32::MIN, i32::MAX, ScrollSource::Trackpad, false, true),
+            transform_scroll(
+                i32::MIN,
+                i32::MAX,
+                ScrollSource::Trackpad,
+                InputPlatform::Macos,
+                InputPlatform::Macos,
+                false,
+                true,
+            ),
             (i32::MAX, -i32::MAX)
+        );
+    }
+
+    #[test]
+    fn cross_platform_scroll_flips_only_horizontal_axis() {
+        assert_eq!(
+            transform_scroll(
+                4,
+                -7,
+                ScrollSource::Trackpad,
+                InputPlatform::Macos,
+                InputPlatform::Macos,
+                false,
+                false,
+            ),
+            (4, -7)
+        );
+        assert_eq!(
+            transform_scroll(
+                4,
+                -7,
+                ScrollSource::Trackpad,
+                InputPlatform::Macos,
+                InputPlatform::Windows,
+                false,
+                false,
+            ),
+            (-4, -7)
+        );
+        assert_eq!(
+            transform_scroll(
+                4,
+                -7,
+                ScrollSource::Trackpad,
+                InputPlatform::Windows,
+                InputPlatform::Macos,
+                false,
+                false,
+            ),
+            (-4, -7)
+        );
+        assert_eq!(
+            transform_scroll(
+                4,
+                -7,
+                ScrollSource::Trackpad,
+                InputPlatform::Windows,
+                InputPlatform::Windows,
+                false,
+                false,
+            ),
+            (4, -7)
         );
     }
 
