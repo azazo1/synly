@@ -1,6 +1,10 @@
 package com.azazo1.synly.ui
 
+import android.accessibilityservice.AccessibilityService
+import android.content.ComponentName
+import android.content.Context
 import android.content.Intent
+import android.os.PowerManager
 import android.provider.Settings
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -13,11 +17,16 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonColors
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -25,6 +34,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -32,14 +42,19 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.azazo1.synly.core.SettingsStore
 import com.azazo1.synly.core.SynlyEngine
 import com.azazo1.synly.core.SynlyTarget
+import com.azazo1.synly.service.ClipboardAccessibilityService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import uniffi.synly_core.FfiClientState
@@ -67,6 +82,22 @@ private fun HomeScreen(onOpenSettings: () -> Unit) {
     var pin by remember { mutableStateOf("") }
     var settings by remember { mutableStateOf(SettingsStore.load(context)) }
     val scope = rememberCoroutineScope()
+    var accessibilityEnabled by remember { mutableStateOf(false) }
+    var batteryIgnored by remember { mutableStateOf(false) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                accessibilityEnabled = isAccessibilityServiceEnabled(
+                    context,
+                    ClipboardAccessibilityService::class.java,
+                )
+                batteryIgnored = isIgnoringBatteryOptimizations(context)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
 
     Scaffold { padding ->
         LazyColumn(
@@ -199,9 +230,14 @@ private fun HomeScreen(onOpenSettings: () -> Unit) {
                                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                                 context.startActivity(intent)
                             },
+                            colors = permissionButtonColors(accessibilityEnabled),
                             modifier = Modifier.fillMaxWidth(),
                         ) {
-                            Text("开启无障碍服务")
+                            if (accessibilityEnabled) {
+                                Icon(Icons.Filled.Check, contentDescription = null)
+                                Spacer(Modifier.width(8.dp))
+                            }
+                            Text(if (accessibilityEnabled) "无障碍服务已开启" else "开启无障碍服务")
                         }
                         OutlinedButton(
                             onClick = {
@@ -211,9 +247,14 @@ private fun HomeScreen(onOpenSettings: () -> Unit) {
                                 )
                                 runCatching { context.startActivity(intent) }
                             },
+                            colors = permissionButtonColors(batteryIgnored),
                             modifier = Modifier.fillMaxWidth(),
                         ) {
-                            Text("忽略电池优化")
+                            if (batteryIgnored) {
+                                Icon(Icons.Filled.Check, contentDescription = null)
+                                Spacer(Modifier.width(8.dp))
+                            }
+                            Text(if (batteryIgnored) "电池优化已忽略" else "忽略电池优化")
                         }
                     }
                 }
@@ -281,6 +322,35 @@ private fun HomeScreen(onOpenSettings: () -> Unit) {
             },
         )
     }
+}
+
+@Composable
+private fun permissionButtonColors(enabled: Boolean): ButtonColors {
+    return if (enabled) {
+        ButtonDefaults.outlinedButtonColors(
+            containerColor = Color(0xFFE8F5E9),
+            contentColor = Color(0xFF2E7D32),
+        )
+    } else {
+        ButtonDefaults.outlinedButtonColors()
+    }
+}
+
+private fun isAccessibilityServiceEnabled(
+    context: Context,
+    serviceClass: Class<out AccessibilityService>,
+): Boolean {
+    val component = ComponentName(context, serviceClass)
+    val enabled = Settings.Secure.getString(
+        context.contentResolver,
+        Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
+    ) ?: return false
+    return enabled.split(':').any { it.equals(component.flattenToString(), ignoreCase = true) }
+}
+
+private fun isIgnoringBatteryOptimizations(context: Context): Boolean {
+    val powerManager = context.getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return false
+    return powerManager.isIgnoringBatteryOptimizations(context.packageName)
 }
 
 @Composable
