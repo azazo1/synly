@@ -358,55 +358,61 @@ async fn run_advertisement_updates(
     mut registration: discovery::DiscoveryRegistration,
     shutdown: tokio_util::sync::CancellationToken,
 ) -> Result<()> {
+    let mut capabilities_closed = false;
+    let mut tuning_closed = false;
     loop {
         tokio::select! {
             _ = shutdown.cancelled() => break,
-            changed = capabilities.changed() => {
-                if changed.is_err() {
-                    break;
+            changed = capabilities.changed(), if !capabilities_closed => {
+                match changed {
+                    Err(_) => capabilities_closed = true,
+                    Ok(()) => {
+                        let next = *capabilities.borrow_and_update();
+                        if advertisement.clipboard_mode == next.clipboard_mode
+                            && advertisement.audio_mode == next.audio_mode
+                            && advertisement.input_mode == next.input_mode
+                        {
+                            continue;
+                        }
+                        registration.stop().await;
+                        advertisement.clipboard_mode = next.clipboard_mode;
+                        advertisement.audio_mode = next.audio_mode;
+                        advertisement.input_mode = next.input_mode;
+                        registration = discovery::advertise(&advertisement, &discovery).await?;
+                        tracing::info!(
+                            clipboard = %next.clipboard_mode.label(),
+                            audio = %next.audio_mode.label(),
+                            input = %next.input_mode.label(),
+                            "发现广播能力已更新"
+                        );
+                    }
                 }
-                let next = *capabilities.borrow_and_update();
-                if advertisement.clipboard_mode == next.clipboard_mode
-                    && advertisement.audio_mode == next.audio_mode
-                    && advertisement.input_mode == next.input_mode
-                {
-                    continue;
-                }
-                registration.stop().await;
-                advertisement.clipboard_mode = next.clipboard_mode;
-                advertisement.audio_mode = next.audio_mode;
-                advertisement.input_mode = next.input_mode;
-                registration = discovery::advertise(&advertisement, &discovery).await?;
-                tracing::info!(
-                    clipboard = %next.clipboard_mode.label(),
-                    audio = %next.audio_mode.label(),
-                    input = %next.input_mode.label(),
-                    "发现广播能力已更新"
-                );
             }
-            changed = tuning.changed() => {
-                if changed.is_err() {
-                    break;
+            changed = tuning.changed(), if !tuning_closed => {
+                match changed {
+                    Err(_) => tuning_closed = true,
+                    Ok(()) => {
+                        let next = tuning.borrow_and_update().clone();
+                        if advertisement.device.device_name == next.device_name
+                            && advertisement.instance_name == next.instance_name
+                            && discovery == next.discovery
+                        {
+                            continue;
+                        }
+                        registration.stop().await;
+                        advertisement.device.device_name = next.device_name;
+                        advertisement.instance_name = next.instance_name;
+                        discovery = next.discovery;
+                        registration = discovery::advertise(&advertisement, &discovery).await?;
+                        tracing::info!(
+                            device_name = %advertisement.device.device_name,
+                            instance_name = ?advertisement.instance_name,
+                            mdns_enabled = discovery.mdns_enabled,
+                            lnd_enabled = discovery.lnd.is_some(),
+                            "发现广播设置已更新"
+                        );
+                    }
                 }
-                let next = tuning.borrow_and_update().clone();
-                if advertisement.device.device_name == next.device_name
-                    && advertisement.instance_name == next.instance_name
-                    && discovery == next.discovery
-                {
-                    continue;
-                }
-                registration.stop().await;
-                advertisement.device.device_name = next.device_name;
-                advertisement.instance_name = next.instance_name;
-                discovery = next.discovery;
-                registration = discovery::advertise(&advertisement, &discovery).await?;
-                tracing::info!(
-                    device_name = %advertisement.device.device_name,
-                    instance_name = ?advertisement.instance_name,
-                    mdns_enabled = discovery.mdns_enabled,
-                    lnd_enabled = discovery.lnd.is_some(),
-                    "发现广播设置已更新"
-                );
             }
         }
     }
@@ -4625,25 +4631,31 @@ fn short_uuid(id: &Uuid) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        FILE_STREAM_CHUNK_SIZE, InitialSnapshotPolicy, SessionRole, SessionTaskAbortGuard,
-        SnapshotEchoSuppressions, SnapshotPathExpectation, accept_policy_label,
-        bootstrap_device_name_matches, bootstrap_peer_label, build_remote_echo_expectations,
-        choose_peer, delete_policy, handle_file_chunk,
+        Advertisement, FILE_STREAM_CHUNK_SIZE, InitialSnapshotPolicy, SessionRole,
+        SessionTaskAbortGuard, SnapshotEchoSuppressions, SnapshotPathExpectation,
+        accept_policy_label, bootstrap_device_name_matches, bootstrap_peer_label,
+        build_remote_echo_expectations, choose_peer, delete_policy, handle_file_chunk,
         identity_display_name, input_task_restart_required, is_connection_shutdown_error,
         next_reconnect_delay,
         parse_direct_peer_addr, peer_matches_query, preferred_peer_query, race_peer_addresses,
         resolve_audio_plan, resolve_initial_snapshot_policy, run_with_session_notifications,
-        select_peer_from_query, send_one_file, should_auto_accept_request, should_try_direct_trusted,
+        run_advertisement_updates, select_peer_from_query, send_one_file,
+        should_auto_accept_request, should_try_direct_trusted,
         trusted_transport_for_device, trusted_transport_for_identity,
     };
     use crate::audio::AudioChannelDirection;
+    use crate::clipboard::ClipboardRuntimeOptions;
     use crate::config::{
         ClipboardConfig, DeviceConfig, DiscoveryConfig, NotificationConfig, SynlyConfig,
         TransferConfig, TrustedDeviceConfig,
     };
     use crate::discovery::DiscoveredPeer;
     use crate::input::{Hotkey, InputMode, InputRuntimeOptions, ScreenEdge};
-    use crate::protocol::{DeviceIdentity, FileChunkHeader, Frame, PairAuthMethod};
+    use crate::protocol::{
+        DeviceIdentity, FileChunkHeader, Frame, PairAuthMethod, PROTOCOL_VERSION,
+        RuntimeCapabilities,
+    };
+    use crate::runtime_control::{RuntimeControl, RuntimeTuning};
     use crate::runtime_options::PairingRuntimeOptions;
     use crate::settings::{AudioMode, ClipboardMode, FileSyncMode, InitialSyncMode};
     use crate::sync::{
@@ -5390,6 +5402,72 @@ mod tests {
             resolve_audio_plan(SessionRole::Client, AudioMode::Receive, AudioMode::Receive)
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn advertisement_updates_survive_detached_control_channels() {
+        let control = RuntimeControl::detached(
+            RuntimeCapabilities {
+                clipboard_mode: ClipboardMode::Off,
+                audio_mode: AudioMode::Off,
+                input_mode: InputMode::Off,
+            },
+            RuntimeTuning {
+                interval_secs: 3,
+                sync_delete: false,
+                notifications_enabled: true,
+                input_backend_generation: 0,
+                device_name: "test-device".to_string(),
+                instance_name: None,
+                discovery: DiscoveryConfig::default(),
+                input: InputRuntimeOptions {
+                    mode: InputMode::Off,
+                    edge: ScreenEdge::Right,
+                    hotkey: Hotkey::DEFAULT.parse().unwrap(),
+                    reverse_mouse_wheel: false,
+                    reverse_trackpad: false,
+                    block_switch_on_press: false,
+                    key_mapping: crate::input::KeyMappingConfig::default(),
+                },
+                clipboard: ClipboardRuntimeOptions {
+                    max_file_bytes: 1,
+                    max_cache_bytes: None,
+                    cache_dir: std::path::PathBuf::from("."),
+                },
+            },
+        );
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let mut task = tokio::spawn(run_advertisement_updates(
+            Advertisement {
+                protocol_version: PROTOCOL_VERSION,
+                port: 0,
+                device: DeviceConfig {
+                    device_id: uuid::Uuid::nil(),
+                    device_name: "test-device".to_string(),
+                    identity_private_key: String::new(),
+                    identity_public_key: String::new(),
+                },
+                file_sync_mode: FileSyncMode::Off,
+                clipboard_mode: ClipboardMode::Off,
+                audio_mode: AudioMode::Off,
+                input_mode: InputMode::Off,
+                instance_name: None,
+            },
+            DiscoveryConfig::default(),
+            control.capabilities(),
+            control.tuning(),
+            crate::discovery::DiscoveryRegistration::default(),
+            shutdown.clone(),
+        ));
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut task)
+                .await
+                .is_err(),
+            "detached 控制通道关闭时广告更新任务不应提前结束"
+        );
+        shutdown.cancel();
+        assert!(task.await.unwrap().is_ok());
     }
 
     fn sample_peer() -> DiscoveredPeer {

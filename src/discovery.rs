@@ -44,6 +44,7 @@ impl Drop for MdnsRegistration {
     }
 }
 
+#[derive(Default)]
 pub struct DiscoveryRegistration {
     mdns: Option<MdnsRegistration>,
     lnd: Option<AnnounceHandle>,
