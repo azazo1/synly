@@ -1,4 +1,5 @@
 mod agent;
+mod cursor_capture;
 mod native;
 
 use super::{CaptureContext, InputBackend};

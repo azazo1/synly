@@ -1,11 +1,14 @@
 use super::super::{CaptureContext, InputBackend, NativeEvent, ScrollSource};
+use super::cursor_capture::{
+    CapturePhase, CursorCaptureTracker, CursorMove, select_capture_anchor,
+};
 use crate::input::{DesktopLayout, DisplayRect, KeySnapshot, ModifierMask, Point};
 use anyhow::{Context, Result, bail};
 use std::collections::BTreeSet;
 use std::ffi::c_void;
 use std::mem::{size_of, zeroed};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicPtr, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicPtr, AtomicU8, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 type HHook = isize;
@@ -22,7 +25,14 @@ const WH_KEYBOARD_LL: i32 = 13;
 const WH_MOUSE_LL: i32 = 14;
 const HC_ACTION: i32 = 0;
 const WM_QUIT: u32 = 0x0012;
+const WM_DISPLAYCHANGE: u32 = 0x007e;
 const WM_SYNLY_CAPTURE: u32 = 0x8001;
+const WM_SYNLY_WARP: u32 = 0x8002;
+const WM_SYNLY_MOUSE_MOVE: u32 = 0x8003;
+const WM_SYNLY_PRE_WARP: u32 = 0x8004;
+const WM_SYNLY_POST_WARP: u32 = 0x8005;
+const WM_SYNLY_MOUSE_BUTTON: u32 = 0x8006;
+const WM_SYNLY_MOUSE_WHEEL: u32 = 0x8007;
 const WM_MOUSEMOVE: u32 = 0x0200;
 const WM_LBUTTONDOWN: u32 = 0x0201;
 const WM_LBUTTONUP: u32 = 0x0202;
@@ -36,7 +46,6 @@ const WM_MOUSEWHEEL: u32 = 0x020a;
 const WM_MOUSEHWHEEL: u32 = 0x020e;
 const LLKHF_INJECTED: u32 = 0x10;
 const LLKHF_LOWER_IL_INJECTED: u32 = 0x02;
-const LLMHF_INJECTED: u32 = 0x00000001;
 const KEYEVENTF_EXTENDEDKEY: u32 = 0x0001;
 const KEYEVENTF_KEYUP: u32 = 0x0002;
 const KEYEVENTF_SCANCODE: u32 = 0x0008;
@@ -84,6 +93,7 @@ const SMTO_BLOCK: u32 = 0x0001;
 const SMTO_ABORTIFHUNG: u32 = 0x0002;
 const CAPTURE_MESSAGE_TIMEOUT_MS: u32 = 1_000;
 const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
+const MONITORINFOF_PRIMARY: u32 = 0x00000001;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -108,6 +118,12 @@ struct MonitorInfo {
     rc_monitor: RectRaw,
     rc_work: RectRaw,
     flags: u32,
+}
+
+#[derive(Clone, Copy)]
+struct MonitorDisplay {
+    rect: DisplayRect,
+    primary: bool,
 }
 
 #[repr(C)]
@@ -276,11 +292,12 @@ unsafe extern "system" {
 struct WindowsState {
     context: CaptureContext,
     layout: Mutex<Option<DesktopLayout>>,
+    cursor: Mutex<Option<CursorCaptureTracker>>,
     physical_pressed: Mutex<BTreeSet<u16>>,
     physical_buttons: Mutex<BTreeSet<u8>>,
     injected_pressed: Mutex<BTreeSet<u16>>,
     injected_buttons: Mutex<BTreeSet<u8>>,
-    last_point: Mutex<Option<Point>>,
+    capture_phase: AtomicU8,
     thread_id: AtomicU32,
     hider_window: AtomicIsize,
     cursor_hidden: AtomicBool,
@@ -296,11 +313,12 @@ pub(super) fn start(context: CaptureContext) -> Result<Arc<dyn InputBackend>> {
     let state = Arc::new(WindowsState {
         context,
         layout: Mutex::new(None),
+        cursor: Mutex::new(None),
         physical_pressed: Mutex::new(BTreeSet::new()),
         physical_buttons: Mutex::new(BTreeSet::new()),
         injected_pressed: Mutex::new(BTreeSet::new()),
         injected_buttons: Mutex::new(BTreeSet::new()),
-        last_point: Mutex::new(None),
+        capture_phase: AtomicU8::new(CapturePhase::Observing as u8),
         thread_id: AtomicU32::new(0),
         hider_window: AtomicIsize::new(0),
         cursor_hidden: AtomicBool::new(false),
@@ -327,8 +345,8 @@ fn run_message_loop(state: Arc<WindowsState>, ready: std::sync::mpsc::SyncSender
     if previous_dpi_context == 0 {
         tracing::warn!("Windows 输入线程无法启用 per-monitor DPI awareness");
     }
-    let layout = match DesktopLayout::new(collect_display_rects()) {
-        Ok(layout) => layout,
+    let (layout, anchor) = match collect_display_snapshot() {
+        Ok(snapshot) => snapshot,
         Err(error) => {
             if previous_dpi_context != 0 {
                 unsafe { SetThreadDpiAwarenessContext(previous_dpi_context) };
@@ -337,7 +355,19 @@ fn run_message_loop(state: Arc<WindowsState>, ready: std::sync::mpsc::SyncSender
             return;
         }
     };
-    *state.layout.lock().unwrap() = Some(layout);
+    let initial_point = read_cursor_position().ok();
+    *state.layout.lock().unwrap() = Some(layout.clone());
+    *state.cursor.lock().unwrap() = Some(CursorCaptureTracker::new(
+        layout.clone(),
+        anchor,
+        initial_point,
+    ));
+    tracing::info!(
+        displays = ?layout.displays,
+        anchor = ?anchor,
+        initial_point = ?initial_point,
+        "Windows 光标捕获布局已初始化"
+    );
     let thread_id = unsafe { GetCurrentThreadId() };
     state.thread_id.store(thread_id, Ordering::Release);
     let hider = match create_cursor_hider(thread_id) {
@@ -378,6 +408,9 @@ fn run_message_loop(state: Arc<WindowsState>, ready: std::sync::mpsc::SyncSender
         if result <= 0 {
             break;
         }
+        if handle_thread_message(&state, &message) {
+            continue;
+        }
         unsafe {
             TranslateMessage(&message);
             DispatchMessageW(&message);
@@ -389,6 +422,7 @@ fn run_message_loop(state: Arc<WindowsState>, ready: std::sync::mpsc::SyncSender
         UnhookWindowsHookEx(mouse);
     }
     *state.hooks.lock().unwrap() = (0, 0);
+    HOOK_STATE.store(ptr::null_mut(), Ordering::Release);
     state.hider_window.store(0, Ordering::Release);
     destroy_cursor_hider(hider);
     if previous_dpi_context != 0 {
@@ -495,12 +529,25 @@ unsafe extern "system" fn cursor_hider_window_proc(
     w_param: WParam,
     l_param: LParam,
 ) -> LResult {
-    if message == WM_SYNLY_CAPTURE {
-        let state = HOOK_STATE.load(Ordering::Acquire);
-        if state.is_null() {
-            return 0;
+    let state = HOOK_STATE.load(Ordering::Acquire);
+    if !state.is_null() {
+        let state = unsafe { &*state };
+        match message {
+            WM_SYNLY_CAPTURE => {
+                return isize::from(sync_cursor_capture(state, w_param != 0));
+            }
+            WM_SYNLY_WARP => {
+                let target = decode_point(w_param, l_param);
+                return isize::from(warp_cursor_in_message_thread(state, target));
+            }
+            WM_DISPLAYCHANGE => {
+                if let Err(error) = refresh_display_layout(state) {
+                    fail_capture(state, format!("Windows 显示器布局刷新失败: {error:#}"));
+                }
+                return 0;
+            }
+            _ => {}
         }
-        return isize::from(sync_cursor_capture(unsafe { &*state }, w_param != 0));
     }
     unsafe { DefWindowProcW(window, message, w_param, l_param) }
 }
@@ -515,7 +562,11 @@ unsafe extern "system" fn keyboard_callback(code: i32, w_param: WParam, l_param:
     {
         return unsafe { CallNextHookEx(0, code, w_param, l_param) };
     }
-    let context = unsafe { &*HOOK_STATE.load(Ordering::Acquire) };
+    let context = HOOK_STATE.load(Ordering::Acquire);
+    if context.is_null() {
+        return unsafe { CallNextHookEx(0, code, w_param, l_param) };
+    }
+    let context = unsafe { &*context };
     let usage = windows_scan_to_hid(state.scan_code as u16, state.vk_code as u16);
     let Some(usage) = usage else {
         return unsafe { CallNextHookEx(0, code, w_param, l_param) };
@@ -530,12 +581,18 @@ unsafe extern "system" fn keyboard_callback(code: i32, w_param: WParam, l_param:
         }
         return 1;
     }
-    if context.context.capture_active.load(Ordering::Acquire) && usage_is_modifier(usage) {
-        context.context.emit_reliable(NativeEvent::Key { usage, modifiers, down, repeat });
+    let phase = capture_phase(context);
+    let suppressing = phase.suppresses_local_input();
+    if suppressing && usage_is_modifier(usage) {
+        if phase == CapturePhase::Relaying {
+            context.context.emit_reliable(NativeEvent::Key { usage, modifiers, down, repeat });
+        }
         return unsafe { CallNextHookEx(0, code, w_param, l_param) };
     }
-    if context.context.capture_active.load(Ordering::Acquire) {
-        context.context.emit_reliable(NativeEvent::Key { usage, modifiers, down, repeat });
+    if suppressing {
+        if phase == CapturePhase::Relaying {
+            context.context.emit_reliable(NativeEvent::Key { usage, modifiers, down, repeat });
+        }
         return 1;
     }
     unsafe { CallNextHookEx(0, code, w_param, l_param) }
@@ -546,41 +603,27 @@ unsafe extern "system" fn mouse_callback(code: i32, w_param: WParam, l_param: LP
         return unsafe { CallNextHookEx(0, code, w_param, l_param) };
     }
     let event = unsafe { &*(l_param as *const MouseLl) };
-    if event.extra_info == EVENT_TAG || event.flags & LLMHF_INJECTED != 0 {
+    if event.extra_info == EVENT_TAG {
         return unsafe { CallNextHookEx(0, code, w_param, l_param) };
     }
-    let context = unsafe { &*HOOK_STATE.load(Ordering::Acquire) };
-    let point = Point { x: event.pt.x, y: event.pt.y };
-    let active = context.context.capture_active.load(Ordering::Acquire);
+    let context = HOOK_STATE.load(Ordering::Acquire);
+    if context.is_null() {
+        return unsafe { CallNextHookEx(0, code, w_param, l_param) };
+    }
+    let context = unsafe { &*context };
+    let suppressing = capture_phase(context).suppresses_local_input();
+    let thread_id = context.thread_id.load(Ordering::Acquire);
+    let mut posted = true;
     match w_param as u32 {
         WM_MOUSEMOVE => {
-            if active {
-                let center = virtual_desktop_center();
-                let dx = point.x.saturating_sub(center.x);
-                let dy = point.y.saturating_sub(center.y);
-                if dx != 0 || dy != 0 {
-                    context.context.motion.add(dx, dy);
-                    if unsafe { SetCursorPos(center.x, center.y) } == 0 {
-                        context.context.emit_reliable(NativeEvent::Failed(
-                            "Windows 捕获期间无法回正本机光标".to_string(),
-                        ));
-                    }
-                }
-                *context.last_point.lock().unwrap() = Some(center);
-            } else {
-                let previous = context.last_point.lock().unwrap().replace(point);
-                if let Some(previous) = previous {
-                    context.context.motion.add_at(
-                        point.x.saturating_sub(previous.x),
-                        point.y.saturating_sub(previous.y),
-                        point,
-                    );
-                }
-            }
+            posted = post_thread_point(thread_id, WM_SYNLY_MOUSE_MOVE, Point {
+                x: event.pt.x,
+                y: event.pt.y,
+            });
         }
         WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN
         | WM_MBUTTONUP | WM_XBUTTONDOWN | WM_XBUTTONUP => {
-            let (button, down) = match w_param as u32 {
+            let (button, down): (u8, bool) = match w_param as u32 {
                 WM_LBUTTONDOWN => (1, true),
                 WM_LBUTTONUP => (1, false),
                 WM_RBUTTONDOWN => (3, true),
@@ -590,30 +633,173 @@ unsafe extern "system" fn mouse_callback(code: i32, w_param: WParam, l_param: LP
                 WM_XBUTTONDOWN => (if event.mouse_data >> 16 == 1 { 4 } else { 5 }, true),
                 _ => (if event.mouse_data >> 16 == 1 { 4 } else { 5 }, false),
             };
-            update_set(&context.physical_buttons, button, down);
-            if active {
-                context.context.emit_reliable(NativeEvent::Button { button, down });
-            }
+            posted = unsafe {
+                PostThreadMessageW(
+                    thread_id,
+                    WM_SYNLY_MOUSE_BUTTON,
+                    usize::from(button),
+                    isize::from(down),
+                )
+            } != 0;
         }
         WM_MOUSEWHEEL => {
-            if active {
-                context.context.emit_reliable(NativeEvent::Wheel {
-                    x: 0,
-                    y: (event.mouse_data >> 16) as i16 as i32 / WHEEL_DELTA,
-                    source: ScrollSource::MouseWheel,
-                });
-            }
+            let y = (event.mouse_data >> 16) as i16 as i32 / WHEEL_DELTA;
+            posted = post_thread_point(thread_id, WM_SYNLY_MOUSE_WHEEL, Point { x: 0, y });
         }
-        WM_MOUSEHWHEEL if active => {
-            context.context.emit_reliable(NativeEvent::Wheel {
-                x: (event.mouse_data >> 16) as i16 as i32 / WHEEL_DELTA,
-                y: 0,
-                source: ScrollSource::MouseWheel,
-            });
+        WM_MOUSEHWHEEL => {
+            let x = (event.mouse_data >> 16) as i16 as i32 / WHEEL_DELTA;
+            posted = post_thread_point(thread_id, WM_SYNLY_MOUSE_WHEEL, Point { x, y: 0 });
         }
         _ => {}
     }
-    if active { 1 } else { unsafe { CallNextHookEx(0, code, w_param, l_param) } }
+    if !posted {
+        fail_capture(context, "Windows 输入消息线程无法接收鼠标事件".to_string());
+    }
+    if suppressing {
+        1
+    } else {
+        unsafe { CallNextHookEx(0, code, w_param, l_param) }
+    }
+}
+
+fn capture_phase(state: &WindowsState) -> CapturePhase {
+    CapturePhase::from_raw(state.capture_phase.load(Ordering::Acquire))
+}
+
+fn post_thread_point(thread_id: u32, message: u32, point: Point) -> bool {
+    thread_id != 0
+        && unsafe {
+            PostThreadMessageW(
+                thread_id,
+                message,
+                encode_coordinate(point.x),
+                encode_coordinate(point.y) as isize,
+            )
+        } != 0
+}
+
+fn encode_coordinate(value: i32) -> usize {
+    value as u32 as usize
+}
+
+fn decode_coordinate(value: usize) -> i32 {
+    value as u32 as i32
+}
+
+fn decode_point(w_param: WParam, l_param: LParam) -> Point {
+    Point {
+        x: decode_coordinate(w_param),
+        y: decode_coordinate(l_param as usize),
+    }
+}
+
+fn handle_thread_message(state: &WindowsState, message: &Msg) -> bool {
+    match message.message {
+        WM_SYNLY_MOUSE_MOVE => {
+            handle_mouse_move(state, decode_point(message.w_param, message.l_param));
+            true
+        }
+        WM_SYNLY_MOUSE_BUTTON => {
+            handle_mouse_button(state, message.w_param as u8, message.l_param != 0);
+            true
+        }
+        WM_SYNLY_MOUSE_WHEEL => {
+            handle_mouse_wheel(state, decode_point(message.w_param, message.l_param));
+            true
+        }
+        WM_SYNLY_PRE_WARP => {
+            handle_pre_warp(state, decode_point(message.w_param, message.l_param));
+            true
+        }
+        WM_SYNLY_POST_WARP => {
+            tracing::warn!("Windows 光标捕获收到未匹配的 POST_WARP");
+            true
+        }
+        _ => false,
+    }
+}
+
+fn handle_mouse_move(state: &WindowsState, point: Point) {
+    let phase = capture_phase(state);
+    let (movement, anchor) = {
+        let mut cursor = state.cursor.lock().unwrap();
+        let Some(cursor) = cursor.as_mut() else {
+            return;
+        };
+        (cursor.handle_move(phase, point), cursor.anchor())
+    };
+    match movement {
+        CursorMove::Observed { point, dx, dy } => {
+            state.context.motion.add_at(dx, dy, point);
+        }
+        CursorMove::Relayed { dx, dy, bogus } => {
+            if dx == 0 && dy == 0 {
+                return;
+            }
+            if bogus {
+                tracing::debug!(dx, dy, anchor = ?anchor, "Windows 光标捕获已丢弃异常回正位移");
+            } else {
+                state.context.motion.add(dx, dy);
+            }
+            if !warp_cursor_in_message_thread(state, anchor) {
+                let _ = sync_cursor_capture(state, false);
+                fail_capture(state, "Windows 捕获期间无法回正本机光标".to_string());
+            }
+        }
+        CursorMove::Ignored => {}
+    }
+}
+
+fn handle_mouse_button(state: &WindowsState, button: u8, down: bool) {
+    update_set(&state.physical_buttons, button, down);
+    if capture_phase(state) == CapturePhase::Relaying {
+        state.context.emit_reliable(NativeEvent::Button { button, down });
+    }
+}
+
+fn handle_mouse_wheel(state: &WindowsState, delta: Point) {
+    if capture_phase(state) == CapturePhase::Relaying {
+        state.context.emit_reliable(NativeEvent::Wheel {
+            x: delta.x,
+            y: delta.y,
+            source: ScrollSource::MouseWheel,
+        });
+    }
+}
+
+fn handle_pre_warp(state: &WindowsState, target: Point) {
+    if let Some(cursor) = state.cursor.lock().unwrap().as_mut() {
+        cursor.begin_warp(target);
+    }
+    let mut pending = Msg::default();
+    let matched = loop {
+        let result = unsafe {
+            GetMessageW(
+                &mut pending,
+                0,
+                WM_SYNLY_MOUSE_MOVE,
+                WM_SYNLY_POST_WARP,
+            )
+        };
+        if result <= 0 {
+            break false;
+        }
+        if pending.message == WM_SYNLY_POST_WARP {
+            break true;
+        }
+    };
+    if let Some(cursor) = state.cursor.lock().unwrap().as_mut() {
+        cursor.end_warp(target);
+    }
+    if !matched {
+        fail_capture(state, "Windows 光标 warp marker 未完整匹配".to_string());
+    }
+}
+
+fn fail_capture(state: &WindowsState, message: String) {
+    state.context.failed.store(true, Ordering::Release);
+    state.context.emit_reliable(NativeEvent::Failed(message.clone()));
+    tracing::error!(error = %message, "Windows 光标捕获失败");
 }
 
 static HOOK_STATE: AtomicPtr<WindowsState> = AtomicPtr::new(ptr::null_mut());
@@ -638,13 +824,7 @@ impl InputBackend for WindowsBackend {
     }
 
     fn cursor_position(&self) -> Result<Point> {
-        with_per_monitor_dpi(|| {
-            let mut point = PointRaw::default();
-            if unsafe { GetCursorPos(&mut point) } == 0 {
-                bail!("无法读取 Windows 光标位置");
-            }
-            Ok(Point { x: point.x, y: point.y })
-        })
+        with_per_monitor_dpi(read_cursor_position)
     }
 
     fn snapshot(&self) -> KeySnapshot {
@@ -656,29 +836,24 @@ impl InputBackend for WindowsBackend {
     }
 
     fn set_capture(&self, active: bool) -> Result<()> {
-        let previous = self.state.context.capture_active.swap(active, Ordering::AcqRel);
-        if previous == active {
+        let phase = capture_phase(&self.state);
+        if (active && phase == CapturePhase::Relaying)
+            || (!active && phase == CapturePhase::Observing)
+        {
             return Ok(());
         }
         let window = self.state.hider_window.load(Ordering::Acquire);
         if window == 0 || !send_capture_message(window, active) {
-            self.state.context.capture_active.store(previous, Ordering::Release);
-            if window != 0 {
-                let _ = send_capture_message(window, previous);
-            }
             bail!("无法切换 Windows 光标捕获状态")
         }
         Ok(())
     }
 
     fn warp_cursor(&self, point: Point) -> Result<()> {
-        with_per_monitor_dpi(|| {
-            if unsafe { SetCursorPos(point.x, point.y) } == 0 {
-                bail!("无法移动 Windows 光标");
-            }
-            Ok(())
-        })?;
-        *self.state.last_point.lock().unwrap() = Some(point);
+        let window = self.state.hider_window.load(Ordering::Acquire);
+        if window == 0 || !send_warp_message(window, point) {
+            bail!("无法移动 Windows 光标")
+        }
         Ok(())
     }
 
@@ -779,9 +954,27 @@ fn send_capture_message(window: HWnd, active: bool) -> bool {
         && result != 0
 }
 
+fn send_warp_message(window: HWnd, point: Point) -> bool {
+    let mut result = 0usize;
+    (unsafe {
+        SendMessageTimeoutW(
+            window,
+            WM_SYNLY_WARP,
+            encode_coordinate(point.x),
+            encode_coordinate(point.y) as isize,
+            SMTO_BLOCK | SMTO_ABORTIFHUNG,
+            CAPTURE_MESSAGE_TIMEOUT_MS,
+            &mut result,
+        )
+    }) != 0
+        && result != 0
+}
+
 fn sync_cursor_capture(state: &WindowsState, active: bool) -> bool {
-    let hidden = state.cursor_hidden.load(Ordering::Acquire);
-    if hidden == active {
+    let phase = capture_phase(state);
+    if (active && phase == CapturePhase::Relaying)
+        || (!active && phase == CapturePhase::Observing)
+    {
         return true;
     }
     let window = state.hider_window.load(Ordering::Acquire);
@@ -789,23 +982,35 @@ fn sync_cursor_capture(state: &WindowsState, active: bool) -> bool {
         return false;
     }
     let succeeded = if active {
-        let center = virtual_desktop_center();
+        state.capture_phase.store(CapturePhase::Arming as u8, Ordering::Release);
+        let anchor = state
+            .cursor
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(CursorCaptureTracker::anchor);
+        let Some(anchor) = anchor else {
+            state.capture_phase.store(CapturePhase::Observing as u8, Ordering::Release);
+            return false;
+        };
         let visibility_ok = set_cursor_visibility(false);
         let window_ok = visibility_ok
             && unsafe {
                 SetWindowPos(
                     window,
                     HWND_TOP,
-                    center.x,
-                    center.y,
+                    anchor.x,
+                    anchor.y,
                     1,
                     1,
                     SWP_NOACTIVATE | SWP_SHOWWINDOW,
                 )
             } != 0;
-        let position_ok = window_ok && unsafe { SetCursorPos(center.x, center.y) } != 0;
+        let position_ok = window_ok && warp_cursor_in_message_thread(state, anchor);
         if position_ok {
-            *state.last_point.lock().unwrap() = Some(center);
+            state.cursor_hidden.store(true, Ordering::Release);
+            state.context.capture_active.store(true, Ordering::Release);
+            state.capture_phase.store(CapturePhase::Relaying as u8, Ordering::Release);
             true
         } else {
             unsafe {
@@ -820,9 +1025,13 @@ fn sync_cursor_capture(state: &WindowsState, active: bool) -> bool {
                 );
             }
             let _ = set_cursor_visibility(true);
+            state.cursor_hidden.store(false, Ordering::Release);
+            state.context.capture_active.store(false, Ordering::Release);
+            state.capture_phase.store(CapturePhase::Observing as u8, Ordering::Release);
             false
         }
     } else {
+        state.capture_phase.store(CapturePhase::Disarming as u8, Ordering::Release);
         let visibility_ok = set_cursor_visibility(true);
         let window_ok = unsafe {
             SetWindowPos(
@@ -835,22 +1044,64 @@ fn sync_cursor_capture(state: &WindowsState, active: bool) -> bool {
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_HIDEWINDOW,
             )
         } != 0;
-        visibility_ok && window_ok
+        if visibility_ok && window_ok {
+            state.cursor_hidden.store(false, Ordering::Release);
+            state.context.capture_active.store(false, Ordering::Release);
+            state.capture_phase.store(CapturePhase::Observing as u8, Ordering::Release);
+            true
+        } else {
+            state.cursor_hidden.store(true, Ordering::Release);
+            state.context.capture_active.store(true, Ordering::Release);
+            state.capture_phase.store(CapturePhase::Relaying as u8, Ordering::Release);
+            false
+        }
     };
     if succeeded {
-        state.cursor_hidden.store(active, Ordering::Release);
-        tracing::debug!(active, "Windows 光标捕获状态已切换");
+        tracing::info!(active, phase = ?capture_phase(state), "Windows 光标捕获状态已切换");
     } else {
         let message = if active {
             "Windows 无法隐藏并固定本机光标"
         } else {
             "Windows 无法恢复本机光标"
         };
-        state.context.failed.store(true, Ordering::Release);
-        state.context.emit_reliable(NativeEvent::Failed(message.to_string()));
-        tracing::error!(active, "{message}");
+        fail_capture(state, message.to_string());
     }
     succeeded
+}
+
+fn warp_cursor_in_message_thread(state: &WindowsState, target: Point) -> bool {
+    let thread_id = state.thread_id.load(Ordering::Acquire);
+    if !post_thread_point(thread_id, WM_SYNLY_PRE_WARP, target) {
+        return false;
+    }
+    let moved = set_cursor_position_verified(target);
+    let marker_posted = unsafe {
+        PostThreadMessageW(thread_id, WM_SYNLY_POST_WARP, 0, 0)
+    } != 0;
+    if marker_posted {
+        handle_pre_warp(state, target);
+    }
+    moved && marker_posted
+}
+
+fn set_cursor_position_verified(target: Point) -> bool {
+    for attempt in 1..=2 {
+        if unsafe { SetCursorPos(target.x, target.y) } != 0
+            && read_cursor_position().is_ok_and(|point| point == target)
+        {
+            return true;
+        }
+        tracing::debug!(attempt, target = ?target, "Windows 光标 warp 校验失败, 正在重试");
+    }
+    false
+}
+
+fn read_cursor_position() -> Result<Point> {
+    let mut point = PointRaw::default();
+    if unsafe { GetCursorPos(&mut point) } == 0 {
+        bail!("无法读取 Windows 光标位置");
+    }
+    Ok(Point { x: point.x, y: point.y })
 }
 
 fn set_cursor_visibility(visible: bool) -> bool {
@@ -881,33 +1132,69 @@ unsafe extern "system" fn monitor_callback(
     _clip: *mut RectRaw,
     data: LParam,
 ) -> i32 {
-    let displays = unsafe { &mut *(data as *mut Vec<DisplayRect>) };
+    let displays = unsafe { &mut *(data as *mut Vec<MonitorDisplay>) };
     let mut info: MonitorInfo = unsafe { zeroed() };
     info.cb_size = size_of::<MonitorInfo>() as u32;
     if unsafe { GetMonitorInfoW(monitor, &mut info) } != 0 {
         let rect = info.rc_monitor;
-        displays.push(DisplayRect {
-            x: rect.left,
-            y: rect.top,
-            width: rect.right - rect.left,
-            height: rect.bottom - rect.top,
+        displays.push(MonitorDisplay {
+            rect: DisplayRect {
+                x: rect.left,
+                y: rect.top,
+                width: rect.right - rect.left,
+                height: rect.bottom - rect.top,
+            },
+            primary: info.flags & MONITORINFOF_PRIMARY != 0,
         });
     }
     1
 }
 
-fn collect_display_rects() -> Vec<DisplayRect> {
+fn collect_display_snapshot() -> Result<(DesktopLayout, Point)> {
     let mut displays = Vec::new();
-    let data = &mut displays as *mut Vec<DisplayRect> as isize;
+    let data = &mut displays as *mut Vec<MonitorDisplay> as isize;
     let ok = unsafe { EnumDisplayMonitors(0, ptr::null(), Some(monitor_callback), data) };
     if ok == 0 || displays.is_empty() {
         let x = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
         let y = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
         let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
         let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
-        displays.push(DisplayRect { x, y, width, height });
+        displays.push(MonitorDisplay {
+            rect: DisplayRect { x, y, width, height },
+            primary: true,
+        });
     }
-    displays
+    let rects = displays.iter().map(|display| display.rect).collect::<Vec<_>>();
+    let primary = displays
+        .iter()
+        .find(|display| display.primary)
+        .map(|display| display.rect);
+    let anchor = select_capture_anchor(primary, &rects)
+        .context("Windows 显示器布局缺少光标捕获锚点")?;
+    Ok((DesktopLayout::new(rects)?, anchor))
+}
+
+fn refresh_display_layout(state: &WindowsState) -> Result<()> {
+    let (layout, anchor) = collect_display_snapshot()?;
+    let changed = {
+        let mut cursor = state.cursor.lock().unwrap();
+        let cursor = cursor
+            .as_mut()
+            .context("Windows 光标捕获状态尚未初始化")?;
+        cursor.update_layout(layout.clone(), anchor)
+    };
+    *state.layout.lock().unwrap() = Some(layout.clone());
+    if !changed {
+        return Ok(());
+    }
+    tracing::info!(displays = ?layout.displays, anchor = ?anchor, "Windows 显示器布局已刷新");
+    if capture_phase(state) == CapturePhase::Relaying
+        && !warp_cursor_in_message_thread(state, anchor)
+    {
+        let _ = sync_cursor_capture(state, false);
+        bail!("Windows 显示器变化后无法回正本机光标");
+    }
+    Ok(())
 }
 
 fn current_modifiers() -> ModifierMask {
@@ -964,17 +1251,6 @@ fn send_mouse(dx: i32, dy: i32, mouse_data: u32, flags: u32) -> Result<()> {
         bail!("Windows SendInput 鼠标注入失败");
     }
     Ok(())
-}
-
-fn virtual_desktop_center() -> Point {
-    let x = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
-    let y = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
-    let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) }.max(1);
-    let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) }.max(1);
-    Point {
-        x: x.saturating_add(width / 2),
-        y: y.saturating_add(height / 2),
-    }
 }
 
 fn send_absolute_mouse(point: Point) -> Result<()> {
