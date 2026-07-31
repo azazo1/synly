@@ -2,6 +2,8 @@
 default:
     @just --list
 
+import? 'local.just'
+
 # 启动 Slint GUI.
 run:
     cargo run --
