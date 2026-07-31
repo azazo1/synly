@@ -195,7 +195,9 @@ private fun HomeScreen(onOpenSettings: () -> Unit) {
                         Text("权限与后台", style = MaterialTheme.typography.titleSmall)
                         OutlinedButton(
                             onClick = {
-                                context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                                val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
+                                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                                context.startActivity(intent)
                             },
                             modifier = Modifier.fillMaxWidth(),
                         ) {
