@@ -363,11 +363,17 @@ private fun StatusCard(state: FfiClientState?, connectedDevice: String?) {
         null -> "未连接"
     }
     Card {
-        Text(
-            label,
-            style = MaterialTheme.typography.titleMedium,
-            modifier = Modifier.padding(16.dp),
-        )
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(label, style = MaterialTheme.typography.titleMedium)
+            if (state != null) {
+                OutlinedButton(
+                    onClick = { SynlyEngine.stop() },
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text("断开连接")
+                }
+            }
+        }
     }
 }
 

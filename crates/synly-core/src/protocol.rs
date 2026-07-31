@@ -18,7 +18,7 @@ const DEFAULT_MAX_FRAME_DATA_LEN: usize = 128 * 1024 * 1024;
 const DEFAULT_MAX_CLIPBOARD_BINARY_LEN: usize = 100 * 1024 * 1024;
 const CLIPBOARD_STREAM_CHUNK_SIZE: usize = 1024 * 1024;
 
-pub const PROTOCOL_VERSION: u16 = 19;
+pub const PROTOCOL_VERSION: u16 = 20;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RuntimeCapabilities {
@@ -129,6 +129,7 @@ pub enum ControlMessage {
         server: DeviceIdentity,
         workspace: WorkspaceSummary,
         agreement: SessionAgreement,
+        clipboard_agreement: SessionAgreement,
         auth_method: PairAuthMethod,
         server_trusts_client: bool,
         proof: String,
@@ -713,6 +714,10 @@ mod tests {
                 host_to_client: true,
                 client_to_host: true,
             },
+            clipboard_agreement: SessionAgreement {
+                host_to_client: true,
+                client_to_host: true,
+            },
             auth_method: super::PairAuthMethod::TrustedDevice,
             server_trusts_client: true,
             proof: "proof".to_string(),
@@ -886,6 +891,10 @@ mod tests {
                     "input_mode": "off"
                 },
                 "agreement": {
+                    "host_to_client": true,
+                    "client_to_host": true
+                },
+                "clipboard_agreement": {
                     "host_to_client": true,
                     "client_to_host": true
                 },

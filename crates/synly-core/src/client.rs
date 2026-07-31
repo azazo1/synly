@@ -11,11 +11,12 @@ use crate::settings::{AudioMode, ClipboardMode, FileSyncMode};
 use crate::workspace::WorkspaceSummary;
 use anyhow::{Context, Result, anyhow, bail};
 use std::net::Ipv4Addr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio_rustls::client::TlsStream;
 use uuid::Uuid;
 
@@ -81,6 +82,7 @@ pub enum ClientEvent {
     Connected {
         remote: DeviceIdentity,
         agreement: SessionAgreement,
+        clipboard_agreement: SessionAgreement,
         remote_workspace: WorkspaceSummary,
     },
     ClipboardReceived(ClipboardPayload),
@@ -108,6 +110,8 @@ pub enum ClientCommand {
 pub struct ClientHandle {
     commands: mpsc::UnboundedSender<ClientCommand>,
     state: Arc<std::sync::Mutex<ClientState>>,
+    finished: Arc<AtomicBool>,
+    shutdown: Arc<Notify>,
 }
 
 impl ClientHandle {
@@ -139,6 +143,18 @@ impl ClientHandle {
         self.send(ClientCommand::Stop)
     }
 
+    pub async fn stop_and_wait(&self) -> Result<()> {
+        if self.send(ClientCommand::Stop).is_err() {
+            return Ok(());
+        }
+        loop {
+            if self.finished.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            self.shutdown.notified().await;
+        }
+    }
+
     fn send(&self, command: ClientCommand) -> Result<()> {
         self.commands
             .send(command)
@@ -156,10 +172,16 @@ pub fn start_client(
     let handle = ClientHandle {
         commands: command_tx,
         state: Arc::clone(&state),
+        finished: Arc::new(AtomicBool::new(false)),
+        shutdown: Arc::new(Notify::new()),
     };
     let worker_state = Arc::clone(&state);
+    let worker_finished = Arc::clone(&handle.finished);
+    let worker_shutdown = Arc::clone(&handle.shutdown);
     tokio::spawn(async move {
         run_client_loop(config, target, listener, command_rx, worker_state).await;
+        worker_finished.store(true, Ordering::Release);
+        worker_shutdown.notify_waiters();
     });
     Ok(handle)
 }
@@ -362,13 +384,14 @@ async fn complete_trusted_pairing(
         Frame::Control(message) => message,
         _ => bail!("对端在可信配对中发送了非控制消息"),
     };
-    let (remote, remote_workspace, agreement) = match reply.clone() {
+    let (remote, remote_workspace, agreement, clipboard_agreement) = match reply.clone() {
         ControlMessage::PairDecision {
             accepted,
             message,
             server,
             workspace,
             agreement,
+            clipboard_agreement,
             auth_method,
             server_trusts_client,
             proof,
@@ -385,6 +408,7 @@ async fn complete_trusted_pairing(
                 server: server.clone(),
                 workspace: workspace.clone(),
                 agreement: agreement.clone(),
+                clipboard_agreement: clipboard_agreement.clone(),
                 auth_method,
                 server_trusts_client,
                 proof,
@@ -399,7 +423,7 @@ async fn complete_trusted_pairing(
             if !accepted {
                 bail!("{}", message);
             }
-            (server, workspace, agreement)
+            (server, workspace, agreement, clipboard_agreement)
         }
         ControlMessage::Error { message } => bail!("{}", message),
         other => bail!("意外的可信配对响应: {other:?}"),
@@ -408,6 +432,7 @@ async fn complete_trusted_pairing(
         stream,
         remote,
         agreement,
+        clipboard_agreement,
         remote_workspace,
     })
 }
@@ -572,13 +597,15 @@ async fn connect_bootstrap_inner(
         Frame::Control(message) => message,
         _ => bail!("对端在配对阶段发送了非控制消息"),
     };
-    let (remote, remote_workspace, agreement, server_trusts_client) = match &reply {
+    let (remote, remote_workspace, agreement, clipboard_agreement, server_trusts_client) =
+        match &reply {
         ControlMessage::PairDecision {
             accepted,
             message,
             server,
             workspace,
             agreement,
+            clipboard_agreement,
             auth_method,
             server_trusts_client,
             ..
@@ -595,6 +622,7 @@ async fn connect_bootstrap_inner(
                 server.clone(),
                 workspace.clone(),
                 agreement.clone(),
+                clipboard_agreement.clone(),
                 *server_trusts_client,
             )
         }
@@ -627,6 +655,7 @@ async fn connect_bootstrap_inner(
         stream,
         remote,
         agreement,
+        clipboard_agreement,
         remote_workspace,
     })
 }
@@ -674,6 +703,7 @@ struct AuthenticatedSession {
     stream: TlsStream<TcpStream>,
     remote: DeviceIdentity,
     agreement: SessionAgreement,
+    clipboard_agreement: SessionAgreement,
     remote_workspace: WorkspaceSummary,
 }
 
@@ -688,6 +718,7 @@ async fn run_session(
     listener.on_event(ClientEvent::Connected {
         remote: session.remote.clone(),
         agreement: session.agreement.clone(),
+        clipboard_agreement: session.clipboard_agreement.clone(),
         remote_workspace: session.remote_workspace.clone(),
     });
     tracing::info!(
@@ -706,8 +737,8 @@ async fn run_session(
         input_mode: session.remote_workspace.input_mode,
     };
     let mut capability_state = CapabilityState::new(false, local_capabilities, remote_capabilities);
-    let can_send = session.agreement.client_to_host;
-    let can_receive = session.agreement.host_to_client;
+    let can_send = session.clipboard_agreement.client_to_host;
+    let can_receive = session.clipboard_agreement.host_to_client;
     if can_send || can_receive {
         tracing::info!(
             send = can_send,
@@ -741,7 +772,12 @@ async fn run_session(
             command = commands.recv() => {
                 match command {
                     Some(ClientCommand::SendClipboard(payload)) => {
-                        if can_send && !payload.is_empty() {
+                        if capability_state
+                            .effective_local()
+                            .clipboard_mode
+                            .can_send()
+                            && !payload.is_empty()
+                        {
                             frame_tx.send(Frame::Clipboard(payload)).await?;
                         } else if !payload.is_empty() {
                             tracing::debug!("当前会话不允许发送剪贴板");
@@ -800,7 +836,11 @@ async fn run_session(
                         }
                     }
                     Frame::Clipboard(payload) => {
-                        if can_receive {
+                        if capability_state
+                            .effective_local()
+                            .clipboard_mode
+                            .can_receive()
+                        {
                             listener.on_event(ClientEvent::ClipboardReceived(payload));
                         } else {
                             tracing::debug!("当前会话不允许接收剪贴板");

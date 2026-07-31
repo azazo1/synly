@@ -371,12 +371,13 @@ impl From<client::ClientEvent> for FfiClientEvent {
             client::ClientEvent::PairingFailed { message } => Self::PairingFailed { message },
             client::ClientEvent::Connected {
                 remote,
-                agreement,
+                agreement: _,
+                clipboard_agreement,
                 remote_workspace,
             } => Self::Connected {
                 remote: remote.into(),
-                client_to_host: agreement.client_to_host,
-                host_to_client: agreement.host_to_client,
+                client_to_host: clipboard_agreement.client_to_host,
+                host_to_client: clipboard_agreement.host_to_client,
                 remote_workspace_summary: remote_workspace.summary_lines().join(" | "),
             },
             client::ClientEvent::ClipboardReceived(payload) => Self::ClipboardReceived {
@@ -502,7 +503,7 @@ impl FfiClientHandle {
     }
 
     pub fn stop(&self) -> Result<(), FfiError> {
-        self.inner.stop().map_err(Into::into)
+        runtime().block_on(self.inner.stop_and_wait()).map_err(Into::into)
     }
 }
 

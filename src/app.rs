@@ -164,6 +164,7 @@ struct PairDecisionParams<'a> {
     audio_mode: AudioMode,
     input_mode: InputMode,
     agreement: &'a SessionAgreement,
+    clipboard_agreement: &'a SessionAgreement,
     auth_method: PairAuthMethod,
     pin: Option<&'a str>,
     server_trusts_client: bool,
@@ -878,6 +879,7 @@ async fn handle_trusted_incoming_connection(
         audio_mode: session_options.audio_mode,
         input_mode: session_options.input_mode,
         agreement: &agreement,
+        clipboard_agreement: &clipboard_agreement,
         auth_method: PairAuthMethod::TrustedDevice,
         pin: None,
         server_trusts_client: true,
@@ -1291,6 +1293,7 @@ async fn handle_bootstrap_incoming_connection(
         audio_mode: session_options.audio_mode,
         input_mode: session_options.input_mode,
         agreement: &agreement,
+        clipboard_agreement: &clipboard_agreement,
         auth_method: PairAuthMethod::Pin,
         pin: Some(&pin),
         server_trusts_client,
@@ -1438,13 +1441,14 @@ where
         Frame::Control(message) => message,
         _ => bail!("peer sent a non-control response during trusted pairing"),
     };
-    let (remote, remote_workspace, agreement) = match reply {
+    let (remote, remote_workspace, agreement, _clipboard_agreement) = match reply {
         ControlMessage::PairDecision {
             accepted,
             message,
             server,
             workspace,
             agreement,
+            clipboard_agreement,
             auth_method,
             server_trusts_client,
             proof,
@@ -1460,6 +1464,7 @@ where
                 server: server.clone(),
                 workspace: workspace.clone(),
                 agreement: agreement.clone(),
+                clipboard_agreement: clipboard_agreement.clone(),
                 auth_method,
                 server_trusts_client,
                 proof,
@@ -1476,7 +1481,7 @@ where
             if !accepted {
                 bail!("{}", message);
             }
-            (server, workspace, agreement)
+            (server, workspace, agreement, clipboard_agreement)
         }
         ControlMessage::Error { message } => bail!("{}", message),
         other => bail!("unexpected trusted pairing response: {other:?}"),
@@ -2253,6 +2258,10 @@ pub(crate) async fn run_sync_session(
         device_id: session.remote.device_id,
         display_name: identity_display_name(&session.remote),
     };
+    options.control.report(RuntimeEvent::Connected(RuntimePeerSummary {
+        device_id: session.remote.device_id,
+        display_name: identity_display_name(&session.remote),
+    }));
     report_capability_state(&options.control, &peer_summary, &capability_state);
     let current_capabilities = *capabilities.borrow_and_update();
     let initial_update = capability_state
@@ -2299,10 +2308,6 @@ pub(crate) async fn run_sync_session(
         InitialSnapshotPolicy::WaitForRemoteSeed
     );
     let mut pending_initial_remote_revision = None;
-    options.control.report(RuntimeEvent::Connected(RuntimePeerSummary {
-        device_id: session.remote.device_id,
-        display_name: identity_display_name(&session.remote),
-    }));
     let disconnected = loop {
         let frame = tokio::select! {
             biased;
@@ -2475,8 +2480,8 @@ pub(crate) async fn run_sync_session(
                         },
                     )
                     .await?;
-                    report_capability_state(&options.control, &peer_summary, &capability_state);
                 }
+                report_capability_state(&options.control, &peer_summary, &capability_state);
             }
             Frame::Control(ControlMessage::CapabilitiesAck { generation }) => {
                 if capability_state.apply_ack(generation)? {
@@ -4391,6 +4396,7 @@ fn signed_pair_decision(params: PairDecisionParams<'_>) -> Result<ControlMessage
             &params.message,
             &server,
             params.agreement,
+            params.clipboard_agreement,
             &summary,
             params.auth_method,
             params.server_trusts_client,
@@ -4404,6 +4410,7 @@ fn signed_pair_decision(params: PairDecisionParams<'_>) -> Result<ControlMessage
             &params.message,
             &server,
             params.agreement,
+            params.clipboard_agreement,
             &summary,
             params.server_trusts_client,
             params.trust_established,
@@ -4415,6 +4422,7 @@ fn signed_pair_decision(params: PairDecisionParams<'_>) -> Result<ControlMessage
         server,
         workspace: summary,
         agreement: params.agreement.clone(),
+        clipboard_agreement: params.clipboard_agreement.clone(),
         auth_method: params.auth_method,
         server_trusts_client: params.server_trusts_client,
         proof,

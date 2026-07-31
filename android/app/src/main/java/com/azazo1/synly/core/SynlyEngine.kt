@@ -3,6 +3,10 @@ package com.azazo1.synly.core
 import android.content.Context
 import android.util.Log
 import com.azazo1.synly.SynlyApplication
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
@@ -28,6 +32,11 @@ object SynlyEngine {
 
     @Volatile
     private var initialized = false
+
+    @Volatile
+    private var currentTarget: SynlyTarget? = null
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private val _uiState = MutableStateFlow(SynlyUiState())
     val uiState: StateFlow<SynlyUiState> = _uiState
@@ -67,6 +76,10 @@ object SynlyEngine {
             Log.i(TAG, "尚无目标设备, 等待用户连接")
             return
         }
+        if (target == currentTarget && handle != null) {
+            Log.i(TAG, "目标设备未变化, 忽略重复连接请求")
+            return
+        }
         val identity = IdentityStore.getOrCreate(context)
         val trusted = TrustedDeviceStore.list(context)
         val config = FfiClientConfig(
@@ -84,27 +97,33 @@ object SynlyEngine {
             port = target.port.toUShort(),
             peerDeviceId = target.peerDeviceId,
         )
-        runCatching {
-            handle?.stop()
-            handle = startClient(config, ffiTarget, listener)
-            Log.i(TAG, "客户端已启动: ${target.addresses.joinToString()}:${target.port}")
-        }.onFailure { error ->
-            Log.e(TAG, "启动客户端失败", error)
-            _uiState.update { it.copy(lastMessage = error.message ?: "启动客户端失败") }
+        scope.launch {
+            runCatching {
+                handle?.stop()
+                handle = startClient(config, ffiTarget, listener)
+                currentTarget = target
+                Log.i(TAG, "客户端已启动: ${target.addresses.joinToString()}:${target.port}")
+            }.onFailure { error ->
+                Log.e(TAG, "启动客户端失败", error)
+                _uiState.update { it.copy(lastMessage = error.message ?: "启动客户端失败") }
+            }
         }
     }
 
     fun stop() {
-        runCatching { handle?.stop() }
-        handle = null
-        _uiState.update {
-            it.copy(
-                state = null,
-                connectedDevice = null,
-                pinRequest = null,
-                canSend = false,
-                canReceive = false,
-            )
+        scope.launch {
+            runCatching { handle?.stop() }
+            handle = null
+            currentTarget = null
+            _uiState.update {
+                it.copy(
+                    state = null,
+                    connectedDevice = null,
+                    pinRequest = null,
+                    canSend = false,
+                    canReceive = false,
+                )
+            }
         }
     }
 
