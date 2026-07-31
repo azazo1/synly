@@ -48,6 +48,19 @@ cargo run --
 
 发布产物位于 `target/release/synly`.
 
+### GitHub 发布
+
+发布工作流在 branch 和 pull request 上执行跨平台编译, 在 tag 或手动指定已有 tag 时生成发布产物. Linux 只做 release 编译, Windows 上传带 exe 图标的 zip, macOS 上传 Intel 和 Apple Silicon 的 app dmg.
+
+创建版本时先提交 `docs/changelog/VERSION.md`, 再创建 annotated tag:
+
+```shell
+git tag -a "v0.1.0" --cleanup=verbatim -F "docs/changelog/0.1.0.md"
+git push origin main --follow-tags
+```
+
+也可以在 GitHub Actions 手动填写已有 tag. 留空时只运行构建并上传 Actions artifact, 不创建 Release.
+
 ### Windows
 
 推荐使用 MSVC 工具链和 Windows 10/11 SDK. 音频依赖 Opus.

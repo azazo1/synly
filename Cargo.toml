@@ -68,6 +68,9 @@ spake2 = "0.4.0"
 [build-dependencies]
 slint-build = "=1.17.1"
 
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1.31"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",

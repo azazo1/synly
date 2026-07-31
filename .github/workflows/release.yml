@@ -1,0 +1,366 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - "**"
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的已有 tag, 留空时只构建并上传 Actions artifact"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: synly-${{ inputs.tag != '' && format('refs/tags/{0}', inputs.tag) || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    outputs:
+      is_release: ${{ steps.release_context.outputs.is_release }}
+      tag_name: ${{ steps.release_context.outputs.tag_name }}
+      source_ref: ${{ steps.release_context.outputs.source_ref }}
+      project_version: ${{ steps.project_version.outputs.version }}
+      version: ${{ steps.release_version.outputs.version }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve release context
+        id: release_context
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          CURRENT_REF: ${{ github.ref }}
+          CURRENT_REF_NAME: ${{ github.ref_name }}
+          CURRENT_SHA: ${{ github.sha }}
+          DISPATCH_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          is_release=false
+          tag_name=""
+          source_ref="$CURRENT_SHA"
+
+          if [[ "$EVENT_NAME" == "push" && "$CURRENT_REF" == refs/tags/* ]]; then
+            is_release=true
+            tag_name="$CURRENT_REF_NAME"
+            source_ref="$CURRENT_REF"
+          elif [[ "$EVENT_NAME" == "workflow_dispatch" && -n "$DISPATCH_TAG" ]]; then
+            git check-ref-format "refs/tags/$DISPATCH_TAG"
+            is_release=true
+            tag_name="$DISPATCH_TAG"
+            source_ref="refs/tags/$DISPATCH_TAG"
+          fi
+
+          if [[ "$is_release" == true ]]; then
+            git check-ref-format "refs/tags/$tag_name"
+            git fetch --force origin "refs/tags/$tag_name:refs/tags/$tag_name"
+            git rev-parse --verify "$source_ref^{commit}" >/dev/null
+          fi
+
+          printf 'is_release=%s\n' "$is_release" >> "$GITHUB_OUTPUT"
+          printf 'tag_name=%s\n' "$tag_name" >> "$GITHUB_OUTPUT"
+          printf 'source_ref=%s\n' "$source_ref" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout resolved release ref
+        if: steps.release_context.outputs.is_release == 'true'
+        env:
+          SOURCE_REF: ${{ steps.release_context.outputs.source_ref }}
+        shell: bash
+        run: git checkout --detach "$SOURCE_REF"
+
+      - name: Read package version
+        id: project_version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --locked --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "synly") | .version')"
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+      - name: Validate release version
+        id: release_version
+        if: steps.release_context.outputs.is_release == 'true'
+        env:
+          TAG_NAME: ${{ steps.release_context.outputs.tag_name }}
+          PROJECT_VERSION: ${{ steps.project_version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_tag="v$PROJECT_VERSION"
+          if [[ "$TAG_NAME" != "$expected_tag" ]]; then
+            printf 'tag %s does not match package version %s\n' "$TAG_NAME" "$PROJECT_VERSION" >&2
+            exit 1
+          fi
+          printf 'version=%s\n' "$PROJECT_VERSION" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            arch: x86_64
+            target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            package: false
+          - platform: windows
+            arch: x86_64
+            target: x86_64-pc-windows-msvc
+            runner: windows-2025
+            package: true
+          - platform: macos
+            arch: x86_64
+            target: x86_64-apple-darwin
+            runner: macos-13
+            package: true
+          - platform: macos
+            arch: aarch64
+            target: aarch64-apple-darwin
+            runner: macos-14
+            package: true
+    steps:
+      - name: Checkout target ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.source_ref }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Windows Opus dependency
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $vcpkgRoot = $env:VCPKG_INSTALLATION_ROOT
+          if ([string]::IsNullOrWhiteSpace($vcpkgRoot)) {
+            $vcpkgRoot = Split-Path -Parent (Get-Command vcpkg).Source
+          }
+          if (-not (Test-Path -LiteralPath $vcpkgRoot -PathType Container)) {
+            throw "vcpkg root does not exist: $vcpkgRoot"
+          }
+          "VCPKG_ROOT=$vcpkgRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          vcpkg install opus:x64-windows-static
+
+      - name: Install macOS Opus dependency
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: brew install pkg-config opus
+
+      - name: Install Linux Opus dependency
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libopus-dev
+
+      - name: Build release binary
+        shell: bash
+        run: cargo build --locked --release --target "${{ matrix.target }}"
+
+      - name: Validate Linux binary
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/synly"
+          test -x "$binary"
+          file "$binary" | grep -q 'ELF'
+
+      - name: Package Windows archive
+        if: matrix.platform == 'windows' && (needs.version.outputs.is_release == 'true' || github.event_name == 'workflow_dispatch')
+        env:
+          PACKAGE_VERSION: ${{ needs.version.outputs.version || needs.version.outputs.project_version }}
+        shell: pwsh
+        run: |
+          $binary = "target/${{ matrix.target }}/release/synly.exe"
+          if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
+            throw "missing Windows executable: $binary"
+          }
+          $header = [System.IO.File]::ReadAllBytes($binary)
+          if ($header.Length -lt 2 -or $header[0] -ne 0x4d -or $header[1] -ne 0x5a) {
+            throw "invalid PE header: $binary"
+          }
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $archive = "dist/synly-$env:PACKAGE_VERSION-windows-x86_64.zip"
+          Compress-Archive -LiteralPath $binary -DestinationPath $archive -Force
+          if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) {
+            throw "missing Windows archive: $archive"
+          }
+
+      - name: Package macOS application
+        if: matrix.platform == 'macos' && (needs.version.outputs.is_release == 'true' || github.event_name == 'workflow_dispatch')
+        env:
+          PACKAGE_VERSION: ${{ needs.version.outputs.version || needs.version.outputs.project_version }}
+        shell: bash
+        run: bash scripts/package-macos.sh "$PACKAGE_VERSION" "${{ matrix.target }}" dist
+
+      - name: Upload Windows artifact
+        if: matrix.platform == 'windows' && (needs.version.outputs.is_release == 'true' || github.event_name == 'workflow_dispatch')
+        uses: actions/upload-artifact@v4
+        with:
+          name: synly-${{ matrix.platform }}-${{ matrix.arch }}
+          path: dist/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload macOS artifact
+        if: matrix.platform == 'macos' && (needs.version.outputs.is_release == 'true' || github.event_name == 'workflow_dispatch')
+        uses: actions/upload-artifact@v4
+        with:
+          name: synly-${{ matrix.platform }}-${{ matrix.arch }}
+          path: dist/*.dmg
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    if: needs.version.outputs.is_release == 'true'
+    needs:
+      - version
+      - build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.source_ref }}
+          fetch-depth: 0
+
+      - name: Refetch annotated tag object
+        env:
+          TAG_NAME: ${{ needs.version.outputs.tag_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git check-ref-format "refs/tags/$TAG_NAME"
+          git fetch --force origin "refs/tags/$TAG_NAME:refs/tags/$TAG_NAME"
+
+      - name: Validate release notes and tag annotation
+        env:
+          TAG_NAME: ${{ needs.version.outputs.tag_name }}
+          VERSION: ${{ needs.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          notes="docs/changelog/$VERSION.md"
+          if [[ ! -s "$notes" ]]; then
+            printf 'missing release notes: %s\n' "$notes" >&2
+            exit 1
+          fi
+          tag_ref="refs/tags/$TAG_NAME"
+          if [[ "$(git cat-file -t "$tag_ref")" != tag ]]; then
+            printf 'release tag must be annotated: %s\n' "$TAG_NAME" >&2
+            exit 1
+          fi
+          git cat-file tag "$tag_ref" | sed '1,/^$/d' > tag-notes.md
+          if [[ ! -s tag-notes.md ]] || ! grep -q '[^[:space:]]' tag-notes.md; then
+            printf 'release tag annotation is empty: %s\n' "$TAG_NAME" >&2
+            exit 1
+          fi
+          if ! cmp -s "$notes" tag-notes.md; then
+            printf 'tag annotation does not match %s\n' "$notes" >&2
+            diff -u "$notes" tag-notes.md || true
+            exit 1
+          fi
+
+      - name: Generate release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ needs.version.outputs.tag_name }}
+          VERSION: ${{ needs.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          notes="docs/changelog/$VERSION.md"
+          target_sha="$(git rev-parse "refs/tags/$TAG_NAME^{commit}")"
+          api_args=(
+            --method POST
+            "repos/$GITHUB_REPOSITORY/releases/generate-notes"
+            -f "tag_name=$TAG_NAME"
+            -f "target_commitish=$target_sha"
+          )
+          base_tag_file="docs/changelog/$VERSION-base.txt"
+          if [[ -s "$base_tag_file" ]]; then
+            base_tag="$(<"$base_tag_file")"
+            git check-ref-format "refs/tags/$base_tag"
+            api_args+=(-f "previous_tag_name=$base_tag")
+          fi
+          gh api "${api_args[@]}" --jq '.body' > generated-notes.md
+          cp "$notes" release-notes.md
+          if [[ -s generated-notes.md ]]; then
+            printf '\n\n' >> release-notes.md
+            cat generated-notes.md >> release-notes.md
+          fi
+
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: synly-*
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          cd release-artifacts
+          archives=(synly-*.zip synly-*.dmg)
+          if (( ${#archives[@]} != 3 )); then
+            printf 'expected 3 archives, found %s\n' "${#archives[@]}" >&2
+            exit 1
+          fi
+          sha256sum "${archives[@]}" > SHA256SUMS
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG_NAME: ${{ needs.version.outputs.tag_name }}
+          VERSION: ${{ needs.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(
+            release-artifacts/synly-*.zip
+            release-artifacts/synly-*.dmg
+            release-artifacts/SHA256SUMS
+          )
+          if (( ${#assets[@]} != 4 )); then
+            printf 'expected 4 release assets, found %s\n' "${#assets[@]}" >&2
+            exit 1
+          fi
+          prerelease_args=()
+          if [[ "$VERSION" == *-* ]]; then
+            prerelease_args+=(--prerelease)
+          fi
+          if gh release view "$TAG_NAME" >/dev/null 2>&1; then
+            gh release edit "$TAG_NAME" \
+              --verify-tag \
+              --title "Synly v$VERSION" \
+              --notes-file release-notes.md \
+              "${prerelease_args[@]}"
+            gh release upload "$TAG_NAME" "${assets[@]}" --clobber
+          else
+            gh release create "$TAG_NAME" "${assets[@]}" \
+              --verify-tag \
+              --title "Synly v$VERSION" \
+              --notes-file release-notes.md \
+              "${prerelease_args[@]}"
+          fi

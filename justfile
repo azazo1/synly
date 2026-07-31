@@ -23,6 +23,10 @@ clippy:
 build:
     cargo build --release
 
+# 构建当前主机架构的 macOS .app 和 .dmg.
+package-macos:
+    bash scripts/package-macos.sh
+
 # 安装当前工作树中的 Synly.
 install:
     cargo install --path .
