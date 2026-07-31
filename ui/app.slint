@@ -99,6 +99,7 @@ export component AppWindow inherits Window {
     in property <[PeerRow]> peers;
     in property <[TrustedRow]> trusted-devices;
     in property <string> log-text;
+    in property <string> about-version: "";
 
     in-out property <int> connection-index: 0;
     in-out property <string> instance-name;
@@ -590,6 +591,7 @@ export component AppWindow inherits Window {
                 spacing: 10px;
                 Text { text: "Synly"; font-size: 24px; font-weight: 700; color: #202523; }
                 Text { text: "安全的局域网同步与跨设备控制"; color: #555b58; }
+                Text { text: root.about-version; color: #7c8380; font-size: 12px; }
                 AboutSlint { height: 104px; }
                 Rectangle { vertical-stretch: 1; }
             }

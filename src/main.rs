@@ -25,6 +25,9 @@ use anyhow::Result;
 use clap::Parser;
 use synly::input;
 
+/// 当前构建版本, 由 build.rs 根据最近版本 tag 与工作区状态生成.
+const BUILD_VERSION: &str = env!("SYNLY_BUILD_VERSION");
+
 fn main() -> Result<()> {
     let cli = cli::Cli::parse();
     if let Some(command) = &cli.command

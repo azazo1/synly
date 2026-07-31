@@ -51,6 +51,7 @@ pub fn run(config: SynlyConfig, force_start: bool) -> Result<()> {
 
     let window = AppWindow::new().context("failed to create Slint main window")?;
     window.set_monospace_font_family(system_monospace_font_family().into());
+    window.set_about_version(crate::BUILD_VERSION.into());
     window.window().set_size(restored_window_size(&config.ui));
     let _single_instance_guard =
         single_instance::SingleInstanceGuard::start(listener, window.as_weak())?;
