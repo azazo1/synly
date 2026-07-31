@@ -6,11 +6,6 @@ use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
     SDDL_REVISION_1,
 };
-use windows_sys::Win32::Security::WinTrust::{
-    WINTRUST_ACTION_GENERIC_VERIFY_V2, WINTRUST_DATA, WINTRUST_FILE_INFO,
-    WTD_CACHE_ONLY_URL_RETRIEVAL, WTD_CHOICE_FILE, WTD_REVOKE_NONE, WTD_STATEACTION_CLOSE,
-    WTD_STATEACTION_VERIFY, WTD_UI_NONE, WinVerifyTrust,
-};
 use windows_sys::Win32::Security::{
     GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
     TokenUser,
@@ -72,8 +67,7 @@ pub(super) fn validate_parent_process(parent_pid: u32) -> Result<()> {
     let parent_path = process_image_path(parent_pid)?;
     let agent_path = std::env::current_exe()?;
     validate_install_directory(&parent_path, &agent_path)?;
-    validate_binary_signature(&parent_path)?;
-    validate_binary_signature(&agent_path)
+    Ok(())
 }
 
 pub(super) fn validate_pipe_server(client: &NativePipe, expected_pid: u32) -> Result<()> {
@@ -116,64 +110,6 @@ fn validate_install_directory(left: &Path, right: &Path) -> Result<()> {
 
 fn normalize_path(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
-}
-
-pub(super) fn validate_binary_signature(path: &Path) -> Result<()> {
-    match verify_authenticode(path) {
-        Ok(()) => Ok(()),
-        Err(error) if cfg!(debug_assertions) => {
-            tracing::warn!(path = %path.display(), error = %error, "debug 构建允许未签名的 Windows 输入组件");
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
-}
-
-fn verify_authenticode(path: &Path) -> Result<()> {
-    let path = wide(&path.to_string_lossy());
-    let mut file = WINTRUST_FILE_INFO {
-        cbStruct: std::mem::size_of::<WINTRUST_FILE_INFO>() as u32,
-        pcwszFilePath: path.as_ptr(),
-        hFile: std::ptr::null_mut(),
-        pgKnownSubject: std::ptr::null_mut(),
-    };
-    let mut data = WINTRUST_DATA {
-        cbStruct: std::mem::size_of::<WINTRUST_DATA>() as u32,
-        pPolicyCallbackData: std::ptr::null_mut(),
-        pSIPClientData: std::ptr::null_mut(),
-        dwUIChoice: WTD_UI_NONE,
-        fdwRevocationChecks: WTD_REVOKE_NONE,
-        dwUnionChoice: WTD_CHOICE_FILE,
-        Anonymous: windows_sys::Win32::Security::WinTrust::WINTRUST_DATA_0 {
-            pFile: &mut file,
-        },
-        dwStateAction: WTD_STATEACTION_VERIFY,
-        hWVTStateData: std::ptr::null_mut(),
-        pwszURLReference: std::ptr::null_mut(),
-        dwProvFlags: WTD_CACHE_ONLY_URL_RETRIEVAL,
-        dwUIContext: 0,
-        pSignatureSettings: std::ptr::null_mut(),
-    };
-    let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
-    let status = unsafe {
-        WinVerifyTrust(
-            std::ptr::null_mut(),
-            &mut action,
-            (&mut data as *mut WINTRUST_DATA).cast(),
-        )
-    };
-    data.dwStateAction = WTD_STATEACTION_CLOSE;
-    unsafe {
-        WinVerifyTrust(
-            std::ptr::null_mut(),
-            &mut action,
-            (&mut data as *mut WINTRUST_DATA).cast(),
-        );
-    }
-    if status != 0 {
-        bail!("Windows Authenticode validation failed with status 0x{status:08X}");
-    }
-    Ok(())
 }
 
 pub(super) fn process_session_id(process_id: u32) -> Result<u32> {

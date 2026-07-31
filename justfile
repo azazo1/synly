@@ -23,9 +23,19 @@ clippy:
 build:
     cargo build --release
 
-# 构建当前主机架构的 macOS .app 和 .dmg.
-package-macos:
+# 构建当前平台的可分发 release 产物.
+[windows]
+dist: build
+    powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows.ps1 -Binary target/release/synly.exe -OutputDir dist
+
+[macos]
+dist: build
     bash scripts/package-macos.sh
+
+[linux]
+dist: build
+    mkdir -p dist
+    cp target/release/synly dist/synly
 
 # 安装当前工作树中的 Synly.
 install:

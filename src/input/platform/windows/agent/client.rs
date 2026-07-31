@@ -3,7 +3,7 @@ use super::protocol::{
     AgentRequest, AgentResponse, AgentToGuiPacket, GuiToAgentPacket, read_packet, write_packet,
 };
 use super::security::{
-    PipeSecurity, process_session_id, validate_binary_signature, validate_pipe_client, wide,
+    PipeSecurity, process_session_id, validate_pipe_client, wide,
 };
 use super::{
     AGENT_HEARTBEAT_TIMEOUT, CLIENT_HEARTBEAT_INTERVAL, CONNECT_TIMEOUT, DISPATCH_TIMEOUT,
@@ -125,7 +125,6 @@ pub fn request_elevation() -> Result<()> {
     transport.wait_until_created()?;
 
     let executable = agent_executable()?;
-    validate_binary_signature(&executable)?;
     launch_elevated(
         &executable,
         &command_pipe_name,

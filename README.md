@@ -37,7 +37,7 @@ Synly 支持 Windows, macOS 和 Linux. 文件与剪贴板同步可在三大平�
 Rust 版本需要满足 Slint 1.17.1 的要求. 当前开发基线使用 Rust 1.97.1.
 
 ```shell
-cargo build --release
+just dist
 ```
 
 开发运行:
@@ -46,7 +46,7 @@ cargo build --release
 cargo run --
 ```
 
-发布产物位于 `target/release/synly`.
+发布产物位于 `dist/`.
 
 ### GitHub 发布
 
@@ -69,12 +69,12 @@ git push origin main --follow-tags
 rustup default stable-x86_64-pc-windows-msvc
 vcpkg install opus:x64-windows-static
 $env:VCPKG_ROOT="C:\path\to\vcpkg"
-cargo build --release
+just dist
 ```
 
 Windows 主 GUI 使用 `asInvoker` manifest 以普通权限运行. 需要管理员输入能力时, GUI 通过 `ShellExecuteW("runas")` 启动当前 `synly.exe` 的隐藏输入代理子进程, 并使用命名管道完成握手. 主进程与子进程来自同一个构建产物, 避免 IPC 协议版本错配. 配置 `input.elevate_on_start = true` 后, 主实例会在恢复会话前请求 UAC, 授权失败时本次启动直接失败.
 
-GUI 和提权子进程通过随机命名管道与随机 token 通信. 管道 DACL 只允许当前用户和 SYSTEM, 双方校验 IPC 版本, PID, session ID, 映像路径和安装目录. release 构建要求当前可执行文件通过 Authenticode 校验, debug 构建会记录签名校验警告但允许本地未签名产物. 管道断开, 心跳超时, 子进程退出或进入非 `Default` 输入桌面时会立即释放输入状态.
+GUI 和提权子进程通过随机命名管道与随机 token 通信. 管道 DACL 只允许当前用户和 SYSTEM, 双方校验 IPC 版本, PID, session ID, 映像路径和安装目录. Windows release 不要求 Authenticode 签名, 因此请仅从可信来源获取程序, 并避免在其他用户可写目录中运行. 管道断开, 心跳超时, 子进程退出或进入非 `Default` 输入桌面时会立即释放输入状态.
 
 ### macOS
 

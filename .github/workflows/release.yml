@@ -188,19 +188,7 @@ jobs:
         shell: pwsh
         run: |
           $binary = "target/${{ matrix.target }}/release/synly.exe"
-          if (-not (Test-Path -LiteralPath $binary -PathType Leaf)) {
-            throw "missing Windows executable: $binary"
-          }
-          $header = [System.IO.File]::ReadAllBytes($binary)
-          if ($header.Length -lt 2 -or $header[0] -ne 0x4d -or $header[1] -ne 0x5a) {
-            throw "invalid PE header: $binary"
-          }
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          $archive = "dist/synly-$env:PACKAGE_VERSION-windows-x86_64.zip"
-          Compress-Archive -LiteralPath $binary -DestinationPath $archive -Force
-          if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) {
-            throw "missing Windows archive: $archive"
-          }
+          & "$PWD/scripts/package-windows.ps1" -Binary $binary -OutputDir dist -Version $env:PACKAGE_VERSION
 
       - name: Package macOS application
         if: matrix.platform == 'macos' && (needs.version.outputs.is_release == 'true' || github.event_name == 'workflow_dispatch')
