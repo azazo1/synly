@@ -41,6 +41,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
@@ -207,9 +208,20 @@ private fun HomeScreen(onOpenSettings: () -> Unit) {
                                 settings = settings.copy(deviceName = it)
                                 SettingsStore.save(context, settings)
                             },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .onFocusChanged { focusState ->
+                                    if (!focusState.isFocused) {
+                                        settings = settings.copy(
+                                            deviceName = SynlyEngine.applyDeviceName(
+                                                context,
+                                                settings.deviceName,
+                                            ),
+                                        )
+                                    }
+                                },
                             label = { Text("设备名称") },
                             singleLine = true,
-                            modifier = Modifier.fillMaxWidth(),
                         )
                     }
                 }

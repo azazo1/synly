@@ -23,10 +23,15 @@ object IdentityStore {
     fun getOrCreate(context: Context): FfiDeviceConfig {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         val deviceId = prefs.getString(PREF_DEVICE_ID, null)
-        val deviceName = prefs.getString(PREF_DEVICE_NAME, null)
+        var deviceName = prefs.getString(PREF_DEVICE_NAME, null)
         val publicKey = prefs.getString(PREF_PUBLIC_KEY, null)
         val privateKeyEnc = prefs.getString(PREF_PRIVATE_KEY, null)
         if (deviceId != null && deviceName != null && publicKey != null && privateKeyEnc != null) {
+            val settingsName = SettingsStore.load(context).deviceName.trim()
+            if (settingsName.isNotEmpty() && settingsName != deviceName) {
+                deviceName = settingsName
+                prefs.edit().putString(PREF_DEVICE_NAME, deviceName).apply()
+            }
             val privateKey = decrypt(privateKeyEnc)
             return FfiDeviceConfig(
                 deviceId = deviceId,
@@ -35,7 +40,7 @@ object IdentityStore {
                 identityPublicKey = publicKey,
             )
         }
-        val fallbackName = SettingsStore.load(context).deviceName
+        val fallbackName = SettingsStore.load(context).deviceName.trim().ifEmpty { DEFAULT_DEVICE_NAME }
         val generated = generateDeviceConfig(fallbackName)
         val encrypted = encrypt(generated.identityPrivateKey)
         prefs.edit()
@@ -45,6 +50,11 @@ object IdentityStore {
             .putString(PREF_PRIVATE_KEY, encrypted)
             .apply()
         return generated
+    }
+
+    fun getDeviceName(context: Context): String? {
+        return context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getString(PREF_DEVICE_NAME, null)
     }
 
     private fun key(): SecretKey {
@@ -80,4 +90,3 @@ object IdentityStore {
         return String(cipher.doFinal(encrypted), Charsets.UTF_8)
     }
 }
-

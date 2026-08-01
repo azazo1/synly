@@ -5,6 +5,8 @@ import org.json.JSONArray
 import org.json.JSONObject
 import uniffi.synly_core.FfiClipboardMode
 
+const val DEFAULT_DEVICE_NAME = "Android 手机"
+
 data class SynlySettings(
     val clipboardMode: FfiClipboardMode = FfiClipboardMode.BOTH,
     val mdnsEnabled: Boolean = true,
@@ -13,7 +15,7 @@ data class SynlySettings(
     val lndBearerToken: String? = null,
     val lndDiscoveryDomain: String? = null,
     val maxImageBytes: Long = 20L * 1024 * 1024,
-    val deviceName: String = "Android 手机",
+    val deviceName: String = DEFAULT_DEVICE_NAME,
     val lastTarget: SynlyTarget? = null,
 )
 
@@ -52,7 +54,7 @@ object SettingsStore {
             lndBearerToken = prefs.getString("lnd_bearer_token", null)?.takeIf { it.isNotBlank() },
             lndDiscoveryDomain = prefs.getString("lnd_discovery_domain", null)?.takeIf { it.isNotBlank() },
             maxImageBytes = prefs.getLong("max_image_bytes", 20L * 1024 * 1024),
-            deviceName = prefs.getString("device_name", null) ?: "Android 手机",
+            deviceName = prefs.getString("device_name", null) ?: DEFAULT_DEVICE_NAME,
             lastTarget = lastTarget,
         )
     }

@@ -80,6 +80,31 @@ object SynlyEngine {
             Log.i(TAG, "目标设备未变化, 忽略重复连接请求")
             return
         }
+        scope.launch { startInternal(context) }
+    }
+
+    fun applyDeviceName(context: Context, newName: String): String {
+        val name = newName.trim()
+        val settings = SettingsStore.load(context)
+        val identityName = IdentityStore.getDeviceName(context)
+        val effectiveName = if (name.isEmpty()) identityName ?: DEFAULT_DEVICE_NAME else name
+        if (settings.deviceName != effectiveName) {
+            SettingsStore.save(context, settings.copy(deviceName = effectiveName))
+        }
+        if (handle != null && effectiveName != identityName) {
+            scope.launch {
+                runCatching { handle?.stop() }
+                handle = null
+                currentTarget = null
+                startInternal(context)
+            }
+        }
+        return effectiveName
+    }
+
+    private fun startInternal(context: Context) {
+        val settings = SettingsStore.load(context)
+        val target = settings.lastTarget ?: return
         val identity = IdentityStore.getOrCreate(context)
         val trusted = TrustedDeviceStore.list(context)
         val config = FfiClientConfig(
@@ -98,16 +123,14 @@ object SynlyEngine {
             port = target.port.toUShort(),
             peerDeviceId = target.peerDeviceId,
         )
-        scope.launch {
-            runCatching {
-                handle?.stop()
-                handle = startClient(config, ffiTarget, listener)
-                currentTarget = target
-                Log.i(TAG, "客户端已启动: ${target.addresses.joinToString()}:${target.port}")
-            }.onFailure { error ->
-                Log.e(TAG, "启动客户端失败", error)
-                _uiState.update { it.copy(lastMessage = error.message ?: "启动客户端失败") }
-            }
+        runCatching {
+            handle?.stop()
+            handle = startClient(config, ffiTarget, listener)
+            currentTarget = target
+            Log.i(TAG, "客户端已启动: ${target.addresses.joinToString()}:${target.port}")
+        }.onFailure { error ->
+            Log.e(TAG, "启动客户端失败", error)
+            _uiState.update { it.copy(lastMessage = error.message ?: "启动客户端失败") }
         }
     }
 
