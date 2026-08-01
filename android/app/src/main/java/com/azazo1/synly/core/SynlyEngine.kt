@@ -144,36 +144,37 @@ object SynlyEngine {
             runCatching { handle?.stop() }
             handle = null
             currentTarget = null
-            _uiState.update {
-                it.copy(
-                    state = null,
-                    connectedDevice = null,
-                    targetLabel = null,
-                    pinRequest = null,
-                    canSend = false,
-                    canReceive = false,
-                )
-            }
+            clearUiState()
         }
     }
 
     fun disconnect(context: Context) {
-        scope.launch {
-            runCatching { handle?.stop() }
-            handle = null
-            currentTarget = null
-            val settings = SettingsStore.load(context).copy(lastTarget = null)
-            SettingsStore.save(context, settings)
-            _uiState.update {
-                it.copy(
-                    state = null,
-                    connectedDevice = null,
-                    targetLabel = null,
-                    pinRequest = null,
-                    canSend = false,
-                    canReceive = false,
-                )
+        val handleToStop = handle
+        handle = null
+        currentTarget = null
+        val settings = SettingsStore.load(context).copy(lastTarget = null)
+        SettingsStore.save(context, settings)
+        clearUiState()
+        if (handleToStop != null) {
+            scope.launch {
+                runCatching { handleToStop.stop() }
+                if (handle == null) {
+                    clearUiState()
+                }
             }
+        }
+    }
+
+    private fun clearUiState() {
+        _uiState.update {
+            it.copy(
+                state = null,
+                connectedDevice = null,
+                targetLabel = null,
+                pinRequest = null,
+                canSend = false,
+                canReceive = false,
+            )
         }
     }
 
@@ -248,6 +249,7 @@ object SynlyEngine {
     }
 
     private fun handleEvent(event: FfiClientEvent) {
+        if (handle == null && currentTarget == null) return
         when (event) {
             is FfiClientEvent.StateChanged -> {
                 _uiState.update { it.copy(state = event.state) }

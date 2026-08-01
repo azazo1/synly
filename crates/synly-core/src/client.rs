@@ -151,6 +151,7 @@ impl ClientHandle {
     }
 
     pub async fn stop_and_wait(&self) -> Result<()> {
+        self.cancellation.cancel();
         if self.send(ClientCommand::Stop).is_err() {
             return Ok(());
         }

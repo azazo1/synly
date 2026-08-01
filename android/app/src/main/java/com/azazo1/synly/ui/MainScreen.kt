@@ -124,13 +124,20 @@ private fun HomeScreen(onOpenSettings: () -> Unit, onOpenLogs: () -> Unit) {
                 }
             }
 
-            item { StatusCard(uiState.state, uiState.targetLabel) }
-
-            if (uiState.state != null) {
-                item {
+            item {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    StatusCard(
+                        state = uiState.state,
+                        targetLabel = uiState.targetLabel,
+                        modifier = Modifier.weight(1f),
+                    )
                     Button(
                         onClick = { SynlyEngine.disconnect(context) },
-                        modifier = Modifier.fillMaxWidth(),
+                        enabled = uiState.state != null,
                     ) {
                         Text("断开连接")
                     }
@@ -378,7 +385,11 @@ private fun isIgnoringBatteryOptimizations(context: Context): Boolean {
 }
 
 @Composable
-private fun StatusCard(state: FfiClientState?, targetLabel: String?) {
+private fun StatusCard(
+    state: FfiClientState?,
+    targetLabel: String?,
+    modifier: Modifier = Modifier,
+) {
     val label = when (state) {
         FfiClientState.CONNECTING -> targetLabel?.let { "连接 $it 中" } ?: "连接中"
         FfiClientState.PAIRING -> "配对中"
@@ -386,7 +397,7 @@ private fun StatusCard(state: FfiClientState?, targetLabel: String?) {
         FfiClientState.RECONNECTING -> targetLabel?.let { "重连 $it 中" } ?: "重连中"
         null -> "未连接"
     }
-    Card {
+    Card(modifier = modifier) {
         Column(Modifier.padding(16.dp)) {
             Text(label, style = MaterialTheme.typography.titleMedium)
         }
