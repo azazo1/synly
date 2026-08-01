@@ -53,72 +53,9 @@ fn main() {
 fn emit_build_version() {
     println!(
         "cargo:rustc-env=SYNLY_BUILD_VERSION={}",
-        build_version_string()
+        synly_build_version::build_version_string()
     );
-    if Path::new(".git").exists() {
-        println!("cargo:rerun-if-changed=.git/HEAD");
-        println!("cargo:rerun-if-changed=.git/index");
-        println!("cargo:rerun-if-changed=.git/refs");
-    }
-}
-
-fn build_version_string() -> String {
-    let fallback = env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "unknown".to_string());
-    let Some(describe) = git_output(&["describe", "--tags", "--always", "--abbrev=6"]) else {
-        return fallback;
-    };
-    let dirty = git_is_dirty();
-    let separator = if dirty { "^" } else { "-" };
-
-    if let Some((base, hash)) = split_describe_offset(&describe) {
-        return format!("{base}{separator}{hash}");
-    }
-
-    if is_hex_hash(&describe) {
-        let hash = &describe[..describe.len().min(6)];
-        return format!("{fallback}{separator}{hash}");
-    }
-
-    if dirty
-        && let Some(head) = git_output(&["rev-parse", "--short=6", "HEAD"])
-    {
-        return format!("{describe}^{head}");
-    }
-    describe
-}
-
-/// 从 git describe 输出解析非 tag 描述, 形如 <tag>-<N>-g<hash>.
-fn split_describe_offset(describe: &str) -> Option<(&str, &str)> {
-    let (before, hash) = describe.rsplit_once("-g")?;
-    if hash.len() < 6 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
-        return None;
-    }
-    let (base, count) = before.rsplit_once('-')?;
-    if count.is_empty() || !count.chars().all(|c| c.is_ascii_digit()) {
-        return None;
-    }
-    Some((base, hash))
-}
-
-fn is_hex_hash(value: &str) -> bool {
-    value.len() >= 6 && value.chars().all(|c| c.is_ascii_hexdigit())
-}
-
-fn git_is_dirty() -> bool {
-    match Command::new("git").args(["status", "--porcelain"]).output() {
-        Ok(output) => !output.stdout.is_empty(),
-        Err(_) => false,
-    }
-}
-
-fn git_output(args: &[&str]) -> Option<String> {
-    let output = Command::new("git").args(args).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8(output.stdout)
-        .ok()
-        .map(|value| value.trim().to_string())
+    synly_build_version::emit_git_rerun_if_changed();
 }
 
 #[cfg(windows)]

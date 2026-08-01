@@ -11,12 +11,19 @@ import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
 import android.os.SystemClock
-import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.azazo1.synly.MainActivity
 import com.azazo1.synly.R
 import com.azazo1.synly.core.SynlyEngine
+import com.azazo1.synly.core.SynlyLog
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import uniffi.synly_core.FfiClientState
 
 class ClipboardSyncService : android.app.Service() {
     companion object {
@@ -41,6 +48,11 @@ class ClipboardSyncService : android.app.Service() {
 
     private var lastReadTriggerMs = 0L
 
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private var notificationJob: Job? = null
+    private var lastNotificationState: FfiClientState? = null
+    private var lastNotificationDevice: String? = null
+
     private val clipboardListener = ClipboardManager.OnPrimaryClipChangedListener {
         maybeReadClipboard()
     }
@@ -51,12 +63,26 @@ class ClipboardSyncService : android.app.Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        startForeground(NOTIFICATION_ID, buildNotification())
+        startForeground(NOTIFICATION_ID, buildNotification(null, null))
         acquireMulticastLock()
         getSystemService(ClipboardManager::class.java)
             .addPrimaryClipChangedListener(clipboardListener)
         SynlyEngine.init(applicationContext)
         SynlyEngine.start(applicationContext)
+        if (notificationJob == null) {
+            notificationJob = scope.launch {
+                SynlyEngine.uiState.collect { ui ->
+                    val state = ui.state
+                    val device = ui.connectedDevice
+                    if (state != lastNotificationState || device != lastNotificationDevice) {
+                        lastNotificationState = state
+                        lastNotificationDevice = device
+                        getSystemService(NotificationManager::class.java)
+                            .notify(NOTIFICATION_ID, buildNotification(state, device))
+                    }
+                }
+            }
+        }
         return START_STICKY
     }
 
@@ -64,6 +90,9 @@ class ClipboardSyncService : android.app.Service() {
         getSystemService(ClipboardManager::class.java)
             .removePrimaryClipChangedListener(clipboardListener)
         releaseMulticastLock()
+        notificationJob?.cancel()
+        notificationJob = null
+        scope.cancel()
         SynlyEngine.stop()
         super.onDestroy()
     }
@@ -81,17 +110,29 @@ class ClipboardSyncService : android.app.Service() {
         manager.createNotificationChannel(channel)
     }
 
-    private fun buildNotification(): Notification {
+    private fun buildNotification(
+        state: FfiClientState?,
+        connectedDevice: String?,
+    ): Notification {
         val pending = PendingIntent.getActivity(
             this,
             0,
             Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE,
         )
+        val statusText = when (state) {
+            FfiClientState.CONNECTING -> getString(R.string.sync_notification_connecting)
+            FfiClientState.PAIRING -> getString(R.string.sync_notification_pairing)
+            FfiClientState.CONNECTED ->
+                getString(R.string.sync_notification_connected, connectedDevice.orEmpty())
+
+            FfiClientState.RECONNECTING -> getString(R.string.sync_notification_reconnecting)
+            null -> getString(R.string.sync_notification_disconnected)
+        }
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(getString(R.string.sync_notification_title))
-            .setContentText(getString(R.string.sync_notification_text))
+            .setContentText(statusText)
             .setContentIntent(pending)
             .setOngoing(true)
             .build()
@@ -122,7 +163,7 @@ class ClipboardSyncService : android.app.Service() {
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
             )
         }.onFailure {
-            Log.w(TAG, "启动剪贴板读取界面失败, 请检查悬浮窗权限", it)
+            SynlyLog.w(TAG, "启动剪贴板读取界面失败, 请检查悬浮窗权限", it)
         }
     }
 

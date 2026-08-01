@@ -64,15 +64,21 @@ import uniffi.synly_core.FfiDiscoveredPeer
 @Composable
 fun MainScreen() {
     var showSettings by remember { mutableStateOf(false) }
+    var showLogs by remember { mutableStateOf(false) }
     if (showSettings) {
         SettingsScreen(onBack = { showSettings = false })
+    } else if (showLogs) {
+        LogsScreen(onBack = { showLogs = false })
     } else {
-        HomeScreen(onOpenSettings = { showSettings = true })
+        HomeScreen(
+            onOpenSettings = { showSettings = true },
+            onOpenLogs = { showLogs = true },
+        )
     }
 }
 
 @Composable
-private fun HomeScreen(onOpenSettings: () -> Unit) {
+private fun HomeScreen(onOpenSettings: () -> Unit, onOpenLogs: () -> Unit) {
     val context = LocalContext.current
     val uiState by SynlyEngine.uiState.collectAsStateWithLifecycle()
     var peers by remember { mutableStateOf<List<FfiDiscoveredPeer>>(emptyList()) }
@@ -109,6 +115,9 @@ private fun HomeScreen(onOpenSettings: () -> Unit) {
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Text("Synly", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.weight(1f))
+                    TextButton(onClick = onOpenLogs) {
+                        Text("日志")
+                    }
                     TextButton(onClick = onOpenSettings) {
                         Text("设置")
                     }

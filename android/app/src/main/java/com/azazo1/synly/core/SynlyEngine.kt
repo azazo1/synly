@@ -41,6 +41,8 @@ object SynlyEngine {
     private val _uiState = MutableStateFlow(SynlyUiState())
     val uiState: StateFlow<SynlyUiState> = _uiState
 
+    val logs: StateFlow<List<LogEntry>> = SynlyLog.entries
+
     private val logListener = object : FfiLogListener {
         override fun log(level: String, target: String, message: String) {
             val priority = when (level.lowercase()) {
@@ -51,6 +53,7 @@ object SynlyEngine {
                 else -> Log.INFO
             }
             Log.println(priority, "$TAG/$target", message)
+            SynlyLog.append(level, "$TAG/$target", message)
         }
     }
 
@@ -65,7 +68,7 @@ object SynlyEngine {
         synchronized(this) {
             if (initialized) return
             runCatching { initTracing(logListener) }
-                .onFailure { Log.w(TAG, "初始化 tracing 失败", it) }
+                .onFailure { SynlyLog.w(TAG, "初始化 tracing 失败", it) }
             initialized = true
         }
     }
@@ -73,11 +76,11 @@ object SynlyEngine {
     fun start(context: Context) {
         val settings = SettingsStore.load(context)
         val target = settings.lastTarget ?: run {
-            Log.i(TAG, "尚无目标设备, 等待用户连接")
+            SynlyLog.i(TAG, "尚无目标设备, 等待用户连接")
             return
         }
         if (target == currentTarget && handle != null) {
-            Log.i(TAG, "目标设备未变化, 忽略重复连接请求")
+            SynlyLog.i(TAG, "目标设备未变化, 忽略重复连接请求")
             return
         }
         scope.launch { startInternal(context) }
@@ -127,9 +130,9 @@ object SynlyEngine {
             handle?.stop()
             handle = startClient(config, ffiTarget, listener)
             currentTarget = target
-            Log.i(TAG, "客户端已启动: ${target.addresses.joinToString()}:${target.port}")
+            SynlyLog.i(TAG, "客户端已启动: ${target.addresses.joinToString()}:${target.port}")
         }.onFailure { error ->
-            Log.e(TAG, "启动客户端失败", error)
+            SynlyLog.e(TAG, "启动客户端失败", error)
             _uiState.update { it.copy(lastMessage = error.message ?: "启动客户端失败") }
         }
     }
@@ -153,7 +156,7 @@ object SynlyEngine {
 
     fun submitPin(pin: String) {
         runCatching { handle?.submitPin(pin) }
-            .onFailure { Log.e(TAG, "提交 PIN 失败", it) }
+            .onFailure { SynlyLog.e(TAG, "提交 PIN 失败", it) }
     }
 
     fun cancelPin() {
@@ -162,14 +165,14 @@ object SynlyEngine {
 
     fun setClipboardMode(mode: FfiClipboardMode) {
         runCatching { handle?.setClipboardMode(mode) }
-            .onFailure { Log.e(TAG, "更新剪贴板模式失败", it) }
+            .onFailure { SynlyLog.e(TAG, "更新剪贴板模式失败", it) }
     }
 
     fun sendClipboard(payload: ClipboardPayload) {
         if (payload.isEmpty()) return
         runCatching {
             handle?.sendClipboard(payload.text, payload.html, payload.imagePng)
-        }.onFailure { Log.e(TAG, "发送剪贴板失败", it) }
+        }.onFailure { SynlyLog.e(TAG, "发送剪贴板失败", it) }
     }
 
     fun canSend(): Boolean = _uiState.value.canSend
@@ -185,8 +188,11 @@ object SynlyEngine {
     fun refreshTrustedDevices(context: Context) {
         runCatching {
             handle?.updateTrustedDevices(TrustedDeviceStore.list(context))
-        }.onFailure { Log.e(TAG, "更新可信设备失败", it) }
+        }.onFailure { SynlyLog.e(TAG, "更新可信设备失败", it) }
     }
+
+    fun buildVersion(): String =
+        runCatching { uniffi.synly_core.buildVersion() }.getOrDefault("unknown")
 
     fun browseDevices(context: Context, timeoutMs: Long): List<FfiDiscoveredPeer> {
         val settings = SettingsStore.load(context)

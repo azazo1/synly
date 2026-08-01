@@ -1,4 +1,15 @@
+param(
+    [string]$GradleTask = '',
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$GradleArgs
+)
+
 $ErrorActionPreference = 'Stop'
+
+if (-not $GradleTask) {
+    Write-Error '用法: android-gradle.ps1 <GradleTask> [gradle args...]'
+    exit 1
+}
 
 function Resolve-JavaHome {
     if ($env:JAVA_HOME -and (Test-Path (Join-Path $env:JAVA_HOME 'bin\java.exe'))) {
@@ -44,5 +55,5 @@ if (-not $env:ANDROID_HOME -or -not (Test-Path $env:ANDROID_HOME)) {
     throw 'ANDROID_HOME 未设置, 且未在默认位置找到 Android SDK'
 }
 
-Set-Location android
-.\gradlew.bat assembleDebug
+Set-Location (Join-Path $PSScriptRoot '..\android')
+.\gradlew.bat $GradleTask @GradleArgs

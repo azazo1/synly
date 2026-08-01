@@ -1,7 +1,21 @@
+import groovy.json.JsonSlurper
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.android)
     alias(libs.plugins.kotlin.compose)
+}
+
+val synlyVersion: String = runCatching {
+    val metadata = providers.exec {
+        commandLine("cargo", "metadata", "--locked", "--no-deps", "--format-version", "1")
+    }.standardOutput.asText.get()
+    val root = JsonSlurper().parseText(metadata) as Map<*, *>
+    val packages = root["packages"] as List<*>
+    val pkg = packages.first { (it as Map<*, *>)["name"] == "synly" } as Map<*, *>
+    pkg["version"] as String
+}.getOrElse { error ->
+    throw GradleException("无法读取 synly 版本, 请确认已安装 Rust 工具链且 cargo 在 PATH 中", error)
 }
 
 android {
@@ -13,7 +27,7 @@ android {
         minSdk = 29
         targetSdk = 36
         versionCode = 1
-        versionName = "0.1.0"
+        versionName = synlyVersion
         ndk {
             abiFilters += listOf("arm64-v8a")
         }

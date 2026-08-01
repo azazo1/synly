@@ -43,6 +43,20 @@ dist: build
 install:
     cargo install --path .
 
+# just gradlew testDebugUnitTest
+# 自动发现 JDK 与 Android SDK 后运行指定 Gradle 任务, 参数原样透传.
+[windows]
+gradlew *args:
+    powershell -NoProfile -ExecutionPolicy Bypass -File scripts/android-gradle.ps1 {{ args }}
+
+[linux]
+gradlew *args:
+    bash scripts/android-gradle.sh {{ args }}
+
+[macos]
+gradlew *args:
+    bash scripts/android-gradle.sh {{ args }}
+
 # just input-screen-mock --edge right
 # 使用 Slint 虚拟屏幕验证当前平台的输入捕获和返回.
 input-screen-mock *args:
@@ -73,12 +87,12 @@ android-core:
 # 构建 Android debug APK, 自动先构建核心库.
 [windows]
 android-build: android-core
-    powershell -NoProfile -ExecutionPolicy Bypass -File scripts/android-build-apk.ps1
+    powershell -NoProfile -ExecutionPolicy Bypass -File scripts/android-gradle.ps1 assembleDebug
 
 [linux]
 android-build: android-core
-    bash scripts/android-build-apk.sh
+    bash scripts/android-gradle.sh assembleDebug
 
 [macos]
 android-build: android-core
-    bash scripts/android-build-apk.sh
+    bash scripts/android-gradle.sh assembleDebug

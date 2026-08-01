@@ -682,6 +682,8 @@ internal object IntegrityCheckingUniffiLib {
     }
     external fun uniffi_synly_core_checksum_func_browse_devices(
     ): Int
+    external fun uniffi_synly_core_checksum_func_build_version(
+    ): Int
     external fun uniffi_synly_core_checksum_func_generate_device_config(
     ): Int
     external fun uniffi_synly_core_checksum_func_init_tracing(
@@ -751,6 +753,8 @@ internal object UniffiLib {
     external fun uniffi_synly_core_fn_init_callback_vtable_ffiloglistener(`vtable`: UniffiVTableCallbackInterfaceFfiLogListener,
     ): Unit
     external fun uniffi_synly_core_fn_func_browse_devices(`config`: RustBuffer.ByValue,`timeoutMs`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
+    external fun uniffi_synly_core_fn_func_build_version(uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_synly_core_fn_func_generate_device_config(`deviceName`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
@@ -880,6 +884,9 @@ private fun uniffiCheckContractApiVersion(lib: IntegrityCheckingUniffiLib) {
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_synly_core_checksum_func_browse_devices() != 31689) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_synly_core_checksum_func_build_version() != 14128) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_synly_core_checksum_func_generate_device_config() != 469) {
@@ -2712,6 +2719,19 @@ public object FfiConverterSequenceTypeFfiTrustedDeviceConfig: FfiConverterRustBu
     UniffiLib.uniffi_synly_core_fn_func_browse_devices(
     
         FfiConverterTypeFfiDiscoveryConfig.lower(`config`),FfiConverterULong.lower(`timeoutMs`),_status)
+}
+    )
+    }
+    
+
+        /**
+         * 当前构建版本号, 由 build.rs 根据最近版本 tag 与工作区状态自动生成.
+         */ fun `buildVersion`(): kotlin.String {
+            return FfiConverterString.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_synly_core_fn_func_build_version(
+    
+        _status)
 }
     )
     }

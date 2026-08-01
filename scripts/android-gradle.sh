@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ $# -lt 1 ]]; then
+    echo "用法: android-gradle.sh <GradleTask> [gradle args...]" >&2
+    exit 1
+fi
+gradle_task="$1"
+shift
+
 resolve_java_home() {
     if [[ -n "${JAVA_HOME:-}" && -x "$JAVA_HOME/bin/java" ]]; then
         major="$( "$JAVA_HOME/bin/java" -version 2>&1 | head -n 1 | sed -E 's/.*version "([0-9]+).*/\1/' )"
@@ -40,5 +47,5 @@ if [[ -z "${ANDROID_HOME:-}" || ! -d "$ANDROID_HOME" ]]; then
     exit 1
 fi
 
-cd android
-./gradlew assembleDebug
+cd "$(dirname "$0")/../android"
+./gradlew "$gradle_task" "$@"

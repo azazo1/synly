@@ -6616,6 +6616,7 @@ dependencies = [
  "slint-build",
  "socket2",
  "spake2",
+ "synly-build-version",
  "synly-core",
  "tokio",
  "tokio-rustls",
@@ -6632,6 +6633,10 @@ dependencies = [
  "winresource",
  "x509-parser",
 ]
+
+[[package]]
+name = "synly-build-version"
+version = "0.2.0"
 
 [[package]]
 name = "synly-core"
@@ -6654,6 +6659,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "spake2",
+ "synly-build-version",
  "tokio",
  "tokio-rustls",
  "tokio-util",

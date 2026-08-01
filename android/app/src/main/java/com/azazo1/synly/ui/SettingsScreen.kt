@@ -194,6 +194,18 @@ fun SettingsScreen(onBack: () -> Unit) {
                     }
                 }
             }
+
+            item {
+                Card {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("关于", style = MaterialTheme.typography.titleSmall)
+                        Text(
+                            "Synly ${SynlyEngine.buildVersion()}",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                }
+            }
         }
     }
 }
