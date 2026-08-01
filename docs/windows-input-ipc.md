@@ -13,6 +13,7 @@ Windows 输入代理原先在 Tokio named pipe 上进行持续双向读写. 在�
 - 阻塞 I/O 使用 OVERLAPPED event 等待, 超时和关闭使用 `CancelIoEx`.
 - 可靠请求采用有界队列, 每次只允许一个请求在途, 完整写入后只启动一个响应期限.
 - cursor 和 Motion 使用 latest-value 合并, button 和 wheel 之前先写出最新 cursor.
+- 游戏光标模式的相对增量 `InjectMotion` 作为普通命令进入同一 FIFO 命令队列, 与 button/wheel 天然保序, 不参与 latest-value 合并.
 - agent backend 不再直接接触 pipe, 只通过内存队列与 command reader 和 event writer 交互.
 
 ## 行为保证

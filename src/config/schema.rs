@@ -1,4 +1,4 @@
-use crate::input::{InputMode, KeyMappingConfig, ScreenEdge};
+use crate::input::{CursorMode, InputMode, KeyMappingConfig, ScreenEdge};
 use crate::path_expand::expand_config_path_string;
 use crate::protocol::TransferLimits;
 use crate::settings::{
@@ -63,6 +63,10 @@ pub struct InputConfig {
     #[serde(default)]
     pub block_switch_on_press: bool,
     pub key_mapping: KeyMappingConfig,
+    #[serde(default)]
+    pub cursor_mode: CursorMode,
+    #[serde(default)]
+    pub auto_game_cursor: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -111,6 +115,8 @@ impl Default for InputConfig {
             reverse_trackpad: false,
             block_switch_on_press: false,
             key_mapping: KeyMappingConfig::default(),
+            cursor_mode: CursorMode::default(),
+            auto_game_cursor: false,
         }
     }
 }

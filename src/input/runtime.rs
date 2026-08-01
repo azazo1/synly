@@ -6,6 +6,7 @@ use super::{
     Hotkey, InputMode, InputPlatform, KeyMappingConfig, KeySnapshot, LocalInputRole, ScreenEdge,
 };
 use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -22,6 +23,7 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(250);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(1);
 const ACTIVATION_TIMEOUT: Duration = Duration::from_secs(5);
 const RETURN_COOLDOWN: Duration = Duration::from_millis(300);
+const GAME_MODE_POLL: Duration = Duration::from_millis(500);
 const EDGE_INSET: i32 = 8;
 const JUMP_ZONE_SIZE: i32 = 1;
 const OVERFLOW_POLL: Duration = Duration::from_millis(50);
@@ -38,6 +40,29 @@ pub struct InputRuntimeOptions {
     pub reverse_trackpad: bool,
     pub block_switch_on_press: bool,
     pub key_mapping: KeyMappingConfig,
+    pub cursor_mode: CursorMode,
+    pub auto_game_cursor: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CursorMode {
+    #[default]
+    Desktop,
+    Game,
+}
+
+impl CursorMode {
+    pub fn is_game(self) -> bool {
+        matches!(self, Self::Game)
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Desktop => "桌面光标",
+            Self::Game => "游戏光标",
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -243,6 +268,8 @@ async fn run_established(
                 &tx,
                 platform,
                 local_layout,
+                options,
+                platform::foreground_cursor_captured,
             )
             .await
         }
@@ -848,11 +875,15 @@ pub(super) async fn run_receiver(
     tx: &mpsc::Sender<InputMessage>,
     platform: &mut platform::PlatformHandle,
     local_layout: super::DesktopLayout,
+    options: &InputRuntimeOptions,
+    foreground_captured: impl Fn() -> bool,
 ) -> Result<()> {
     let mut generation = 0u64;
     let mut active = false;
     let mut return_edge = ScreenEdge::Left;
     let mut cursor = None;
+    let mut cursor_mode_active =
+        options.cursor_mode.is_game() || (options.auto_game_cursor && foreground_captured());
     let mut last_heartbeat = Instant::now();
     let mut timeout_tick = time::interval(HEARTBEAT_INTERVAL);
     timeout_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -861,6 +892,8 @@ pub(super) async fn run_receiver(
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut motion_tick = time::interval(MOTION_INTERVAL);
     motion_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut monitor_tick = time::interval(GAME_MODE_POLL);
+    monitor_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -879,6 +912,29 @@ pub(super) async fn run_receiver(
                 if platform.overflowed.load(std::sync::atomic::Ordering::Acquire) {
                     let _ = platform.backend.release_all();
                     bail!("本机输入可靠事件队列已满, 已停止远程控制");
+                }
+            }
+            _ = monitor_tick.tick() => {
+                if !options.auto_game_cursor {
+                    continue;
+                }
+                let captured = foreground_captured();
+                let game = options.cursor_mode.is_game() || captured;
+                if game == cursor_mode_active {
+                    continue;
+                }
+                cursor_mode_active = game;
+                tracing::info!(
+                    game,
+                    foreground_cursor_captured = captured,
+                    "前台光标捕获状态变化, 游戏光标模式已切换"
+                );
+                if !game && active {
+                    platform.backend.release_all()?;
+                    active = false;
+                    cursor = None;
+                    enqueue_message(tx, InputMessage::Deactivate { generation })?;
+                    tracing::info!(generation, "前台光标捕获状态结束, 已自动释放远端控制");
                 }
             }
             message = incoming.recv() => {
@@ -930,7 +986,9 @@ pub(super) async fn run_receiver(
                     }
                     InputMessage::Motion { generation: incoming_generation, dx, dy }
                         if active && incoming_generation == generation => {
-                            if let Some(edge_position) = apply_receiver_motion(
+                            if cursor_mode_active {
+                                platform.backend.inject_motion(dx, dy)?;
+                            } else if let Some(edge_position) = apply_receiver_motion(
                                 &*platform.backend,
                                 &local_layout,
                                 return_edge,
@@ -950,16 +1008,19 @@ pub(super) async fn run_receiver(
                 if let Some(motion) = incoming_motion.take()
                     && active
                     && motion.generation == generation
-                    && let Some(edge_position) = apply_receiver_motion(
+                {
+                    if cursor_mode_active {
+                        platform.backend.inject_motion(motion.dx, motion.dy)?;
+                    } else if let Some(edge_position) = apply_receiver_motion(
                         &*platform.backend,
                         &local_layout,
                         return_edge,
                         &mut cursor,
                         motion.dx,
                         motion.dy,
-                    )?
-                {
-                    enqueue_message(tx, InputMessage::ReturnRequest { generation, edge_position })?;
+                    )? {
+                        enqueue_message(tx, InputMessage::ReturnRequest { generation, edge_position })?;
+                    }
                 }
             }
             Some(event) = platform.events.recv() => {
@@ -1083,6 +1144,7 @@ mod tests {
     };
     use anyhow::Result;
     use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
     use tokio::sync::mpsc;
     use tokio::io::AsyncWriteExt;
@@ -1094,6 +1156,7 @@ mod tests {
         warped: Mutex<Option<Point>>,
         recovery_actions: Mutex<Vec<&'static str>>,
         pressed: Mutex<Option<KeySnapshot>>,
+        motions: Mutex<Vec<(i32, i32)>>,
     }
 
     impl InputBackend for FakeBackend {
@@ -1141,11 +1204,17 @@ mod tests {
             Ok(())
         }
 
+        fn inject_motion(&self, dx: i32, dy: i32) -> Result<()> {
+            self.motions.lock().unwrap().push((dx, dy));
+            Ok(())
+        }
+
         fn inject_wheel(&self, _x: i32, _y: i32) -> Result<()> {
             Ok(())
         }
 
         fn release_all(&self) -> Result<()> {
+            self.recovery_actions.lock().unwrap().push("release");
             Ok(())
         }
     }
@@ -1448,6 +1517,8 @@ mod tests {
             reverse_trackpad: false,
             block_switch_on_press: false,
             key_mapping: KeyMappingConfig::default(),
+            cursor_mode: super::CursorMode::Desktop,
+            auto_game_cursor: false,
         }
     }
 
@@ -1512,6 +1583,8 @@ mod tests {
                 &outgoing,
                 &mut platform,
                 layout,
+                &test_input_options(ScreenEdge::Left),
+                || false,
             )
             .await
         });
@@ -1570,6 +1643,8 @@ mod tests {
                 &outgoing,
                 &mut platform,
                 layout,
+                &test_input_options(ScreenEdge::Left),
+                || false,
             )
             .await
         });
@@ -1648,6 +1723,164 @@ mod tests {
         })
         .await;
         assert!(released.is_err(), "返回后应停止接受控制");
+
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn receiver_game_mode_injects_relative_motion_without_edge_return() {
+        let backend = Arc::new(FakeBackend::default());
+        let layout = backend.layout().unwrap();
+        let motion = Arc::new(MotionAccumulator::default());
+        let (_events_tx, events) = mpsc::channel(1);
+        let mut platform = PlatformHandle {
+            backend: Arc::clone(&backend) as Arc<dyn InputBackend>,
+            events,
+            motion,
+            overflowed: Arc::new(AtomicBool::new(false)),
+            failed: Arc::new(AtomicBool::new(false)),
+        };
+        let (incoming_tx, mut incoming) = mpsc::channel(256);
+        let incoming_motion = Arc::new(IncomingMotion::default());
+        let (outgoing, mut messages) = mpsc::channel(16);
+        let mut options = test_input_options(ScreenEdge::Left);
+        options.cursor_mode = super::CursorMode::Game;
+        incoming_tx
+            .send(Ok(InputMessage::Activate {
+                generation: 7,
+                source_edge: ScreenEdge::Right,
+                edge_position: 0.5,
+                pressed: KeySnapshot {
+                    usages: Vec::new(),
+                    modifiers: ModifierMask::default(),
+                    buttons: Vec::new(),
+                },
+            }))
+            .await
+            .unwrap();
+
+        let incoming_motion_for_task = Arc::clone(&incoming_motion);
+        let task = tokio::spawn(async move {
+            run_receiver(
+                &mut incoming,
+                &incoming_motion_for_task,
+                &outgoing,
+                &mut platform,
+                layout,
+                &options,
+                || false,
+            )
+            .await
+        });
+
+        // 游戏模式下连续运动应直接相对注入, 不维护绝对光标, 也不产生边缘返回请求.
+        for _ in 0..500 {
+            incoming_motion.push(7, -3, 2);
+        }
+        let no_return = timeout(Duration::from_millis(300), async {
+            loop {
+                match messages.recv().await {
+                    Some(InputMessage::ReturnRequest { .. }) => {
+                        panic!("游戏模式不应请求边缘返回")
+                    }
+                    Some(_) => {}
+                    None => panic!("接收端不应提前停止"),
+                }
+            }
+        })
+        .await;
+        assert!(no_return.is_err(), "游戏模式应持续接受控制");
+        assert!(
+            !backend.motions.lock().unwrap().is_empty(),
+            "游戏模式应注入相对移动"
+        );
+
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn receiver_auto_releases_when_cursor_capture_lost() {
+        let backend = Arc::new(FakeBackend::default());
+        let layout = backend.layout().unwrap();
+        let motion = Arc::new(MotionAccumulator::default());
+        let (_events_tx, events) = mpsc::channel(1);
+        let mut platform = PlatformHandle {
+            backend: Arc::clone(&backend) as Arc<dyn InputBackend>,
+            events,
+            motion,
+            overflowed: Arc::new(AtomicBool::new(false)),
+            failed: Arc::new(AtomicBool::new(false)),
+        };
+        let (incoming_tx, mut incoming) = mpsc::channel(256);
+        let incoming_motion = Arc::new(IncomingMotion::default());
+        let (outgoing, mut messages) = mpsc::channel(16);
+        let mut options = test_input_options(ScreenEdge::Left);
+        options.auto_game_cursor = true;
+        let captured = Arc::new(AtomicBool::new(true));
+        incoming_tx
+            .send(Ok(InputMessage::Activate {
+                generation: 7,
+                source_edge: ScreenEdge::Right,
+                edge_position: 0.5,
+                pressed: KeySnapshot {
+                    usages: Vec::new(),
+                    modifiers: ModifierMask::default(),
+                    buttons: Vec::new(),
+                },
+            }))
+            .await
+            .unwrap();
+
+        let captured_for_task = Arc::clone(&captured);
+        let task = tokio::spawn(async move {
+            run_receiver(
+                &mut incoming,
+                &incoming_motion,
+                &outgoing,
+                &mut platform,
+                layout,
+                &options,
+                move || captured_for_task.load(Ordering::Acquire),
+            )
+            .await
+        });
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if matches!(
+                    messages.recv().await,
+                    Some(InputMessage::Heartbeat { generation: 7 })
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("接收端应确认激活");
+
+        // 前台光标捕获状态结束: 自动释放并通知发送端.
+        captured.store(false, Ordering::Release);
+        timeout(Duration::from_secs(2), async {
+            loop {
+                match messages.recv().await {
+                    Some(InputMessage::Deactivate { generation: 7 }) => break,
+                    Some(_) => {}
+                    None => panic!("接收端不应提前停止"),
+                }
+            }
+        })
+        .await
+        .expect("捕获状态结束后应发送 Deactivate");
+        assert!(
+            backend
+                .recovery_actions
+                .lock()
+                .unwrap()
+                .contains(&"release"),
+            "自动释放应调用 release_all"
+        );
 
         task.abort();
         let _ = task.await;

@@ -2118,6 +2118,8 @@ fn input_task_restart_required(
         || previous.reverse_trackpad != next.reverse_trackpad
         || previous.block_switch_on_press != next.block_switch_on_press
         || previous.key_mapping != next.key_mapping
+        || previous.cursor_mode != next.cursor_mode
+        || previous.auto_game_cursor != next.auto_game_cursor
         || previous_backend_generation != next_backend_generation
 }
 
@@ -4704,6 +4706,8 @@ mod tests {
             reverse_trackpad: false,
             block_switch_on_press: false,
             key_mapping: crate::input::KeyMappingConfig::default(),
+            cursor_mode: crate::input::CursorMode::Desktop,
+            auto_game_cursor: false,
         };
 
         assert!(!input_task_restart_required(&input, &input, 3, 3));
@@ -5432,6 +5436,8 @@ mod tests {
                     reverse_trackpad: false,
                     block_switch_on_press: false,
                     key_mapping: crate::input::KeyMappingConfig::default(),
+                    cursor_mode: crate::input::CursorMode::Desktop,
+                    auto_game_cursor: false,
                 },
                 clipboard: ClipboardRuntimeOptions {
                     max_file_bytes: 1,

@@ -1110,6 +1110,8 @@ mod tests {
                 reverse_trackpad: false,
                 block_switch_on_press: false,
                 key_mapping: crate::input::KeyMappingConfig::default(),
+                cursor_mode: crate::input::CursorMode::Desktop,
+                auto_game_cursor: false,
             },
             clipboard: crate::clipboard::ClipboardRuntimeOptions {
                 max_file_bytes: 1,

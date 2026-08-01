@@ -2,7 +2,8 @@ use super::platform;
 use super::protocol::InputMessage;
 use super::runtime;
 use super::{
-    DesktopLayout, Hotkey, InputMode, InputPlatform, KeySnapshot, ModifierMask, ScreenEdge,
+    CursorMode, DesktopLayout, Hotkey, InputMode, InputPlatform, InputRuntimeOptions,
+    KeyMappingConfig, KeySnapshot, ModifierMask, ScreenEdge,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -88,6 +89,17 @@ pub async fn run_receiver_mock(options: ReceiverMockOptions) -> Result<()> {
     });
     let (mut incoming, incoming_motion, finish, reader_task) = spawn_receiver_reader(reader);
     let mut finish = Box::pin(finish);
+    let input_options = InputRuntimeOptions {
+        mode: InputMode::Receive,
+        edge: ScreenEdge::Left,
+        hotkey: options.hotkey,
+        reverse_mouse_wheel: false,
+        reverse_trackpad: false,
+        block_switch_on_press: false,
+        key_mapping: KeyMappingConfig::default(),
+        cursor_mode: CursorMode::Desktop,
+        auto_game_cursor: false,
+    };
     let result = {
         let session = runtime::run_receiver(
             &mut incoming,
@@ -95,6 +107,8 @@ pub async fn run_receiver_mock(options: ReceiverMockOptions) -> Result<()> {
             &outgoing,
             &mut platform,
             local_layout,
+            &input_options,
+            platform::foreground_cursor_captured,
         );
         tokio::pin!(session);
         tokio::select! {

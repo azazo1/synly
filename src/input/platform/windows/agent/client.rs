@@ -400,6 +400,10 @@ impl InputBackend for AgentBackend {
         self.notify(AgentRequest::InjectCursor(point))
     }
 
+    fn inject_motion(&self, dx: i32, dy: i32) -> Result<()> {
+        self.notify(AgentRequest::InjectMotion { dx, dy })
+    }
+
     fn inject_wheel(&self, x: i32, y: i32) -> Result<()> {
         self.request(AgentRequest::InjectWheel { x, y })?;
         Ok(())

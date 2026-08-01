@@ -9,6 +9,10 @@ use std::sync::{Arc, Mutex};
 
 pub mod permissions;
 
+pub(super) fn foreground_cursor_captured() -> bool {
+    permissions::foreground_cursor_captured()
+}
+
 type CGEventRef = *mut c_void;
 type CGEventTapProxy = *mut c_void;
 type CFMachPortRef = *mut c_void;
@@ -666,6 +670,34 @@ impl InputBackend for MacBackend {
         let modifiers = current_modifiers(&self.state.injected_pressed.lock().unwrap());
         post_event(event, flags_from_modifiers(modifiers))?;
         *self.state.injected_cursor.lock().unwrap() = Some(point);
+        Ok(())
+    }
+
+    fn inject_motion(&self, dx: i32, dy: i32) -> Result<()> {
+        if dx == 0 && dy == 0 {
+            return Ok(());
+        }
+        let point = match *self.state.injected_cursor.lock().unwrap() {
+            Some(point) => point,
+            None => self.cursor_position()?,
+        };
+        let event = unsafe {
+            CGEventCreateMouseEvent(
+                ptr::null(),
+                EVENT_MOUSE_MOVED,
+                CGPoint { x: point.x as f64, y: point.y as f64 },
+                0,
+            )
+        };
+        if event.is_null() {
+            bail!("无法创建 macOS 相对鼠标移动事件");
+        }
+        unsafe {
+            CGEventSetIntegerValueField(event, FIELD_MOUSE_DELTA_X, i64::from(dx));
+            CGEventSetIntegerValueField(event, FIELD_MOUSE_DELTA_Y, i64::from(dy));
+        }
+        let modifiers = current_modifiers(&self.state.injected_pressed.lock().unwrap());
+        post_event(event, flags_from_modifiers(modifiers))?;
         Ok(())
     }
 

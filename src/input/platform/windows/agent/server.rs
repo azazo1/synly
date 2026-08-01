@@ -486,6 +486,10 @@ async fn handle_agent_request(
             agent_backend(runtime)?.inject_cursor(point)?;
             Ok(AgentResponse::Ok)
         }
+        AgentRequest::InjectMotion { dx, dy } => {
+            agent_backend(runtime)?.inject_motion(dx, dy)?;
+            Ok(AgentResponse::Ok)
+        }
         AgentRequest::InjectWheel { x, y } => {
             agent_backend(runtime)?.inject_wheel(x, y)?;
             Ok(AgentResponse::Ok)

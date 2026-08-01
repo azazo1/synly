@@ -72,6 +72,7 @@ const SM_CXVIRTUALSCREEN: i32 = 78;
 const SM_CYVIRTUALSCREEN: i32 = 79;
 const SM_CXCURSOR: i32 = 13;
 const SM_CYCURSOR: i32 = 14;
+const CURSOR_SHOWING: u32 = 0x0001;
 const VK_CONTROL: i32 = 0x11;
 const VK_SHIFT: i32 = 0x10;
 const VK_MENU: i32 = 0x12;
@@ -94,6 +95,7 @@ const SMTO_ABORTIFHUNG: u32 = 0x0002;
 const CAPTURE_MESSAGE_TIMEOUT_MS: u32 = 1_000;
 const DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2: isize = -4;
 const MONITORINFOF_PRIMARY: u32 = 0x00000001;
+const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -118,6 +120,15 @@ struct MonitorInfo {
     rc_monitor: RectRaw,
     rc_work: RectRaw,
     flags: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CursorInfo {
+    cb_size: u32,
+    flags: u32,
+    cursor: HCursor,
+    point: PointRaw,
 }
 
 #[derive(Clone, Copy)]
@@ -282,11 +293,23 @@ unsafe extern "system" {
         data: LParam,
     ) -> i32;
     fn GetMonitorInfoW(monitor: HMonitor, info: *mut MonitorInfo) -> i32;
+    fn GetForegroundWindow() -> HWnd;
+    fn GetWindowThreadProcessId(window: HWnd, process_id: *mut u32) -> u32;
+    fn GetClipCursor(rect: *mut RectRaw) -> i32;
+    fn GetCursorInfo(info: *mut CursorInfo) -> i32;
 }
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn GetModuleHandleW(module_name: *const u16) -> HInstance;
+    fn OpenProcess(access: u32, inherit: i32, process_id: u32) -> isize;
+    fn CloseHandle(handle: isize) -> i32;
+    fn QueryFullProcessImageNameW(
+        process: isize,
+        flags: u32,
+        buffer: *mut u16,
+        size: *mut u32,
+    ) -> i32;
 }
 
 struct WindowsState {
@@ -894,6 +917,13 @@ impl InputBackend for WindowsBackend {
         with_per_monitor_dpi(|| send_absolute_mouse(bounded))
     }
 
+    fn inject_motion(&self, dx: i32, dy: i32) -> Result<()> {
+        if dx == 0 && dy == 0 {
+            return Ok(());
+        }
+        send_mouse(dx, dy, 0, MOUSEEVENTF_MOVE)
+    }
+
     fn inject_wheel(&self, x: i32, y: i32) -> Result<()> {
         if y != 0 {
             send_mouse(
@@ -1264,6 +1294,67 @@ fn send_absolute_mouse(point: Point) -> Result<()> {
         0,
         MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
     )
+}
+
+pub(super) fn foreground_cursor_captured() -> bool {
+    let window = unsafe { GetForegroundWindow() };
+    if window == 0 || foreground_process_is_explorer(window) {
+        return false;
+    }
+    // ClipCursor 生效时返回的矩形会小于虚拟屏幕, 这是游戏锁定光标的直接信号.
+    let mut clip = RectRaw::default();
+    if unsafe { GetClipCursor(&mut clip) } != 0 {
+        let screen = virtual_screen_rect();
+        if clip.left != screen.left
+            || clip.top != screen.top
+            || clip.right != screen.right
+            || clip.bottom != screen.bottom
+        {
+            return true;
+        }
+    }
+    // 部分游戏只隐藏系统光标并读取相对移动(例如 MC 的 3D 光标), 不裁剪范围.
+    let mut info = CursorInfo {
+        cb_size: size_of::<CursorInfo>() as u32,
+        ..CursorInfo::default()
+    };
+    unsafe { GetCursorInfo(&mut info) } != 0 && info.flags & CURSOR_SHOWING == 0
+}
+
+fn virtual_screen_rect() -> RectRaw {
+    let x = unsafe { GetSystemMetrics(SM_XVIRTUALSCREEN) };
+    let y = unsafe { GetSystemMetrics(SM_YVIRTUALSCREEN) };
+    let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
+    let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
+    RectRaw {
+        left: x,
+        top: y,
+        right: x + width,
+        bottom: y + height,
+    }
+}
+
+fn foreground_process_is_explorer(window: HWnd) -> bool {
+    let mut process_id = 0u32;
+    unsafe { GetWindowThreadProcessId(window, &mut process_id) };
+    if process_id == 0 {
+        return false;
+    }
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
+    if handle == 0 {
+        return false;
+    }
+    let mut buffer = [0u16; 260];
+    let mut size = buffer.len() as u32;
+    let ok = unsafe { QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut size) };
+    unsafe { CloseHandle(handle) };
+    if ok == 0 {
+        return false;
+    }
+    let path = String::from_utf16_lossy(&buffer[..size as usize]);
+    path.rsplit('\\')
+        .next()
+        .is_some_and(|file| file.eq_ignore_ascii_case("explorer.exe"))
 }
 
 fn normalize_absolute_coordinate(coordinate: i32, origin: i32, extent: i32) -> i32 {

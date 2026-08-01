@@ -30,7 +30,7 @@ pub use hotkey::{Hotkey, ModifierMask};
 pub use mapping::{InputPlatform, KeyMappingConfig, validate_key_mapping};
 pub use protocol::KeySnapshot;
 pub use runtime::{
-    InputRuntimeOptions, InputSessionContext, InputSocketConnection, InputSocketInbox,
+    CursorMode, InputRuntimeOptions, InputSessionContext, InputSocketConnection, InputSocketInbox,
     run_input_session,
 };
 

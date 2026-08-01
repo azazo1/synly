@@ -3,7 +3,7 @@ use crate::config::{
     TransferConfig, UiConfig,
 };
 use crate::core::{AppCommand, AppSettings, AppSnapshot, AppSupervisor};
-use crate::input::{InputMode, ScreenEdge};
+use crate::input::{CursorMode, InputMode, ScreenEdge};
 use crate::runtime_control::{InteractionRequest, InteractionResponse};
 use crate::runtime_options::normalize_pin;
 use crate::settings::{
@@ -801,6 +801,8 @@ fn apply_settings_to_window(
     window.set_input_edge_index(input_edge_index(runtime.input.edge));
     window.set_input_hotkey(runtime.input.hotkey.clone().into());
     window.set_block_switch_on_press(runtime.input.block_switch_on_press);
+    window.set_game_cursor_mode(runtime.input.cursor_mode.is_game());
+    window.set_auto_game_cursor(runtime.input.auto_game_cursor);
     window.set_accept_untrusted(runtime.accept);
     window.set_trust_device(runtime.trust_device);
     window.set_trusted_only(runtime.trusted_only);
@@ -914,6 +916,12 @@ fn settings_from_window(
             reverse_trackpad: current_input.reverse_trackpad,
             block_switch_on_press: window.get_block_switch_on_press(),
             key_mapping: current_input.key_mapping.clone(),
+            cursor_mode: if window.get_game_cursor_mode() {
+                CursorMode::Game
+            } else {
+                CursorMode::Desktop
+            },
+            auto_game_cursor: window.get_auto_game_cursor(),
         },
         interval_secs: window.get_interval_secs().max(1) as u64,
         max_folder_depth: (window.get_max_depth() >= 0)
@@ -1071,6 +1079,8 @@ fn runtime_form_fields_changed(previous: &RuntimeConfig, next: &RuntimeConfig) -
     previous.clipboard_mode = next.clipboard_mode;
     previous.audio_mode = next.audio_mode;
     previous.input.mode = next.input.mode;
+    previous.input.cursor_mode = next.input.cursor_mode;
+    previous.input.auto_game_cursor = next.input.auto_game_cursor;
     &previous != next
 }
 

@@ -179,6 +179,8 @@ async fn run_mock_worker(
         reverse_trackpad: false,
         block_switch_on_press: false,
         key_mapping: KeyMappingConfig::default(),
+        cursor_mode: crate::input::CursorMode::Desktop,
+        auto_game_cursor: false,
     };
     let sender = super::runtime::run_sender(
         &mut incoming_rx,

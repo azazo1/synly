@@ -25,6 +25,10 @@ pub(super) fn ensure_permissions(_mode: InputMode) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn foreground_cursor_captured() -> bool {
+    native::foreground_cursor_captured()
+}
+
 pub(super) fn start(context: CaptureContext) -> Result<Arc<dyn InputBackend>> {
     let elevation_requested = agent::elevation_requested();
     if agent::is_ready() {

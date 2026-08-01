@@ -1,5 +1,5 @@
 use super::{DesktopLayout, Hotkey, InputMode, KeySnapshot, ModifierMask, Point};
-use anyhow::Result;
+use anyhow::{Result, bail};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use tokio::sync::mpsc;
@@ -61,8 +61,29 @@ pub trait InputBackend: Send + Sync {
     ) -> Result<()>;
     fn inject_button(&self, button: u8, down: bool) -> Result<()>;
     fn inject_cursor(&self, point: Point) -> Result<()>;
+    fn inject_motion(&self, _dx: i32, _dy: i32) -> Result<()> {
+        bail!("相对光标注入在当前平台不可用")
+    }
     fn inject_wheel(&self, x: i32, y: i32) -> Result<()>;
     fn release_all(&self) -> Result<()>;
+}
+
+/// 前台窗口是否处于"光标捕获"状态(隐藏/锁定光标并只读取相对移动, 类似 MC 的 3D 光标).
+///
+/// 用于接收端自动切换游戏光标模式, 全屏本身不算, 只有系统级光标捕获信号才算.
+pub fn foreground_cursor_captured() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        macos::foreground_cursor_captured()
+    }
+    #[cfg(windows)]
+    {
+        windows::foreground_cursor_captured()
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        false
+    }
 }
 
 #[derive(Default)]

@@ -126,6 +126,29 @@ fn cursor_notifications_keep_only_the_latest_value() {
 }
 
 #[test]
+fn motion_notifications_are_queued_in_fifo_order() {
+    let (commands, receiver) = std::sync::mpsc::sync_channel(64);
+    let client = test_client(commands, Arc::new(AtomicBool::new(true)));
+
+    for i in 0..10_000 {
+        client
+            .notify(AgentRequest::InjectMotion { dx: i, dy: -i })
+            .unwrap();
+        let item = receiver.try_recv().unwrap();
+        let ClientQueueItem::Command(command) = item else {
+            panic!("motion 通知应进入命令队列");
+        };
+        match command.request {
+            AgentRequest::InjectMotion { dx, dy } => {
+                assert_eq!(dx, i);
+                assert_eq!(dy, -i);
+            }
+            other => panic!("队列中不应出现其他请求: {other:?}"),
+        }
+    }
+}
+
+#[test]
 fn native_dual_pipe_transport_survives_cursor_lifecycle_and_event_pressure() {
     const CYCLES: usize = 1000;
     const EXPECTED_REQUESTS: usize = 1 + CYCLES * 2 + 2;

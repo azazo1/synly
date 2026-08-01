@@ -37,3 +37,28 @@ void synly_permissions_set_change_handler(void (*handler)(bool trusted)) {
     });
   }];
 }
+
+bool synly_foreground_cursor_captured(void) {
+  if (CGCursorIsVisible()) {
+    return false;
+  }
+  NSRunningApplication *front = [[NSWorkspace sharedWorkspace] frontmostApplication];
+  if (front == nil) {
+    return false;
+  }
+  NSString *bundleId = front.bundleIdentifier ?: @"";
+  NSArray<NSString *> *excluded = @[
+    @"com.apple.finder",
+    @"com.apple.dock",
+    @"com.apple.systemuiserver",
+    @"com.apple.loginwindow",
+    @"com.apple.Spotlight",
+    @"com.apple.notificationcenterui",
+  ];
+  for (NSString *candidate in excluded) {
+    if ([bundleId isEqualToString:candidate]) {
+      return false;
+    }
+  }
+  return true;
+}

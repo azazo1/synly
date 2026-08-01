@@ -62,6 +62,8 @@ pub fn runtime_options_from_config(
         reverse_trackpad: runtime.input.reverse_trackpad,
         block_switch_on_press: runtime.input.block_switch_on_press,
         key_mapping: runtime.input.key_mapping.clone(),
+        cursor_mode: runtime.input.cursor_mode,
+        auto_game_cursor: runtime.input.auto_game_cursor,
     };
     let clipboard = ClipboardRuntimeOptions {
         max_file_bytes: config.clipboard.max_file_bytes,

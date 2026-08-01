@@ -26,6 +26,7 @@ pub(super) enum AgentRequest {
     },
     InjectButton { button: u8, down: bool },
     InjectCursor(Point),
+    InjectMotion { dx: i32, dy: i32 },
     InjectWheel { x: i32, y: i32 },
     ReleaseAll,
 }
@@ -43,6 +44,7 @@ impl AgentRequest {
             Self::InjectKey { .. } => "InjectKey",
             Self::InjectButton { .. } => "InjectButton",
             Self::InjectCursor(_) => "InjectCursor",
+            Self::InjectMotion { .. } => "InjectMotion",
             Self::InjectWheel { .. } => "InjectWheel",
             Self::ReleaseAll => "ReleaseAll",
         }
