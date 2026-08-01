@@ -52,6 +52,7 @@ class ClipboardSyncService : android.app.Service() {
     private var notificationJob: Job? = null
     private var lastNotificationState: FfiClientState? = null
     private var lastNotificationDevice: String? = null
+    private var lastNotificationTarget: String? = null
 
     private val clipboardListener = ClipboardManager.OnPrimaryClipChangedListener {
         maybeReadClipboard()
@@ -63,7 +64,7 @@ class ClipboardSyncService : android.app.Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        startForeground(NOTIFICATION_ID, buildNotification(null, null))
+        startForeground(NOTIFICATION_ID, buildNotification(null, null, null))
         acquireMulticastLock()
         getSystemService(ClipboardManager::class.java)
             .addPrimaryClipChangedListener(clipboardListener)
@@ -74,11 +75,16 @@ class ClipboardSyncService : android.app.Service() {
                 SynlyEngine.uiState.collect { ui ->
                     val state = ui.state
                     val device = ui.connectedDevice
-                    if (state != lastNotificationState || device != lastNotificationDevice) {
+                    val target = ui.targetLabel
+                    if (state != lastNotificationState ||
+                        device != lastNotificationDevice ||
+                        target != lastNotificationTarget
+                    ) {
                         lastNotificationState = state
                         lastNotificationDevice = device
+                        lastNotificationTarget = target
                         getSystemService(NotificationManager::class.java)
-                            .notify(NOTIFICATION_ID, buildNotification(state, device))
+                            .notify(NOTIFICATION_ID, buildNotification(state, device, target))
                     }
                 }
             }
@@ -113,6 +119,7 @@ class ClipboardSyncService : android.app.Service() {
     private fun buildNotification(
         state: FfiClientState?,
         connectedDevice: String?,
+        targetLabel: String?,
     ): Notification {
         val pending = PendingIntent.getActivity(
             this,
@@ -120,13 +127,14 @@ class ClipboardSyncService : android.app.Service() {
             Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE,
         )
+        val target = targetLabel ?: getString(R.string.sync_notification_unknown)
         val statusText = when (state) {
-            FfiClientState.CONNECTING -> getString(R.string.sync_notification_connecting)
+            FfiClientState.CONNECTING -> getString(R.string.sync_notification_connecting, target)
             FfiClientState.PAIRING -> getString(R.string.sync_notification_pairing)
             FfiClientState.CONNECTED ->
                 getString(R.string.sync_notification_connected, connectedDevice.orEmpty())
 
-            FfiClientState.RECONNECTING -> getString(R.string.sync_notification_reconnecting)
+            FfiClientState.RECONNECTING -> getString(R.string.sync_notification_reconnecting, target)
             null -> getString(R.string.sync_notification_disconnected)
         }
         return NotificationCompat.Builder(this, CHANNEL_ID)

@@ -13,6 +13,7 @@ data class PinRequest(
 data class SynlyUiState(
     val state: FfiClientState? = null,
     val connectedDevice: String? = null,
+    val targetLabel: String? = null,
     val pinRequest: PinRequest? = null,
     val lastMessage: String? = null,
     val lastReceivedText: String? = null,
@@ -20,4 +21,3 @@ data class SynlyUiState(
     val canSend: Boolean = false,
     val canReceive: Boolean = false,
 )
-

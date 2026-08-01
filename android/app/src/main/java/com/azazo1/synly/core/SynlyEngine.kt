@@ -83,6 +83,7 @@ object SynlyEngine {
             SynlyLog.i(TAG, "目标设备未变化, 忽略重复连接请求")
             return
         }
+        _uiState.update { it.copy(targetLabel = targetLabel(context, target)) }
         scope.launch { startInternal(context) }
     }
 
@@ -108,6 +109,7 @@ object SynlyEngine {
     private fun startInternal(context: Context) {
         val settings = SettingsStore.load(context)
         val target = settings.lastTarget ?: return
+        _uiState.update { it.copy(targetLabel = targetLabel(context, target)) }
         val identity = IdentityStore.getOrCreate(context)
         val trusted = TrustedDeviceStore.list(context)
         val config = FfiClientConfig(
@@ -146,6 +148,27 @@ object SynlyEngine {
                 it.copy(
                     state = null,
                     connectedDevice = null,
+                    targetLabel = null,
+                    pinRequest = null,
+                    canSend = false,
+                    canReceive = false,
+                )
+            }
+        }
+    }
+
+    fun disconnect(context: Context) {
+        scope.launch {
+            runCatching { handle?.stop() }
+            handle = null
+            currentTarget = null
+            val settings = SettingsStore.load(context).copy(lastTarget = null)
+            SettingsStore.save(context, settings)
+            _uiState.update {
+                it.copy(
+                    state = null,
+                    connectedDevice = null,
+                    targetLabel = null,
                     pinRequest = null,
                     canSend = false,
                     canReceive = false,
@@ -216,6 +239,14 @@ object SynlyEngine {
         start(context)
     }
 
+    private fun targetLabel(context: Context, target: SynlyTarget): String {
+        val trustedName = target.peerDeviceId
+            ?.let { id ->
+                TrustedDeviceStore.list(context).firstOrNull { it.deviceId == id }?.deviceName
+            }
+        return trustedName ?: "${target.addresses.joinToString(", ")}:${target.port}"
+    }
+
     private fun handleEvent(event: FfiClientEvent) {
         when (event) {
             is FfiClientEvent.StateChanged -> {
@@ -241,6 +272,7 @@ object SynlyEngine {
                     it.copy(
                         state = FfiClientState.CONNECTED,
                         connectedDevice = event.remote.deviceName,
+                        targetLabel = event.remote.deviceName,
                         pinRequest = null,
                         canSend = event.clientToHost,
                         canReceive = event.hostToClient,
@@ -282,7 +314,6 @@ object SynlyEngine {
             is FfiClientEvent.Disconnected -> {
                 _uiState.update {
                     it.copy(
-                        state = null,
                         connectedDevice = null,
                         pinRequest = null,
                         canSend = false,
@@ -295,7 +326,13 @@ object SynlyEngine {
                 // core 在配对终止后不再自动重连, 清空句柄以便下次重新启动
                 handle = null
                 currentTarget = null
-                _uiState.update { it.copy(lastMessage = event.message) }
+                _uiState.update {
+                    it.copy(
+                        state = null,
+                        targetLabel = null,
+                        lastMessage = event.message,
+                    )
+                }
             }
         }
     }

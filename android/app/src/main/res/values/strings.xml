@@ -4,8 +4,9 @@
     <string name="sync_notification_channel">剪贴板同步</string>
     <string name="sync_notification_title">Synly 正在同步剪贴板</string>
     <string name="sync_notification_disconnected">未连接</string>
-    <string name="sync_notification_connecting">连接中</string>
+    <string name="sync_notification_connecting">连接 %1$s 中</string>
     <string name="sync_notification_pairing">配对中</string>
-    <string name="sync_notification_reconnecting">重连中</string>
+    <string name="sync_notification_reconnecting">重连 %1$s 中</string>
     <string name="sync_notification_connected">已连接 %1$s</string>
+    <string name="sync_notification_unknown">未知设备</string>
 </resources>

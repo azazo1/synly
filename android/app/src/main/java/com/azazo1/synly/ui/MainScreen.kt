@@ -124,7 +124,18 @@ private fun HomeScreen(onOpenSettings: () -> Unit, onOpenLogs: () -> Unit) {
                 }
             }
 
-            item { StatusCard(uiState.state, uiState.connectedDevice) }
+            item { StatusCard(uiState.state, uiState.targetLabel) }
+
+            if (uiState.state != null) {
+                item {
+                    Button(
+                        onClick = { SynlyEngine.disconnect(context) },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text("断开连接")
+                    }
+                }
+            }
 
             uiState.lastMessage?.let { message ->
                 item { Text(message, color = MaterialTheme.colorScheme.error) }
@@ -367,25 +378,17 @@ private fun isIgnoringBatteryOptimizations(context: Context): Boolean {
 }
 
 @Composable
-private fun StatusCard(state: FfiClientState?, connectedDevice: String?) {
+private fun StatusCard(state: FfiClientState?, targetLabel: String?) {
     val label = when (state) {
-        FfiClientState.CONNECTING -> "连接中"
+        FfiClientState.CONNECTING -> targetLabel?.let { "连接 $it 中" } ?: "连接中"
         FfiClientState.PAIRING -> "配对中"
-        FfiClientState.CONNECTED -> "已连接 ${connectedDevice.orEmpty()}"
-        FfiClientState.RECONNECTING -> "重连中"
+        FfiClientState.CONNECTED -> "已连接 ${targetLabel.orEmpty()}"
+        FfiClientState.RECONNECTING -> targetLabel?.let { "重连 $it 中" } ?: "重连中"
         null -> "未连接"
     }
     Card {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Column(Modifier.padding(16.dp)) {
             Text(label, style = MaterialTheme.typography.titleMedium)
-            if (state != null) {
-                OutlinedButton(
-                    onClick = { SynlyEngine.stop() },
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Text("断开连接")
-                }
-            }
         }
     }
 }
