@@ -17,6 +17,7 @@ use crate::protocol::{
     FrameReader, FrameWriter, PROTOCOL_VERSION, PairAuthMethod, PairRequestPayload,
     RuntimeCapabilities, SessionAgreement, TransferLimits, frame_size_limit_message,
 };
+use crate::reconnect::{AttemptVerdict, ReconnectPolicy, run_auto_reconnect};
 use crate::runtime_control::{
     InteractionRequest, InteractionResponse, RuntimeCommand, RuntimeControl, RuntimeEvent,
     RuntimeLifecycle, RuntimePeerSummary, RuntimeTuning,
@@ -329,7 +330,6 @@ pub(crate) async fn run_advertisement_updates(
 pub(crate) async fn run_client(mut config: SynlyConfig, mut options: RuntimeOptions) -> Result<()> {
     let discovery_timeout = Duration::from_secs(options.pairing.discovery_secs);
     let mut reconnect_query = options.pairing.peer_query.clone();
-    let mut reconnect_delay = RECONNECT_BASE_DELAY;
     let notifier = SystemNotifier::new(options.control.tuning());
     let shutdown = options.control.shutdown().clone();
     let mut runtime_capabilities = options.control.capabilities();
@@ -340,120 +340,163 @@ pub(crate) async fn run_client(mut config: SynlyConfig, mut options: RuntimeOpti
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
 
+    let policy = ReconnectPolicy::new(RECONNECT_BASE_DELAY, RECONNECT_MAX_DELAY);
+    let drive_shutdown = shutdown.clone();
+    let mut attempt = PeerReconnectAttempt {
+        config: &mut config,
+        options: &mut options,
+        reconnect_query: &mut reconnect_query,
+        runtime_capabilities: &mut runtime_capabilities,
+        runtime_tuning: &mut runtime_tuning,
+        notifier: &notifier,
+        discovery_timeout,
+    };
     tokio::select! {
-        result = async {
-            loop {
-                refresh_runtime_options(
-                    &mut config,
-                    &mut options,
-                    &mut runtime_capabilities,
-                    &mut runtime_tuning,
-                );
-                let local_workspace_summary = options.workspace.session_summary(
-                    options.clipboard_mode,
-                    options.audio_mode,
-                    options.input_mode,
-                );
-                let peer_target = match choose_peer(
-                    reconnect_query.as_deref(),
-                    discovery_timeout,
-                    options.pairing.headless,
-                    &local_workspace_summary,
-                    &options.discovery,
-                )
-                .await
-                {
-                    Ok(peer) => peer,
-                    Err(err) => {
-                        if reconnect_query.is_some() {
-                            tracing::warn!(error = %err, "等待目标设备重新出现");
-                            sleep_before_reconnect(reconnect_delay).await;
-                            reconnect_delay = next_reconnect_delay(reconnect_delay);
-                            continue;
-                        }
-                        return Err(err);
-                    }
-                };
-                if let PeerTarget::Discovered(peer) = &peer_target {
-                    tracing::info!(
-                        peer = %peer.display_name(),
-                        device_id = %&peer.device_id[..8.min(peer.device_id.len())],
-                        source = peer.source.label(),
-                        "已发现目标设备"
-                    );
-                }
-                reconnect_query = Some(peer_target.reconnect_query());
-                options
-                    .control
-                    .report(RuntimeEvent::Lifecycle(RuntimeLifecycle::Connecting));
-
-                match connect_to_peer(&peer_target, &mut config, &options).await {
-                    Ok(session) => {
-                        let remote_label = format!(
-                            "{} ({})",
-                            identity_display_name(&session.remote),
-                            short_uuid(&session.remote.device_id)
-                        );
-                        let peer_summary = RuntimePeerSummary {
-                            device_id: session.remote.device_id,
-                            display_name: identity_display_name(&session.remote),
-                        };
-                        reconnect_delay = RECONNECT_BASE_DELAY;
-                        let peer = notification_peer(&session.remote);
-                        if let Err(err) = run_with_session_notifications(
-                            &notifier,
-                            peer,
-                            run_sync_session(
-                                session,
-                                &options.workspace,
-                                SyncSessionOptions {
-                                    clipboard_mode: options.clipboard_mode,
-                                    audio_mode: options.audio_mode,
-                                    input_mode: options.input_mode,
-                                    input_options: options.input.clone(),
-                                    input_inbox: None,
-                                    input_session_id: None,
-                                    input_socket_tx: None,
-                                    input_routes: None,
-                                    clipboard_options: &options.clipboard,
-                                    transfer_limits: options.transfer_limits,
-                                    control: options.control.clone(),
-                                    clipboard_hub: None,
-                                    capability_profile: SessionCapabilityProfile::Full,
-                                    session_shutdown: None,
-                                },
-                            ),
-                        )
-                        .await
-                        {
-                            tracing::warn!(peer = %remote_label, error = %err, "同步会话中断");
-                        } else {
-                            tracing::info!(peer = %remote_label, "连接已断开");
-                        }
-                        options.control.report(RuntimeEvent::Disconnected(peer_summary));
-                        options
-                            .control
-                            .report(RuntimeEvent::Lifecycle(RuntimeLifecycle::Discovering));
-                        sleep_before_reconnect(reconnect_delay).await;
-                        reconnect_delay = next_reconnect_delay(reconnect_delay);
-                    }
-                    Err(err) => {
-                        if err.downcast_ref::<PairingTerminal>().is_some() {
-                            tracing::warn!(error = %err, "配对流程已终止, 不再自动重连");
-                            return Err(err);
-                        }
-                        tracing::warn!(error = %err, "连接失败");
-                        options
-                            .control
-                            .report(RuntimeEvent::Lifecycle(RuntimeLifecycle::Discovering));
-                        sleep_before_reconnect(reconnect_delay).await;
-                        reconnect_delay = next_reconnect_delay(reconnect_delay);
-                    }
-                }
-            }
-        } => result,
+        result = run_auto_reconnect(policy, drive_shutdown, &mut attempt) => result,
         signal_result = &mut ctrl_c => finish_ctrl_c(signal_result),
         _ = shutdown.cancelled() => Ok(()),
+    }
+}
+
+struct PeerReconnectAttempt<'a> {
+    config: &'a mut SynlyConfig,
+    options: &'a mut RuntimeOptions,
+    reconnect_query: &'a mut Option<String>,
+    runtime_capabilities: &'a mut watch::Receiver<RuntimeCapabilities>,
+    runtime_tuning: &'a mut watch::Receiver<RuntimeTuning>,
+    notifier: &'a SystemNotifier,
+    discovery_timeout: Duration,
+}
+
+impl crate::reconnect::ReconnectAttempt for PeerReconnectAttempt<'_> {
+    fn attempt(
+        &mut self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = AttemptVerdict> + Send + '_>,
+    > {
+        Box::pin(attempt_peer_connection(
+            self.config,
+            self.options,
+            self.reconnect_query,
+            self.runtime_capabilities,
+            self.runtime_tuning,
+            self.notifier,
+            self.discovery_timeout,
+        ))
+    }
+}
+
+async fn attempt_peer_connection(
+    config: &mut SynlyConfig,
+    options: &mut RuntimeOptions,
+    reconnect_query: &mut Option<String>,
+    runtime_capabilities: &mut watch::Receiver<RuntimeCapabilities>,
+    runtime_tuning: &mut watch::Receiver<RuntimeTuning>,
+    notifier: &SystemNotifier,
+    discovery_timeout: Duration,
+) -> AttemptVerdict {
+    refresh_runtime_options(
+        config,
+        options,
+        runtime_capabilities,
+        runtime_tuning,
+    );
+    let local_workspace_summary = options.workspace.session_summary(
+        options.clipboard_mode,
+        options.audio_mode,
+        options.input_mode,
+    );
+    let peer_target = match choose_peer(
+        reconnect_query.as_deref(),
+        discovery_timeout,
+        options.pairing.headless,
+        &local_workspace_summary,
+        &options.discovery,
+    )
+    .await
+    {
+        Ok(peer) => peer,
+        Err(err) => {
+            if reconnect_query.is_some() {
+                tracing::warn!(error = %err, "等待目标设备重新出现");
+                return AttemptVerdict::Failed;
+            }
+            return AttemptVerdict::Terminal(err);
+        }
+    };
+    if let PeerTarget::Discovered(peer) = &peer_target {
+        tracing::info!(
+            peer = %peer.display_name(),
+            device_id = %&peer.device_id[..8.min(peer.device_id.len())],
+            source = peer.source.label(),
+            "已发现目标设备"
+        );
+    }
+    *reconnect_query = Some(peer_target.reconnect_query());
+    options
+        .control
+        .report(RuntimeEvent::Lifecycle(RuntimeLifecycle::Connecting));
+
+    match connect_to_peer(&peer_target, config, options).await {
+        Ok(session) => {
+            let remote_label = format!(
+                "{} ({})",
+                identity_display_name(&session.remote),
+                short_uuid(&session.remote.device_id)
+            );
+            let peer_summary = RuntimePeerSummary {
+                device_id: session.remote.device_id,
+                display_name: identity_display_name(&session.remote),
+            };
+            let peer = notification_peer(&session.remote);
+            if let Err(err) = run_with_session_notifications(
+                notifier,
+                peer,
+                run_sync_session(
+                    session,
+                    &options.workspace,
+                    SyncSessionOptions {
+                        clipboard_mode: options.clipboard_mode,
+                        audio_mode: options.audio_mode,
+                        input_mode: options.input_mode,
+                        input_options: options.input.clone(),
+                        input_inbox: None,
+                        input_session_id: None,
+                        input_socket_tx: None,
+                        input_routes: None,
+                        clipboard_options: &options.clipboard,
+                        transfer_limits: options.transfer_limits,
+                        control: options.control.clone(),
+                        clipboard_hub: None,
+                        capability_profile: SessionCapabilityProfile::Full,
+                        session_shutdown: None,
+                    },
+                ),
+            )
+            .await
+            {
+                tracing::warn!(peer = %remote_label, error = %err, "同步会话中断");
+            } else {
+                tracing::info!(peer = %remote_label, "连接已断开");
+            }
+            options.control.report(RuntimeEvent::Disconnected(peer_summary));
+            options
+                .control
+                .report(RuntimeEvent::Lifecycle(RuntimeLifecycle::Discovering));
+            AttemptVerdict::Disconnected
+        }
+        Err(err) => {
+            if err.downcast_ref::<PairingTerminal>().is_some() {
+                tracing::warn!(error = %err, "配对流程已终止, 不再自动重连");
+                AttemptVerdict::Terminal(err)
+            } else {
+                tracing::warn!(error = %err, "连接失败");
+                options
+                    .control
+                    .report(RuntimeEvent::Lifecycle(RuntimeLifecycle::Discovering));
+                AttemptVerdict::Failed
+            }
+        }
     }
 }
 
@@ -4164,20 +4207,6 @@ fn is_connection_shutdown_error(err: &anyhow::Error) -> bool {
     })
 }
 
-async fn sleep_before_reconnect(delay: Duration) {
-    if delay.is_zero() {
-        return;
-    }
-
-    tracing::info!(delay_secs = delay.as_secs(), "等待后重试连接");
-    time::sleep(delay).await;
-}
-
-fn next_reconnect_delay(current: Duration) -> Duration {
-    let next = current.as_secs().saturating_mul(2).max(1);
-    Duration::from_secs(next.min(RECONNECT_MAX_DELAY.as_secs()))
-}
-
 async fn register_pairing_failure(pairing_throttle: &mut PairingThrottle, peer_key: &str) {
     let backoff = pairing_throttle.note_failure(peer_key);
     if !backoff.is_zero() {
@@ -4628,7 +4657,6 @@ mod tests {
         accept_policy_label, bootstrap_device_name_matches, bootstrap_peer_label,
         build_remote_echo_expectations, choose_peer, delete_policy, handle_file_chunk,
         identity_display_name, input_task_restart_required, is_connection_shutdown_error,
-        next_reconnect_delay,
         parse_direct_peer_addr, peer_matches_query, preferred_peer_query, race_peer_addresses,
         resolve_audio_plan, resolve_initial_snapshot_policy, run_with_session_notifications,
         run_advertisement_updates, select_peer_from_query, send_one_file,
@@ -4760,22 +4788,6 @@ mod tests {
 
         assert!(err.contains("双向初始状态冲突"));
         assert!(err.contains("initial = this"));
-    }
-
-    #[test]
-    fn reconnect_backoff_doubles_until_cap() {
-        assert_eq!(
-            next_reconnect_delay(Duration::from_secs(2)),
-            Duration::from_secs(4)
-        );
-        assert_eq!(
-            next_reconnect_delay(Duration::from_secs(10)),
-            Duration::from_secs(20)
-        );
-        assert_eq!(
-            next_reconnect_delay(Duration::from_secs(20)),
-            Duration::from_secs(20)
-        );
     }
 
     #[test]

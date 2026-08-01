@@ -11,6 +11,7 @@ mod gui;
 mod host;
 mod path_expand;
 mod protocol;
+mod reconnect;
 mod runtime_control;
 mod runtime_options;
 mod settings;

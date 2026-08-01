@@ -8,6 +8,7 @@ use crate::protocol::{
     PairAuthMethod, PairRequestPayload, PROTOCOL_VERSION, RuntimeCapabilities, SessionAgreement,
     TransferLimits,
 };
+use crate::reconnect::{self, AttemptVerdict, ReconnectPolicy};
 use crate::settings::{AudioMode, ClipboardMode, FileSyncMode};
 use crate::workspace::WorkspaceSummary;
 use anyhow::{Context, Result, anyhow, bail};
@@ -19,6 +20,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::{Notify, mpsc};
 use tokio_rustls::client::TlsStream;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const PAIRING_TIMEOUT: Duration = Duration::from_secs(90);
@@ -115,6 +117,7 @@ pub struct ClientHandle {
     state: Arc<std::sync::Mutex<ClientState>>,
     finished: Arc<AtomicBool>,
     shutdown: Arc<Notify>,
+    cancellation: CancellationToken,
 }
 
 impl ClientHandle {
@@ -143,6 +146,7 @@ impl ClientHandle {
     }
 
     pub fn stop(&self) -> Result<()> {
+        self.cancellation.cancel();
         self.send(ClientCommand::Stop)
     }
 
@@ -172,17 +176,19 @@ pub fn start_client(
 ) -> Result<ClientHandle> {
     let (command_tx, command_rx) = mpsc::unbounded_channel();
     let state = Arc::new(std::sync::Mutex::new(ClientState::Connecting));
+    let cancellation = CancellationToken::new();
     let handle = ClientHandle {
         commands: command_tx,
         state: Arc::clone(&state),
         finished: Arc::new(AtomicBool::new(false)),
         shutdown: Arc::new(Notify::new()),
+        cancellation: cancellation.clone(),
     };
     let worker_state = Arc::clone(&state);
     let worker_finished = Arc::clone(&handle.finished);
     let worker_shutdown = Arc::clone(&handle.shutdown);
     tokio::spawn(async move {
-        run_client_loop(config, target, listener, command_rx, worker_state).await;
+        run_client_loop(config, target, listener, command_rx, worker_state, cancellation).await;
         worker_finished.store(true, Ordering::Release);
         worker_shutdown.notify_waiters();
     });
@@ -195,65 +201,86 @@ async fn run_client_loop(
     listener: Arc<dyn ClientListener>,
     mut commands: mpsc::UnboundedReceiver<ClientCommand>,
     state: Arc<std::sync::Mutex<ClientState>>,
+    cancellation: CancellationToken,
 ) {
-    let mut reconnect_delay = RECONNECT_BASE_DELAY;
-    loop {
-        let result = connect_and_run(&mut config, &mut target, &listener, &mut commands, &state).await;
-        if let Err(err) = &result
-            && err.downcast_ref::<PairingTerminal>().is_some()
-        {
+    let policy = ReconnectPolicy::new(RECONNECT_BASE_DELAY, RECONNECT_MAX_DELAY);
+    let shutdown = cancellation.clone();
+    let mut attempt = ClientReconnectAttempt {
+        config: &mut config,
+        target: &mut target,
+        listener: &listener,
+        commands: &mut commands,
+        state: &state,
+        cancellation: &cancellation,
+    };
+    let result = reconnect::run_auto_reconnect(policy, shutdown, &mut attempt).await;
+    if let Err(err) = result {
+        tracing::debug!(error = %err, "客户端重连循环退出");
+    }
+}
+
+struct ClientReconnectAttempt<'a> {
+    config: &'a mut ClientConfig,
+    target: &'a mut ClientTarget,
+    listener: &'a Arc<dyn ClientListener>,
+    commands: &'a mut mpsc::UnboundedReceiver<ClientCommand>,
+    state: &'a Arc<std::sync::Mutex<ClientState>>,
+    cancellation: &'a CancellationToken,
+}
+
+impl reconnect::ReconnectAttempt for ClientReconnectAttempt<'_> {
+    fn attempt(
+        &mut self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = reconnect::AttemptVerdict> + Send + '_>,
+    > {
+        Box::pin(attempt_connect_once(
+            self.config,
+            self.target,
+            self.listener,
+            self.commands,
+            self.state,
+            self.cancellation,
+        ))
+    }
+}
+
+async fn attempt_connect_once(
+    config: &mut ClientConfig,
+    target: &mut ClientTarget,
+    listener: &Arc<dyn ClientListener>,
+    commands: &mut mpsc::UnboundedReceiver<ClientCommand>,
+    state: &Arc<std::sync::Mutex<ClientState>>,
+    cancellation: &CancellationToken,
+) -> AttemptVerdict {
+    let result = connect_and_run(config, target, listener, commands, state, cancellation).await;
+    match result {
+        Err(err) if err.downcast_ref::<PairingTerminal>().is_some() => {
             let message = format!("{err:#}");
             tracing::warn!(error = %message, "配对流程已终止, 不再自动重连");
             listener.on_event(ClientEvent::Disconnected {
                 message: message.clone(),
             });
             listener.on_event(ClientEvent::PairingFailed { message });
-            return;
+            AttemptVerdict::Terminal(err)
         }
-        if let Err(err) = result {
+        Err(err) => {
             listener.on_event(ClientEvent::Disconnected {
                 message: format!("{err:#}"),
             });
-        } else {
+            set_state(state, ClientState::Reconnecting);
+            listener.on_event(ClientEvent::StateChanged(ClientState::Reconnecting));
+            AttemptVerdict::Failed
+        }
+        Ok(()) => {
             listener.on_event(ClientEvent::Disconnected {
                 message: "连接已关闭".to_string(),
             });
+            set_state(state, ClientState::Reconnecting);
+            listener.on_event(ClientEvent::StateChanged(ClientState::Reconnecting));
+            AttemptVerdict::Disconnected
         }
-        set_state(&state, ClientState::Reconnecting);
-        listener.on_event(ClientEvent::StateChanged(ClientState::Reconnecting));
-
-        let mut stopped = false;
-        while !stopped {
-            tokio::select! {
-                _ = tokio::time::sleep(reconnect_delay) => break,
-                command = commands.recv() => {
-                    match command {
-                        Some(ClientCommand::Stop) | None => {
-                            stopped = true;
-                        }
-                        Some(ClientCommand::UpdateTrustedDevices(devices)) => {
-                            config.trusted_devices = devices;
-                        }
-                        Some(ClientCommand::SetClipboardMode(mode)) => {
-                            config.clipboard_mode = mode;
-                        }
-                        Some(command) => {
-                            tracing::debug!(?command, "重连等待期间忽略非控制命令");
-                        }
-                    }
-                }
-            }
-        }
-        if stopped {
-            break;
-        }
-        reconnect_delay = next_reconnect_delay(reconnect_delay);
     }
-}
-
-fn next_reconnect_delay(current: Duration) -> Duration {
-    let next = current.as_secs().saturating_mul(2);
-    Duration::from_secs(next.min(RECONNECT_MAX_DELAY.as_secs()))
 }
 
 fn set_state(state: &Arc<std::sync::Mutex<ClientState>>, next: ClientState) {
@@ -266,6 +293,7 @@ async fn connect_and_run(
     listener: &Arc<dyn ClientListener>,
     commands: &mut mpsc::UnboundedReceiver<ClientCommand>,
     state: &Arc<std::sync::Mutex<ClientState>>,
+    cancellation: &CancellationToken,
 ) -> Result<()> {
     set_state(state, ClientState::Connecting);
     listener.on_event(ClientEvent::StateChanged(ClientState::Connecting));
@@ -275,7 +303,7 @@ async fn connect_and_run(
         };
         match connect_trusted(config, socket, trusted).await {
             Ok(session) => {
-                return run_session(config, listener, commands, state, session).await;
+                return run_session(config, listener, commands, state, session, cancellation).await;
             }
             Err(err) => {
                 tracing::warn!(error = %err, "可信 mTLS 连接失败, 回退到 bootstrap 配对");
@@ -286,8 +314,9 @@ async fn connect_and_run(
     let Some(socket) = connect_with_rediscovery(config, target).await? else {
         bail!("目标设备没有可用地址");
     };
-    let session = connect_bootstrap(config, socket, target, listener, commands).await?;
-    run_session(config, listener, commands, state, session).await
+    let session =
+        connect_bootstrap(config, socket, target, listener, commands, cancellation).await?;
+    run_session(config, listener, commands, state, session, cancellation).await
 }
 
 async fn connect_with_rediscovery(
@@ -505,8 +534,9 @@ async fn connect_bootstrap(
     target: &ClientTarget,
     listener: &Arc<dyn ClientListener>,
     commands: &mut mpsc::UnboundedReceiver<ClientCommand>,
+    cancellation: &CancellationToken,
 ) -> Result<AuthenticatedSession> {
-    connect_bootstrap_inner(config, socket, target, listener, commands)
+    connect_bootstrap_inner(config, socket, target, listener, commands, cancellation)
         .await
         .map_err(|err| anyhow!(PairingTerminal(err)))
 }
@@ -517,6 +547,7 @@ async fn connect_bootstrap_inner(
     _target: &ClientTarget,
     listener: &Arc<dyn ClientListener>,
     commands: &mut mpsc::UnboundedReceiver<ClientCommand>,
+    cancellation: &CancellationToken,
 ) -> Result<AuthenticatedSession> {
     let client_bootstrap_key = crypto::generate_bootstrap_key_material()?;
     let client_bootstrap_public_key = client_bootstrap_key.public_key_encoded();
@@ -561,18 +592,23 @@ async fn connect_bootstrap_inner(
     });
     let pin = match tokio::time::timeout(PAIRING_TIMEOUT, async {
         loop {
-            match commands.recv().await {
-                Some(ClientCommand::SubmitPin(pin)) => return normalize_pin(&pin),
-                Some(ClientCommand::CancelPin) => bail!("用户取消了 PIN 配对"),
-                Some(ClientCommand::Stop) | None => bail!("客户端已停止"),
-                Some(ClientCommand::UpdateTrustedDevices(devices)) => {
-                    config.trusted_devices = devices;
-                }
-                Some(ClientCommand::SetClipboardMode(mode)) => {
-                    config.clipboard_mode = mode;
-                }
-                Some(command) => {
-                    tracing::debug!(?command, "配对阶段忽略剪贴板命令");
+            tokio::select! {
+                _ = cancellation.cancelled() => bail!("客户端已停止"),
+                command = commands.recv() => {
+                    match command {
+                        Some(ClientCommand::SubmitPin(pin)) => return normalize_pin(&pin),
+                        Some(ClientCommand::CancelPin) => bail!("用户取消了 PIN 配对"),
+                        Some(ClientCommand::Stop) | None => bail!("客户端已停止"),
+                        Some(ClientCommand::UpdateTrustedDevices(devices)) => {
+                            config.trusted_devices = devices;
+                        }
+                        Some(ClientCommand::SetClipboardMode(mode)) => {
+                            config.clipboard_mode = mode;
+                        }
+                        Some(command) => {
+                            tracing::debug!(?command, "配对阶段忽略剪贴板命令");
+                        }
+                    }
                 }
             }
         }
@@ -775,6 +811,7 @@ async fn run_session(
     commands: &mut mpsc::UnboundedReceiver<ClientCommand>,
     state: &Arc<std::sync::Mutex<ClientState>>,
     session: AuthenticatedSession,
+    cancellation: &CancellationToken,
 ) -> Result<()> {
     set_state(state, ClientState::Connected);
     listener.on_event(ClientEvent::Connected {
@@ -928,6 +965,10 @@ async fn run_session(
             }
             _ = &mut writer_task, if writer_task.is_finished() => {
                 bail!("发送消息的任务已结束");
+            }
+            _ = cancellation.cancelled() => {
+                let _ = frame_tx.send(Frame::Control(ControlMessage::Goodbye)).await;
+                running = false;
             }
         }
     }

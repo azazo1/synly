@@ -12,5 +12,6 @@ pub mod discovery;
 pub mod identity;
 pub mod input;
 pub mod protocol;
+pub mod reconnect;
 pub mod settings;
 pub mod workspace;
