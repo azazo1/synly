@@ -1,6 +1,7 @@
 use super::pipe::{NativePipe, PipeDirection};
 use super::protocol::{
-    AgentRequest, AgentResponse, AgentToGuiPacket, GuiToAgentPacket, read_packet, write_packet,
+    AgentRequest, AgentResponse, AgentToGuiPacket, GuiToAgentPacket, is_timeout_error, read_packet,
+    write_packet,
 };
 use super::security::{
     PipeSecurity, current_process_is_elevated, process_session_id, validate_pipe_client, wide,
@@ -107,10 +108,11 @@ pub(super) struct AgentBackend {
 }
 
 pub fn request_elevation() -> Result<()> {
-    if let Some(client) = current_client()
-        && client.request(AgentRequest::Health).is_ok()
-    {
-        return Ok(());
+    if let Some(client) = current_client() {
+        if client.request(AgentRequest::Health).is_ok() {
+            return Ok(());
+        }
+        mark_agent_unavailable(&client.alive, "Health", "elevation-recheck");
     }
 
     let connection_id = Uuid::new_v4();
@@ -159,7 +161,10 @@ pub(in crate::input) fn ensure_ready(mode: InputMode) -> Result<()> {
         return Ok(());
     }
     let client = current_client().context("Windows 输入代理尚未获得本机管理员授权")?;
-    client.request(AgentRequest::Health)?;
+    if let Err(error) = client.request(AgentRequest::Health) {
+        mark_agent_unavailable(&client.alive, "Health", "startup-recheck");
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -220,7 +225,6 @@ impl AgentClient {
                 anyhow!("Windows input agent {request_name} command queue unavailable: {error}")
             })?;
         wait_for_agent_response(
-            &self.alive,
             request_name,
             dispatch_rx,
             response_rx,
@@ -294,7 +298,6 @@ fn mark_agent_unavailable(alive: &AtomicBool, request_name: &str, phase: &str) {
 }
 
 pub(super) fn wait_for_agent_response(
-    alive: &AtomicBool,
     request_name: &str,
     dispatch_rx: std::sync::mpsc::Receiver<()>,
     response_rx: std::sync::mpsc::Receiver<Result<AgentResponse, String>>,
@@ -303,11 +306,9 @@ pub(super) fn wait_for_agent_response(
     match dispatch_rx.recv_timeout(dispatch_timeout) {
         Ok(()) => {}
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            mark_agent_unavailable(alive, request_name, "dispatch-timeout");
             bail!("Windows input agent {request_name} dispatch timed out");
         }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            mark_agent_unavailable(alive, request_name, "dispatch-disconnected");
             bail!("Windows input agent {request_name} dispatch failed before pipe write");
         }
     }
@@ -315,12 +316,9 @@ pub(super) fn wait_for_agent_response(
         Ok(Ok(AgentResponse::Error(message))) => Err(anyhow!(message)),
         Ok(Ok(response)) => Ok(response),
         Ok(Err(message)) => Err(anyhow!(message)),
-        Err(error) => {
-            mark_agent_unavailable(alive, request_name, "response-disconnected");
-            Err(error).with_context(|| {
-                format!("Windows input agent {request_name} response channel closed")
-            })
-        }
+        Err(error) => Err(error).with_context(|| {
+            format!("Windows input agent {request_name} response channel closed")
+        }),
     }
 }
 
@@ -686,6 +684,7 @@ pub(super) fn client_event_reader_loop(
         let packet = match read_packet::<AgentToGuiPacket>(&mut pipe, AGENT_HEARTBEAT_TIMEOUT) {
             Ok(packet) => packet,
             Err(_) if !alive.load(Ordering::Acquire) => return Ok(()),
+            Err(error) if is_timeout_error(&error) => continue,
             Err(error) => return Err(error),
         };
         match packet {
@@ -766,19 +765,19 @@ pub(super) fn command_writer_loop(
         match commands.recv_timeout(wait) {
             Ok(ClientQueueItem::Command(command)) => {
                 if command.request.requires_cursor_ordering() {
-                    flush_latest_cursor(&mut pipe, &cursor, &pending, &alive, &mut next_id)?;
+                    flush_latest_cursor(&mut pipe, &cursor, &pending, &mut next_id)?;
                 }
-                write_client_command(&mut pipe, command, &pending, &alive, &mut next_id)?;
+                let _ = write_client_command(&mut pipe, command, &pending, &mut next_id)?;
                 next_heartbeat = Instant::now() + CLIENT_HEARTBEAT_INTERVAL;
             }
             Ok(ClientQueueItem::Cursor) => {
-                flush_latest_cursor(&mut pipe, &cursor, &pending, &alive, &mut next_id)?;
+                flush_latest_cursor(&mut pipe, &cursor, &pending, &mut next_id)?;
                 next_heartbeat = Instant::now() + CLIENT_HEARTBEAT_INTERVAL;
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                flush_latest_cursor(&mut pipe, &cursor, &pending, &alive, &mut next_id)?;
+                flush_latest_cursor(&mut pipe, &cursor, &pending, &mut next_id)?;
                 if Instant::now() >= next_heartbeat {
-                    write_client_command(
+                    let _ = write_client_command(
                         &mut pipe,
                         ClientCommand {
                             request: AgentRequest::Health,
@@ -786,7 +785,6 @@ pub(super) fn command_writer_loop(
                             response: None,
                         },
                         &pending,
-                        &alive,
                         &mut next_id,
                     )?;
                     next_heartbeat = Instant::now() + CLIENT_HEARTBEAT_INTERVAL;
@@ -802,7 +800,6 @@ fn flush_latest_cursor(
     pipe: &mut NativePipe,
     cursor: &ClientCursorState,
     pending: &PendingResponses,
-    alive: &Arc<AtomicBool>,
     next_id: &mut u64,
 ) -> Result<()> {
     let update = {
@@ -815,7 +812,7 @@ fn flush_latest_cursor(
         update
     };
     if let Some(update) = update {
-        write_client_command(
+        let _ = write_client_command(
             pipe,
             ClientCommand {
                 request: AgentRequest::InjectCursor(update.point),
@@ -823,7 +820,6 @@ fn flush_latest_cursor(
                 response: None,
             },
             pending,
-            alive,
             next_id,
         )?;
     }
@@ -834,9 +830,8 @@ pub(super) fn write_client_command(
     pipe: &mut NativePipe,
     command: ClientCommand,
     pending: &PendingResponses,
-    alive: &Arc<AtomicBool>,
     next_id: &mut u64,
-) -> Result<()> {
+) -> Result<bool> {
     let ClientCommand {
         request,
         dispatched,
@@ -869,19 +864,22 @@ pub(super) fn write_client_command(
         let _ = dispatched.send(());
     }
     match completion_rx.recv_timeout(REQUEST_DELIVERY_TIMEOUT) {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(message)) => Err(anyhow!(message)),
+        Ok(Ok(())) => Ok(true),
+        Ok(Err(message)) => {
+            tracing::warn!(request = request_name, error = %message, "Windows 输入代理请求未完成, 保持连接");
+            Ok(false)
+        }
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
             let message = format!("Windows input agent {request_name} response timed out");
             complete_pending_with_error(pending, id, message.clone());
-            mark_agent_unavailable(alive, request_name, "response-timeout");
-            Err(anyhow!(message))
+            tracing::warn!(request = request_name, "Windows 输入代理请求响应超时, 保持连接");
+            Ok(false)
         }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
             let message = format!("Windows input agent {request_name} response channel closed");
             complete_pending_with_error(pending, id, message.clone());
-            mark_agent_unavailable(alive, request_name, "response-disconnected");
-            Err(anyhow!(message))
+            tracing::warn!(request = request_name, "Windows 输入代理请求响应通道关闭, 保持连接");
+            Ok(false)
         }
     }
 }

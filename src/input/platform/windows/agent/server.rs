@@ -335,6 +335,7 @@ async fn run_agent_loop(
 ) -> Result<()> {
     let mut runtime = None;
     let mut heartbeat = AgentHeartbeat::new(Instant::now());
+    let mut heartbeat_stalled = false;
     let mut paused = false;
     let mut desktop_tick = time::interval(Duration::from_millis(250));
     desktop_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -355,8 +356,15 @@ async fn run_agent_loop(
                 }
                 _ = desktop_tick.tick() => {
                     if heartbeat.expired(Instant::now()) {
-                        let message = "Windows input agent GUI heartbeat timed out";
-                        break Err(anyhow!(message));
+                        if !heartbeat_stalled {
+                            heartbeat_stalled = true;
+                            tracing::warn!(
+                                "Windows 输入代理 GUI 心跳超时, 保持连接等待恢复"
+                            );
+                        }
+                    } else if heartbeat_stalled {
+                        heartbeat_stalled = false;
+                        tracing::info!("Windows 输入代理 GUI 心跳已恢复");
                     }
                     let current_paused = !is_default_input_desktop();
                     if current_paused != paused {

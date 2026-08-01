@@ -74,6 +74,11 @@ pub fn windows_input_agent_ready() -> bool {
     platform::windows::agent_ready()
 }
 
+#[cfg(windows)]
+pub fn windows_input_elevation_requested() -> bool {
+    platform::windows::agent_elevation_requested()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{InputMode, LocalInputRole, negotiate_input};

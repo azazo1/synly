@@ -803,6 +803,24 @@ impl AppSupervisor {
                         if internal.send(InternalEvent::InputElevation(ready)).is_err() {
                             break;
                         }
+                        if !ready && crate::input::windows_input_elevation_requested() {
+                            tracing::warn!("Windows 输入代理连接丢失, 自动尝试恢复");
+                            let internal = internal.clone();
+                            tokio::task::spawn_blocking(move || {
+                                match crate::windows_input_agent::request_elevation() {
+                                    Ok(()) => {
+                                        let _ =
+                                            internal.send(InternalEvent::InputElevation(true));
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            error = %error,
+                                            "自动恢复 Windows 输入代理失败"
+                                        );
+                                    }
+                                }
+                            });
+                        }
                     }
                 }
             });

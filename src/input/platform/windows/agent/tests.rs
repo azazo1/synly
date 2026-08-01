@@ -300,7 +300,6 @@ fn native_dual_pipe_transport_survives_cursor_lifecycle_and_event_pressure() {
     let (dispatch_rx, response_rx) = producer.join().unwrap();
     assert!(matches!(
         wait_for_agent_response(
-            &alive,
             "InjectWheel",
             dispatch_rx,
             response_rx,
@@ -403,14 +402,13 @@ fn native_pipe_read_timeout_is_cancelled() {
 }
 
 #[test]
-fn reliable_request_timeout_marks_transport_unavailable() {
+fn reliable_request_timeout_keeps_transport_alive() {
     let name = format!(
         r"\\.\pipe\synly-test-response-timeout-{}",
         Uuid::new_v4()
     );
     let (created_tx, created_rx) = std::sync::mpsc::sync_channel(1);
     let alive = Arc::new(AtomicBool::new(true));
-    let server_alive = Arc::clone(&alive);
     let server_name = name.clone();
     let server = std::thread::spawn(move || {
         let mut pipe = create_test_server(&server_name, PipeDirection::ServerToClient);
@@ -426,7 +424,6 @@ fn reliable_request_timeout_marks_transport_unavailable() {
                 response: None,
             },
             &pending,
-            &server_alive,
             &mut next_id,
         )
     });
@@ -446,8 +443,8 @@ fn reliable_request_timeout_marks_transport_unavailable() {
         }
     ));
 
-    assert!(server.join().unwrap().is_err());
-    assert!(!alive.load(Ordering::Acquire));
+    assert!(server.join().unwrap().is_ok());
+    assert!(alive.load(Ordering::Acquire));
 }
 
 #[test]

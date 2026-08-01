@@ -17,6 +17,10 @@ pub(in crate::input) fn agent_ready() -> bool {
     agent::is_ready()
 }
 
+pub(in crate::input) fn agent_elevation_requested() -> bool {
+    agent::elevation_requested()
+}
+
 pub(super) fn ensure_permissions(_mode: InputMode) -> Result<()> {
     Ok(())
 }
