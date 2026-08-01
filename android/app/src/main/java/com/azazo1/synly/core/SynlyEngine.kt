@@ -91,6 +91,7 @@ object SynlyEngine {
             clipboardMode = settings.clipboardMode,
             instanceName = null,
             requestTrust = true,
+            discovery = discoveryConfig(settings),
         )
         val ffiTarget = FfiClientTarget(
             addresses = target.addresses,
@@ -166,15 +167,18 @@ object SynlyEngine {
 
     fun browseDevices(context: Context, timeoutMs: Long): List<FfiDiscoveredPeer> {
         val settings = SettingsStore.load(context)
+        return browseDevices(discoveryConfig(settings), timeoutMs.toULong())
+    }
+
+    private fun discoveryConfig(settings: SynlySettings): FfiDiscoveryConfig {
         val lndServerUrl = if (settings.lndEnabled) settings.lndServerUrl else null
         val lndBearerToken = if (settings.lndEnabled) settings.lndBearerToken else null
-        val config = FfiDiscoveryConfig(
+        return FfiDiscoveryConfig(
             mdnsEnabled = settings.mdnsEnabled,
             lndServerUrl = lndServerUrl,
             lndBearerToken = lndBearerToken,
             lndDiscoveryDomain = if (settings.lndEnabled) settings.lndDiscoveryDomain else null,
         )
-        return browseDevices(config, timeoutMs.toULong())
     }
 
     fun connect(context: Context, target: SynlyTarget) {
@@ -259,6 +263,9 @@ object SynlyEngine {
             }
 
             is FfiClientEvent.PairingFailed -> {
+                // core 在配对终止后不再自动重连, 清空句柄以便下次重新启动
+                handle = null
+                currentTarget = null
                 _uiState.update { it.copy(lastMessage = event.message) }
             }
         }

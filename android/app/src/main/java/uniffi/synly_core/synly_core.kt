@@ -1639,6 +1639,8 @@ data class FfiClientConfig (
     var `instanceName`: kotlin.String?
     , 
     var `requestTrust`: kotlin.Boolean
+    , 
+    var `discovery`: FfiDiscoveryConfig?
     
 ){
     
@@ -1663,6 +1665,7 @@ public object FfiConverterTypeFfiClientConfig: FfiConverterRustBuffer<FfiClientC
             FfiConverterTypeFfiClipboardMode.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterOptionalTypeFfiDiscoveryConfig.read(buf),
         )
     }
 
@@ -1674,7 +1677,8 @@ public object FfiConverterTypeFfiClientConfig: FfiConverterRustBuffer<FfiClientC
             FfiConverterUInt.allocationSize(value.`maxClipboardBinaryLen`) +
             FfiConverterTypeFfiClipboardMode.allocationSize(value.`clipboardMode`) +
             FfiConverterOptionalString.allocationSize(value.`instanceName`) +
-            FfiConverterBoolean.allocationSize(value.`requestTrust`)
+            FfiConverterBoolean.allocationSize(value.`requestTrust`) +
+            FfiConverterOptionalTypeFfiDiscoveryConfig.allocationSize(value.`discovery`)
     )
 
     override fun write(value: FfiClientConfig, buf: ByteBuffer) {
@@ -1686,6 +1690,7 @@ public object FfiConverterTypeFfiClientConfig: FfiConverterRustBuffer<FfiClientC
             FfiConverterTypeFfiClipboardMode.write(value.`clipboardMode`, buf)
             FfiConverterOptionalString.write(value.`instanceName`, buf)
             FfiConverterBoolean.write(value.`requestTrust`, buf)
+            FfiConverterOptionalTypeFfiDiscoveryConfig.write(value.`discovery`, buf)
     }
 }
 
@@ -2582,6 +2587,38 @@ public object FfiConverterOptionalByteArray: FfiConverterRustBuffer<kotlin.ByteA
         } else {
             buf.put(1)
             FfiConverterByteArray.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeFfiDiscoveryConfig: FfiConverterRustBuffer<FfiDiscoveryConfig?> {
+    override fun read(buf: ByteBuffer): FfiDiscoveryConfig? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeFfiDiscoveryConfig.read(buf)
+    }
+
+    override fun allocationSize(value: FfiDiscoveryConfig?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeFfiDiscoveryConfig.allocationSize(value)
+        }
+    }
+
+    override fun write(value: FfiDiscoveryConfig?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeFfiDiscoveryConfig.write(value, buf)
         }
     }
 }

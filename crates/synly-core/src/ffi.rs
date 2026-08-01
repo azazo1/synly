@@ -1,5 +1,5 @@
 use crate::client;
-use crate::device::{DeviceConfig, TrustedDeviceConfig};
+use crate::device::{DeviceConfig, DiscoveryConfig, LndDiscoveryConfig, TrustedDeviceConfig};
 use crate::protocol::{ClipboardImage, ClipboardPayload, DeviceIdentity, TransferLimits};
 use crate::settings::ClipboardMode;
 use std::net::Ipv4Addr;
@@ -254,6 +254,7 @@ pub struct FfiClientConfig {
     pub clipboard_mode: FfiClipboardMode,
     pub instance_name: Option<String>,
     pub request_trust: bool,
+    pub discovery: Option<FfiDiscoveryConfig>,
 }
 
 #[derive(uniffi::Record)]
@@ -535,6 +536,7 @@ pub fn start_client(
         .as_deref()
         .map(Uuid::parse_str)
         .transpose()?;
+    let discovery = config.discovery.map(into_discovery_config);
     let bridge = ListenerBridge { inner: listener };
     let _guard = runtime().enter();
     let handle = client::start_client(
@@ -545,6 +547,7 @@ pub fn start_client(
             clipboard_mode,
             instance_name: config.instance_name,
             request_trust: config.request_trust,
+            discovery,
         },
         client::ClientTarget {
             addresses,
@@ -577,19 +580,22 @@ pub fn browse_devices(
     config: FfiDiscoveryConfig,
     timeout_ms: u64,
 ) -> Result<Vec<FfiDiscoveredPeer>, FfiError> {
-    let lnd = match (config.lnd_server_url, config.lnd_bearer_token) {
-        (Some(server_url), Some(bearer_token)) => Some(crate::device::LndDiscoveryConfig {
-            server_url,
-            bearer_token,
-            discovery_domain: config.lnd_discovery_domain,
-        }),
-        _ => None,
-    };
-    let discovery = crate::device::DiscoveryConfig {
-        mdns_enabled: config.mdns_enabled,
-        lnd,
-    };
+    let discovery = into_discovery_config(config);
     let peers = runtime()
         .block_on(crate::discovery::browse(Duration::from_millis(timeout_ms), &discovery))?;
     Ok(peers.into_iter().map(Into::into).collect())
+}
+
+fn into_discovery_config(config: FfiDiscoveryConfig) -> DiscoveryConfig {
+    DiscoveryConfig {
+        mdns_enabled: config.mdns_enabled,
+        lnd: match (config.lnd_server_url, config.lnd_bearer_token) {
+            (Some(server_url), Some(bearer_token)) => Some(LndDiscoveryConfig {
+                server_url,
+                bearer_token,
+                discovery_domain: config.lnd_discovery_domain,
+            }),
+            _ => None,
+        },
+    }
 }

@@ -1,6 +1,7 @@
 use crate::capabilities::CapabilityState;
 use crate::crypto;
-use crate::device::{DeviceConfig, TrustedDeviceConfig};
+use crate::device::{DeviceConfig, DiscoveryConfig, TrustedDeviceConfig};
+use crate::discovery::{self, DiscoveredPeer};
 use crate::input::InputMode;
 use crate::protocol::{
     ClipboardPayload, ControlMessage, DeviceIdentity, Frame, FrameReader, FrameWriter,
@@ -25,6 +26,7 @@ const TLS_UPGRADE_TIMEOUT: Duration = Duration::from_secs(15);
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const RECONNECT_BASE_DELAY: Duration = Duration::from_secs(2);
 const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(20);
+const REDISCOVER_TIMEOUT: Duration = Duration::from_secs(3);
 
 #[derive(Debug)]
 struct PairingTerminal(anyhow::Error);
@@ -49,6 +51,7 @@ pub struct ClientConfig {
     pub clipboard_mode: ClipboardMode,
     pub instance_name: Option<String>,
     pub request_trust: bool,
+    pub discovery: Option<DiscoveryConfig>,
 }
 
 #[derive(Clone, Debug)]
@@ -188,14 +191,14 @@ pub fn start_client(
 
 async fn run_client_loop(
     mut config: ClientConfig,
-    target: ClientTarget,
+    mut target: ClientTarget,
     listener: Arc<dyn ClientListener>,
     mut commands: mpsc::UnboundedReceiver<ClientCommand>,
     state: Arc<std::sync::Mutex<ClientState>>,
 ) {
     let mut reconnect_delay = RECONNECT_BASE_DELAY;
     loop {
-        let result = connect_and_run(&mut config, &target, &listener, &mut commands, &state).await;
+        let result = connect_and_run(&mut config, &mut target, &listener, &mut commands, &state).await;
         if let Err(err) = &result
             && err.downcast_ref::<PairingTerminal>().is_some()
         {
@@ -259,7 +262,7 @@ fn set_state(state: &Arc<std::sync::Mutex<ClientState>>, next: ClientState) {
 
 async fn connect_and_run(
     config: &mut ClientConfig,
-    target: &ClientTarget,
+    target: &mut ClientTarget,
     listener: &Arc<dyn ClientListener>,
     commands: &mut mpsc::UnboundedReceiver<ClientCommand>,
     state: &Arc<std::sync::Mutex<ClientState>>,
@@ -267,7 +270,7 @@ async fn connect_and_run(
     set_state(state, ClientState::Connecting);
     listener.on_event(ClientEvent::StateChanged(ClientState::Connecting));
     if let Some(trusted) = trusted_device_for_target(config, target) {
-        let Some(socket) = connect_any(&target.addresses, target.port).await? else {
+        let Some(socket) = connect_with_rediscovery(config, target).await? else {
             bail!("目标设备没有可用地址");
         };
         match connect_trusted(config, socket, trusted).await {
@@ -280,11 +283,70 @@ async fn connect_and_run(
         }
     }
 
-    let Some(socket) = connect_any(&target.addresses, target.port).await? else {
+    let Some(socket) = connect_with_rediscovery(config, target).await? else {
         bail!("目标设备没有可用地址");
     };
     let session = connect_bootstrap(config, socket, target, listener, commands).await?;
     run_session(config, listener, commands, state, session).await
+}
+
+async fn connect_with_rediscovery(
+    config: &ClientConfig,
+    target: &mut ClientTarget,
+) -> Result<Option<TcpStream>> {
+    match connect_any(&target.addresses, target.port).await {
+        Ok(socket @ Some(_)) => return Ok(socket),
+        Ok(None) => {}
+        Err(original) => {
+            if refresh_target_addresses(target, &config.discovery).await {
+                return connect_any(&target.addresses, target.port).await;
+            }
+            return Err(original);
+        }
+    }
+    if refresh_target_addresses(target, &config.discovery).await {
+        return connect_any(&target.addresses, target.port).await;
+    }
+    Ok(None)
+}
+
+async fn refresh_target_addresses(
+    target: &mut ClientTarget,
+    discovery: &Option<DiscoveryConfig>,
+) -> bool {
+    let Some(device_id) = target.peer_device_id else {
+        return false;
+    };
+    let Some(config) = discovery.as_ref() else {
+        return false;
+    };
+    let peers = match discovery::browse(REDISCOVER_TIMEOUT, config).await {
+        Ok(peers) => peers,
+        Err(err) => {
+            tracing::warn!(error = %err, "按设备 ID 重新发现目标失败");
+            return false;
+        }
+    };
+    let Some(peer) = rediscovered_peer(&peers, device_id) else {
+        tracing::info!(device_id = %device_id, "重新发现未找到目标设备");
+        return false;
+    };
+    if peer.addresses.is_empty() {
+        return false;
+    }
+    tracing::info!(
+        device_id = %device_id,
+        port = peer.port,
+        addresses = ?peer.addresses,
+        "已重新发现目标设备, 更新重连地址"
+    );
+    target.addresses.clone_from(&peer.addresses);
+    target.port = peer.port;
+    true
+}
+
+fn rediscovered_peer(peers: &[DiscoveredPeer], device_id: Uuid) -> Option<&DiscoveredPeer> {
+    peers.iter().find(|peer| Uuid::parse_str(&peer.device_id).ok() == Some(device_id))
 }
 
 fn trusted_device_for_target<'a>(
@@ -949,7 +1011,12 @@ fn unix_time_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_pin;
+    use super::{DiscoveredPeer, normalize_pin, rediscovered_peer};
+    use crate::discovery::DiscoverySource;
+    use crate::input::InputMode;
+    use crate::settings::{AudioMode, ClipboardMode, FileSyncMode};
+    use std::net::Ipv4Addr;
+    use uuid::Uuid;
 
     #[test]
     fn pin_must_be_six_digits() {
@@ -958,5 +1025,39 @@ mod tests {
         assert!(normalize_pin("12345").is_err());
         assert!(normalize_pin("abcdef").is_err());
         assert!(normalize_pin("1234567").is_err());
+    }
+
+    #[test]
+    fn rediscovered_peer_matches_full_device_id() {
+        let device_id = Uuid::new_v4();
+        let peers = vec![test_peer(device_id, vec![Ipv4Addr::LOCALHOST])];
+        assert_eq!(
+            rediscovered_peer(&peers, device_id).map(|peer| peer.device_id.as_str()),
+            Some(device_id.to_string().as_str())
+        );
+    }
+
+    #[test]
+    fn rediscovered_peer_ignores_unrelated_devices() {
+        let device_id = Uuid::new_v4();
+        let peers = vec![test_peer(Uuid::new_v4(), vec![Ipv4Addr::LOCALHOST])];
+        assert!(rediscovered_peer(&peers, device_id).is_none());
+    }
+
+    fn test_peer(device_id: Uuid, addresses: Vec<Ipv4Addr>) -> DiscoveredPeer {
+        DiscoveredPeer {
+            fullname: "test._synly._tcp.local.".to_string(),
+            device_name: "测试设备".to_string(),
+            instance_name: None,
+            device_id: device_id.to_string(),
+            protocol_version: 1,
+            file_sync_mode: FileSyncMode::Off,
+            clipboard_mode: ClipboardMode::Both,
+            audio_mode: AudioMode::Off,
+            input_mode: InputMode::Off,
+            source: DiscoverySource::Mdns,
+            port: 42000,
+            addresses,
+        }
     }
 }
