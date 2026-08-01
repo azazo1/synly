@@ -25,6 +25,8 @@ const FINISH_DELAY: Duration = Duration::from_millis(300);
 pub struct ReceiverMockOptions {
     pub listen: SocketAddr,
     pub hotkey: Hotkey,
+    pub cursor_mode: CursorMode,
+    pub auto_game_cursor: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -38,10 +40,87 @@ pub struct ControllerMockOptions {
     pub inject_wheel: bool,
 }
 
+#[derive(Clone, Debug)]
+pub struct InteractiveControllerOptions {
+    pub address: SocketAddr,
+    pub edge: ScreenEdge,
+    pub motion_step: u32,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 enum MockFrame {
     Input(InputMessage),
     Finish,
+}
+
+struct ControllerChannel {
+    outgoing: mpsc::Sender<MockFrame>,
+    incoming: mpsc::Receiver<Result<MockFrame>>,
+    writer_task: tokio::task::JoinHandle<Result<()>>,
+    reader_task: tokio::task::JoinHandle<()>,
+}
+
+const ESC_USAGE: u16 = 0x29;
+const DIRECTION_UP_USAGE: u16 = 0x52;
+const DIRECTION_DOWN_USAGE: u16 = 0x51;
+const DIRECTION_LEFT_USAGE: u16 = 0x50;
+const DIRECTION_RIGHT_USAGE: u16 = 0x4f;
+
+/// 方向键 usage 到相对位移的映射, 非方向键返回 None.
+fn direction_motion(usage: u16, step: u32) -> Option<(i32, i32)> {
+    let step = step.min(i32::MAX as u32) as i32;
+    match usage {
+        DIRECTION_UP_USAGE => Some((0, -step)),
+        DIRECTION_DOWN_USAGE => Some((0, step)),
+        DIRECTION_LEFT_USAGE => Some((-step, 0)),
+        DIRECTION_RIGHT_USAGE => Some((step, 0)),
+        _ => None,
+    }
+}
+
+async fn open_controller_channel(address: SocketAddr) -> Result<ControllerChannel> {
+    let stream = TcpStream::connect(address)
+        .await
+        .with_context(|| format!("无法连接真实输入被控端 {address}"))?;
+    stream.set_nodelay(true)?;
+    let (mut reader, mut writer) = stream.into_split();
+    let mock_layout = DesktopLayout::new(vec![super::DisplayRect {
+        x: 0,
+        y: 0,
+        width: 1440,
+        height: 900,
+    }])?;
+    write_mock_frame(
+        &mut writer,
+        &MockFrame::Input(InputMessage::Hello {
+            platform: InputPlatform::current(),
+            layout: mock_layout,
+        }),
+    )
+    .await?;
+    let remote_layout = match read_mock_frame(&mut reader).await? {
+        MockFrame::Input(InputMessage::Hello { layout, .. }) => layout,
+        _ => bail!("真实输入被控端未先发送桌面布局"),
+    };
+    tracing::info!(
+        address = %address,
+        displays = ?remote_layout.displays,
+        "mock 控制端布局交换完成"
+    );
+    let (outgoing, mut outgoing_rx) = mpsc::channel::<MockFrame>(256);
+    let writer_task = tokio::spawn(async move {
+        while let Some(frame) = outgoing_rx.recv().await {
+            write_mock_frame(&mut writer, &frame).await?;
+        }
+        Result::<()>::Ok(())
+    });
+    let (incoming, reader_task) = spawn_controller_reader(reader);
+    Ok(ControllerChannel {
+        outgoing,
+        incoming,
+        writer_task,
+        reader_task,
+    })
 }
 
 pub async fn run_receiver_mock(options: ReceiverMockOptions) -> Result<()> {
@@ -97,8 +176,8 @@ pub async fn run_receiver_mock(options: ReceiverMockOptions) -> Result<()> {
         reverse_trackpad: false,
         block_switch_on_press: false,
         key_mapping: KeyMappingConfig::default(),
-        cursor_mode: CursorMode::Desktop,
-        auto_game_cursor: false,
+        cursor_mode: options.cursor_mode,
+        auto_game_cursor: options.auto_game_cursor,
     };
     let result = {
         let session = runtime::run_receiver(
@@ -138,52 +217,16 @@ pub async fn run_controller_mock(options: ControllerMockOptions) -> Result<()> {
     if options.motion_steps == 0 {
         bail!("motion_steps 必须大于 0");
     }
-    let stream = TcpStream::connect(options.address)
-        .await
-        .with_context(|| format!("无法连接真实输入被控端 {}", options.address))?;
-    stream.set_nodelay(true)?;
-    let (mut reader, mut writer) = stream.into_split();
-    let mock_layout = DesktopLayout::new(vec![super::DisplayRect {
-        x: 0,
-        y: 0,
-        width: 1440,
-        height: 900,
-    }])?;
-    write_mock_frame(
-        &mut writer,
-        &MockFrame::Input(InputMessage::Hello {
-            platform: InputPlatform::current(),
-            layout: mock_layout,
-        }),
-    )
-    .await?;
-    let remote_layout = match read_mock_frame(&mut reader).await? {
-        MockFrame::Input(InputMessage::Hello { layout, .. }) => layout,
-        _ => bail!("真实输入被控端未先发送桌面布局"),
-    };
-    tracing::info!(
-        address = %options.address,
-        displays = ?remote_layout.displays,
-        "mock 控制端布局交换完成"
-    );
-
-    let (outgoing, mut outgoing_rx) = mpsc::channel::<MockFrame>(256);
-    let writer_task = tokio::spawn(async move {
-        while let Some(frame) = outgoing_rx.recv().await {
-            write_mock_frame(&mut writer, &frame).await?;
-        }
-        Result::<()>::Ok(())
-    });
-    let (mut incoming, reader_task) = spawn_controller_reader(reader);
+    let mut channel = open_controller_channel(options.address).await?;
     let generation = Arc::new(AtomicU64::new(1));
     let heartbeat_task = spawn_controller_heartbeat(
-        outgoing.clone(),
+        channel.outgoing.clone(),
         Arc::clone(&generation),
     );
     let started = Instant::now();
 
     send_input(
-        &outgoing,
+        &channel.outgoing,
         InputMessage::Activate {
             generation: 1,
             source_edge: options.edge,
@@ -193,8 +236,8 @@ pub async fn run_controller_mock(options: ControllerMockOptions) -> Result<()> {
     )
     .await?;
     let first_pressure_steps = wait_for_receiver_heartbeat_under_motion(
-        &mut incoming,
-        &outgoing,
+        &mut channel.incoming,
+        &channel.outgoing,
         options.edge,
         1,
         options.step_delay,
@@ -205,12 +248,12 @@ pub async fn run_controller_mock(options: ControllerMockOptions) -> Result<()> {
         pressure_steps = first_pressure_steps,
         "真实被控端已确认第一次接管"
     );
-    send_full_input_sequence(&outgoing, &options, 1).await?;
-    send_input(&outgoing, InputMessage::Deactivate { generation: 1 }).await?;
+    send_full_input_sequence(&channel.outgoing, &options, 1).await?;
+    send_input(&channel.outgoing, InputMessage::Deactivate { generation: 1 }).await?;
 
     generation.store(2, Ordering::Release);
     send_input(
-        &outgoing,
+        &channel.outgoing,
         InputMessage::Activate {
             generation: 2,
             source_edge: options.edge,
@@ -220,8 +263,8 @@ pub async fn run_controller_mock(options: ControllerMockOptions) -> Result<()> {
     )
     .await?;
     let second_pressure_steps = wait_for_receiver_heartbeat_under_motion(
-        &mut incoming,
-        &outgoing,
+        &mut channel.incoming,
+        &channel.outgoing,
         options.edge,
         2,
         options.step_delay,
@@ -233,20 +276,20 @@ pub async fn run_controller_mock(options: ControllerMockOptions) -> Result<()> {
         "真实被控端已确认重新接管"
     );
     send_input(
-        &outgoing,
+        &channel.outgoing,
         motion_message(options.edge, 2, 4),
     )
     .await?;
-    send_input(&outgoing, InputMessage::Deactivate { generation: 2 }).await?;
+    send_input(&channel.outgoing, InputMessage::Deactivate { generation: 2 }).await?;
     time::sleep(FINISH_DELAY).await;
 
     heartbeat_task.abort();
     let _ = heartbeat_task.await;
-    outgoing.send(MockFrame::Finish).await?;
-    drop(outgoing);
-    writer_task.await??;
-    reader_task.abort();
-    let _ = reader_task.await;
+    channel.outgoing.send(MockFrame::Finish).await?;
+    drop(channel.outgoing);
+    channel.writer_task.await??;
+    channel.reader_task.abort();
+    let _ = channel.reader_task.await;
     tracing::info!(
         elapsed_ms = started.elapsed().as_millis(),
         motion_steps = options.motion_steps,
@@ -256,6 +299,208 @@ pub async fn run_controller_mock(options: ControllerMockOptions) -> Result<()> {
         "mock 控制端完整输入序列已完成"
     );
     Ok(())
+}
+
+pub async fn run_controller_mock_interactive(options: InteractiveControllerOptions) -> Result<()> {
+    if options.motion_step == 0 {
+        bail!("motion_step 必须大于 0");
+    }
+    let mut platform = platform::start(InputMode::Send, Hotkey::DEFAULT.parse()?)?;
+    platform.backend.set_keyboard_capture(true)?;
+    let mut channel = open_controller_channel(options.address).await?;
+    let generation = Arc::new(AtomicU64::new(1));
+    let heartbeat_task = spawn_controller_heartbeat(
+        channel.outgoing.clone(),
+        Arc::clone(&generation),
+    );
+    let mut active = true;
+    send_input(
+        &channel.outgoing,
+        InputMessage::Activate {
+            generation: 1,
+            source_edge: options.edge,
+            edge_position: 0.5,
+            pressed: empty_snapshot(),
+        },
+    )
+    .await?;
+    let started = Instant::now();
+
+    // 等待被控端确认接管, 期间若立即请求返回则批准并等待方向键重新接管.
+    time::timeout(CONFIRM_TIMEOUT, async {
+        loop {
+            match channel.incoming.recv().await.context("被控端读取任务已停止")?? {
+                MockFrame::Input(InputMessage::Heartbeat {
+                    generation: 1,
+                }) => break,
+                MockFrame::Input(InputMessage::ReturnRequest {
+                    generation: 1,
+                    edge_position,
+                }) => {
+                    send_input(
+                        &channel.outgoing,
+                        InputMessage::Return {
+                            generation: 1,
+                            edge_position,
+                        },
+                    )
+                    .await?;
+                    active = false;
+                    break;
+                }
+                MockFrame::Finish => bail!("被控端提前结束测试"),
+                MockFrame::Input(_) => {}
+            }
+        }
+        Result::<()>::Ok(())
+    })
+    .await
+    .context("等待被控端确认接管超时")??;
+    tracing::info!(
+        edge = ?options.edge,
+        step = options.motion_step,
+        "交互控制已启动: 方向键移动被控端光标, Esc 退出"
+    );
+
+    let result: Result<()> = async {
+        loop {
+            tokio::select! {
+                event = platform.events.recv() => {
+                    let Some(event) = event else {
+                        bail!("本机按键捕获事件流已结束");
+                    };
+                    match event {
+                        platform::NativeEvent::Key { usage, down, repeat, .. } => {
+                            if let Some((dx, dy)) = direction_motion(usage, options.motion_step) {
+                                if down || repeat {
+                                    let current = ensure_active(
+                                        &channel.outgoing,
+                                        &generation,
+                                        &mut active,
+                                        options.edge,
+                                    )
+                                    .await?;
+                                    send_input(
+                                        &channel.outgoing,
+                                        InputMessage::Motion {
+                                            generation: current,
+                                            dx,
+                                            dy,
+                                        },
+                                    )
+                                    .await?;
+                                }
+                            } else if usage == ESC_USAGE && down {
+                                tracing::info!("Esc 已按下, 结束交互控制");
+                                return Ok(());
+                            }
+                        }
+                        platform::NativeEvent::Emergency => {
+                            tracing::info!("紧急热键已触发, 结束交互控制");
+                            return Ok(());
+                        }
+                        platform::NativeEvent::Failed(message) => {
+                            bail!("本机按键捕获失败: {message}")
+                        }
+                        platform::NativeEvent::ReliableQueueOverflow => {
+                            bail!("本机按键捕获事件队列已满")
+                        }
+                        _ => {}
+                    }
+                }
+                frame = channel.incoming.recv() => {
+                    match frame.context("被控端读取任务已停止")?? {
+                        MockFrame::Input(InputMessage::ReturnRequest {
+                            generation: incoming_generation,
+                            edge_position,
+                        }) => {
+                            if active && incoming_generation == generation.load(Ordering::Acquire) {
+                                send_input(
+                                    &channel.outgoing,
+                                    InputMessage::Return {
+                                        generation: incoming_generation,
+                                        edge_position,
+                                    },
+                                )
+                                .await?;
+                                active = false;
+                                tracing::info!(
+                                    generation = incoming_generation,
+                                    "被控端请求边缘返回, 已批准; 按方向键重新接管"
+                                );
+                            }
+                        }
+                        MockFrame::Input(InputMessage::Return { .. }) => {
+                            active = false;
+                        }
+                        MockFrame::Input(InputMessage::Deactivate {
+                            generation: incoming_generation,
+                        }) => {
+                            if incoming_generation == generation.load(Ordering::Acquire) {
+                                active = false;
+                                tracing::info!(
+                                    generation = incoming_generation,
+                                    "被控端已释放控制, 按方向键重新接管"
+                                );
+                            }
+                        }
+                        MockFrame::Finish => bail!("被控端提前结束测试"),
+                        MockFrame::Input(_) => {}
+                    }
+                }
+            }
+        }
+    }
+    .await;
+
+    if active {
+        let _ = send_input(
+            &channel.outgoing,
+            InputMessage::Deactivate {
+                generation: generation.load(Ordering::Acquire),
+            },
+        )
+        .await;
+    }
+    heartbeat_task.abort();
+    let _ = heartbeat_task.await;
+    let _ = channel.outgoing.send(MockFrame::Finish).await;
+    drop(channel.outgoing);
+    let _ = channel.writer_task.await;
+    channel.reader_task.abort();
+    let _ = channel.reader_task.await;
+    let _ = platform.backend.set_keyboard_capture(false);
+    let _ = platform.backend.release_all();
+    tracing::info!(
+        elapsed_ms = started.elapsed().as_millis(),
+        "交互控制已结束"
+    );
+    result
+}
+
+async fn ensure_active(
+    outgoing: &mpsc::Sender<MockFrame>,
+    generation: &AtomicU64,
+    active: &mut bool,
+    edge: ScreenEdge,
+) -> Result<u64> {
+    if *active {
+        return Ok(generation.load(Ordering::Acquire));
+    }
+    let next = generation.fetch_add(1, Ordering::AcqRel) + 1;
+    send_input(
+        outgoing,
+        InputMessage::Activate {
+            generation: next,
+            source_edge: edge,
+            edge_position: 0.5,
+            pressed: empty_snapshot(),
+        },
+    )
+    .await?;
+    *active = true;
+    tracing::info!(generation = next, "按方向键重新接管被控端");
+    Ok(next)
 }
 
 async fn send_full_input_sequence(
@@ -539,7 +784,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{MockFrame, inward_motion, read_mock_frame, write_mock_frame};
+    use super::{
+        DIRECTION_DOWN_USAGE, DIRECTION_LEFT_USAGE, DIRECTION_RIGHT_USAGE, DIRECTION_UP_USAGE,
+        ESC_USAGE, MockFrame, direction_motion, inward_motion, read_mock_frame, write_mock_frame,
+    };
     use crate::input::protocol::InputMessage;
     use crate::input::ScreenEdge;
     use tokio::io::duplex;
@@ -550,6 +798,28 @@ mod tests {
         assert_eq!(inward_motion(ScreenEdge::Left, 4), (-4, 0));
         assert_eq!(inward_motion(ScreenEdge::Top, 4), (0, -4));
         assert_eq!(inward_motion(ScreenEdge::Bottom, 4), (0, 4));
+    }
+
+    #[test]
+    fn direction_motion_maps_arrow_keys_to_relative_deltas() {
+        assert_eq!(
+            direction_motion(DIRECTION_UP_USAGE, 4),
+            Some((0, -4))
+        );
+        assert_eq!(
+            direction_motion(DIRECTION_DOWN_USAGE, 4),
+            Some((0, 4))
+        );
+        assert_eq!(
+            direction_motion(DIRECTION_LEFT_USAGE, 4),
+            Some((-4, 0))
+        );
+        assert_eq!(
+            direction_motion(DIRECTION_RIGHT_USAGE, 4),
+            Some((4, 0))
+        );
+        assert_eq!(direction_motion(ESC_USAGE, 4), None);
+        assert_eq!(direction_motion(0x04, 4), None);
     }
 
     #[tokio::test]

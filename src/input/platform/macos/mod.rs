@@ -4,7 +4,7 @@ use anyhow::{Context, Result, bail};
 use std::collections::BTreeSet;
 use std::ffi::{c_double, c_void};
 use std::ptr;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub mod permissions;
@@ -162,6 +162,7 @@ struct MacState {
     injected_pressed: Mutex<BTreeSet<u16>>,
     injected_buttons: Mutex<BTreeSet<u8>>,
     injected_cursor: Mutex<Option<Point>>,
+    keyboard_capture: AtomicBool,
     tap: Mutex<Option<usize>>,
     run_loop: Mutex<Option<usize>>,
 }
@@ -202,6 +203,7 @@ pub fn start(context: CaptureContext) -> Result<Arc<dyn InputBackend>> {
         injected_pressed: Mutex::new(BTreeSet::new()),
         injected_buttons: Mutex::new(BTreeSet::new()),
         injected_cursor: Mutex::new(None),
+        keyboard_capture: AtomicBool::new(false),
         tap: Mutex::new(None),
         run_loop: Mutex::new(None),
     });
@@ -383,7 +385,9 @@ unsafe extern "C" fn event_callback(
                 }
                 return ptr::null_mut();
             }
-            if active && event_type == EVENT_FLAGS_CHANGED && usage_is_modifier(usage) {
+            let listening =
+                active || state.keyboard_capture.load(Ordering::Acquire);
+            if listening && event_type == EVENT_FLAGS_CHANGED && usage_is_modifier(usage) {
                 state.context.emit_reliable(NativeEvent::Key {
                     usage,
                     modifiers,
@@ -392,17 +396,18 @@ unsafe extern "C" fn event_callback(
                 });
                 return event;
             }
-            if active {
+            if listening {
                 state.context.emit_reliable(NativeEvent::Key {
                     usage,
                     modifiers,
                     down,
                     repeat,
                 });
-                ptr::null_mut()
-            } else {
-                event
+                if active {
+                    return ptr::null_mut();
+                }
             }
+            event
         }
         _ => event,
     }
@@ -572,6 +577,14 @@ impl InputBackend for MacBackend {
             bail!(
                 "切换 macOS 光标捕获状态失败, visibility={visibility_result}, association={association_result}"
             );
+        }
+        Ok(())
+    }
+
+    fn set_keyboard_capture(&self, active: bool) -> Result<()> {
+        self.state.keyboard_capture.store(active, Ordering::Release);
+        if active {
+            tracing::info!("macOS 键盘监听捕获已开启, 光标状态不受影响");
         }
         Ok(())
     }
@@ -853,6 +866,7 @@ mod tests {
             injected_pressed: Mutex::new(BTreeSet::new()),
             injected_buttons: Mutex::new(BTreeSet::new()),
             injected_cursor: Mutex::new(None),
+            keyboard_capture: AtomicBool::new(false),
             tap: Mutex::new(None),
             run_loop: Mutex::new(None),
         });

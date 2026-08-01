@@ -884,6 +884,12 @@ pub(super) async fn run_receiver(
     let mut cursor = None;
     let mut cursor_mode_active =
         options.cursor_mode.is_game() || (options.auto_game_cursor && foreground_captured());
+    tracing::info!(
+        game = cursor_mode_active,
+        manual_game = options.cursor_mode.is_game(),
+        auto_game_cursor = options.auto_game_cursor,
+        "接收端游戏光标模式初始状态"
+    );
     let mut last_heartbeat = Instant::now();
     let mut timeout_tick = time::interval(HEARTBEAT_INTERVAL);
     timeout_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);

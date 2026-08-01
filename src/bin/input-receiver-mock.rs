@@ -4,9 +4,10 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use std::time::Duration;
 use synly::input::receiver_mock::{
-    ControllerMockOptions, ReceiverMockOptions, run_controller_mock, run_receiver_mock,
+    ControllerMockOptions, InteractiveControllerOptions, ReceiverMockOptions,
+    run_controller_mock, run_controller_mock_interactive, run_receiver_mock,
 };
-use synly::input::{Hotkey, ScreenEdge};
+use synly::input::{CursorMode, Hotkey, ScreenEdge};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -25,6 +26,10 @@ enum Command {
         listen: SocketAddr,
         #[arg(long, default_value = Hotkey::DEFAULT)]
         hotkey: String,
+        #[arg(long)]
+        game_cursor: bool,
+        #[arg(long, default_value_t = true)]
+        auto_game_cursor: bool,
     },
     Control {
         address: SocketAddr,
@@ -34,6 +39,10 @@ enum Command {
         motion_steps: u16,
         #[arg(long, default_value_t = 8)]
         step_delay_ms: u64,
+        #[arg(long)]
+        interactive: bool,
+        #[arg(long, default_value_t = 4)]
+        motion_step: u32,
         #[arg(long)]
         skip_click: bool,
         #[arg(long)]
@@ -56,10 +65,21 @@ async fn main() -> Result<()> {
         .map_err(|error| anyhow!("无法初始化输入接收 mock 日志: {error}"))?;
 
     match Cli::parse().command {
-        Command::Receive { listen, hotkey } => {
+        Command::Receive {
+            listen,
+            hotkey,
+            game_cursor,
+            auto_game_cursor,
+        } => {
             run_receiver_mock(ReceiverMockOptions {
                 listen,
                 hotkey: Hotkey::from_str(&hotkey)?,
+                cursor_mode: if game_cursor {
+                    CursorMode::Game
+                } else {
+                    CursorMode::Desktop
+                },
+                auto_game_cursor,
             })
             .await
         }
@@ -68,20 +88,31 @@ async fn main() -> Result<()> {
             edge,
             motion_steps,
             step_delay_ms,
+            interactive,
+            motion_step,
             skip_click,
             skip_keyboard,
             skip_wheel,
         } => {
-            run_controller_mock(ControllerMockOptions {
-                address,
-                edge,
-                motion_steps,
-                step_delay: Duration::from_millis(step_delay_ms),
-                inject_click: !skip_click,
-                inject_keyboard: !skip_keyboard,
-                inject_wheel: !skip_wheel,
-            })
-            .await
+            if interactive {
+                run_controller_mock_interactive(InteractiveControllerOptions {
+                    address,
+                    edge,
+                    motion_step,
+                })
+                .await
+            } else {
+                run_controller_mock(ControllerMockOptions {
+                    address,
+                    edge,
+                    motion_steps,
+                    step_delay: Duration::from_millis(step_delay_ms),
+                    inject_click: !skip_click,
+                    inject_keyboard: !skip_keyboard,
+                    inject_wheel: !skip_wheel,
+                })
+                .await
+            }
         }
     }
 }

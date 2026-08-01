@@ -321,6 +321,7 @@ struct WindowsState {
     injected_pressed: Mutex<BTreeSet<u16>>,
     injected_buttons: Mutex<BTreeSet<u8>>,
     capture_phase: AtomicU8,
+    keyboard_capture: AtomicBool,
     thread_id: AtomicU32,
     hider_window: AtomicIsize,
     cursor_hidden: AtomicBool,
@@ -342,6 +343,7 @@ pub(super) fn start(context: CaptureContext) -> Result<Arc<dyn InputBackend>> {
         injected_pressed: Mutex::new(BTreeSet::new()),
         injected_buttons: Mutex::new(BTreeSet::new()),
         capture_phase: AtomicU8::new(CapturePhase::Observing as u8),
+        keyboard_capture: AtomicBool::new(false),
         thread_id: AtomicU32::new(0),
         hider_window: AtomicIsize::new(0),
         cursor_hidden: AtomicBool::new(false),
@@ -605,17 +607,13 @@ unsafe extern "system" fn keyboard_callback(code: i32, w_param: WParam, l_param:
         return 1;
     }
     let phase = capture_phase(context);
+    let capturing =
+        phase == CapturePhase::Relaying || context.keyboard_capture.load(Ordering::Acquire);
     let suppressing = phase.suppresses_local_input();
-    if suppressing && usage_is_modifier(usage) {
-        if phase == CapturePhase::Relaying {
-            context.context.emit_reliable(NativeEvent::Key { usage, modifiers, down, repeat });
-        }
-        return unsafe { CallNextHookEx(0, code, w_param, l_param) };
+    if capturing {
+        context.context.emit_reliable(NativeEvent::Key { usage, modifiers, down, repeat });
     }
-    if suppressing {
-        if phase == CapturePhase::Relaying {
-            context.context.emit_reliable(NativeEvent::Key { usage, modifiers, down, repeat });
-        }
+    if suppressing && !usage_is_modifier(usage) {
         return 1;
     }
     unsafe { CallNextHookEx(0, code, w_param, l_param) }
@@ -868,6 +866,14 @@ impl InputBackend for WindowsBackend {
         let window = self.state.hider_window.load(Ordering::Acquire);
         if window == 0 || !send_capture_message(window, active) {
             bail!("无法切换 Windows 光标捕获状态")
+        }
+        Ok(())
+    }
+
+    fn set_keyboard_capture(&self, active: bool) -> Result<()> {
+        self.state.keyboard_capture.store(active, Ordering::Release);
+        if active {
+            tracing::info!("Windows 键盘监听捕获已开启, 光标状态不受影响");
         }
         Ok(())
     }

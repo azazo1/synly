@@ -51,6 +51,11 @@ pub trait InputBackend: Send + Sync {
     fn cursor_position(&self) -> Result<Point>;
     fn snapshot(&self) -> KeySnapshot;
     fn set_capture(&self, active: bool) -> Result<()>;
+    /// 仅监听键盘事件而不进入完整捕获: 不隐藏光标, 不分离鼠标, 不吞掉按键.
+    /// 用于需要读取本机方向键但不想改变光标状态的工具, 默认不做任何事.
+    fn set_keyboard_capture(&self, _active: bool) -> Result<()> {
+        Ok(())
+    }
     fn warp_cursor(&self, point: Point) -> Result<()>;
     fn inject_key(
         &self,
