@@ -5536,6 +5536,7 @@ mod tests {
             ui: crate::config::UiConfig::default(),
             runtime: crate::config::RuntimeConfig::default(),
             trusted_devices,
+            preferred_active: None,
         }
     }
 

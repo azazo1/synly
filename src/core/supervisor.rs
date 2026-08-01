@@ -336,16 +336,25 @@ impl AppSupervisor {
                 if self.config.revoke_trusted_device(device_id) {
                     self.save_trusted_devices();
                     self.snapshot.trusted_devices = self.config.trusted_devices.clone();
-                    if self
-                        .snapshot
-                        .sessions
-                        .iter()
-                        .any(|session| session.device_id == device_id)
-                        && let Some(session) = &self.session
-                    {
-                        let _ = session
-                            .commands
-                            .send(RuntimeCommand::DisconnectPeer(device_id));
+                    let was_preferred = self.config.preferred_active == Some(device_id);
+                    if was_preferred {
+                        self.config.preferred_active = None;
+                        self.save_settings();
+                    }
+                    if let Some(session) = &self.session {
+                        if was_preferred {
+                            let _ = session.commands.send(RuntimeCommand::ClearPreferredActive);
+                        }
+                        if self
+                            .snapshot
+                            .sessions
+                            .iter()
+                            .any(|session| session.device_id == device_id)
+                        {
+                            let _ = session
+                                .commands
+                                .send(RuntimeCommand::DisconnectPeer(device_id));
+                        }
                     }
                     self.publish();
                 }
@@ -518,6 +527,12 @@ impl AppSupervisor {
                 self.snapshot.lifecycle = AppLifecycle::Connected;
                 self.sync_active_flags();
                 self.refresh_aggregate_capabilities();
+            }
+            RuntimeEvent::PreferredActiveChanged { device_id } => {
+                if self.config.preferred_active != device_id {
+                    self.config.preferred_active = device_id;
+                    self.save_settings();
+                }
             }
             RuntimeEvent::Interaction(envelope) => self.handle_interaction(envelope),
             RuntimeEvent::Capabilities {
@@ -1143,6 +1158,7 @@ mod tests {
             ui: UiConfig::default(),
             runtime: RuntimeConfig::default(),
             trusted_devices: Vec::new(),
+            preferred_active: None,
         }
     }
 }

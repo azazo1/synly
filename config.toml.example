@@ -1,4 +1,6 @@
 # 每台设备的 UUID 和身份密钥由 identity.toml 保存.
+# 首选活跃设备 ID, 由程序写入, host 重启后保持其活跃身份.
+# preferred_active = "00000000-0000-0000-0000-000000000000"
 [device]
 device_name = "workstation"
 

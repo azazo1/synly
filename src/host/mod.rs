@@ -2,7 +2,7 @@ pub(crate) mod active_slot;
 pub(crate) mod clipboard_hub;
 pub(crate) mod session;
 
-pub(crate) use active_slot::{ActiveSlot, ActiveSlotReserver, SlotReservation};
+pub(crate) use active_slot::{ActiveSlot, ActiveSlotReserver, ExpiryAction, SlotReservation};
 pub(crate) use clipboard_hub::ClipboardHub;
 pub(crate) use session::InputRouteRegistry;
 
@@ -98,6 +98,27 @@ struct HostSessionEntry {
     task: JoinHandle<()>,
 }
 
+/// 按会话接入顺序返回当前在线且受信的设备, 作为活跃会话提升候选.
+async fn trusted_candidates_in_order(
+    config: &Arc<Mutex<SynlyConfig>>,
+    sessions: &HashMap<Uuid, HostSessionEntry>,
+) -> Vec<Uuid> {
+    let config_guard = config.lock().await;
+    let mut candidates: Vec<(Uuid, u64)> = sessions
+        .values()
+        .filter_map(|candidate| {
+            config_guard
+                .trusted_device(&candidate.device_id)
+                .map(|_| (candidate.device_id, candidate.order))
+        })
+        .collect();
+    candidates.sort_by_key(|(_, order)| *order);
+    candidates
+        .into_iter()
+        .map(|(device_id, _)| device_id)
+        .collect()
+}
+
 pub(crate) async fn run_host_runtime(
     config: SynlyConfig,
     mut options: RuntimeOptions,
@@ -150,10 +171,13 @@ pub(crate) async fn run_host_runtime(
 
     print_host_ready(&device, &options, port);
 
+    let preferred_active = config.preferred_active;
     let config = Arc::new(Mutex::new(config));
     let pairing_slot = Arc::new(Semaphore::new(1));
     let pairing_throttle = Arc::new(Mutex::new(PairingThrottle::default()));
-    let active_slot = Arc::new(std::sync::Mutex::new(ActiveSlot::new()));
+    let active_slot = Arc::new(std::sync::Mutex::new(ActiveSlot::with_preferred(
+        preferred_active,
+    )));
     let input_routes = Arc::new(InputRouteRegistry::default());
     let clipboard_hub = ClipboardHub::new(options.clipboard.clone());
     let (host_events_tx, mut host_events_rx) = mpsc::unbounded_channel::<HostEvent>();
@@ -297,7 +321,22 @@ pub(crate) async fn run_host_runtime(
                                         .await;
                                     }
                                 }
+                                let old_preferred = active_slot
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .preferred();
                                 let demote = reservation.claim();
+                                let new_preferred = active_slot
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .preferred();
+                                if new_preferred != old_preferred {
+                                    options
+                                        .control
+                                        .report(RuntimeEvent::PreferredActiveChanged {
+                                            device_id: new_preferred,
+                                        });
+                                }
                                 if let Some(old) = demote {
                                     tracing::info!(%old, "新活跃会话已建立, 正在降级旧活跃会话");
                                     if let Some(entry) = sessions.get(&old) {
@@ -340,24 +379,8 @@ pub(crate) async fn run_host_runtime(
                                 }
                                 if let Some(entry) = sessions.remove(&device_id) {
                                     let _ = entry.task.await;
-                                    let trusted_candidates = {
-                                        let config_guard = config.lock().await;
-                                        let mut candidates: Vec<(Uuid, u64)> = sessions
-                                            .values()
-                                            .filter_map(|candidate| {
-                                                config_guard
-                                                    .trusted_device(&candidate.device_id)
-                                                    .map(|_| {
-                                                        (candidate.device_id, candidate.order)
-                                                    })
-                                            })
-                                            .collect();
-                                        candidates.sort_by_key(|(_, order)| *order);
-                                        candidates
-                                            .into_iter()
-                                            .map(|(device_id, _)| device_id)
-                                            .collect::<Vec<_>>()
-                                    };
+                                    let trusted_candidates =
+                                        trusted_candidates_in_order(&config, &sessions).await;
                                     let promoted = active_slot
                                         .lock()
                                         .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -398,22 +421,54 @@ pub(crate) async fn run_host_runtime(
                                     && sessions.contains_key(&device_id)
                                 {
                                     slot.request_switch(device_id);
+                                    let preferred = slot.preferred();
                                     drop(slot);
                                     tracing::info!(%device_id, "收到切换活跃会话请求");
+                                    options.control.report(
+                                        RuntimeEvent::PreferredActiveChanged {
+                                            device_id: preferred,
+                                        },
+                                    );
                                     if let Some(entry) = sessions.get(&device_id) {
                                         entry.shutdown.cancel();
                                     }
                                 }
                             }
+                            RuntimeCommand::ClearPreferredActive => {
+                                active_slot
+                                    .lock()
+                                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                    .clear_preferred();
+                                tracing::info!("已清除首选活跃设备");
+                                options
+                                    .control
+                                    .report(RuntimeEvent::PreferredActiveChanged {
+                                        device_id: None,
+                                    });
+                            }
                         }
                     }
                     _ = promotion_ticker.tick() => {
-                        let expired = active_slot
+                        let action = active_slot
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
                             .pending_expired(std::time::Instant::now());
-                        if expired {
-                            tracing::info!("活跃会话提升等待超时, 槽位已开放");
+                        match action {
+                            ExpiryAction::PromoteStandIn => {
+                                tracing::info!("首选活跃设备回归等待超时, 正在提升临时活跃会话");
+                                let candidates =
+                                    trusted_candidates_in_order(&config, &sessions).await;
+                                if let Some(promoted) = candidates.first()
+                                    && let Some(entry) = sessions.get(promoted)
+                                {
+                                    tracing::info!(%promoted, "临时活跃会话接管活跃槽位");
+                                    entry.shutdown.cancel();
+                                }
+                            }
+                            ExpiryAction::SlotOpened => {
+                                tracing::info!("活跃会话提升等待超时, 槽位已开放");
+                            }
+                            ExpiryAction::None => {}
                         }
                     }
                     _ = shutdown.cancelled() => break,

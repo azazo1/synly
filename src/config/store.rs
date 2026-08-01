@@ -30,6 +30,9 @@ struct MainConfigFile {
     ui: UiConfig,
     runtime: RuntimeFileConfig,
     input: InputConfig,
+    /// 首选活跃设备, 旧配置缺失时按无处理.
+    #[serde(default)]
+    preferred_active: Option<Uuid>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -157,6 +160,7 @@ impl MainConfigFile {
             ui: UiConfig::default(),
             runtime: RuntimeFileConfig::default(),
             input: InputConfig::default(),
+            preferred_active: None,
         }
     }
 
@@ -179,6 +183,7 @@ impl MainConfigFile {
             ui: self.ui,
             runtime: self.runtime.into_runtime(self.input),
             trusted_devices,
+            preferred_active: self.preferred_active,
         }
     }
 }
@@ -196,6 +201,7 @@ impl From<&SynlyConfig> for MainConfigFile {
             ui: config.ui.clone(),
             runtime: RuntimeFileConfig::from(&config.runtime),
             input: config.runtime.input.clone(),
+            preferred_active: config.preferred_active,
         }
     }
 }
@@ -503,6 +509,22 @@ mod tests {
         .unwrap();
         assert_eq!(fs::read_to_string(dir.join(CONFIG_FILE_NAME)).unwrap(), settings);
         assert_eq!(fs::read_to_string(dir.join(IDENTITY_FILE_NAME)).unwrap(), identity);
+        cleanup_dir(&dir);
+    }
+
+    #[test]
+    fn preferred_active_survives_settings_round_trip() {
+        let dir = unique_test_dir("preferred-active");
+        let mut config = load_or_create_in_dir(&dir).unwrap();
+        let preferred = Uuid::new_v4();
+        config.preferred_active = Some(preferred);
+        write_toml_atomic(
+            &dir.join(CONFIG_FILE_NAME),
+            &MainConfigFile::from(&config),
+        )
+        .unwrap();
+        let reloaded = load_or_create_in_dir(&dir).unwrap();
+        assert_eq!(reloaded.preferred_active, Some(preferred));
         cleanup_dir(&dir);
     }
 

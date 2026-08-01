@@ -44,6 +44,7 @@ pub struct RuntimePeerSummary {
 pub enum RuntimeCommand {
     DisconnectPeer(Uuid),
     SwitchActiveSession(Uuid),
+    ClearPreferredActive,
 }
 
 #[allow(dead_code)]
@@ -118,6 +119,10 @@ pub enum RuntimeEvent {
     Disconnected(RuntimePeerSummary),
     ActiveSession {
         device_id: Uuid,
+    },
+    /// 首选活跃设备身份变化, 供上层持久化.
+    PreferredActiveChanged {
+        device_id: Option<Uuid>,
     },
     Interaction(InteractionEnvelope),
     Capabilities {

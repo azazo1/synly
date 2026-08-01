@@ -319,6 +319,7 @@ mod tests {
             ui: UiConfig::default(),
             runtime: RuntimeConfig::default(),
             trusted_devices: Vec::new(),
+            preferred_active: None,
         }
     }
 }

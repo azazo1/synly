@@ -27,6 +27,8 @@ pub struct SynlyConfig {
     pub ui: UiConfig,
     pub runtime: RuntimeConfig,
     pub trusted_devices: Vec<TrustedDeviceConfig>,
+    /// 首选活跃设备, 跨 host 重启保留.
+    pub preferred_active: Option<Uuid>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
