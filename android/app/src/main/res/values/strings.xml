@@ -1,10 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Synly</string>
-    <string name="accessibility_service_label">Synly 剪贴板同步</string>
-    <string name="accessibility_service_description">用于在后台监听剪贴板变化, 与 Synly 桌面端双向同步剪贴板。</string>
     <string name="sync_notification_channel">剪贴板同步</string>
     <string name="sync_notification_title">Synly 正在同步剪贴板</string>
     <string name="sync_notification_text">点击打开 Synly</string>
 </resources>
-

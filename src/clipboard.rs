@@ -44,7 +44,6 @@ struct ClipboardSyncState {
 
 struct LocalClipboardHandler {
     ctx: ClipboardContext,
-    state: Arc<Mutex<ClipboardSyncState>>,
     tx: mpsc::UnboundedSender<ClipboardPayload>,
     options: Arc<Mutex<ClipboardRuntimeOptions>>,
 }
@@ -80,7 +79,6 @@ impl ClipboardSync {
         tx: mpsc::UnboundedSender<ClipboardPayload>,
     ) -> Result<ClipboardWatcherHandle> {
         let handler = LocalClipboardHandler::new(
-            self.state.clone(),
             tx,
             Arc::clone(&self.options),
         )?;
@@ -225,14 +223,12 @@ impl ClipboardSyncState {
 
 impl LocalClipboardHandler {
     fn new(
-        state: Arc<Mutex<ClipboardSyncState>>,
         tx: mpsc::UnboundedSender<ClipboardPayload>,
         options: Arc<Mutex<ClipboardRuntimeOptions>>,
     ) -> Result<Self> {
         let ctx = ClipboardContext::new().map_err(clipboard_error)?;
         Ok(Self {
             ctx,
-            state,
             tx,
             options,
         })
@@ -256,13 +252,9 @@ impl ClipboardHandler for LocalClipboardHandler {
             return;
         };
 
-        let should_send = match self.state.lock() {
-            Ok(mut state) => state.note_local_payload(&payload),
-            Err(_) => false,
-        };
-        if should_send {
-            let _ = self.tx.send(payload);
-        }
+        // 去重统一由剪贴板中枢处理, 这里只负责捕获与上报,
+        // 避免 watcher 与中枢先后两次更新 last_sent 导致广播永远被抑制.
+        let _ = self.tx.send(payload);
     }
 }
 

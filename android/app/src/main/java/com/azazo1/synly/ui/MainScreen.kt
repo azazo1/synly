@@ -1,9 +1,8 @@
 package com.azazo1.synly.ui
 
-import android.accessibilityservice.AccessibilityService
-import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
 import android.os.PowerManager
 import android.provider.Settings
 import androidx.compose.foundation.layout.Arrangement
@@ -54,7 +53,6 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.azazo1.synly.core.SettingsStore
 import com.azazo1.synly.core.SynlyEngine
 import com.azazo1.synly.core.SynlyTarget
-import com.azazo1.synly.service.ClipboardAccessibilityService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import uniffi.synly_core.FfiClientState
@@ -82,16 +80,13 @@ private fun HomeScreen(onOpenSettings: () -> Unit) {
     var pin by remember { mutableStateOf("") }
     var settings by remember { mutableStateOf(SettingsStore.load(context)) }
     val scope = rememberCoroutineScope()
-    var accessibilityEnabled by remember { mutableStateOf(false) }
+    var overlayEnabled by remember { mutableStateOf(false) }
     var batteryIgnored by remember { mutableStateOf(false) }
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
-                accessibilityEnabled = isAccessibilityServiceEnabled(
-                    context,
-                    ClipboardAccessibilityService::class.java,
-                )
+                overlayEnabled = Settings.canDrawOverlays(context)
                 batteryIgnored = isIgnoringBatteryOptimizations(context)
             }
         }
@@ -226,18 +221,27 @@ private fun HomeScreen(onOpenSettings: () -> Unit) {
                         Text("权限与后台", style = MaterialTheme.typography.titleSmall)
                         OutlinedButton(
                             onClick = {
-                                val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
+                                val intent = Intent(
+                                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                    Uri.parse("package:${context.packageName}"),
+                                )
                                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
                                 context.startActivity(intent)
                             },
-                            colors = permissionButtonColors(accessibilityEnabled),
+                            colors = permissionButtonColors(overlayEnabled),
                             modifier = Modifier.fillMaxWidth(),
                         ) {
-                            if (accessibilityEnabled) {
+                            if (overlayEnabled) {
                                 Icon(Icons.Filled.Check, contentDescription = null)
                                 Spacer(Modifier.width(8.dp))
                             }
-                            Text(if (accessibilityEnabled) "无障碍服务已开启" else "开启无障碍服务")
+                            Text(
+                                if (overlayEnabled) {
+                                    "后台读取剪贴板已允许"
+                                } else {
+                                    "允许后台读取剪贴板"
+                                },
+                            )
                         }
                         OutlinedButton(
                             onClick = {
@@ -334,18 +338,6 @@ private fun permissionButtonColors(enabled: Boolean): ButtonColors {
     } else {
         ButtonDefaults.outlinedButtonColors()
     }
-}
-
-private fun isAccessibilityServiceEnabled(
-    context: Context,
-    serviceClass: Class<out AccessibilityService>,
-): Boolean {
-    val component = ComponentName(context, serviceClass)
-    val enabled = Settings.Secure.getString(
-        context.contentResolver,
-        Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES,
-    ) ?: return false
-    return enabled.split(':').any { it.equals(component.flattenToString(), ignoreCase = true) }
 }
 
 private fun isIgnoringBatteryOptimizations(context: Context): Boolean {

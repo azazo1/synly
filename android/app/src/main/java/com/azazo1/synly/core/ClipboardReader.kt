@@ -13,7 +13,7 @@ object ClipboardReader {
     @Volatile
     private var suppressSignature: String? = null
 
-    fun poll(context: Context, onPayload: (ClipboardPayload) -> Unit) {
+    fun takePending(context: Context, onPayload: (ClipboardPayload) -> Unit) {
         val payload = readNow(context) ?: return
         val signature = payload.signature()
         if (signature == lastSignature) return

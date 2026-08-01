@@ -4,11 +4,14 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
+import android.os.SystemClock
+import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.azazo1.synly.MainActivity
@@ -17,8 +20,10 @@ import com.azazo1.synly.core.SynlyEngine
 
 class ClipboardSyncService : android.app.Service() {
     companion object {
+        private const val TAG = "ClipboardSyncService"
         private const val CHANNEL_ID = "synly_sync"
         private const val NOTIFICATION_ID = 1
+        private const val MIN_TRIGGER_INTERVAL_MS = 300L
 
         fun start(context: Context) {
             ContextCompat.startForegroundService(
@@ -34,6 +39,12 @@ class ClipboardSyncService : android.app.Service() {
 
     private var multicastLock: WifiManager.MulticastLock? = null
 
+    private var lastReadTriggerMs = 0L
+
+    private val clipboardListener = ClipboardManager.OnPrimaryClipChangedListener {
+        maybeReadClipboard()
+    }
+
     override fun onCreate() {
         super.onCreate()
         createChannel()
@@ -42,12 +53,16 @@ class ClipboardSyncService : android.app.Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startForeground(NOTIFICATION_ID, buildNotification())
         acquireMulticastLock()
+        getSystemService(ClipboardManager::class.java)
+            .addPrimaryClipChangedListener(clipboardListener)
         SynlyEngine.init(applicationContext)
         SynlyEngine.start(applicationContext)
         return START_STICKY
     }
 
     override fun onDestroy() {
+        getSystemService(ClipboardManager::class.java)
+            .removePrimaryClipChangedListener(clipboardListener)
         releaseMulticastLock()
         SynlyEngine.stop()
         super.onDestroy()
@@ -95,4 +110,20 @@ class ClipboardSyncService : android.app.Service() {
         multicastLock?.takeIf { it.isHeld }?.release()
         multicastLock = null
     }
+
+    private fun maybeReadClipboard() {
+        if (!SynlyEngine.canSend()) return
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastReadTriggerMs < MIN_TRIGGER_INTERVAL_MS) return
+        lastReadTriggerMs = now
+        runCatching {
+            startActivity(
+                Intent(this, ClipboardReadActivity::class.java)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+            )
+        }.onFailure {
+            Log.w(TAG, "启动剪贴板读取界面失败, 请检查悬浮窗权限", it)
+        }
+    }
+
 }
