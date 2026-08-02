@@ -921,12 +921,12 @@ pub(super) async fn run_receiver(
                 }
             }
             _ = monitor_tick.tick() => {
-                if !options.auto_game_cursor {
-                    continue;
-                }
                 let captured = foreground_captured();
                 let game = options.cursor_mode.is_game() || captured;
                 if game == cursor_mode_active {
+                    continue;
+                }
+                if game && !options.auto_game_cursor {
                     continue;
                 }
                 cursor_mode_active = game;
@@ -955,9 +955,31 @@ pub(super) async fn run_receiver(
                         active = true;
                         return_edge = source_edge.opposite();
                         last_heartbeat = Instant::now();
-                        let entry = local_layout.point_inside_edge(return_edge, edge_position, EDGE_INSET);
-                        platform.backend.warp_cursor(entry)?;
-                        cursor = Some(entry);
+                        if cursor_mode_active {
+                            tracing::info!(
+                                generation,
+                                edge = ?return_edge,
+                                "游戏光标模式接管, 跳过边缘定位"
+                            );
+                        } else {
+                            let entry = local_layout.point_inside_edge(
+                                return_edge,
+                                edge_position,
+                                EDGE_INSET,
+                            );
+                            match platform.backend.warp_cursor(entry) {
+                                Ok(()) => cursor = Some(entry),
+                                Err(error) if foreground_captured() => {
+                                    cursor_mode_active = true;
+                                    tracing::warn!(
+                                        generation,
+                                        error = %error,
+                                        "前台游戏锁定光标, 无法定位到边缘, 已切换游戏光标模式"
+                                    );
+                                }
+                                Err(error) => return Err(error),
+                            }
+                        }
                         apply_snapshot(&*platform.backend, &pressed)?;
                         enqueue_message(tx, InputMessage::Heartbeat { generation })?;
                         tracing::info!(generation, edge = ?return_edge, "开始接受对端控制");
@@ -1160,6 +1182,7 @@ mod tests {
     struct FakeBackend {
         capture: Mutex<bool>,
         warped: Mutex<Option<Point>>,
+        warp_fail: AtomicBool,
         recovery_actions: Mutex<Vec<&'static str>>,
         pressed: Mutex<Option<KeySnapshot>>,
         motions: Mutex<Vec<(i32, i32)>>,
@@ -1193,6 +1216,9 @@ mod tests {
         }
 
         fn warp_cursor(&self, point: Point) -> Result<()> {
+            if self.warp_fail.load(Ordering::Acquire) {
+                anyhow::bail!("无法移动光标");
+            }
             *self.warped.lock().unwrap() = Some(point);
             self.recovery_actions.lock().unwrap().push("warp");
             Ok(())
@@ -1800,6 +1826,97 @@ mod tests {
         assert!(
             !backend.motions.lock().unwrap().is_empty(),
             "游戏模式应注入相对移动"
+        );
+        assert!(
+            backend.warped.lock().unwrap().is_none(),
+            "游戏模式接管不应 warp 光标"
+        );
+
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn receiver_falls_back_to_game_mode_when_warp_blocked_by_cursor_capture() {
+        let backend = Arc::new(FakeBackend::default());
+        backend.warp_fail.store(true, Ordering::Release);
+        let layout = backend.layout().unwrap();
+        let motion = Arc::new(MotionAccumulator::default());
+        let (_events_tx, events) = mpsc::channel(1);
+        let mut platform = PlatformHandle {
+            backend: Arc::clone(&backend) as Arc<dyn InputBackend>,
+            events,
+            motion,
+            overflowed: Arc::new(AtomicBool::new(false)),
+            failed: Arc::new(AtomicBool::new(false)),
+        };
+        let (incoming_tx, mut incoming) = mpsc::channel(256);
+        let incoming_motion = Arc::new(IncomingMotion::default());
+        let (outgoing, mut messages) = mpsc::channel(16);
+        let options = test_input_options(ScreenEdge::Left);
+        let captured = Arc::new(AtomicBool::new(true));
+        incoming_tx
+            .send(Ok(InputMessage::Activate {
+                generation: 7,
+                source_edge: ScreenEdge::Right,
+                edge_position: 0.5,
+                pressed: KeySnapshot {
+                    usages: Vec::new(),
+                    modifiers: ModifierMask::default(),
+                    buttons: Vec::new(),
+                },
+            }))
+            .await
+            .unwrap();
+
+        let incoming_motion_for_task = Arc::clone(&incoming_motion);
+        let captured_for_task = Arc::clone(&captured);
+        let task = tokio::spawn(async move {
+            run_receiver(
+                &mut incoming,
+                &incoming_motion_for_task,
+                &outgoing,
+                &mut platform,
+                layout,
+                &options,
+                move || captured_for_task.load(Ordering::Acquire),
+            )
+            .await
+        });
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if matches!(
+                    messages.recv().await,
+                    Some(InputMessage::Heartbeat { generation: 7 })
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("接收端应确认激活");
+
+        // warp 被游戏锁定后应降级为游戏光标模式, 运动直接相对注入.
+        for _ in 0..500 {
+            incoming_motion.push(7, -3, 2);
+        }
+        let no_return = timeout(Duration::from_millis(300), async {
+            loop {
+                match messages.recv().await {
+                    Some(InputMessage::ReturnRequest { .. }) => {
+                        panic!("游戏模式不应请求边缘返回")
+                    }
+                    Some(_) => {}
+                    None => panic!("接收端不应提前停止"),
+                }
+            }
+        })
+        .await;
+        assert!(no_return.is_err(), "warp 失败后应保持游戏光标模式");
+        assert!(
+            !backend.motions.lock().unwrap().is_empty(),
+            "warp 失败后应注入相对移动"
         );
 
         task.abort();
