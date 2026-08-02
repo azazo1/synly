@@ -1324,7 +1324,7 @@ pub(super) fn foreground_cursor_captured() -> bool {
         cb_size: size_of::<CursorInfo>() as u32,
         ..CursorInfo::default()
     };
-    unsafe { GetCursorInfo(&mut info) } != 0 && info.flags & CURSOR_SHOWING == 0
+    (unsafe { GetCursorInfo(&mut info) }) != 0 && info.flags & CURSOR_SHOWING == 0
 }
 
 fn virtual_screen_rect() -> RectRaw {
