@@ -57,6 +57,21 @@ object IdentityStore {
             .getString(PREF_DEVICE_NAME, null)
     }
 
+    fun replace(context: Context, config: FfiDeviceConfig) {
+        require(config.deviceId.isNotBlank()) { "device_id 不能为空" }
+        require(config.deviceName.isNotBlank()) { "device_name 不能为空" }
+        require(config.identityPrivateKey.isNotBlank()) { "identity_private_key 不能为空" }
+        require(config.identityPublicKey.isNotBlank()) { "identity_public_key 不能为空" }
+        val encrypted = encrypt(config.identityPrivateKey)
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .edit()
+            .putString(PREF_DEVICE_ID, config.deviceId)
+            .putString(PREF_DEVICE_NAME, config.deviceName)
+            .putString(PREF_PUBLIC_KEY, config.identityPublicKey)
+            .putString(PREF_PRIVATE_KEY, encrypted)
+            .apply()
+    }
+
     private fun key(): SecretKey {
         val keyStore = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
         (keyStore.getKey(KEY_ALIAS, null) as? SecretKey)?.let { return it }

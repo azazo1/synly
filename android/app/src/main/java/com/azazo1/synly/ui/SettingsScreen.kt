@@ -1,5 +1,9 @@
 package com.azazo1.synly.ui
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -8,10 +12,12 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
@@ -21,6 +27,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -33,15 +40,112 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import com.azazo1.synly.core.ConfigBackup
 import com.azazo1.synly.core.SettingsStore
 import com.azazo1.synly.core.SynlyEngine
 import com.azazo1.synly.core.TrustedDeviceStore
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 @Composable
 fun SettingsScreen(onBack: () -> Unit) {
     val context = LocalContext.current
     var settings by remember { mutableStateOf(SettingsStore.load(context)) }
+    var trustedDevices by remember { mutableStateOf(TrustedDeviceStore.list(context)) }
     var showToken by remember { mutableStateOf(false) }
+    var busy by remember { mutableStateOf(false) }
+    var statusMessage by remember { mutableStateOf<String?>(null) }
+    var pendingImport by remember { mutableStateOf<ConfigBackup.Backup?>(null) }
+    val scope = rememberCoroutineScope()
+
+    val exportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/json"),
+    ) { uri ->
+        if (uri != null) {
+            busy = true
+            statusMessage = null
+            scope.launch {
+                val result = withContext(Dispatchers.IO) {
+                    runCatching {
+                        val json = ConfigBackup.create(context)
+                        val stream = context.contentResolver.openOutputStream(uri)
+                            ?: error("无法打开输出文件")
+                        stream.use { it.write(json.toByteArray(Charsets.UTF_8)) }
+                    }
+                }
+                result
+                    .onSuccess { statusMessage = "配置已导出" }
+                    .onFailure { statusMessage = "导出失败: ${it.message ?: "未知错误"}" }
+                busy = false
+            }
+        }
+    }
+    val importLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        if (uri != null) {
+            busy = true
+            statusMessage = null
+            scope.launch {
+                val result = withContext(Dispatchers.IO) {
+                    runCatching {
+                        val raw = context.contentResolver.openInputStream(uri)?.use { input ->
+                            input.readBytes().toString(Charsets.UTF_8)
+                        } ?: error("无法打开输入文件")
+                        ConfigBackup.parse(raw)
+                    }
+                }
+                result
+                    .onSuccess { pendingImport = it }
+                    .onFailure { statusMessage = "导入失败: ${it.message ?: "未知错误"}" }
+                busy = false
+            }
+        }
+    }
+    val copyConfigToClipboard: () -> Unit = {
+        val clipboard = context.getSystemService(ClipboardManager::class.java)
+        if (clipboard == null) {
+            statusMessage = "剪贴板不可用"
+        } else {
+            busy = true
+            statusMessage = null
+            scope.launch {
+                val result = withContext(Dispatchers.IO) {
+                    runCatching {
+                        val json = ConfigBackup.create(context)
+                        clipboard.setPrimaryClip(ClipData.newPlainText("Synly 配置", json))
+                    }
+                }
+                result
+                    .onSuccess { statusMessage = "配置已复制到剪贴板" }
+                    .onFailure { statusMessage = "复制失败: ${it.message ?: "未知错误"}" }
+                busy = false
+            }
+        }
+    }
+    val importConfigFromClipboard: () -> Unit = {
+        val clipboard = context.getSystemService(ClipboardManager::class.java)
+        val text = clipboard?.primaryClip?.getItemAt(0)?.text?.toString().orEmpty()
+        if (text.isBlank()) {
+            statusMessage = "剪贴板中没有配置文本"
+        } else {
+            busy = true
+            statusMessage = null
+            scope.launch {
+                val result = withContext(Dispatchers.IO) {
+                    runCatching { ConfigBackup.parse(text) }
+                }
+                result
+                    .onSuccess { pendingImport = it }
+                    .onFailure { statusMessage = "导入失败: ${it.message ?: "未知错误"}" }
+                busy = false
+            }
+        }
+    }
 
     Scaffold { padding ->
         LazyColumn(
@@ -167,13 +271,69 @@ fun SettingsScreen(onBack: () -> Unit) {
                 }
             }
 
-            val trusted = TrustedDeviceStore.list(context)
-            if (trusted.isNotEmpty()) {
+            item {
+                Card {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("配置导入导出", style = MaterialTheme.typography.titleSmall)
+                        Text(
+                            "导出文件包含本机身份私钥和 LND Token, 请妥善保管",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            OutlinedButton(
+                                onClick = {
+                                    exportLauncher.launch(
+                                        "synly-config-${SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())}.json",
+                                    )
+                                },
+                                enabled = !busy,
+                                modifier = Modifier.weight(1f),
+                            ) {
+                                Text(if (busy) "处理中" else "导出到文件")
+                            }
+                            OutlinedButton(
+                                onClick = { importLauncher.launch(arrayOf("*/*")) },
+                                enabled = !busy,
+                                modifier = Modifier.weight(1f),
+                            ) {
+                                Text("从文件导入")
+                            }
+                        }
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            OutlinedButton(
+                                onClick = copyConfigToClipboard,
+                                enabled = !busy,
+                                modifier = Modifier.weight(1f),
+                            ) {
+                                Text("复制到剪贴板")
+                            }
+                            OutlinedButton(
+                                onClick = importConfigFromClipboard,
+                                enabled = !busy,
+                                modifier = Modifier.weight(1f),
+                            ) {
+                                Text("从剪贴板导入")
+                            }
+                        }
+                        statusMessage?.let { message ->
+                            Text(message, style = MaterialTheme.typography.bodySmall)
+                        }
+                    }
+                }
+            }
+
+            if (trustedDevices.isNotEmpty()) {
                 item {
                     Card {
                         Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                             Text("可信设备")
-                            trusted.forEach { device ->
+                            trustedDevices.forEach { device ->
                                 Row(
                                     modifier = Modifier.fillMaxWidth(),
                                     verticalAlignment = Alignment.CenterVertically,
@@ -184,6 +344,7 @@ fun SettingsScreen(onBack: () -> Unit) {
                                     )
                                     TextButton(onClick = {
                                         TrustedDeviceStore.remove(context, device.deviceId)
+                                        trustedDevices = TrustedDeviceStore.list(context)
                                         SynlyEngine.refreshTrustedDevices(context)
                                     }) {
                                         Text("撤销")
@@ -207,6 +368,46 @@ fun SettingsScreen(onBack: () -> Unit) {
                 }
             }
         }
+    }
+
+    pendingImport?.let { backup ->
+        AlertDialog(
+            onDismissRequest = { pendingImport = null },
+            title = { Text("导入配置") },
+            text = { Text("将覆盖当前设置, 身份和可信设备. 确定继续吗?") },
+            confirmButton = {
+                TextButton(onClick = {
+                    pendingImport = null
+                    busy = true
+                    statusMessage = null
+                    scope.launch {
+                        val result = withContext(Dispatchers.IO) {
+                            runCatching {
+                                ConfigBackup.apply(context, backup)
+                                SynlyEngine.reloadConfiguration(context)
+                            }
+                        }
+                        result
+                            .onSuccess {
+                                settings = SettingsStore.load(context)
+                                trustedDevices = TrustedDeviceStore.list(context)
+                                statusMessage = "配置已导入"
+                            }
+                            .onFailure {
+                                statusMessage = "导入失败: ${it.message ?: "未知错误"}"
+                            }
+                        busy = false
+                    }
+                }) {
+                    Text("导入")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingImport = null }) {
+                    Text("取消")
+                }
+            },
+        )
     }
 }
 

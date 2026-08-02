@@ -53,6 +53,10 @@ object TrustedDeviceStore {
         save(context, list(context).filterNot { it.deviceId == deviceId })
     }
 
+    fun replace(context: Context, devices: List<FfiTrustedDeviceConfig>) {
+        save(context, devices)
+    }
+
     private fun save(context: Context, devices: List<FfiTrustedDeviceConfig>) {
         val array = JSONArray()
         devices.forEach { device ->

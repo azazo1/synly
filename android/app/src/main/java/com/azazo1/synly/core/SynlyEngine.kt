@@ -165,6 +165,19 @@ object SynlyEngine {
         }
     }
 
+    fun reloadConfiguration(context: Context) {
+        val oldHandle = handle
+        handle = null
+        currentTarget = null
+        clearUiState()
+        if (oldHandle != null) {
+            scope.launch {
+                runCatching { oldHandle.stop() }
+            }
+        }
+        start(context)
+    }
+
     private fun clearUiState() {
         _uiState.update {
             it.copy(
