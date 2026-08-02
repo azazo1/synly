@@ -792,7 +792,7 @@ fn mac_keycode_to_hid(code: u16) -> Option<u16> {
         1 => 0x16, 17 => 0x17, 32 => 0x18, 9 => 0x19, 13 => 0x1a, 7 => 0x1b,
         16 => 0x1c, 6 => 0x1d, 18 => 0x1e, 19 => 0x1f, 20 => 0x20, 21 => 0x21,
         23 => 0x22, 22 => 0x23, 26 => 0x24, 28 => 0x25, 25 => 0x26, 29 => 0x27,
-        36 => 0x28, 53 => 0x29, 51 => 0x2a, 48 => 0x2b, 49 => 0x2c, 24 => 0x2e,
+        36 => 0x28, 53 => 0x29, 51 => 0x2a, 48 => 0x2b, 49 => 0x2c, 50 => 0x35, 24 => 0x2e,
         27 => 0x2d, 33 => 0x2f, 30 => 0x30, 42 => 0x31, 41 => 0x33, 39 => 0x34,
         43 => 0x36, 47 => 0x37, 44 => 0x38, 57 => 0x39, 122 => 0x3a, 120 => 0x3b,
         99 => 0x3c, 118 => 0x3d, 96 => 0x3e, 97 => 0x3f, 98 => 0x40, 100 => 0x41,
@@ -813,7 +813,8 @@ fn hid_to_mac_keycode(usage: u16) -> Option<u16> {
 mod tests {
     use super::{
         CaptureContext, EVENT_DOCK_SWIPE, EVENT_GESTURE, EVENT_NAVIGATION_SWIPE, EVENT_SCROLL,
-        MacBackend, MacState, NativeEvent, mac_mouse_button, scroll_source, suppress_local_gesture,
+        MacBackend, MacState, NativeEvent, hid_to_mac_keycode, mac_keycode_to_hid,
+        mac_mouse_button, scroll_source, suppress_local_gesture,
     };
     use crate::input::platform::{InputBackend, MotionAccumulator, ScrollSource};
     use crate::input::{Hotkey, InputMode, ModifierMask};
@@ -829,6 +830,12 @@ mod tests {
         assert_eq!(mac_mouse_button(2), 2);
         assert_eq!(mac_mouse_button(3), 1);
         assert_eq!(mac_mouse_button(4), 3);
+    }
+
+    #[test]
+    fn grave_key_roundtrips_between_macos_and_hid() {
+        assert_eq!(mac_keycode_to_hid(50), Some(0x35));
+        assert_eq!(hid_to_mac_keycode(0x35), Some(50));
     }
 
     #[test]

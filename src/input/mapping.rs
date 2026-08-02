@@ -283,7 +283,7 @@ fn platform_supports_usage(platform: InputPlatform, usage: u16) -> bool {
     match platform {
         InputPlatform::Macos => matches!(
             usage,
-            0x04..=0x31 | 0x33..=0x34 | 0x36..=0x52 | 0xe0..=0xe7
+            0x04..=0x31 | 0x33..=0x52 | 0xe0..=0xe7
         ),
         InputPlatform::Windows => matches!(
             usage,
@@ -381,6 +381,12 @@ mod tests {
             .macos_to_windows
             .insert("unknown".to_string(), "a".to_string());
         assert!(validate_key_mapping(&config).is_err());
+    }
+
+    #[test]
+    fn grave_is_a_valid_mapping_key_on_both_platforms() {
+        assert!(parse_key_name(InputPlatform::Macos, "grave").is_some());
+        assert!(parse_key_name(InputPlatform::Windows, "grave").is_some());
     }
 
     #[test]
