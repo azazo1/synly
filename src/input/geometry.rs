@@ -137,6 +137,39 @@ impl DesktopLayout {
         0.0
     }
 
+    pub fn edge_position(&self, edge: ScreenEdge, point: Point) -> f32 {
+        let segments = self.outer_edge_segments(edge);
+        let coordinate = match edge {
+            ScreenEdge::Left | ScreenEdge::Right => point.y,
+            ScreenEdge::Top | ScreenEdge::Bottom => point.x,
+        };
+        let display_boundary = self.displays.iter().find(|display| display.contains(point)).map(
+            |display| match edge {
+                ScreenEdge::Left => display.x,
+                ScreenEdge::Right => display.right(),
+                ScreenEdge::Top => display.y,
+                ScreenEdge::Bottom => display.bottom(),
+            },
+        );
+        let total = segments
+            .iter()
+            .map(|segment| segment.end - segment.start)
+            .sum::<i32>()
+            .max(1);
+        let mut offset = 0i32;
+        for segment in &segments {
+            if coordinate >= segment.start
+                && coordinate < segment.end
+                && Some(segment.boundary) == display_boundary
+            {
+                return ((offset + coordinate - segment.start) as f32 / total as f32)
+                    .clamp(0.0, 1.0);
+            }
+            offset += segment.end - segment.start;
+        }
+        0.0
+    }
+
     pub fn point_inside_edge(&self, edge: ScreenEdge, position: f32, inset: i32) -> Point {
         let segments = self.outer_edge_segments(edge);
         let total = segments
@@ -396,6 +429,28 @@ mod tests {
         let layout = DesktopLayout::new(vec![DisplayRect { x: -1200, y: -400, width: 1200, height: 900 }]).unwrap();
         let point = layout.point_inside_edge(ScreenEdge::Right, 0.5, 8);
         assert_eq!(point, Point { x: -9, y: 50 });
+    }
+
+    #[test]
+    fn edge_position_maps_interior_point_along_the_edge() {
+        let layout = DesktopLayout::new(vec![DisplayRect { x: 0, y: 0, width: 100, height: 100 }]).unwrap();
+        assert_eq!(
+            layout.edge_position(ScreenEdge::Right, Point { x: 50, y: 25 }),
+            0.25
+        );
+        assert_eq!(
+            layout.edge_position(ScreenEdge::Right, Point { x: 50, y: 75 }),
+            0.75
+        );
+        let parallel = DesktopLayout::new(vec![
+            DisplayRect { x: 0, y: 0, width: 100, height: 100 },
+            DisplayRect { x: 200, y: 0, width: 100, height: 100 },
+        ])
+        .unwrap();
+        assert_eq!(
+            parallel.edge_position(ScreenEdge::Right, Point { x: 250, y: 50 }),
+            0.75
+        );
     }
 
     #[test]

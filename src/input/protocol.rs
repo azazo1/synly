@@ -30,6 +30,7 @@ pub enum InputMessage {
     },
     Deactivate {
         generation: u64,
+        edge_position: Option<f32>,
     },
     ReturnRequest {
         generation: u64,

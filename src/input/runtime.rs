@@ -510,9 +510,9 @@ pub(super) async fn run_sender(
                                 )?;
                             }
                         }
-                    InputMessage::Deactivate { generation: remote_generation }
+                    InputMessage::Deactivate { generation: remote_generation, edge_position }
                         if control.active && remote_generation == control.generation => {
-                            control.recovery.recover();
+                            control.recovery.recover_at(edge_position);
                             control.deactivate();
                             key_mapper.clear();
                         }
@@ -542,8 +542,10 @@ pub(super) async fn run_sender(
                             control.recovery.recover();
                             control.deactivate();
                             key_mapper.clear();
-                            let _ =
-                                tx.try_send(InputMessage::Deactivate { generation: control.generation });
+                            let _ = tx.try_send(InputMessage::Deactivate {
+                                generation: control.generation,
+                                edge_position: None,
+                            });
                             tracing::info!(generation = control.generation, "紧急热键已收回本机控制");
                         }
                     }
@@ -600,8 +602,10 @@ pub(super) async fn run_sender(
                     NativeEvent::ReliableQueueOverflow => {
                         if control.active {
                             control.recovery.recover();
-                            let _ =
-                                tx.try_send(InputMessage::Deactivate { generation: control.generation });
+                            let _ = tx.try_send(InputMessage::Deactivate {
+                                generation: control.generation,
+                                edge_position: None,
+                            });
                         }
                         bail!("本机输入可靠事件队列已满, 已停止远程控制");
                     }
@@ -714,6 +718,7 @@ pub(super) async fn run_sender(
                         control.recovery.recover();
                         let _ = tx.try_send(InputMessage::Deactivate {
                             generation: control.generation,
+                            edge_position: None,
                         });
                     }
                     bail!("本机输入可靠事件队列已满, 已停止远程控制");
@@ -784,7 +789,11 @@ impl SenderRecoveryGuard {
     }
 
     fn recover(&mut self) {
-        let Some(edge_position) = self.edge_position.take() else {
+        self.recover_at(None);
+    }
+
+    fn recover_at(&mut self, edge_position: Option<f32>) {
+        let Some(edge_position) = edge_position.or(self.edge_position.take()) else {
             return;
         };
         let _ = restore_sender(
@@ -941,8 +950,13 @@ pub(super) async fn run_receiver(
                 if !game && active {
                     platform.backend.release_all()?;
                     active = false;
+                    let edge_position =
+                        cursor.map(|point| local_layout.edge_position(return_edge, point));
                     cursor = None;
-                    enqueue_message(tx, InputMessage::Deactivate { generation })?;
+                    enqueue_message(tx, InputMessage::Deactivate {
+                        generation,
+                        edge_position,
+                    })?;
                     tracing::info!(generation, "前台光标捕获状态结束, 已自动释放远端控制");
                 }
             }
@@ -987,7 +1001,8 @@ pub(super) async fn run_receiver(
                         enqueue_message(tx, InputMessage::Heartbeat { generation })?;
                         tracing::info!(generation, edge = ?return_edge, "开始接受对端控制");
                     }
-                    InputMessage::Deactivate { generation: incoming_generation } if incoming_generation == generation => {
+                    InputMessage::Deactivate { generation: incoming_generation, .. }
+                        if incoming_generation == generation => {
                         platform.backend.release_all()?;
                         active = false;
                         cursor = None;
@@ -1061,7 +1076,10 @@ pub(super) async fn run_receiver(
                             platform.backend.release_all()?;
                             active = false;
                             cursor = None;
-                            let _ = tx.try_send(InputMessage::Deactivate { generation });
+                            let _ = tx.try_send(InputMessage::Deactivate {
+                                generation,
+                                edge_position: None,
+                            });
                             tracing::info!(generation, "接收端紧急热键已停止远程控制");
                         }
                     }
@@ -1930,7 +1948,7 @@ mod tests {
         timeout(Duration::from_millis(800), async {
             loop {
                 match messages.recv().await {
-                    Some(InputMessage::Deactivate { generation: 7 }) => break,
+                    Some(InputMessage::Deactivate { generation: 7, .. }) => break,
                     Some(_) => {}
                     None => panic!("接收端不应提前停止"),
                 }
@@ -2008,7 +2026,7 @@ mod tests {
         timeout(Duration::from_secs(2), async {
             loop {
                 match messages.recv().await {
-                    Some(InputMessage::Deactivate { generation: 7 }) => break,
+                    Some(InputMessage::Deactivate { generation: 7, .. }) => break,
                     Some(_) => {}
                     None => panic!("接收端不应提前停止"),
                 }
@@ -2024,6 +2042,101 @@ mod tests {
                 .contains(&"release"),
             "自动释放应调用 release_all"
         );
+
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn receiver_reports_current_edge_position_when_auto_mode_releases_desktop_cursor() {
+        let backend = Arc::new(FakeBackend::default());
+        let layout = backend.layout().unwrap();
+        let motion = Arc::new(MotionAccumulator::default());
+        let (_events_tx, events) = mpsc::channel(1);
+        let mut platform = PlatformHandle {
+            backend: Arc::clone(&backend) as Arc<dyn InputBackend>,
+            events,
+            motion,
+            overflowed: Arc::new(AtomicBool::new(false)),
+            failed: Arc::new(AtomicBool::new(false)),
+        };
+        let (incoming_tx, mut incoming) = mpsc::channel(256);
+        let incoming_motion = Arc::new(IncomingMotion::default());
+        let (outgoing, mut messages) = mpsc::channel(16);
+        let mut options = test_input_options(ScreenEdge::Left);
+        options.cursor_mode = super::CursorMode::Auto;
+        let captured = Arc::new(AtomicBool::new(false));
+        incoming_tx
+            .send(Ok(InputMessage::Activate {
+                generation: 7,
+                source_edge: ScreenEdge::Right,
+                edge_position: 0.5,
+                pressed: KeySnapshot {
+                    usages: Vec::new(),
+                    modifiers: ModifierMask::default(),
+                    buttons: Vec::new(),
+                },
+            }))
+            .await
+            .unwrap();
+
+        let incoming_motion_for_task = Arc::clone(&incoming_motion);
+        let captured_for_task = Arc::clone(&captured);
+        let task = tokio::spawn(async move {
+            run_receiver(
+                &mut incoming,
+                &incoming_motion_for_task,
+                &outgoing,
+                &mut platform,
+                layout,
+                &options,
+                move || captured_for_task.load(Ordering::Acquire),
+            )
+            .await
+        });
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if matches!(
+                    messages.recv().await,
+                    Some(InputMessage::Heartbeat { generation: 7 })
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("接收端应确认激活");
+
+        // 先在桌面模式下把接收端光标移动到 75% 位置, 再切到自动游戏模式后退出.
+        incoming_motion.push(7, 0, 25);
+        sleep(Duration::from_millis(50)).await;
+        incoming_tx
+            .send(Ok(InputMessage::Heartbeat { generation: 7 }))
+            .await
+            .unwrap();
+        captured.store(true, Ordering::Release);
+        sleep(Duration::from_millis(550)).await;
+        incoming_tx
+            .send(Ok(InputMessage::Heartbeat { generation: 7 }))
+            .await
+            .unwrap();
+        captured.store(false, Ordering::Release);
+        let edge_position = timeout(Duration::from_millis(900), async {
+            loop {
+                match messages.recv().await {
+                    Some(InputMessage::Deactivate {
+                        generation: 7,
+                        edge_position,
+                    }) => break edge_position,
+                    Some(_) => {}
+                    None => panic!("接收端不应提前停止"),
+                }
+            }
+        })
+        .await
+        .expect("捕获结束后应发送带当前位置的 Deactivate");
+        assert_eq!(edge_position, Some(0.75));
 
         task.abort();
         let _ = task.await;
@@ -2093,6 +2206,79 @@ mod tests {
         .await
         .expect("应批准对端返回");
         assert_eq!(edge_position, 0.5);
+        assert!(!*backend.capture.lock().unwrap());
+
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn sender_restores_at_receiver_reported_edge_position_on_deactivate() {
+        let backend = Arc::new(FakeBackend::default());
+        let layout = backend.layout().unwrap();
+        let motion = Arc::new(MotionAccumulator::default());
+        let (_events_tx, events) = mpsc::channel(8);
+        let mut platform = PlatformHandle {
+            backend: Arc::clone(&backend) as Arc<dyn InputBackend>,
+            events,
+            motion: Arc::clone(&motion),
+            overflowed: Arc::new(AtomicBool::new(false)),
+            failed: Arc::new(AtomicBool::new(false)),
+        };
+        let (incoming_tx, mut incoming) = mpsc::channel(8);
+        let (outgoing, mut messages) = mpsc::channel(16);
+        motion.add_at(4, 0, Point { x: 97, y: 50 });
+        let input_options = test_input_options(ScreenEdge::Right);
+
+        let task = tokio::spawn(async move {
+            run_sender(
+                &mut incoming,
+                &outgoing,
+                &mut platform,
+                layout.clone(),
+                ScreenEdge::Right,
+                InputPlatform::current(),
+                &input_options,
+            )
+            .await
+        });
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if let InputMessage::Activate { generation, .. } =
+                    messages.recv().await.expect("sender 不应提前停止")
+                {
+                    assert_eq!(generation, 1);
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("sender 应激活");
+
+        incoming_tx
+            .send(Ok(InputMessage::Deactivate {
+                generation: 1,
+                edge_position: Some(0.75),
+            }))
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if !*backend.capture.lock().unwrap()
+                    && backend.warped.lock().unwrap().is_some()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("应使用接收端报告的位置恢复本机");
+        assert_eq!(
+            *backend.warped.lock().unwrap(),
+            Some(Point { x: 91, y: 75 })
+        );
         assert!(!*backend.capture.lock().unwrap());
 
         task.abort();

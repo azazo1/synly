@@ -269,7 +269,7 @@ async fn run_mock_peer(
                             "mock 收到正式 sender 的 Activate"
                         );
                     }
-                    InputMessage::Deactivate { generation: incoming_generation }
+                    InputMessage::Deactivate { generation: incoming_generation, .. }
                         if incoming_generation == generation => {
                         active = false;
                         keys.clear();

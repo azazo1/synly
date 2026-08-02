@@ -257,7 +257,11 @@ pub async fn run_controller_mock(options: ControllerMockOptions) -> Result<()> {
         "真实被控端已确认第一次接管"
     );
     send_full_input_sequence(&channel.outgoing, &options, 1).await?;
-    send_input(&channel.outgoing, InputMessage::Deactivate { generation: 1 }).await?;
+    send_input(&channel.outgoing, InputMessage::Deactivate {
+        generation: 1,
+        edge_position: None,
+    })
+    .await?;
 
     generation.store(2, Ordering::Release);
     send_input(
@@ -288,7 +292,11 @@ pub async fn run_controller_mock(options: ControllerMockOptions) -> Result<()> {
         motion_message(options.edge, 2, 4),
     )
     .await?;
-    send_input(&channel.outgoing, InputMessage::Deactivate { generation: 2 }).await?;
+    send_input(&channel.outgoing, InputMessage::Deactivate {
+        generation: 2,
+        edge_position: None,
+    })
+    .await?;
     time::sleep(FINISH_DELAY).await;
 
     heartbeat_task.abort();
@@ -443,6 +451,7 @@ pub async fn run_controller_mock_interactive(options: InteractiveControllerOptio
                         }
                         MockFrame::Input(InputMessage::Deactivate {
                             generation: incoming_generation,
+                            ..
                         }) => {
                             if incoming_generation == generation.load(Ordering::Acquire) {
                                 active = false;
@@ -466,6 +475,7 @@ pub async fn run_controller_mock_interactive(options: InteractiveControllerOptio
             &channel.outgoing,
             InputMessage::Deactivate {
                 generation: generation.load(Ordering::Acquire),
+                edge_position: None,
             },
         )
         .await;
