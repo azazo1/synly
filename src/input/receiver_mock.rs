@@ -27,6 +27,7 @@ pub struct ReceiverMockOptions {
     pub hotkey: Hotkey,
     pub cursor_mode: CursorMode,
     pub auto_game_cursor: bool,
+    pub elevated: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -125,6 +126,15 @@ async fn open_controller_channel(address: SocketAddr) -> Result<ControllerChanne
 
 pub async fn run_receiver_mock(options: ReceiverMockOptions) -> Result<()> {
     super::ensure_platform_supported(InputMode::Receive)?;
+    if options.elevated {
+        #[cfg(windows)]
+        {
+            tracing::info!("--elevated 已启用, 请求 Windows 输入管理员代理");
+            super::request_windows_input_elevation()?;
+        }
+        #[cfg(not(windows))]
+        bail!("--elevated 目前只支持 Windows 提权输入代理");
+    }
 
     let mut platform = platform::start(InputMode::Receive, options.hotkey)?;
     let local_layout = platform.backend.layout()?;

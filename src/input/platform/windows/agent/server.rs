@@ -300,6 +300,10 @@ pub async fn run_agent(
     token: String,
     parent_pid: u32,
 ) -> Result<()> {
+    tracing::info!(
+        pid = unsafe { GetCurrentProcessId() },
+        "Windows 输入代理进程已启动"
+    );
     let transport = start_agent_transport(command_pipe_name, event_pipe_name, token, parent_pid)?;
     let result = run_agent_loop(
         transport.requests,
@@ -317,7 +321,13 @@ pub async fn run_agent(
         .event_thread
         .join()
         .map_err(|_| anyhow!("Windows input agent event owner panicked"))?;
-    result.and(command_result).and(event_result)
+    let combined = result.and(command_result).and(event_result);
+    if let Err(error) = &combined {
+        tracing::error!(error = %error, "Windows 输入代理已退出");
+    } else {
+        tracing::info!("Windows 输入代理已退出");
+    }
+    combined
 }
 
 fn agent_completion_packet(id: u64, response: Result<AgentResponse>) -> AgentToGuiPacket {
@@ -349,9 +359,17 @@ async fn run_agent_loop(
                         bail!("Windows input agent received an unexpected packet");
                     };
                     heartbeat.observe(Instant::now());
+                    let request_name = request.name();
+                    tracing::trace!(request = request_name, "Windows 输入代理收到请求");
+                    let started = Instant::now();
                     let response = handle_agent_request(request, &mut runtime, output.clone()).await;
                     let completion = agent_completion_packet(id, response);
                     output.send_reliable(completion)?;
+                    tracing::trace!(
+                        request = request_name,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "Windows 输入代理请求处理完成"
+                    );
                     heartbeat.observe(Instant::now());
                 }
                 _ = desktop_tick.tick() => {
@@ -383,6 +401,9 @@ async fn run_agent_loop(
     }
     .await;
     alive.store(false, Ordering::Release);
+    if let Err(error) = &result {
+        tracing::error!(error = %error, "Windows 输入代理主循环已退出");
+    }
     if let Some(runtime) = runtime {
         runtime.stop().await;
     }

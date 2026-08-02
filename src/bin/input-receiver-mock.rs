@@ -30,6 +30,8 @@ enum Command {
         game_cursor: bool,
         #[arg(long, default_value_t = true)]
         auto_game_cursor: bool,
+        #[arg(long)]
+        elevated: bool,
     },
     Control {
         address: SocketAddr,
@@ -70,6 +72,7 @@ async fn main() -> Result<()> {
             hotkey,
             game_cursor,
             auto_game_cursor,
+            elevated,
         } => {
             run_receiver_mock(ReceiverMockOptions {
                 listen,
@@ -80,6 +83,7 @@ async fn main() -> Result<()> {
                     CursorMode::Desktop
                 },
                 auto_game_cursor,
+                elevated,
             })
             .await
         }

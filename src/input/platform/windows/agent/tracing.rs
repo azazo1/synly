@@ -5,6 +5,10 @@ use tracing_subscriber::layer::{Layer, SubscriberExt};
 use tracing_subscriber::util::SubscriberInitExt;
 
 pub fn init() -> Result<WorkerGuard> {
+    std::panic::set_hook(Box::new(|info| {
+        eprintln!("{info}");
+        tracing::error!(panic = %info, "Windows 输入代理发生 panic");
+    }));
     let log_dir = dirs::data_local_dir()
         .context("unable to determine local data directory")?
         .join("synly")

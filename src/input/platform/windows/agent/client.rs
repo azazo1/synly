@@ -936,10 +936,37 @@ pub(super) fn current_client() -> Option<Arc<AgentClient>> {
 
 fn agent_executable() -> Result<PathBuf> {
     let current = std::env::current_exe().context("failed to locate Synly executable")?;
-    if !current.is_file() {
-        bail!("Windows input agent host is missing: {}", current.display());
+    let host = resolve_agent_host(&current);
+    if !host.is_file() {
+        bail!("Windows input agent host is missing: {}", host.display());
     }
-    Ok(current)
+    if host != current {
+        tracing::info!(
+            host = %host.display(),
+            "Windows 输入代理宿主已解析为同目录主程序"
+        );
+    }
+    Ok(host)
+}
+
+fn resolve_agent_host(current: &Path) -> PathBuf {
+    resolve_agent_host_with(current, |path| path.is_file())
+}
+
+fn resolve_agent_host_with(current: &Path, exists: impl Fn(&Path) -> bool) -> PathBuf {
+    let is_host = current
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().eq_ignore_ascii_case("synly"))
+        .unwrap_or(false);
+    if is_host {
+        return current.to_path_buf();
+    }
+    let sibling = current.with_file_name("synly.exe");
+    if exists(&sibling) {
+        sibling
+    } else {
+        current.to_path_buf()
+    }
 }
 
 fn launch_elevated(
@@ -993,4 +1020,29 @@ fn launch_with_current_token(
         .spawn()
         .context("failed to start Windows input agent with the current elevated token")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_agent_host_with;
+    use std::path::Path;
+
+    #[test]
+    fn auxiliary_binary_prefers_sibling_synly_as_agent_host() {
+        let mock = Path::new(r"C:\tools\input-receiver-mock.exe");
+        let main = Path::new(r"C:\tools\synly.exe");
+        let exists = |path: &Path| path == main;
+        assert_eq!(resolve_agent_host_with(mock, exists), main);
+        assert_eq!(resolve_agent_host_with(main, exists), main);
+    }
+
+    #[test]
+    fn auxiliary_binary_falls_back_to_itself_without_sibling_host() {
+        let mock = Path::new(r"C:\tools\input-receiver-mock.exe");
+        let main = Path::new(r"C:\tools\synly.exe");
+        let standalone = Path::new(r"C:\tools\standalone.exe");
+        assert_eq!(resolve_agent_host_with(mock, |_| false), mock);
+        assert_eq!(resolve_agent_host_with(standalone, |_| false), standalone);
+        assert_eq!(resolve_agent_host_with(main, |_| false), main);
+    }
 }
