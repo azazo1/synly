@@ -425,11 +425,7 @@ impl AgentBackend {
         if !self.is_current() {
             bail!("Windows input agent backend was superseded by a newer session");
         }
-        let response = self.client.request(request);
-        if let Err(error) = &response {
-            self.client.emit_failure(error);
-        }
-        response
+        self.client.request(request)
     }
 
     fn is_current(&self) -> bool {
