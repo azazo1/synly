@@ -53,6 +53,7 @@ class ClipboardSyncService : android.app.Service() {
     private var lastNotificationState: FfiClientState? = null
     private var lastNotificationDevice: String? = null
     private var lastNotificationTarget: String? = null
+    private var stopping = false
 
     private val clipboardListener = ClipboardManager.OnPrimaryClipChangedListener {
         maybeReadClipboard()
@@ -64,12 +65,16 @@ class ClipboardSyncService : android.app.Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        startForeground(NOTIFICATION_ID, buildNotification(null, null, null))
+        SynlyEngine.init(applicationContext)
+        SynlyEngine.start(applicationContext)
+        val currentUi = SynlyEngine.uiState.value
+        startForeground(
+            NOTIFICATION_ID,
+            buildNotification(currentUi.state, currentUi.connectedDevice, currentUi.targetLabel),
+        )
         acquireMulticastLock()
         getSystemService(ClipboardManager::class.java)
             .addPrimaryClipChangedListener(clipboardListener)
-        SynlyEngine.init(applicationContext)
-        SynlyEngine.start(applicationContext)
         if (notificationJob == null) {
             notificationJob = scope.launch {
                 SynlyEngine.uiState.collect { ui ->
@@ -86,6 +91,11 @@ class ClipboardSyncService : android.app.Service() {
                         getSystemService(NotificationManager::class.java)
                             .notify(NOTIFICATION_ID, buildNotification(state, device, target))
                     }
+                    if (state == null && !stopping) {
+                        stopping = true
+                        stopForeground(STOP_FOREGROUND_REMOVE)
+                        stopSelf()
+                    }
                 }
             }
         }
@@ -93,6 +103,7 @@ class ClipboardSyncService : android.app.Service() {
     }
 
     override fun onDestroy() {
+        stopForeground(STOP_FOREGROUND_REMOVE)
         getSystemService(ClipboardManager::class.java)
             .removePrimaryClipChangedListener(clipboardListener)
         releaseMulticastLock()

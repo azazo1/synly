@@ -5,6 +5,7 @@ import android.content.Intent
 import android.net.Uri
 import android.os.PowerManager
 import android.provider.Settings
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -61,6 +62,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.azazo1.synly.core.SettingsStore
 import com.azazo1.synly.core.SynlyEngine
 import com.azazo1.synly.core.SynlyTarget
+import com.azazo1.synly.service.ClipboardSyncService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import uniffi.synly_core.FfiClientState
@@ -72,6 +74,10 @@ import uniffi.synly_core.FfiDiscoveredPeer
 fun MainScreen() {
     var showSettings by remember { mutableStateOf(false) }
     var showLogs by remember { mutableStateOf(false) }
+    BackHandler(enabled = showSettings || showLogs) {
+        showSettings = false
+        showLogs = false
+    }
     if (showSettings) {
         SettingsScreen(onBack = { showSettings = false })
     } else if (showLogs) {
@@ -144,7 +150,10 @@ private fun HomeScreen(onOpenSettings: () -> Unit, onOpenLogs: () -> Unit) {
                         modifier = Modifier.weight(1f),
                     )
                     Button(
-                        onClick = { SynlyEngine.disconnect(context) },
+                        onClick = {
+                            SynlyEngine.disconnect(context)
+                            ClipboardSyncService.stop(context)
+                        },
                         enabled = uiState.state != null,
                     ) {
                         Text("断开连接")
@@ -184,7 +193,7 @@ private fun HomeScreen(onOpenSettings: () -> Unit, onOpenLogs: () -> Unit) {
                                     val address = parts.getOrNull(0).orEmpty()
                                     val port = parts.getOrNull(1)?.toIntOrNull() ?: return@OutlinedButton
                                     if (address.isNotBlank() && port in 1..65535) {
-                                        SynlyEngine.connect(
+                                        connectSync(
                                             context,
                                             SynlyTarget(listOf(address), port),
                                         )
@@ -210,7 +219,7 @@ private fun HomeScreen(onOpenSettings: () -> Unit, onOpenLogs: () -> Unit) {
                 item { Text("发现 ${peers.size} 台设备", style = MaterialTheme.typography.titleSmall) }
                 items(peers, key = { it.deviceId }) { peer ->
                     PeerCard(peer = peer, onClick = {
-                        SynlyEngine.connect(
+                        connectSync(
                             context,
                             SynlyTarget(peer.addresses, peer.port.toInt(), peer.deviceId),
                         )
@@ -452,6 +461,11 @@ private fun EyeIcon(revealed: Boolean) {
 
 private fun maskText(text: String): String {
     return text.map { "•" }.joinToString("")
+}
+
+private fun connectSync(context: Context, target: SynlyTarget) {
+    SynlyEngine.connect(context, target)
+    ClipboardSyncService.start(context)
 }
 
 private fun isIgnoringBatteryOptimizations(context: Context): Boolean {

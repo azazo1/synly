@@ -79,11 +79,21 @@ object SynlyEngine {
             SynlyLog.i(TAG, "尚无目标设备, 等待用户连接")
             return
         }
-        if (target == currentTarget && handle != null) {
+        if (target == currentTarget) {
             SynlyLog.i(TAG, "目标设备未变化, 忽略重复连接请求")
             return
         }
-        _uiState.update { it.copy(targetLabel = targetLabel(context, target)) }
+        currentTarget = target
+        _uiState.update {
+            it.copy(
+                state = FfiClientState.CONNECTING,
+                connectedDevice = null,
+                targetLabel = targetLabel(context, target),
+                pinRequest = null,
+                canSend = false,
+                canReceive = false,
+            )
+        }
         scope.launch { startInternal(context) }
     }
 
@@ -134,7 +144,10 @@ object SynlyEngine {
             currentTarget = target
             SynlyLog.i(TAG, "客户端已启动: ${target.addresses.joinToString()}:${target.port}")
         }.onFailure { error ->
+            handle = null
+            currentTarget = null
             SynlyLog.e(TAG, "启动客户端失败", error)
+            clearUiState()
             _uiState.update { it.copy(lastMessage = error.message ?: "启动客户端失败") }
         }
     }
@@ -169,11 +182,14 @@ object SynlyEngine {
         val oldHandle = handle
         handle = null
         currentTarget = null
-        clearUiState()
         if (oldHandle != null) {
             scope.launch {
                 runCatching { oldHandle.stop() }
             }
+        }
+        if (SettingsStore.load(context).lastTarget == null) {
+            clearUiState()
+            return
         }
         start(context)
     }

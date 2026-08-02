@@ -4,12 +4,12 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import androidx.activity.OnBackPressedCallback
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
 import com.azazo1.synly.core.SynlyEngine
-import com.azazo1.synly.service.ClipboardSyncService
 import com.azazo1.synly.ui.MainScreen
 
 class MainActivity : ComponentActivity() {
@@ -20,7 +20,18 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         SynlyEngine.init(applicationContext)
         requestNotificationPermissionIfNeeded()
-        ClipboardSyncService.start(this)
+        onBackPressedDispatcher.addCallback(
+            this,
+            object : OnBackPressedCallback(true) {
+                override fun handleOnBackPressed() {
+                    if (SynlyEngine.uiState.value.state != null) {
+                        moveTaskToBack(true)
+                    } else {
+                        finish()
+                    }
+                }
+            },
+        )
         setContent {
             MainScreen()
         }
@@ -35,4 +46,3 @@ class MainActivity : ComponentActivity() {
         }
     }
 }
-
