@@ -4,11 +4,14 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.text.KeyboardOptions
@@ -373,8 +376,10 @@ fun SettingsScreen(onBack: () -> Unit) {
     pendingImport?.let { backup ->
         AlertDialog(
             onDismissRequest = { pendingImport = null },
-            title = { Text("导入配置") },
-            text = { Text("将覆盖当前设置, 身份和可信设备. 确定继续吗?") },
+            title = { Text("导入配置预览") },
+            text = {
+                ConfigImportPreview(backup = backup)
+            },
             confirmButton = {
                 TextButton(onClick = {
                     pendingImport = null
@@ -409,6 +414,54 @@ fun SettingsScreen(onBack: () -> Unit) {
             },
         )
     }
+}
+
+@Composable
+private fun ConfigImportPreview(backup: ConfigBackup.Backup) {
+    val settings = backup.settings
+    val trustedNames = backup.trustedDevices.take(5).joinToString { it.deviceName }
+    val trustedSummary = when {
+        backup.trustedDevices.isEmpty() -> "无"
+        backup.trustedDevices.size > 5 -> "$trustedNames 等 ${backup.trustedDevices.size} 台"
+        else -> trustedNames
+    }
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(max = 360.dp)
+            .verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Text("将覆盖当前设置, 身份和可信设备", style = MaterialTheme.typography.bodySmall)
+        PreviewLine("设备名称", settings.deviceName)
+        PreviewLine("剪贴板模式", settings.clipboardMode.name)
+        PreviewLine("图片大小上限", "${settings.maxImageBytes / 1024 / 1024} MB")
+        PreviewLine("mDNS 发现", if (settings.mdnsEnabled) "开启" else "关闭")
+        PreviewLine("LND 发现", if (settings.lndEnabled) "开启" else "关闭")
+        if (settings.lndEnabled) {
+            PreviewLine("LND 服务器", settings.lndServerUrl ?: "未配置")
+            PreviewLine("LND Token", if (settings.lndBearerToken.isNullOrBlank()) "未配置" else "已配置")
+            PreviewLine("LND Discovery Domain", settings.lndDiscoveryDomain ?: "未配置")
+        }
+        PreviewLine(
+            "上次目标",
+            settings.lastTarget?.let { "${it.addresses.joinToString(", ")}:${it.port}" } ?: "未配置",
+        )
+        if (backup.identity != null) {
+            PreviewLine("本机身份", "${backup.identity.deviceName} (${backup.identity.deviceId})")
+        } else {
+            PreviewLine("本机身份", "未包含")
+        }
+        PreviewLine("可信设备", trustedSummary)
+    }
+}
+
+@Composable
+private fun PreviewLine(label: String, value: String) {
+    Text(
+        text = "$label: $value",
+        style = MaterialTheme.typography.bodySmall,
+    )
 }
 
 private val EyeIcon: ImageVector by lazy {
