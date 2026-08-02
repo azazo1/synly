@@ -564,6 +564,7 @@ mod tests {
         assert_eq!(config.input.key_mapping, crate::input::KeyMappingConfig::default());
         assert!(!config.input.elevate_on_start);
         assert!(!config.input.block_switch_on_press);
+        assert_eq!(config.input.cursor_mode, crate::input::CursorMode::Auto);
     }
 
     fn unique_test_dir(label: &str) -> PathBuf {

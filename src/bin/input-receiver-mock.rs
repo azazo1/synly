@@ -26,10 +26,8 @@ enum Command {
         listen: SocketAddr,
         #[arg(long, default_value = Hotkey::DEFAULT)]
         hotkey: String,
-        #[arg(long)]
-        game_cursor: bool,
-        #[arg(long, default_value_t = true)]
-        auto_game_cursor: bool,
+        #[arg(long, value_enum, default_value_t = CursorMode::Auto)]
+        cursor_mode: CursorMode,
         #[arg(long)]
         elevated: bool,
     },
@@ -70,19 +68,13 @@ async fn main() -> Result<()> {
         Command::Receive {
             listen,
             hotkey,
-            game_cursor,
-            auto_game_cursor,
+            cursor_mode,
             elevated,
         } => {
             run_receiver_mock(ReceiverMockOptions {
                 listen,
                 hotkey: Hotkey::from_str(&hotkey)?,
-                cursor_mode: if game_cursor {
-                    CursorMode::Game
-                } else {
-                    CursorMode::Desktop
-                },
-                auto_game_cursor,
+                cursor_mode,
                 elevated,
             })
             .await

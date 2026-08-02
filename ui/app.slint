@@ -125,8 +125,7 @@ export component AppWindow inherits Window {
     in-out property <int> input-edge-index: 1;
     in-out property <string> input-hotkey: "ctrl+alt+shift+esc";
     in-out property <bool> block-switch-on-press: false;
-    in-out property <bool> game-cursor-mode: false;
-    in-out property <bool> auto-game-cursor: false;
+    in-out property <int> cursor-mode-index: 0;
     in-out property <bool> accept-untrusted: false;
     in-out property <bool> trust-device: false;
     in-out property <bool> trusted-only: false;
@@ -471,8 +470,8 @@ export component AppWindow inherits Window {
                             Text { text: "紧急收回热键"; color: #737b77; font-size: 11px; }
                             LineEdit { text <=> root.input-hotkey; placeholder-text: "紧急收回热键"; }
                             CheckBox { text: "按住按键或鼠标按钮时不切换"; checked <=> root.block-switch-on-press; }
-                            CheckBox { text: "游戏光标模式(相对增量注入)"; checked <=> root.game-cursor-mode; }
-                            CheckBox { text: "自动切换(前台光标被捕获时)"; checked <=> root.auto-game-cursor; }
+                            Text { text: "光标模式"; color: #737b77; font-size: 11px; }
+                            ComboBox { model: ["桌面光标", "自动切换", "游戏光标"]; current-index <=> root.cursor-mode-index; }
                         }
                         }
                     }

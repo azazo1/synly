@@ -41,25 +41,22 @@ pub struct InputRuntimeOptions {
     pub block_switch_on_press: bool,
     pub key_mapping: KeyMappingConfig,
     pub cursor_mode: CursorMode,
-    pub auto_game_cursor: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum CursorMode {
     #[default]
     Desktop,
+    Auto,
     Game,
 }
 
 impl CursorMode {
-    pub fn is_game(self) -> bool {
-        matches!(self, Self::Game)
-    }
-
     pub fn label(self) -> &'static str {
         match self {
             Self::Desktop => "桌面光标",
+            Self::Auto => "自动切换",
             Self::Game => "游戏光标",
         }
     }
@@ -882,12 +879,14 @@ pub(super) async fn run_receiver(
     let mut active = false;
     let mut return_edge = ScreenEdge::Left;
     let mut cursor = None;
-    let mut cursor_mode_active =
-        options.cursor_mode.is_game() || (options.auto_game_cursor && foreground_captured());
+    let mut cursor_mode_active = match options.cursor_mode {
+        CursorMode::Desktop => false,
+        CursorMode::Auto => foreground_captured(),
+        CursorMode::Game => true,
+    };
     tracing::info!(
         game = cursor_mode_active,
-        manual_game = options.cursor_mode.is_game(),
-        auto_game_cursor = options.auto_game_cursor,
+        mode = ?options.cursor_mode,
         "接收端游戏光标模式初始状态"
     );
     let mut last_heartbeat = Instant::now();
@@ -921,12 +920,16 @@ pub(super) async fn run_receiver(
                 }
             }
             _ = monitor_tick.tick() => {
-                let captured = foreground_captured();
-                let game = options.cursor_mode.is_game() || captured;
-                if game == cursor_mode_active {
+                if options.cursor_mode == CursorMode::Game {
                     continue;
                 }
-                if game && !options.auto_game_cursor {
+                let captured = foreground_captured();
+                let game = match options.cursor_mode {
+                    CursorMode::Desktop => cursor_mode_active && captured,
+                    CursorMode::Auto => captured,
+                    CursorMode::Game => true,
+                };
+                if game == cursor_mode_active {
                     continue;
                 }
                 cursor_mode_active = game;
@@ -1550,7 +1553,6 @@ mod tests {
             block_switch_on_press: false,
             key_mapping: KeyMappingConfig::default(),
             cursor_mode: super::CursorMode::Desktop,
-            auto_game_cursor: false,
         }
     }
 
@@ -1919,6 +1921,24 @@ mod tests {
             "warp 失败后应注入相对移动"
         );
 
+        // Desktop 配置下 warp 被锁只是临时切到游戏模式, 捕获结束后应恢复桌面并释放远端控制.
+        incoming_tx
+            .send(Ok(InputMessage::Heartbeat { generation: 7 }))
+            .await
+            .unwrap();
+        captured.store(false, Ordering::Release);
+        timeout(Duration::from_millis(800), async {
+            loop {
+                match messages.recv().await {
+                    Some(InputMessage::Deactivate { generation: 7 }) => break,
+                    Some(_) => {}
+                    None => panic!("接收端不应提前停止"),
+                }
+            }
+        })
+        .await
+        .expect("捕获结束后应恢复桌面光标模式");
+
         task.abort();
         let _ = task.await;
     }
@@ -1940,7 +1960,7 @@ mod tests {
         let incoming_motion = Arc::new(IncomingMotion::default());
         let (outgoing, mut messages) = mpsc::channel(16);
         let mut options = test_input_options(ScreenEdge::Left);
-        options.auto_game_cursor = true;
+        options.cursor_mode = super::CursorMode::Auto;
         let captured = Arc::new(AtomicBool::new(true));
         incoming_tx
             .send(Ok(InputMessage::Activate {

@@ -26,7 +26,6 @@ pub struct ReceiverMockOptions {
     pub listen: SocketAddr,
     pub hotkey: Hotkey,
     pub cursor_mode: CursorMode,
-    pub auto_game_cursor: bool,
     pub elevated: bool,
 }
 
@@ -187,7 +186,6 @@ pub async fn run_receiver_mock(options: ReceiverMockOptions) -> Result<()> {
         block_switch_on_press: false,
         key_mapping: KeyMappingConfig::default(),
         cursor_mode: options.cursor_mode,
-        auto_game_cursor: options.auto_game_cursor,
     };
     let result = {
         let session = runtime::run_receiver(

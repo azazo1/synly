@@ -63,10 +63,7 @@ pub struct InputConfig {
     #[serde(default)]
     pub block_switch_on_press: bool,
     pub key_mapping: KeyMappingConfig,
-    #[serde(default)]
     pub cursor_mode: CursorMode,
-    #[serde(default)]
-    pub auto_game_cursor: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -116,7 +113,6 @@ impl Default for InputConfig {
             block_switch_on_press: false,
             key_mapping: KeyMappingConfig::default(),
             cursor_mode: CursorMode::default(),
-            auto_game_cursor: false,
         }
     }
 }
