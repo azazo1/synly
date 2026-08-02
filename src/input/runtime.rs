@@ -948,16 +948,10 @@ pub(super) async fn run_receiver(
                     "前台光标捕获状态变化, 游戏光标模式已切换"
                 );
                 if !game && active {
-                    platform.backend.release_all()?;
-                    active = false;
-                    let edge_position =
-                        cursor.map(|point| local_layout.edge_position(return_edge, point));
-                    cursor = None;
-                    enqueue_message(tx, InputMessage::Deactivate {
-                        generation,
-                        edge_position,
-                    })?;
-                    tracing::info!(generation, "前台光标捕获状态结束, 已自动释放远端控制");
+                    if cursor.is_none() {
+                        cursor = Some(platform.backend.cursor_position()?);
+                    }
+                    tracing::info!(generation, "前台光标捕获状态结束, 已切回桌面光标模式");
                 }
             }
             message = incoming.recv() => {
@@ -1074,11 +1068,13 @@ pub(super) async fn run_receiver(
                     NativeEvent::Emergency => {
                         if active {
                             platform.backend.release_all()?;
+                            let edge_position =
+                                cursor.map(|point| local_layout.edge_position(return_edge, point));
                             active = false;
                             cursor = None;
                             let _ = tx.try_send(InputMessage::Deactivate {
                                 generation,
-                                edge_position: None,
+                                edge_position,
                             });
                             tracing::info!(generation, "接收端紧急热键已停止远程控制");
                         }
@@ -1939,16 +1935,28 @@ mod tests {
             "warp 失败后应注入相对移动"
         );
 
-        // Desktop 配置下 warp 被锁只是临时切到游戏模式, 捕获结束后应恢复桌面并释放远端控制.
+        // Desktop 配置下 warp 被锁只是临时切到游戏模式, 捕获结束后应恢复桌面模式并保持控制.
         incoming_tx
             .send(Ok(InputMessage::Heartbeat { generation: 7 }))
             .await
             .unwrap();
         captured.store(false, Ordering::Release);
-        timeout(Duration::from_millis(800), async {
+        sleep(Duration::from_millis(550)).await;
+        incoming_tx
+            .send(Ok(InputMessage::Heartbeat { generation: 7 }))
+            .await
+            .unwrap();
+        incoming_motion.push(7, -100, 0);
+        let edge_position = timeout(Duration::from_millis(800), async {
             loop {
                 match messages.recv().await {
-                    Some(InputMessage::Deactivate { generation: 7, .. }) => break,
+                    Some(InputMessage::ReturnRequest {
+                        generation: 7,
+                        edge_position,
+                    }) => break edge_position,
+                    Some(InputMessage::Deactivate { .. }) => {
+                        panic!("捕获结束后不应释放控制")
+                    }
                     Some(_) => {}
                     None => panic!("接收端不应提前停止"),
                 }
@@ -1956,13 +1964,14 @@ mod tests {
         })
         .await
         .expect("捕获结束后应恢复桌面光标模式");
+        assert_eq!(edge_position, 0.5);
 
         task.abort();
         let _ = task.await;
     }
 
     #[tokio::test]
-    async fn receiver_auto_releases_when_cursor_capture_lost() {
+    async fn receiver_switches_to_desktop_when_cursor_capture_lost() {
         let backend = Arc::new(FakeBackend::default());
         let layout = backend.layout().unwrap();
         let motion = Arc::new(MotionAccumulator::default());
@@ -1980,92 +1989,6 @@ mod tests {
         let mut options = test_input_options(ScreenEdge::Left);
         options.cursor_mode = super::CursorMode::Auto;
         let captured = Arc::new(AtomicBool::new(true));
-        incoming_tx
-            .send(Ok(InputMessage::Activate {
-                generation: 7,
-                source_edge: ScreenEdge::Right,
-                edge_position: 0.5,
-                pressed: KeySnapshot {
-                    usages: Vec::new(),
-                    modifiers: ModifierMask::default(),
-                    buttons: Vec::new(),
-                },
-            }))
-            .await
-            .unwrap();
-
-        let captured_for_task = Arc::clone(&captured);
-        let task = tokio::spawn(async move {
-            run_receiver(
-                &mut incoming,
-                &incoming_motion,
-                &outgoing,
-                &mut platform,
-                layout,
-                &options,
-                move || captured_for_task.load(Ordering::Acquire),
-            )
-            .await
-        });
-
-        timeout(Duration::from_secs(1), async {
-            loop {
-                if matches!(
-                    messages.recv().await,
-                    Some(InputMessage::Heartbeat { generation: 7 })
-                ) {
-                    break;
-                }
-            }
-        })
-        .await
-        .expect("接收端应确认激活");
-
-        // 前台光标捕获状态结束: 自动释放并通知发送端.
-        captured.store(false, Ordering::Release);
-        timeout(Duration::from_secs(2), async {
-            loop {
-                match messages.recv().await {
-                    Some(InputMessage::Deactivate { generation: 7, .. }) => break,
-                    Some(_) => {}
-                    None => panic!("接收端不应提前停止"),
-                }
-            }
-        })
-        .await
-        .expect("捕获状态结束后应发送 Deactivate");
-        assert!(
-            backend
-                .recovery_actions
-                .lock()
-                .unwrap()
-                .contains(&"release"),
-            "自动释放应调用 release_all"
-        );
-
-        task.abort();
-        let _ = task.await;
-    }
-
-    #[tokio::test]
-    async fn receiver_reports_current_edge_position_when_auto_mode_releases_desktop_cursor() {
-        let backend = Arc::new(FakeBackend::default());
-        let layout = backend.layout().unwrap();
-        let motion = Arc::new(MotionAccumulator::default());
-        let (_events_tx, events) = mpsc::channel(1);
-        let mut platform = PlatformHandle {
-            backend: Arc::clone(&backend) as Arc<dyn InputBackend>,
-            events,
-            motion,
-            overflowed: Arc::new(AtomicBool::new(false)),
-            failed: Arc::new(AtomicBool::new(false)),
-        };
-        let (incoming_tx, mut incoming) = mpsc::channel(256);
-        let incoming_motion = Arc::new(IncomingMotion::default());
-        let (outgoing, mut messages) = mpsc::channel(16);
-        let mut options = test_input_options(ScreenEdge::Left);
-        options.cursor_mode = super::CursorMode::Auto;
-        let captured = Arc::new(AtomicBool::new(false));
         incoming_tx
             .send(Ok(InputMessage::Activate {
                 generation: 7,
@@ -2108,35 +2031,38 @@ mod tests {
         .await
         .expect("接收端应确认激活");
 
-        // 先在桌面模式下把接收端光标移动到 75% 位置, 再切到自动游戏模式后退出.
-        incoming_motion.push(7, 0, 25);
-        sleep(Duration::from_millis(50)).await;
-        incoming_tx
-            .send(Ok(InputMessage::Heartbeat { generation: 7 }))
-            .await
-            .unwrap();
-        captured.store(true, Ordering::Release);
-        sleep(Duration::from_millis(550)).await;
+        // 前台光标捕获状态结束: 应切回桌面光标模式并保持远端控制, 不应释放.
         incoming_tx
             .send(Ok(InputMessage::Heartbeat { generation: 7 }))
             .await
             .unwrap();
         captured.store(false, Ordering::Release);
-        let edge_position = timeout(Duration::from_millis(900), async {
+        sleep(Duration::from_millis(550)).await;
+        incoming_tx
+            .send(Ok(InputMessage::Heartbeat { generation: 7 }))
+            .await
+            .unwrap();
+
+        // 切回桌面模式后, 绝对移动仍应继续, 光标越过返回边时正常请求返回.
+        incoming_motion.push(7, -100, 0);
+        let edge_position = timeout(Duration::from_millis(800), async {
             loop {
                 match messages.recv().await {
-                    Some(InputMessage::Deactivate {
+                    Some(InputMessage::ReturnRequest {
                         generation: 7,
                         edge_position,
                     }) => break edge_position,
+                    Some(InputMessage::Deactivate { .. }) => {
+                        panic!("捕获状态结束后不应发送 Deactivate")
+                    }
                     Some(_) => {}
                     None => panic!("接收端不应提前停止"),
                 }
             }
         })
         .await
-        .expect("捕获结束后应发送带当前位置的 Deactivate");
-        assert_eq!(edge_position, Some(0.75));
+        .expect("桌面模式应继续处理绝对移动");
+        assert_eq!(edge_position, 0.5);
 
         task.abort();
         let _ = task.await;
