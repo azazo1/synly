@@ -63,6 +63,8 @@ git push origin main --follow-tags
 
 也可以在 GitHub Actions 手动填写已有 tag. 留空时只运行构建并上传 Actions artifact, 不创建 Release.
 
+正式发布 Android 签名 APK 前, 在仓库 secrets 中设置 `SYNLY_ANDROID_KEYSTORE_BASE64`, `SYNLY_ANDROID_KEYSTORE_PASSWORD`, `SYNLY_ANDROID_KEY_ALIAS` 和 `SYNLY_ANDROID_KEY_PASSWORD`. 未设置时 tag 发布会失败, 分支/PR 和空 tag 手动触发仍构建 debug APK.
+
 ### Windows
 
 推荐使用 MSVC 工具链和 Windows 10/11 SDK. 音频依赖 Opus.

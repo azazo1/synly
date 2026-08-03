@@ -6,6 +6,15 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
+val signingStoreFile = System.getenv("SYNLY_ANDROID_KEYSTORE_FILE")
+val signingStorePassword = System.getenv("SYNLY_ANDROID_KEYSTORE_PASSWORD")
+val signingKeyAlias = System.getenv("SYNLY_ANDROID_KEY_ALIAS")
+val signingKeyPassword = System.getenv("SYNLY_ANDROID_KEY_PASSWORD")
+val hasReleaseSigning = !signingStoreFile.isNullOrBlank() &&
+    !signingStorePassword.isNullOrBlank() &&
+    !signingKeyAlias.isNullOrBlank() &&
+    !signingKeyPassword.isNullOrBlank()
+
 val synlyVersion: String = runCatching {
     val metadata = providers.exec {
         commandLine("cargo", "metadata", "--locked", "--no-deps", "--format-version", "1")
@@ -33,9 +42,23 @@ android {
         }
     }
 
+    signingConfigs {
+        create("release") {
+            if (hasReleaseSigning) {
+                storeFile = file(signingStoreFile!!)
+                storePassword = signingStorePassword!!
+                keyAlias = signingKeyAlias!!
+                keyPassword = signingKeyPassword!!
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
+            if (hasReleaseSigning) {
+                signingConfig = signingConfigs.getByName("release")
+            }
         }
     }
 

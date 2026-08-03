@@ -10,3 +10,4 @@ AGENTS.*.md
 /android/local.properties
 /android/.kotlin/
 local.just
+/secrets/

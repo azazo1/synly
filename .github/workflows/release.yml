@@ -256,18 +256,53 @@ jobs:
           uniffi-bindgen generate --library android/app/src/main/jniLibs/arm64-v8a/libsynly_core.so --language kotlin --out-dir android/app/src/main/java --no-format
 
       - name: Build debug APK
+        if: needs.version.outputs.is_release != 'true'
         working-directory: android
         run: ./gradlew assembleDebug
 
-      - name: Prepare APK artifact
-        if: needs.version.outputs.is_release == 'true' || github.event_name == 'workflow_dispatch'
+      - name: Prepare Android signing key
+        if: needs.version.outputs.is_release == 'true'
         env:
-          PACKAGE_VERSION: ${{ needs.version.outputs.version || needs.version.outputs.project_version }}
+          SYNLY_ANDROID_KEYSTORE_BASE64: ${{ secrets.SYNLY_ANDROID_KEYSTORE_BASE64 }}
+          SYNLY_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.SYNLY_ANDROID_KEYSTORE_PASSWORD }}
+          SYNLY_ANDROID_KEY_ALIAS: ${{ secrets.SYNLY_ANDROID_KEY_ALIAS }}
+          SYNLY_ANDROID_KEY_PASSWORD: ${{ secrets.SYNLY_ANDROID_KEY_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          keystore_path="$(bash scripts/android-prepare-signing.sh dist/keystore)"
+          printf 'SYNLY_ANDROID_KEYSTORE_FILE=%s\n' "$keystore_path" >> "$GITHUB_ENV"
+
+      - name: Build release APK
+        if: needs.version.outputs.is_release == 'true'
+        env:
+          SYNLY_ANDROID_KEYSTORE_PASSWORD: ${{ secrets.SYNLY_ANDROID_KEYSTORE_PASSWORD }}
+          SYNLY_ANDROID_KEY_ALIAS: ${{ secrets.SYNLY_ANDROID_KEY_ALIAS }}
+          SYNLY_ANDROID_KEY_PASSWORD: ${{ secrets.SYNLY_ANDROID_KEY_PASSWORD }}
+        working-directory: android
+        run: ./gradlew assembleRelease
+
+      - name: Prepare debug APK artifact
+        if: github.event_name == 'workflow_dispatch' && needs.version.outputs.is_release != 'true'
+        env:
+          PACKAGE_VERSION: ${{ needs.version.outputs.project_version }}
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist
           cp android/app/build/outputs/apk/debug/app-debug.apk "dist/synly-$PACKAGE_VERSION-android-arm64.apk"
+          file "dist/synly-$PACKAGE_VERSION-android-arm64.apk" | grep -q 'Zip archive'
+          "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --print-certs "dist/synly-$PACKAGE_VERSION-android-arm64.apk" >/dev/null
+
+      - name: Prepare release APK artifact
+        if: needs.version.outputs.is_release == 'true'
+        env:
+          PACKAGE_VERSION: ${{ needs.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp android/app/build/outputs/apk/release/app-release.apk "dist/synly-$PACKAGE_VERSION-android-arm64.apk"
           file "dist/synly-$PACKAGE_VERSION-android-arm64.apk" | grep -q 'Zip archive'
           "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --print-certs "dist/synly-$PACKAGE_VERSION-android-arm64.apk" >/dev/null
 
