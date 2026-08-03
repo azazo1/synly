@@ -124,11 +124,20 @@ v1 同步范围为文本, HTML 与 PNG 图片, 不支持文件与 RTF. 图片写
 just android-core
 ```
 
-构建 debug APK:
+构建 Android APK:
 
 ```shell
 just android-build
 ```
+
+默认会根据签名环境变量自动选择 debug 或 release, 也可以显式指定:
+
+```shell
+just android-build debug
+just android-build release
+```
+
+如果存在 `secrets/synly-signing.env`, `just android-build` 会自动加载其中的签名配置并构建签名 release APK.
 
 也可以使用 Android Studio 打开 `android/` 目录直接构建. 首次配对时, 在桌面端确认 PIN 与指纹, 手机端输入同一 PIN 并核对指纹; 配对成功后双方会保存长期 mTLS 信任, 之后免 PIN 重连.
 

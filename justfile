@@ -84,15 +84,17 @@ android-core:
 android-core:
     bash scripts/android-build-core.sh
 
-# 构建 Android debug APK, 自动先构建核心库.
+# just android-build
+# just android-build release
+# 构建 Android APK, 自动先构建核心库; 默认根据签名环境变量选择 debug/release, 也可显式指定.
 [windows]
-android-build: android-core
-    powershell -NoProfile -ExecutionPolicy Bypass -File scripts/android-gradle.ps1 assembleDebug
+android-build mode='auto': android-core
+    powershell -NoProfile -ExecutionPolicy Bypass -File scripts/android-build.ps1 {{ mode }}
 
 [linux]
-android-build: android-core
-    bash scripts/android-gradle.sh assembleDebug
+android-build mode='auto': android-core
+    bash scripts/android-build.sh {{ mode }}
 
 [macos]
-android-build: android-core
-    bash scripts/android-gradle.sh assembleDebug
+android-build mode='auto': android-core
+    bash scripts/android-build.sh {{ mode }}
