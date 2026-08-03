@@ -17,7 +17,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
@@ -32,6 +31,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LocalContentColor
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedCard
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
@@ -213,19 +213,21 @@ private fun HomeScreen(onOpenSettings: () -> Unit, onOpenLogs: () -> Unit) {
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
                             modifier = Modifier.fillMaxWidth(),
                         )
+                        if (peers.isNotEmpty()) {
+                            Text(
+                                "发现 ${peers.size} 台设备",
+                                style = MaterialTheme.typography.titleSmall,
+                            )
+                            peers.forEach { peer ->
+                                PeerCard(peer = peer, onClick = {
+                                    connectSync(
+                                        context,
+                                        SynlyTarget(peer.addresses, peer.port.toInt(), peer.deviceId),
+                                    )
+                                })
+                            }
+                        }
                     }
-                }
-            }
-
-            if (peers.isNotEmpty()) {
-                item { Text("发现 ${peers.size} 台设备", style = MaterialTheme.typography.titleSmall) }
-                items(peers, key = { it.deviceId }) { peer ->
-                    PeerCard(peer = peer, onClick = {
-                        connectSync(
-                            context,
-                            SynlyTarget(peer.addresses, peer.port.toInt(), peer.deviceId),
-                        )
-                    })
                 }
             }
 
@@ -532,7 +534,7 @@ private fun StatusCard(
 
 @Composable
 private fun PeerCard(peer: FfiDiscoveredPeer, onClick: () -> Unit) {
-    Card(onClick = onClick, modifier = Modifier.fillMaxWidth()) {
+    OutlinedCard(onClick = onClick, modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text(peer.deviceName, style = MaterialTheme.typography.titleSmall)
             Text(
