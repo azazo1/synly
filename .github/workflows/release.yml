@@ -291,7 +291,7 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           cp android/app/build/outputs/apk/debug/app-debug.apk "dist/synly-$PACKAGE_VERSION-android-arm64.apk"
-          file "dist/synly-$PACKAGE_VERSION-android-arm64.apk" | grep -q 'Zip archive'
+          unzip -tq "dist/synly-$PACKAGE_VERSION-android-arm64.apk" >/dev/null
           "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --print-certs "dist/synly-$PACKAGE_VERSION-android-arm64.apk" >/dev/null
 
       - name: Prepare release APK artifact
@@ -303,7 +303,7 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           cp android/app/build/outputs/apk/release/app-release.apk "dist/synly-$PACKAGE_VERSION-android-arm64.apk"
-          file "dist/synly-$PACKAGE_VERSION-android-arm64.apk" | grep -q 'Zip archive'
+          unzip -tq "dist/synly-$PACKAGE_VERSION-android-arm64.apk" >/dev/null
           "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --print-certs "dist/synly-$PACKAGE_VERSION-android-arm64.apk" >/dev/null
 
       - name: Upload APK artifact
