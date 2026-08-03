@@ -12,5 +12,6 @@ pub use client::{
     is_installed as service_installed, mark_install_attempted, uninstall_via_uac,
 };
 pub(crate) use client::{
-    install_attempted, install_via_uac, is_available, spawn_agent,
+    install_attempted, install_via_uac, is_available, mark_path_repair_attempted,
+    path_repair_attempted, spawn_agent,
 };

@@ -174,7 +174,7 @@ fn spawn_agent_via_service(
             return false;
         }
     }
-    match super::super::service::spawn_agent(
+    match spawn_agent_request(
         command_pipe_name,
         event_pipe_name,
         token,
@@ -190,6 +190,53 @@ fn spawn_agent_via_service(
             false
         }
     }
+}
+
+fn spawn_agent_request(
+    command_pipe_name: &str,
+    event_pipe_name: &str,
+    token: &str,
+    parent_pid: u32,
+) -> Result<()> {
+    match super::super::service::spawn_agent(
+        command_pipe_name,
+        event_pipe_name,
+        token,
+        parent_pid,
+    ) {
+        Ok(()) => Ok(()),
+        Err(error) if is_service_path_mismatch(&error) => {
+            if super::super::service::path_repair_attempted() {
+                return Err(error).context("SYSTEM 输入服务路径修复已尝试但仍失败");
+            }
+            super::super::service::mark_path_repair_attempted();
+            tracing::warn!(error = %format!("{error:#}"), "SYSTEM 输入服务注册路径与当前程序不一致, 尝试重新配置");
+            match super::super::service::install_via_uac() {
+                Ok(true) => {
+                    tracing::info!("SYSTEM 输入服务已重新配置到当前程序路径");
+                    super::super::service::spawn_agent(
+                        command_pipe_name,
+                        event_pipe_name,
+                        token,
+                        parent_pid,
+                    )
+                }
+                Ok(false) => Err(error).context("用户取消了输入服务路径修复"),
+                Err(repair_error) => {
+                    Err(repair_error).context("重新配置 SYSTEM 输入服务失败")
+                }
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn is_service_path_mismatch(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .to_string()
+            .contains("映像路径校验失败")
+    })
 }
 
 fn try_install_service_once() -> bool {

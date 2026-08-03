@@ -18,6 +18,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 const ELEVATED_ACTION_TIMEOUT_MS: u32 = 30_000;
 
 static INSTALL_ATTEMPTED: AtomicBool = AtomicBool::new(false);
+static PATH_REPAIR_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn install_attempted() -> bool {
     INSTALL_ATTEMPTED.load(Ordering::Acquire)
@@ -25,6 +26,14 @@ pub(crate) fn install_attempted() -> bool {
 
 pub fn mark_install_attempted() {
     INSTALL_ATTEMPTED.store(true, Ordering::Release);
+}
+
+pub(crate) fn path_repair_attempted() -> bool {
+    PATH_REPAIR_ATTEMPTED.load(Ordering::Acquire)
+}
+
+pub(crate) fn mark_path_repair_attempted() {
+    PATH_REPAIR_ATTEMPTED.store(true, Ordering::Release);
 }
 
 pub fn is_installed() -> bool {

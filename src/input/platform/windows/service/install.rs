@@ -3,16 +3,19 @@ use anyhow::{Context, Result, bail};
 use std::ffi::c_void;
 use std::time::{Duration, Instant};
 use windows_sys::Win32::Foundation::{
-    ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_EXISTS,
+    ERROR_INSUFFICIENT_BUFFER, ERROR_SERVICE_ALREADY_RUNNING, ERROR_SERVICE_DOES_NOT_EXIST,
+    ERROR_SERVICE_EXISTS,
 };
 use windows_sys::Win32::System::Services::{
     ChangeServiceConfig2W, ChangeServiceConfigW, CloseServiceHandle, ControlService,
-    CreateServiceW, DeleteService, OpenSCManagerW, OpenServiceW, QueryServiceStatus,
+    CreateServiceW, DeleteService, OpenSCManagerW, OpenServiceW, QUERY_SERVICE_CONFIGW,
+    QueryServiceConfigW, QueryServiceStatus,
     SC_HANDLE, SC_MANAGER_ALL_ACCESS, SC_MANAGER_CONNECT, SERVICE_ALL_ACCESS, SERVICE_AUTO_START,
     SERVICE_CHANGE_CONFIG, SERVICE_CONFIG_DELAYED_AUTO_START_INFO, SERVICE_CONFIG_DESCRIPTION,
     SERVICE_CONTROL_STOP, SERVICE_DELAYED_AUTO_START_INFO, SERVICE_DESCRIPTIONW,
-    SERVICE_ERROR_NORMAL, SERVICE_NO_CHANGE, SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START,
-    SERVICE_STOPPED, SERVICE_WIN32_OWN_PROCESS, SERVICE_STATUS, StartServiceW,
+    SERVICE_ERROR_NORMAL, SERVICE_NO_CHANGE, SERVICE_QUERY_CONFIG, SERVICE_QUERY_STATUS,
+    SERVICE_RUNNING, SERVICE_START, SERVICE_STOP, SERVICE_STOPPED, SERVICE_WIN32_OWN_PROCESS,
+    SERVICE_STATUS, StartServiceW,
 };
 
 pub(crate) const SERVICE_NAME: &str = "SynlyInputService";
@@ -88,7 +91,11 @@ pub fn install() -> Result<()> {
             OpenServiceW(
                 scm.0,
                 service_name.as_ptr(),
-                SERVICE_CHANGE_CONFIG | SERVICE_START | SERVICE_QUERY_STATUS,
+                SERVICE_CHANGE_CONFIG
+                    | SERVICE_START
+                    | SERVICE_STOP
+                    | SERVICE_QUERY_CONFIG
+                    | SERVICE_QUERY_STATUS,
             )
         };
         if handle.is_null() {
@@ -143,6 +150,12 @@ pub fn install() -> Result<()> {
         tracing::warn!(error = %std::io::Error::last_os_error(), "无法设置输入服务描述");
     }
 
+    let was_running = matches!(query_current_state(service.0)?, ServiceStatus::Running);
+    let path_changed = !registered_bin_path_matches(service.0, &bin_path)?;
+    if was_running && path_changed {
+        tracing::info!("检测到输入服务注册路径变化, 停止服务以重新加载");
+        stop_service(service.0)?;
+    }
     let started = unsafe { StartServiceW(service.0, 0, std::ptr::null()) };
     if started == 0 {
         let error = std::io::Error::last_os_error();
@@ -152,6 +165,78 @@ pub fn install() -> Result<()> {
     }
     tracing::info!("Synly 输入服务已安装并启动");
     Ok(())
+}
+
+fn query_current_state(service: SC_HANDLE) -> Result<ServiceStatus> {
+    let mut status = SERVICE_STATUS::default();
+    if unsafe { QueryServiceStatus(service, &mut status) } == 0 {
+        return Err(std::io::Error::last_os_error()).context("查询输入服务状态失败");
+    }
+    Ok(if status.dwCurrentState == SERVICE_RUNNING {
+        ServiceStatus::Running
+    } else {
+        ServiceStatus::Stopped
+    })
+}
+
+fn registered_bin_path_matches(service: SC_HANDLE, expected: &str) -> Result<bool> {
+    let mut needed = 0u32;
+    unsafe {
+        QueryServiceConfigW(service, std::ptr::null_mut(), 0, &mut needed);
+    }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32) {
+        return Err(error).context("查询输入服务注册路径失败");
+    }
+    let mut buffer = vec![0u8; needed as usize];
+    let ok = unsafe {
+        QueryServiceConfigW(
+            service,
+            buffer.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error()).context("查询输入服务注册路径失败");
+    }
+    let config = unsafe { &*buffer.as_ptr().cast::<QUERY_SERVICE_CONFIGW>() };
+    if config.lpBinaryPathName.is_null() {
+        return Ok(false);
+    }
+    let mut length = 0usize;
+    unsafe {
+        while *config.lpBinaryPathName.add(length) != 0 {
+            length += 1;
+        }
+    }
+    let registered = unsafe {
+        String::from_utf16_lossy(std::slice::from_raw_parts(
+            config.lpBinaryPathName,
+            length,
+        ))
+    };
+    Ok(registered == expected)
+}
+
+fn stop_service(service: SC_HANDLE) -> Result<()> {
+    let mut status = SERVICE_STATUS::default();
+    if unsafe { ControlService(service, SERVICE_CONTROL_STOP, &mut status) } == 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(ERROR_SERVICE_DOES_NOT_EXIST as i32) {
+            return Err(error).context("停止输入服务失败");
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if matches!(query_current_state(service)?, ServiceStatus::Stopped) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("等待输入服务停止超时");
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
 }
 
 pub fn uninstall() -> Result<()> {
