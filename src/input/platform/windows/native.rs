@@ -334,6 +334,17 @@ struct WindowsBackend {
     state: Arc<WindowsState>,
 }
 
+impl WindowsBackend {
+    /// 主显示器矩形, 用于安全桌面期间的光标钳制; 未知时返回 None.
+    fn primary_rect(&self) -> Option<DisplayRect> {
+        self.state
+            .primary
+            .lock()
+            .ok()
+            .and_then(|primary| *primary)
+    }
+}
+
 pub(super) fn start(context: CaptureContext) -> Result<Arc<dyn InputBackend>> {
     let state = Arc::new(WindowsState {
         context,
@@ -845,14 +856,6 @@ impl InputBackend for WindowsBackend {
             .map_err(|_| anyhow::anyhow!("Windows display layout cache poisoned"))?
             .clone()
             .context("Windows display layout cache is empty")
-    }
-
-    fn primary_rect(&self) -> Option<DisplayRect> {
-        self.state
-            .primary
-            .lock()
-            .ok()
-            .and_then(|primary| *primary)
     }
 
     fn secure_desktop_state(&self) -> (bool, Option<DisplayRect>) {

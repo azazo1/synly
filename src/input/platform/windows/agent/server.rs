@@ -414,7 +414,7 @@ async fn run_agent_loop(
                         let primary = if secure_desktop {
                             runtime
                                 .as_ref()
-                                .and_then(|runtime| runtime.backend.primary_rect())
+                                .and_then(|runtime| runtime.backend.secure_desktop_state().1)
                         } else {
                             None
                         };
@@ -500,7 +500,7 @@ async fn handle_agent_request(
             let secure_desktop =
                 !super::super::desktop::current_input_desktop_is_default();
             let primary = if secure_desktop {
-                agent_backend(runtime)?.primary_rect()
+                agent_backend(runtime)?.secure_desktop_state().1
             } else {
                 None
             };

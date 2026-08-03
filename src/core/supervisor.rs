@@ -79,6 +79,7 @@ enum InternalEvent {
     },
     #[cfg_attr(not(windows), allow(dead_code))]
     InputElevation(bool),
+    #[cfg_attr(not(windows), allow(dead_code))]
     RefreshInputServiceStatus,
     Runtime {
         session_id: Uuid,
