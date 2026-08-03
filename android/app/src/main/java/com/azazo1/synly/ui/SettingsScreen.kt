@@ -43,8 +43,10 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import com.azazo1.synly.R
 import com.azazo1.synly.core.ConfigBackup
 import com.azazo1.synly.core.SettingsStore
+import com.azazo1.synly.core.SynlyCache
 import com.azazo1.synly.core.SynlyEngine
 import com.azazo1.synly.core.TrustedDeviceStore
 import java.text.SimpleDateFormat
@@ -63,6 +65,7 @@ fun SettingsScreen(onBack: () -> Unit) {
     var showToken by remember { mutableStateOf(false) }
     var busy by remember { mutableStateOf(false) }
     var statusMessage by remember { mutableStateOf<String?>(null) }
+    var cacheStatus by remember { mutableStateOf<String?>(null) }
     var pendingImport by remember { mutableStateOf<ConfigBackup.Backup?>(null) }
     val scope = rememberCoroutineScope()
 
@@ -194,6 +197,39 @@ fun SettingsScreen(onBack: () -> Unit) {
                             minBytes = 1,
                             maxBytes = 4096L * 1024 * 1024,
                         )
+                        OutlinedButton(
+                            onClick = {
+                                busy = true
+                                cacheStatus = null
+                                scope.launch {
+                                    val result = withContext(Dispatchers.IO) {
+                                        runCatching { SynlyCache.clear(context) }
+                                    }
+                                    result
+                                        .onSuccess {
+                                            cacheStatus = context.getString(
+                                                R.string.cache_clear_done,
+                                                it.fileCount,
+                                                formatHumanBytes(it.bytes.toULong()),
+                                            )
+                                        }
+                                        .onFailure {
+                                            cacheStatus = context.getString(
+                                                R.string.cache_clear_failed,
+                                                it.message ?: "未知错误",
+                                            )
+                                        }
+                                    busy = false
+                                }
+                            },
+                            enabled = !busy,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Text(context.getString(R.string.cache_clear))
+                        }
+                        cacheStatus?.let { message ->
+                            Text(message, style = MaterialTheme.typography.bodySmall)
+                        }
                     }
                 }
             }

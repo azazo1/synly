@@ -59,9 +59,11 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.azazo1.synly.R
 import com.azazo1.synly.core.SettingsStore
 import com.azazo1.synly.core.SynlyEngine
 import com.azazo1.synly.core.SynlyTarget
+import com.azazo1.synly.service.ClipboardSendActivity
 import com.azazo1.synly.service.ClipboardSyncService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -267,6 +269,41 @@ private fun HomeScreen(onOpenSettings: () -> Unit, onOpenLogs: () -> Unit) {
                             label = { Text("设备名称") },
                             singleLine = true,
                         )
+                    }
+                }
+            }
+
+            item {
+                Card {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("快速发送", style = MaterialTheme.typography.titleSmall)
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Button(
+                                onClick = {
+                                    context.startActivity(
+                                        Intent(context, ClipboardSendActivity::class.java)
+                                            .setAction(ClipboardSendActivity.ACTION_PICK_FILE),
+                                    )
+                                },
+                                modifier = Modifier.weight(1f),
+                            ) {
+                                Text(context.getString(R.string.main_action_pick_file))
+                            }
+                            Button(
+                                onClick = {
+                                    context.startActivity(
+                                        Intent(context, ClipboardSendActivity::class.java)
+                                            .setAction(ClipboardSendActivity.ACTION_CAPTURE_PHOTO),
+                                    )
+                                },
+                                modifier = Modifier.weight(1f),
+                            ) {
+                                Text(context.getString(R.string.main_action_capture_photo))
+                            }
+                        }
                     }
                 }
             }
