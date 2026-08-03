@@ -60,6 +60,7 @@ pub struct AppSupervisor {
     input_backend_generation: u64,
     pending_responses: HashMap<Uuid, oneshot::Sender<crate::runtime_control::InteractionResponse>>,
     runtime_active_session: Option<Uuid>,
+    input_permission_monitor: Option<JoinHandle<()>>,
 }
 
 struct SessionHandle {
@@ -120,6 +121,7 @@ impl AppSupervisor {
                 input_backend_generation: 0,
                 pending_responses: HashMap::new(),
                 runtime_active_session: None,
+                input_permission_monitor: None,
             },
             AppSupervisorHandle {
                 commands,
@@ -160,6 +162,9 @@ impl AppSupervisor {
 
         self.stop_session().await;
         if let Some(task) = self.discovery_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.input_permission_monitor.take() {
             task.abort();
         }
         self.snapshot.lifecycle = AppLifecycle::Stopping;
@@ -830,11 +835,11 @@ impl AppSupervisor {
         }));
     }
 
-    fn spawn_input_permission_monitor(&self) {
+    fn spawn_input_permission_monitor(&mut self) {
         #[cfg(windows)]
         {
             let internal = self.internal_tx.clone();
-            tokio::spawn(async move {
+            self.input_permission_monitor = Some(tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(Duration::from_secs(1));
                 let mut previous = None;
                 loop {
@@ -865,7 +870,7 @@ impl AppSupervisor {
                         }
                     }
                 }
-            });
+            }));
         }
     }
 
