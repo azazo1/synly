@@ -54,7 +54,12 @@ class ClipboardSendActivity : ComponentActivity() {
         SynlyEngine.init(applicationContext)
         SynlyEngine.start(applicationContext)
         ClipboardSyncService.start(applicationContext)
-        pendingCaptureUri = savedInstanceState?.getParcelable(KEY_CAPTURE_URI)
+        pendingCaptureUri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            savedInstanceState?.getParcelable(KEY_CAPTURE_URI, Uri::class.java)
+        } else {
+            @Suppress("DEPRECATION")
+            savedInstanceState?.getParcelable(KEY_CAPTURE_URI)
+        }
         when (intent.action) {
             ACTION_PICK_FILE -> pickFilesLauncher.launch(arrayOf("*/*"))
             ACTION_CAPTURE_PHOTO -> startCapture()
