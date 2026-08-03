@@ -13,6 +13,7 @@ use std::ffi::c_void;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_CALL_NOT_IMPLEMENTED, HANDLE, LUID, NO_ERROR, WAIT_OBJECT_0,
 };
@@ -266,11 +267,23 @@ fn service_accept_loop() -> Result<()> {
                 continue;
             }
         }
-        if let Err(error) = handle_client(&mut pipe, session_id, user_token) {
-            tracing::warn!(error = %error, "处理输入服务请求失败");
+        match handle_client(&mut pipe, session_id, user_token) {
+            Ok(()) => wait_for_client_close(&mut pipe),
+            Err(error) => {
+                let detail = format!("{error:#}");
+                tracing::warn!(error = %detail, "处理输入服务请求失败");
+            }
         }
     }
     Ok(())
+}
+
+/// 响应写入后保持服务端不主动断开, 等待客户端读取完响应并关闭连接.
+/// 若立即 DisconnectNamedPipe, 客户端尚未完成的读可能以 ERROR_PIPE_NOT_CONNECTED
+/// 失败, 导致已写入的响应丢失.
+fn wait_for_client_close(pipe: &mut NativePipe) {
+    let mut buffer = [0u8; 256];
+    let _ = pipe.read_exact(&mut buffer, Duration::from_secs(5));
 }
 
 fn handle_client(
@@ -348,7 +361,7 @@ fn enable_required_privileges() -> Result<()> {
             tracing::warn!(error = %std::io::Error::last_os_error(), "查询服务特权 LUID 失败");
             continue;
         }
-        let mut privileges = TOKEN_PRIVILEGES {
+        let privileges = TOKEN_PRIVILEGES {
             PrivilegeCount: 1,
             Privileges: [LUID_AND_ATTRIBUTES {
                 Luid: luid,
@@ -359,7 +372,7 @@ fn enable_required_privileges() -> Result<()> {
             AdjustTokenPrivileges(
                 token,
                 0,
-                &mut privileges,
+                &privileges,
                 0,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
@@ -526,7 +539,6 @@ fn duplicate_system_token_for_session(session_id: u32) -> Result<HANDLE> {
     {
         return Err(std::io::Error::last_os_error()).context("复制 SYSTEM 令牌失败");
     }
-    let _session_token = OwnedHandle(session_token);
     let session_id_raw = session_id;
     if unsafe {
         SetTokenInformation(
@@ -537,6 +549,9 @@ fn duplicate_system_token_for_session(session_id: u32) -> Result<HANDLE> {
         )
     } == 0
     {
+        unsafe {
+            CloseHandle(session_token);
+        }
         return Err(std::io::Error::last_os_error()).context("设置 SYSTEM 令牌会话 ID 失败");
     }
     Ok(session_token)
