@@ -13,6 +13,7 @@ import androidx.core.content.FileProvider
 import androidx.lifecycle.lifecycleScope
 import com.azazo1.synly.R
 import com.azazo1.synly.core.ClipboardSend
+import com.azazo1.synly.core.SynlyEngine
 import com.azazo1.synly.core.SynlyLog
 import java.io.File
 import java.text.SimpleDateFormat
@@ -50,6 +51,9 @@ class ClipboardSendActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        SynlyEngine.init(applicationContext)
+        SynlyEngine.start(applicationContext)
+        ClipboardSyncService.start(applicationContext)
         pendingCaptureUri = savedInstanceState?.getParcelable(KEY_CAPTURE_URI)
         when (intent.action) {
             ACTION_PICK_FILE -> pickFilesLauncher.launch(arrayOf("*/*"))

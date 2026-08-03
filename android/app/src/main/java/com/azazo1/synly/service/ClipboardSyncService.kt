@@ -10,11 +10,11 @@ import android.content.Intent
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
-import android.os.SystemClock
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.azazo1.synly.MainActivity
 import com.azazo1.synly.R
+import com.azazo1.synly.core.ClipboardReadGate
 import com.azazo1.synly.core.SynlyEngine
 import com.azazo1.synly.core.SynlyLog
 import kotlinx.coroutines.CoroutineScope
@@ -30,8 +30,6 @@ class ClipboardSyncService : android.app.Service() {
         private const val TAG = "ClipboardSyncService"
         private const val CHANNEL_ID = "synly_sync"
         private const val NOTIFICATION_ID = 1
-        private const val MIN_TRIGGER_INTERVAL_MS = 300L
-
         fun start(context: Context) {
             ContextCompat.startForegroundService(
                 context,
@@ -46,14 +44,11 @@ class ClipboardSyncService : android.app.Service() {
 
     private var multicastLock: WifiManager.MulticastLock? = null
 
-    private var lastReadTriggerMs = 0L
-
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var notificationJob: Job? = null
     private var lastNotificationState: FfiClientState? = null
     private var lastNotificationDevice: String? = null
     private var lastNotificationTarget: String? = null
-    private var stopping = false
 
     private val clipboardListener = ClipboardManager.OnPrimaryClipChangedListener {
         maybeReadClipboard()
@@ -91,23 +86,10 @@ class ClipboardSyncService : android.app.Service() {
                         getSystemService(NotificationManager::class.java)
                             .notify(NOTIFICATION_ID, buildNotification(state, device, target))
                     }
-                    if (state == null && !stopping) {
-                        stopping = true
-                        stopForeground(STOP_FOREGROUND_REMOVE)
-                        stopSelf()
-                    }
                 }
             }
         }
         return START_STICKY
-    }
-
-    override fun onTaskRemoved(rootIntent: Intent?) {
-        super.onTaskRemoved(rootIntent)
-        stopping = true
-        SynlyEngine.stop()
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
     }
 
     override fun onDestroy() {
@@ -154,6 +136,13 @@ class ClipboardSyncService : android.app.Service() {
             2,
             ClipboardSendActivity.ACTION_CAPTURE_PHOTO,
         )
+        val sendClipboardPending = PendingIntent.getActivity(
+            this,
+            3,
+            Intent(this, ClipboardReadActivity::class.java)
+                .putExtra(ClipboardReadActivity.EXTRA_MANUAL, true),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
         val target = targetLabel ?: getString(R.string.sync_notification_unknown)
         val statusText = when (state) {
             FfiClientState.CONNECTING -> getString(R.string.sync_notification_connecting, target)
@@ -178,6 +167,11 @@ class ClipboardSyncService : android.app.Service() {
                 0,
                 getString(R.string.sync_notification_action_capture_photo),
                 capturePhotoPending,
+            )
+            .addAction(
+                0,
+                getString(R.string.sync_notification_action_send_clipboard),
+                sendClipboardPending,
             )
             .setOngoing(true)
             .build()
@@ -208,16 +202,14 @@ class ClipboardSyncService : android.app.Service() {
 
     private fun maybeReadClipboard() {
         if (!SynlyEngine.canSend()) return
-        val now = SystemClock.elapsedRealtime()
-        if (now - lastReadTriggerMs < MIN_TRIGGER_INTERVAL_MS) return
-        lastReadTriggerMs = now
+        if (!ClipboardReadGate.tryAcquire()) return
         runCatching {
             startActivity(
                 Intent(this, ClipboardReadActivity::class.java)
                     .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
             )
         }.onFailure {
-            SynlyLog.w(TAG, "启动剪贴板读取界面失败, 请检查悬浮窗权限", it)
+            SynlyLog.w(TAG, "启动剪贴板读取界面失败", it)
         }
     }
 

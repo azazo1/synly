@@ -363,6 +363,7 @@ object SynlyEngine {
             is FfiClientEvent.Disconnected -> {
                 _uiState.update {
                     it.copy(
+                        state = null,
                         connectedDevice = null,
                         pinRequest = null,
                         canSend = false,

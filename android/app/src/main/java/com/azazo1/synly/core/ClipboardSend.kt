@@ -4,6 +4,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 
 object ClipboardSend {
@@ -11,7 +12,14 @@ object ClipboardSend {
         return withContext(Dispatchers.IO) {
             runCatching {
                 if (!SynlyEngine.canSend()) {
-                    error("未连接")
+                    SynlyEngine.start(context)
+                    val deadline = System.currentTimeMillis() + CONNECT_WAIT_MS
+                    while (System.currentTimeMillis() < deadline && !SynlyEngine.canSend()) {
+                        delay(100)
+                    }
+                    if (!SynlyEngine.canSend()) {
+                        error("未连接")
+                    }
                 }
                 val files = ClipboardFiles.read(context, uris)
                 if (files.isEmpty()) {
@@ -38,4 +46,6 @@ object ClipboardSend {
             }
         }
     }
+
+    private const val CONNECT_WAIT_MS = 3000L
 }

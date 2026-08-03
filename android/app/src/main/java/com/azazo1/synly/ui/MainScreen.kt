@@ -9,6 +9,7 @@ import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -63,6 +64,7 @@ import com.azazo1.synly.R
 import com.azazo1.synly.core.SettingsStore
 import com.azazo1.synly.core.SynlyEngine
 import com.azazo1.synly.core.SynlyTarget
+import com.azazo1.synly.service.ClipboardReadActivity
 import com.azazo1.synly.service.ClipboardSendActivity
 import com.azazo1.synly.service.ClipboardSyncService
 import kotlinx.coroutines.Dispatchers
@@ -102,14 +104,12 @@ private fun HomeScreen(onOpenSettings: () -> Unit, onOpenLogs: () -> Unit) {
     var pin by remember { mutableStateOf("") }
     var settings by remember { mutableStateOf(SettingsStore.load(context)) }
     val scope = rememberCoroutineScope()
-    var overlayEnabled by remember { mutableStateOf(false) }
     var batteryIgnored by remember { mutableStateOf(false) }
     var revealReceived by remember { mutableStateOf(false) }
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
-                overlayEnabled = Settings.canDrawOverlays(context)
                 batteryIgnored = isIgnoringBatteryOptimizations(context)
             }
         }
@@ -291,8 +291,12 @@ private fun HomeScreen(onOpenSettings: () -> Unit, onOpenLogs: () -> Unit) {
                                     )
                                 },
                                 modifier = Modifier.weight(1f),
+                                contentPadding = PaddingValues(horizontal = 8.dp),
                             ) {
-                                Text(context.getString(R.string.main_action_pick_file))
+                                Text(
+                                    context.getString(R.string.main_action_pick_file),
+                                    maxLines = 1,
+                                )
                             }
                             Button(
                                 onClick = {
@@ -302,8 +306,27 @@ private fun HomeScreen(onOpenSettings: () -> Unit, onOpenLogs: () -> Unit) {
                                     )
                                 },
                                 modifier = Modifier.weight(1f),
+                                contentPadding = PaddingValues(horizontal = 8.dp),
                             ) {
-                                Text(context.getString(R.string.main_action_capture_photo))
+                                Text(
+                                    context.getString(R.string.main_action_capture_photo),
+                                    maxLines = 1,
+                                )
+                            }
+                            Button(
+                                onClick = {
+                                    context.startActivity(
+                                        Intent(context, ClipboardReadActivity::class.java)
+                                            .putExtra(ClipboardReadActivity.EXTRA_MANUAL, true),
+                                    )
+                                },
+                                modifier = Modifier.weight(1f),
+                                contentPadding = PaddingValues(horizontal = 8.dp),
+                            ) {
+                                Text(
+                                    context.getString(R.string.main_action_send_clipboard),
+                                    maxLines = 1,
+                                )
                             }
                         }
                     }
@@ -314,30 +337,6 @@ private fun HomeScreen(onOpenSettings: () -> Unit, onOpenLogs: () -> Unit) {
                 Card {
                     Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Text("权限与后台", style = MaterialTheme.typography.titleSmall)
-                        OutlinedButton(
-                            onClick = {
-                                val intent = Intent(
-                                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                                    Uri.parse("package:${context.packageName}"),
-                                )
-                                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                                context.startActivity(intent)
-                            },
-                            colors = permissionButtonColors(overlayEnabled),
-                            modifier = Modifier.fillMaxWidth(),
-                        ) {
-                            if (overlayEnabled) {
-                                Icon(Icons.Filled.Check, contentDescription = null)
-                                Spacer(Modifier.width(8.dp))
-                            }
-                            Text(
-                                if (overlayEnabled) {
-                                    "后台读取剪贴板已允许"
-                                } else {
-                                    "允许后台读取剪贴板"
-                                },
-                            )
-                        }
                         OutlinedButton(
                             onClick = {
                                 val intent = Intent(
@@ -436,6 +435,7 @@ private fun HomeScreen(onOpenSettings: () -> Unit, onOpenLogs: () -> Unit) {
             },
         )
     }
+
 }
 
 @Composable
