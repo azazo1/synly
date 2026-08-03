@@ -137,6 +137,7 @@ export component AppWindow inherits Window {
     in-out property <string> transfer-meta-text;
     in-out property <string> transfer-frame-text;
     in-out property <string> transfer-clipboard-text;
+    in-out property <string> settings-error-text;
     in-out property <bool> mdns-enabled: true;
     in-out property <bool> lnd-enabled: false;
     in-out property <string> lnd-server-url;
@@ -576,12 +577,12 @@ export component AppWindow inherits Window {
                             horizontal-stretch: 1;
                             VerticalLayout {
                                 spacing: 5px;
-                                LineEdit { text <=> root.clipboard-max-file-text; placeholder-text: "剪贴板单文件上限, 字节"; input-type: number; }
-                                LineEdit { text <=> root.clipboard-max-cache-text; placeholder-text: "剪贴板缓存上限, 字节, 留空不限制"; input-type: number; }
+                                LineEdit { text <=> root.clipboard-max-file-text; placeholder-text: "剪贴板单文件上限, 例如 100 MiB"; }
+                                LineEdit { text <=> root.clipboard-max-cache-text; placeholder-text: "剪贴板缓存上限, 例如 512 MiB, 留空不限制"; }
                                 LineEdit { text <=> root.clipboard-cache-dir; placeholder-text: "剪贴板缓存目录, 可选"; }
-                                LineEdit { text <=> root.transfer-meta-text; placeholder-text: "元数据上限, 字节"; input-type: number; }
-                                LineEdit { text <=> root.transfer-frame-text; placeholder-text: "传输帧上限, 字节"; input-type: number; }
-                                LineEdit { text <=> root.transfer-clipboard-text; placeholder-text: "剪贴板帧上限, 字节"; input-type: number; }
+                                LineEdit { text <=> root.transfer-meta-text; placeholder-text: "元数据上限, 例如 20 MiB"; }
+                                LineEdit { text <=> root.transfer-frame-text; placeholder-text: "传输帧上限, 例如 128 MiB"; }
+                                LineEdit { text <=> root.transfer-clipboard-text; placeholder-text: "剪贴板帧上限, 例如 100 MiB"; }
                             }
                         }
                         Panel {
@@ -608,6 +609,7 @@ export component AppWindow inherits Window {
                         Rectangle { horizontal-stretch: 1; }
                         Button { text: "保存设置"; clicked => { root.apply-settings(); } }
                     }
+                    if root.settings-error-text != "": Text { text: root.settings-error-text; color: #b3261e; wrap: word-wrap; }
                 }
             }
 

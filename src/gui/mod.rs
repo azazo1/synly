@@ -15,6 +15,7 @@ use slint::{CloseRequestResponse, ComponentHandle, LogicalSize, ModelRc, VecMode
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use synly_core::size::{format_human_bytes, parse_human_bytes};
 use uuid::Uuid;
 
 mod single_instance;
@@ -219,6 +220,7 @@ fn wire_window_callbacks(
             let current_input = snapshots.borrow().desired.input.clone();
             match settings_from_window(&window, &current_input) {
                 Ok((runtime, settings, session_pin)) => {
+                    window.set_settings_error_text("".into());
                     let enabling_delete = runtime.sync_delete
                         && !snapshots.borrow().desired.sync_delete;
                     if enabling_delete
@@ -244,7 +246,11 @@ fn wire_window_callbacks(
                         },
                     );
                 }
-                Err(error) => tracing::error!(error = %error, "GUI 设置校验失败"),
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    window.set_settings_error_text(message.into());
+                    tracing::error!(error = %error, "GUI 设置校验失败");
+                }
             }
         }
     });
@@ -769,6 +775,7 @@ fn apply_settings_to_window(
     runtime: &RuntimeConfig,
     settings: &AppSettings,
 ) {
+    window.set_settings_error_text("".into());
     window.set_connection_index(match runtime.connection {
         Some(ConnectionPreference::Join) => 1,
         _ => 0,
@@ -806,12 +813,14 @@ fn apply_settings_to_window(
     window.set_trust_device(runtime.trust_device);
     window.set_trusted_only(runtime.trusted_only);
     window.set_device_name(settings.device_name.clone().into());
-    window.set_clipboard_max_file_text(settings.clipboard.max_file_bytes.to_string().into());
+    window.set_clipboard_max_file_text(
+        format_human_bytes(settings.clipboard.max_file_bytes).into(),
+    );
     window.set_clipboard_max_cache_text(
         settings
             .clipboard
             .max_cache_bytes
-            .map(|value| value.to_string())
+            .map(format_human_bytes)
             .unwrap_or_default()
             .into(),
     );
@@ -824,10 +833,14 @@ fn apply_settings_to_window(
             .unwrap_or_default()
             .into(),
     );
-    window.set_transfer_meta_text(settings.transfer.max_meta_bytes.to_string().into());
-    window.set_transfer_frame_text(settings.transfer.max_frame_data_bytes.to_string().into());
+    window.set_transfer_meta_text(
+        format_human_bytes(settings.transfer.max_meta_bytes).into(),
+    );
+    window.set_transfer_frame_text(
+        format_human_bytes(settings.transfer.max_frame_data_bytes).into(),
+    );
     window.set_transfer_clipboard_text(
-        settings.transfer.max_clipboard_bytes.to_string().into(),
+        format_human_bytes(settings.transfer.max_clipboard_bytes).into(),
     );
     window.set_mdns_enabled(settings.discovery.mdns_enabled);
     window.set_lnd_enabled(settings.discovery.lnd.is_some());
@@ -1042,9 +1055,7 @@ fn clamped_window_size(width: f32, height: f32) -> LogicalSize {
 
 fn parse_required_u64(value: &str, label: &str) -> Result<u64> {
     let value = value.trim();
-    let parsed = value
-        .parse::<u64>()
-        .with_context(|| format!("{label}不是有效的非负整数"))?;
+    let parsed = parse_human_bytes(value).with_context(|| format!("{label}格式无效"))?;
     if parsed == 0 {
         anyhow::bail!("{label}必须大于 0");
     }

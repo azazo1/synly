@@ -595,6 +595,16 @@ pub fn normalize_pin(pin: String) -> Result<String, FfiError> {
 }
 
 #[uniffi::export]
+pub fn parse_human_bytes(input: String) -> Result<u64, FfiError> {
+    crate::size::parse_human_bytes(&input).map_err(Into::into)
+}
+
+#[uniffi::export]
+pub fn format_human_bytes(bytes: u64) -> String {
+    crate::size::format_human_bytes(bytes)
+}
+
+#[uniffi::export]
 pub fn generate_device_config(device_name: String) -> Result<FfiDeviceConfig, FfiError> {
     let device = crate::identity::generate_device_config(device_name)?;
     Ok(FfiDeviceConfig {

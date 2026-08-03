@@ -684,11 +684,15 @@ internal object IntegrityCheckingUniffiLib {
     ): Int
     external fun uniffi_synly_core_checksum_func_build_version(
     ): Int
+    external fun uniffi_synly_core_checksum_func_format_human_bytes(
+    ): Int
     external fun uniffi_synly_core_checksum_func_generate_device_config(
     ): Int
     external fun uniffi_synly_core_checksum_func_init_tracing(
     ): Int
     external fun uniffi_synly_core_checksum_func_normalize_pin(
+    ): Int
+    external fun uniffi_synly_core_checksum_func_parse_human_bytes(
     ): Int
     external fun uniffi_synly_core_checksum_func_start_client(
     ): Int
@@ -756,12 +760,16 @@ internal object UniffiLib {
     ): RustBuffer.ByValue
     external fun uniffi_synly_core_fn_func_build_version(uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    external fun uniffi_synly_core_fn_func_format_human_bytes(`bytes`: Long,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     external fun uniffi_synly_core_fn_func_generate_device_config(`deviceName`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
     external fun uniffi_synly_core_fn_func_init_tracing(`listener`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     external fun uniffi_synly_core_fn_func_normalize_pin(`pin`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    external fun uniffi_synly_core_fn_func_parse_human_bytes(`input`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Long
     external fun uniffi_synly_core_fn_func_start_client(`config`: RustBuffer.ByValue,`target`: RustBuffer.ByValue,`listener`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Long
     external fun ffi_synly_core_rustbuffer_alloc(`size`: Long,uniffi_out_err: UniffiRustCallStatus, 
@@ -889,6 +897,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_synly_core_checksum_func_build_version() != 14128) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_synly_core_checksum_func_format_human_bytes() != 46935) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_synly_core_checksum_func_generate_device_config() != 469) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -896,6 +907,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_synly_core_checksum_func_normalize_pin() != 25980) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_synly_core_checksum_func_parse_human_bytes() != 9760) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_synly_core_checksum_func_start_client() != 26905) {
@@ -2806,6 +2820,16 @@ public object FfiConverterSequenceTypeFfiTrustedDeviceConfig: FfiConverterRustBu
     )
     }
     
+ fun `formatHumanBytes`(`bytes`: kotlin.ULong): kotlin.String {
+            return FfiConverterString.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.uniffi_synly_core_fn_func_format_human_bytes(
+    
+        FfiConverterULong.lower(`bytes`),_status)
+}
+    )
+    }
+    
 
     @Throws(FfiException::class) fun `generateDeviceConfig`(`deviceName`: kotlin.String): FfiDeviceConfig {
             return FfiConverterTypeFfiDeviceConfig.lift(
@@ -2834,6 +2858,17 @@ public object FfiConverterSequenceTypeFfiTrustedDeviceConfig: FfiConverterRustBu
     UniffiLib.uniffi_synly_core_fn_func_normalize_pin(
     
         FfiConverterString.lower(`pin`),_status)
+}
+    )
+    }
+    
+
+    @Throws(FfiException::class) fun `parseHumanBytes`(`input`: kotlin.String): kotlin.ULong {
+            return FfiConverterULong.lift(
+    uniffiRustCallWithError(FfiException) { _status ->
+    UniffiLib.uniffi_synly_core_fn_func_parse_human_bytes(
+    
+        FfiConverterString.lower(`input`),_status)
 }
     )
     }

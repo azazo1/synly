@@ -53,6 +53,7 @@ import java.util.Locale
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import uniffi.synly_core.formatHumanBytes
 
 @Composable
 fun SettingsScreen(onBack: () -> Unit) {
@@ -173,30 +174,25 @@ fun SettingsScreen(onBack: () -> Unit) {
             item {
                 Card {
                     Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        OutlinedTextField(
-                            value = (settings.maxClipboardBytes / 1024 / 1024).toString(),
-                            onValueChange = {
-                                val mb = it.toLongOrNull()?.coerceIn(1, 100) ?: return@OutlinedTextField
-                                settings = settings.copy(maxClipboardBytes = mb * 1024 * 1024)
+                        ByteSizeField(
+                            valueBytes = settings.maxClipboardBytes,
+                            onCommit = { bytes ->
+                                settings = settings.copy(maxClipboardBytes = bytes)
                                 SettingsStore.save(context, settings)
                             },
-                            label = { Text("剪贴板大小上限 (MB)") },
-                            singleLine = true,
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                            modifier = Modifier.fillMaxWidth(),
+                            label = "剪贴板大小上限",
+                            minBytes = 1,
+                            maxBytes = 100L * 1024 * 1024,
                         )
-                        OutlinedTextField(
-                            value = (settings.maxClipboardCacheBytes / 1024 / 1024).toString(),
-                            onValueChange = {
-                                val mb = it.toLongOrNull()?.coerceIn(1, 4096)
-                                    ?: return@OutlinedTextField
-                                settings = settings.copy(maxClipboardCacheBytes = mb * 1024 * 1024)
+                        ByteSizeField(
+                            valueBytes = settings.maxClipboardCacheBytes,
+                            onCommit = { bytes ->
+                                settings = settings.copy(maxClipboardCacheBytes = bytes)
                                 SettingsStore.save(context, settings)
                             },
-                            label = { Text("剪贴板缓存上限 (MB)") },
-                            singleLine = true,
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                            modifier = Modifier.fillMaxWidth(),
+                            label = "剪贴板缓存上限",
+                            minBytes = 1,
+                            maxBytes = 4096L * 1024 * 1024,
                         )
                     }
                 }
@@ -448,8 +444,14 @@ private fun ConfigImportPreview(backup: ConfigBackup.Backup) {
         Text("将覆盖当前设置, 身份和可信设备", style = MaterialTheme.typography.bodySmall)
         PreviewLine("设备名称", settings.deviceName)
         PreviewLine("剪贴板模式", settings.clipboardMode.name)
-        PreviewLine("剪贴板大小上限", "${settings.maxClipboardBytes / 1024 / 1024} MB")
-        PreviewLine("剪贴板缓存上限", "${settings.maxClipboardCacheBytes / 1024 / 1024} MB")
+        PreviewLine(
+            "剪贴板大小上限",
+            formatHumanBytes(settings.maxClipboardBytes.toULong()),
+        )
+        PreviewLine(
+            "剪贴板缓存上限",
+            formatHumanBytes(settings.maxClipboardCacheBytes.toULong()),
+        )
         PreviewLine("mDNS 发现", if (settings.mdnsEnabled) "开启" else "关闭")
         PreviewLine("LND 发现", if (settings.lndEnabled) "开启" else "关闭")
         if (settings.lndEnabled) {
