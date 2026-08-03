@@ -1,7 +1,7 @@
 package com.azazo1.synly.service
 
-import android.app.Activity
 import android.os.Bundle
+import androidx.activity.ComponentActivity
 import androidx.lifecycle.lifecycleScope
 import com.azazo1.synly.core.ClipboardReader
 import com.azazo1.synly.core.SynlyEngine
@@ -14,7 +14,7 @@ import kotlinx.coroutines.withContext
  * Android 10+ 只允许前台有焦点的应用读取剪贴板, 因此后台收到剪贴板变化通知后,
  * 通过本界面短暂抢占前台焦点完成读取, 随后立即关闭.
  */
-class ClipboardReadActivity : Activity() {
+class ClipboardReadActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
     }

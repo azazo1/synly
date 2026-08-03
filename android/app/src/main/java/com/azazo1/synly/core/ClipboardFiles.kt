@@ -12,8 +12,13 @@ object ClipboardFiles {
     fun read(context: Context, uris: List<android.net.Uri>): List<ClipboardFile> {
         require(uris.isNotEmpty()) { "没有收到文件" }
         val maxBytes = SettingsStore.load(context).maxClipboardBytes
+        var totalBytes = 0L
         return uris.mapIndexed { index, uri ->
             val bytes = readBoundedBytes(context, uri, maxBytes)
+            totalBytes += bytes.size
+            if (totalBytes > maxBytes) {
+                throw IOException("剪贴板内容超过大小上限")
+            }
             ClipboardFile(displayName(context, uri, index), bytes)
         }
     }
