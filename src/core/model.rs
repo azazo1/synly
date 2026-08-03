@@ -105,6 +105,7 @@ pub struct AppSnapshot {
     pub interaction: Option<PendingInteraction>,
     pub last_error: Option<String>,
     pub input_elevation_ready: bool,
+    pub input_service_installed: bool,
     pub actual_capabilities: Option<RuntimeCapabilities>,
     pub remote_capabilities: Option<RuntimeCapabilities>,
     pub capability_epoch: Option<CapabilityEpoch>,
@@ -125,6 +126,7 @@ impl AppSnapshot {
             interaction: None,
             last_error: None,
             input_elevation_ready: initial_input_elevation_ready(),
+            input_service_installed: false,
             actual_capabilities: None,
             remote_capabilities: None,
             capability_epoch: None,
@@ -172,6 +174,7 @@ pub enum AppCommand {
     },
     RevokeTrust(Uuid),
     RequestInputElevation,
+    UninstallInputService,
     SaveWindowState {
         width: u32,
         height: u32,

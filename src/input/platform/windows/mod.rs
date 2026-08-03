@@ -1,6 +1,8 @@
 mod agent;
 mod cursor_capture;
+pub(crate) mod desktop;
 mod native;
+pub(crate) mod service;
 
 use super::{CaptureContext, InputBackend};
 use crate::input::InputMode;
@@ -8,6 +10,10 @@ use anyhow::{Context, Result, bail};
 use std::sync::Arc;
 
 pub use agent::{request_elevation, run_agent};
+pub use service::{
+    install, init_tracing, mark_install_attempted, run_service, service_installed, status,
+    uninstall, uninstall_via_uac,
+};
 
 pub fn init_agent_tracing() -> Result<tracing_appender::non_blocking::WorkerGuard> {
     agent::init_tracing()

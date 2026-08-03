@@ -41,6 +41,23 @@ pub enum Command {
         #[arg(long)]
         parent_pid: u32,
     },
+    /// 管理 Windows SYSTEM 输入服务
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+    #[command(name = "__service", hide = true)]
+    ServiceEntry,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ServiceAction {
+    /// 安装并启动输入服务, 需要管理员权限
+    Install,
+    /// 停止并卸载输入服务, 需要管理员权限
+    Uninstall,
+    /// 查询输入服务状态
+    Status,
 }
 
 #[derive(Clone, Debug)]
@@ -61,6 +78,7 @@ impl Cli {
                 connection: ConnectionPreference::Join,
                 peer_query: peer.clone(),
             }),
+            Some(Command::Service { .. } | Command::ServiceEntry) => None,
             _ => None,
         }
     }

@@ -51,6 +51,7 @@ fn test_client(
         lifecycle: Mutex::new(()),
         next_lease: AtomicU64::new(1),
         active_lease: AtomicU64::new(0),
+        is_system: AtomicBool::new(false),
     }
 }
 
@@ -190,7 +191,7 @@ fn native_dual_pipe_transport_survives_cursor_lifecycle_and_event_pressure() {
         let mut pipe = create_test_server(&event_server_name, PipeDirection::ClientToServer);
         event_created.send(()).unwrap();
         pipe.connect_server(CONNECT_TIMEOUT)?;
-        client_event_reader_loop(pipe, event_pending, event_context, event_alive)
+        client_event_reader_loop(pipe, event_pending, event_context, event_alive, false)
     });
 
     created_rx.recv_timeout(CONNECT_TIMEOUT).unwrap();

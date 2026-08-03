@@ -1,7 +1,7 @@
 use super::pipe::NativePipe;
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
-use windows_sys::Win32::Foundation::{CloseHandle, LocalFree};
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LocalFree};
 use windows_sys::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
     SDDL_REVISION_1,
@@ -19,13 +19,13 @@ use windows_sys::Win32::System::Threading::{
     PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 
-pub(super) struct PipeSecurity {
+pub(crate) struct PipeSecurity {
     descriptor: PSECURITY_DESCRIPTOR,
     pub(super) attributes: SECURITY_ATTRIBUTES,
 }
 
 impl PipeSecurity {
-    pub(super) fn for_current_user() -> Result<Self> {
+    pub(crate) fn for_current_user() -> Result<Self> {
         let user_sid = current_user_sid_string()?;
         let sddl = wide(&format!("D:P(A;;GA;;;SY)(A;;GA;;;{user_sid})"));
         let mut descriptor = std::ptr::null_mut();
@@ -60,7 +60,7 @@ impl Drop for PipeSecurity {
     }
 }
 
-pub(super) fn validate_parent_process(parent_pid: u32) -> Result<()> {
+pub(crate) fn validate_parent_process(parent_pid: u32) -> Result<()> {
     if process_session_id(parent_pid)? != process_session_id(unsafe { GetCurrentProcessId() })? {
         bail!("Windows input agent and GUI are not in the same session");
     }
@@ -70,7 +70,7 @@ pub(super) fn validate_parent_process(parent_pid: u32) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn validate_pipe_server(client: &NativePipe, expected_pid: u32) -> Result<()> {
+pub(crate) fn validate_pipe_server(client: &NativePipe, expected_pid: u32) -> Result<()> {
     let mut actual_pid = 0u32;
     let ok = unsafe { GetNamedPipeServerProcessId(client.raw_handle(), &mut actual_pid) };
     if ok == 0 || actual_pid != expected_pid {
@@ -79,7 +79,7 @@ pub(super) fn validate_pipe_server(client: &NativePipe, expected_pid: u32) -> Re
     Ok(())
 }
 
-pub(super) fn validate_pipe_client(
+pub(crate) fn validate_pipe_client(
     server: &NativePipe,
     expected_pid: u32,
     reported_path: &Path,
@@ -112,7 +112,7 @@ fn normalize_path(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
-pub(super) fn process_session_id(process_id: u32) -> Result<u32> {
+pub(crate) fn process_session_id(process_id: u32) -> Result<u32> {
     let mut session_id = 0u32;
     if unsafe { ProcessIdToSessionId(process_id, &mut session_id) } == 0 {
         bail!("failed to resolve Windows process session ID");
@@ -120,7 +120,7 @@ pub(super) fn process_session_id(process_id: u32) -> Result<u32> {
     Ok(session_id)
 }
 
-pub(super) fn current_process_is_elevated() -> Result<bool> {
+pub(crate) fn current_process_is_elevated() -> Result<bool> {
     let mut token = std::ptr::null_mut();
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
         return Err(std::io::Error::last_os_error())
@@ -151,7 +151,7 @@ pub(super) fn current_process_is_elevated() -> Result<bool> {
     Ok(elevation.TokenIsElevated != 0)
 }
 
-fn process_image_path(process_id: u32) -> Result<PathBuf> {
+pub(crate) fn process_image_path(process_id: u32) -> Result<PathBuf> {
     let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
     if process.is_null() {
         bail!("failed to open Windows process {process_id} for image validation");
@@ -170,13 +170,20 @@ fn process_image_path(process_id: u32) -> Result<PathBuf> {
     )))
 }
 
-fn current_user_sid_string() -> Result<String> {
+pub(crate) fn current_user_sid_string() -> Result<String> {
     let mut token = std::ptr::null_mut();
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
         return Err(std::io::Error::last_os_error())
             .context("failed to open current Windows process token");
     }
+    let result = token_user_sid_string(token);
+    unsafe {
+        CloseHandle(token);
+    }
+    result
+}
 
+pub(crate) fn token_user_sid_string(token: HANDLE) -> Result<String> {
     let mut required = 0u32;
     unsafe {
         GetTokenInformation(
@@ -206,9 +213,6 @@ fn current_user_sid_string() -> Result<String> {
             &mut required,
         )
     };
-    unsafe {
-        CloseHandle(token);
-    }
     if ok == 0 {
         return Err(std::io::Error::last_os_error())
             .context("failed to read current Windows user SID");
@@ -233,6 +237,19 @@ fn current_user_sid_string() -> Result<String> {
     Ok(sid)
 }
 
-pub(super) fn wide(value: &str) -> Vec<u16> {
+pub(crate) fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+pub(crate) fn current_process_is_system() -> Result<bool> {
+    let mut token = std::ptr::null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("failed to open current Windows process token for system check");
+    }
+    let result = token_user_sid_string(token).map(|sid| sid.eq_ignore_ascii_case("S-1-5-18"));
+    unsafe {
+        CloseHandle(token);
+    }
+    result
 }

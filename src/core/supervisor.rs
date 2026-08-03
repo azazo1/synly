@@ -78,6 +78,7 @@ enum InternalEvent {
     },
     #[cfg_attr(not(windows), allow(dead_code))]
     InputElevation(bool),
+    RefreshInputServiceStatus,
     Runtime {
         session_id: Uuid,
         event: RuntimeEvent,
@@ -96,6 +97,10 @@ impl AppSupervisor {
             AppSettings::from_config(&config),
         );
         snapshot.trusted_devices = config.trusted_devices.clone();
+        #[cfg(windows)]
+        {
+            snapshot.input_service_installed = crate::windows_input_agent::service_is_installed();
+        }
         let (snapshot_tx, snapshots) = watch::channel(snapshot.clone());
         let (commands, command_rx) = mpsc::channel(COMMAND_CAPACITY);
         let (internal_tx, internal_rx) = mpsc::unbounded_channel();
@@ -369,6 +374,7 @@ impl AppSupervisor {
                         }
                         Err(error) => self.set_error(error.to_string()),
                     }
+                    self.refresh_input_service_status();
                     self.publish();
                 }
                 #[cfg(target_os = "macos")]
@@ -385,6 +391,23 @@ impl AppSupervisor {
                     self.snapshot.input_elevation_ready = true;
                     self.publish();
                 }
+            }
+            AppCommand::UninstallInputService => {
+                #[cfg(windows)]
+                {
+                    let internal = self.internal_tx.clone();
+                    tokio::task::spawn_blocking(move || {
+                        match crate::windows_input_agent::request_service_uninstall_via_uac() {
+                            Ok(()) => tracing::info!("Synly 输入服务已卸载"),
+                            Err(error) => {
+                                tracing::warn!(error = %error, "Synly 输入服务卸载失败")
+                            }
+                        }
+                        let _ = internal.send(InternalEvent::RefreshInputServiceStatus);
+                    });
+                }
+                #[cfg(not(windows))]
+                {}
             }
             AppCommand::RefreshInputPermission => {
                 #[cfg(target_os = "macos")]
@@ -440,6 +463,10 @@ impl AppSupervisor {
                 }
                 self.snapshot.input_elevation_ready = ready;
                 self.restart_input_backend_if_active();
+                self.publish();
+            }
+            InternalEvent::RefreshInputServiceStatus => {
+                self.refresh_input_service_status();
                 self.publish();
             }
             InternalEvent::Runtime { session_id, event } => {
@@ -881,6 +908,14 @@ impl AppSupervisor {
 
     fn publish(&self) {
         self.snapshot_tx.send_replace(self.snapshot.clone());
+    }
+
+    fn refresh_input_service_status(&mut self) {
+        #[cfg(windows)]
+        {
+            self.snapshot.input_service_installed =
+                crate::windows_input_agent::service_is_installed();
+        }
     }
 }
 

@@ -1,4 +1,4 @@
-use super::{DesktopLayout, Hotkey, InputMode, KeySnapshot, ModifierMask, Point};
+use super::{DesktopLayout, DisplayRect, Hotkey, InputMode, KeySnapshot, ModifierMask, Point};
 use anyhow::{Result, bail};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
@@ -32,6 +32,10 @@ pub enum NativeEvent {
         source: ScrollSource,
     },
     Emergency,
+    SecureDesktop {
+        active: bool,
+        primary: Option<DisplayRect>,
+    },
     ReliableQueueOverflow,
     Failed(String),
 }
@@ -48,6 +52,10 @@ pub trait InputBackend: Send + Sync {
     }
 
     fn layout(&self) -> Result<DesktopLayout>;
+    /// 主显示器矩形, 用于安全桌面期间的光标钳制; 未知时返回 None.
+    fn primary_rect(&self) -> Option<DisplayRect> {
+        None
+    }
     fn cursor_position(&self) -> Result<Point>;
     fn snapshot(&self) -> KeySnapshot;
     fn set_capture(&self, active: bool) -> Result<()>;

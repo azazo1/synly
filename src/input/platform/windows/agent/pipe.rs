@@ -9,7 +9,7 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, OPEN_EXISTING,
-    PIPE_ACCESS_INBOUND, PIPE_ACCESS_OUTBOUND, ReadFile, WriteFile,
+    PIPE_ACCESS_DUPLEX, PIPE_ACCESS_INBOUND, PIPE_ACCESS_OUTBOUND, ReadFile, WriteFile,
 };
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::Pipes::{
@@ -21,12 +21,13 @@ use windows_sys::Win32::System::Threading::{CreateEventW, ResetEvent, WaitForSin
 const PIPE_BUFFER_SIZE: u32 = 64 * 1024;
 
 #[derive(Clone, Copy, Debug)]
-pub enum PipeDirection {
+pub(crate) enum PipeDirection {
     ServerToClient,
     ClientToServer,
+    Duplex,
 }
 
-pub struct NativePipe {
+pub(crate) struct NativePipe {
     handle: HANDLE,
     event: HANDLE,
     server: bool,
@@ -35,7 +36,7 @@ pub struct NativePipe {
 unsafe impl Send for NativePipe {}
 
 impl NativePipe {
-    pub fn create_server(
+    pub(crate) fn create_server(
         name: &str,
         direction: PipeDirection,
         security: *const SECURITY_ATTRIBUTES,
@@ -44,6 +45,7 @@ impl NativePipe {
         let access = match direction {
             PipeDirection::ServerToClient => PIPE_ACCESS_OUTBOUND,
             PipeDirection::ClientToServer => PIPE_ACCESS_INBOUND,
+            PipeDirection::Duplex => PIPE_ACCESS_DUPLEX,
         } | FILE_FLAG_OVERLAPPED
             | FILE_FLAG_FIRST_PIPE_INSTANCE;
         let mode = PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS;
@@ -65,11 +67,16 @@ impl NativePipe {
         Self::from_handle(handle, true)
     }
 
-    pub fn connect_client(name: &str, direction: PipeDirection, timeout: Duration) -> Result<Self> {
+    pub(crate) fn connect_client(
+        name: &str,
+        direction: PipeDirection,
+        timeout: Duration,
+    ) -> Result<Self> {
         let name = wide(name);
         let access = match direction {
             PipeDirection::ServerToClient => GENERIC_READ,
             PipeDirection::ClientToServer => GENERIC_WRITE,
+            PipeDirection::Duplex => GENERIC_READ | GENERIC_WRITE,
         };
         let deadline = Instant::now() + timeout;
         loop {
@@ -119,7 +126,7 @@ impl NativePipe {
         })
     }
 
-    pub fn connect_server(&mut self, timeout: Duration) -> Result<()> {
+    pub(crate) fn connect_server(&mut self, timeout: Duration) -> Result<()> {
         self.reset_event()?;
         let mut overlapped = OVERLAPPED {
             hEvent: self.event,
@@ -139,7 +146,7 @@ impl NativePipe {
         }
     }
 
-    pub fn read_exact(&mut self, bytes: &mut [u8], timeout: Duration) -> Result<()> {
+    pub(crate) fn read_exact(&mut self, bytes: &mut [u8], timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
         let mut offset = 0usize;
         while offset < bytes.len() {
@@ -157,7 +164,7 @@ impl NativePipe {
         Ok(())
     }
 
-    pub fn write_all(&mut self, bytes: &[u8], timeout: Duration) -> Result<()> {
+    pub(crate) fn write_all(&mut self, bytes: &[u8], timeout: Duration) -> Result<()> {
         let deadline = Instant::now() + timeout;
         let mut offset = 0usize;
         while offset < bytes.len() {
@@ -260,7 +267,7 @@ impl NativePipe {
         Ok(())
     }
 
-    pub fn raw_handle(&self) -> HANDLE {
+    pub(crate) fn raw_handle(&self) -> HANDLE {
         self.handle
     }
 }

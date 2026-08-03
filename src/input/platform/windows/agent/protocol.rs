@@ -1,13 +1,13 @@
 use super::pipe::NativePipe;
 use super::super::super::NativeEvent;
-use crate::input::{DesktopLayout, Hotkey, InputMode, KeySnapshot, ModifierMask, Point};
+use crate::input::{DesktopLayout, DisplayRect, Hotkey, InputMode, KeySnapshot, ModifierMask, Point};
 use anyhow::{Context, Result, bail};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-pub(super) const IPC_MAX_FRAME: usize = 1024 * 1024;
+pub(crate) const IPC_MAX_FRAME: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) enum AgentRequest {
@@ -83,6 +83,7 @@ pub(super) enum AgentToGuiPacket {
         agent_pid: u32,
         parent_pid: u32,
         agent_path: PathBuf,
+        agent_is_system: bool,
     },
     Ready,
     StartupError {
@@ -99,7 +100,10 @@ pub(super) enum AgentToGuiPacket {
         position: Option<Point>,
         position_updated: bool,
     },
-    SecureDesktopPaused(bool),
+    SecureDesktopChanged {
+        secure: bool,
+        primary: Option<DisplayRect>,
+    },
 }
 
 impl AgentToGuiPacket {
@@ -111,12 +115,12 @@ impl AgentToGuiPacket {
             Self::Response { .. } => "Response",
             Self::Event(_) => "Event",
             Self::Motion { .. } => "Motion",
-            Self::SecureDesktopPaused(_) => "SecureDesktopPaused",
+            Self::SecureDesktopChanged { .. } => "SecureDesktopChanged",
         }
     }
 }
 
-pub(super) fn write_packet<P>(
+pub(crate) fn write_packet<P>(
     pipe: &mut NativePipe,
     packet: &P,
     timeout: Duration,
@@ -134,7 +138,7 @@ where
     pipe.write_all(&frame, timeout)
 }
 
-pub(super) fn read_packet<P>(pipe: &mut NativePipe, timeout: Duration) -> Result<P>
+pub(crate) fn read_packet<P>(pipe: &mut NativePipe, timeout: Duration) -> Result<P>
 where
     P: DeserializeOwned,
 {
@@ -155,7 +159,7 @@ where
         .context("failed to decode Windows input agent packet")
 }
 
-pub(super) fn is_timeout_error(error: &anyhow::Error) -> bool {
+pub(crate) fn is_timeout_error(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause
             .downcast_ref::<std::io::Error>()

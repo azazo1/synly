@@ -14,3 +14,19 @@ pub fn request_startup_elevation() -> Result<()> {
     tracing::info!("Windows 输入管理员代理已在启动阶段就绪");
     Ok(())
 }
+
+pub fn service_is_installed() -> bool {
+    synly::input::windows_input_service_installed()
+}
+
+pub fn request_service_uninstall_via_uac() -> Result<()> {
+    match synly::input::request_windows_input_service_uninstall_via_uac() {
+        Ok(true) => {
+            synly::input::mark_windows_input_service_install_attempted();
+            tracing::info!("Synly 输入服务已通过提权命令卸载");
+            Ok(())
+        }
+        Ok(false) => anyhow::bail!("用户取消了输入服务卸载"),
+        Err(error) => Err(error),
+    }
+}

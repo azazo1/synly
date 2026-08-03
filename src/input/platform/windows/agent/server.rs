@@ -3,12 +3,13 @@ use super::protocol::{
     AgentRequest, AgentResponse, AgentToGuiPacket, GuiToAgentPacket, is_timeout_error, read_packet,
     write_packet,
 };
-use super::security::{process_session_id, validate_parent_process, validate_pipe_server};
+use super::security::{
+    current_process_is_system, process_session_id, validate_parent_process, validate_pipe_server,
+};
 use super::{AGENT_HEARTBEAT_TIMEOUT, CONNECT_TIMEOUT, REQUEST_DELIVERY_TIMEOUT};
 use super::super::super::{CaptureContext, InputBackend, MotionAccumulator};
 use crate::input::{Hotkey, InputMode, Point};
 use anyhow::{Context, Result, anyhow, bail};
-use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -114,6 +115,7 @@ fn start_agent_transport(
     event_pipe_name: String,
     token: String,
     parent_pid: u32,
+    agent_is_system: bool,
 ) -> Result<AgentTransport> {
     let (request_tx, request_rx) = mpsc::channel(256);
     let (reliable_tx, reliable_rx) = std::sync::mpsc::sync_channel(256);
@@ -157,6 +159,7 @@ fn start_agent_transport(
                 event_pipe_name,
                 token,
                 parent_pid,
+                agent_is_system,
                 reliable_rx,
                 motion,
                 startup_rx,
@@ -245,6 +248,7 @@ fn agent_event_owner(
     pipe_name: String,
     token: String,
     parent_pid: u32,
+    agent_is_system: bool,
     reliable: std::sync::mpsc::Receiver<AgentToGuiPacket>,
     motion: Arc<AgentMotionSlot>,
     startup: std::sync::mpsc::Receiver<Result<(), String>>,
@@ -265,6 +269,7 @@ fn agent_event_owner(
             agent_pid: unsafe { GetCurrentProcessId() },
             parent_pid,
             agent_path,
+            agent_is_system,
         },
         REQUEST_DELIVERY_TIMEOUT,
     )?;
@@ -300,15 +305,24 @@ pub async fn run_agent(
     token: String,
     parent_pid: u32,
 ) -> Result<()> {
+    let agent_is_system = current_process_is_system()?;
     tracing::info!(
         pid = unsafe { GetCurrentProcessId() },
+        agent_is_system,
         "Windows 输入代理进程已启动"
     );
-    let transport = start_agent_transport(command_pipe_name, event_pipe_name, token, parent_pid)?;
+    let transport = start_agent_transport(
+        command_pipe_name,
+        event_pipe_name,
+        token,
+        parent_pid,
+        agent_is_system,
+    )?;
     let result = run_agent_loop(
         transport.requests,
         transport.output.clone(),
         Arc::clone(&transport.alive),
+        agent_is_system,
     )
     .await;
     transport.alive.store(false, Ordering::Release);
@@ -342,11 +356,12 @@ async fn run_agent_loop(
     mut packets: mpsc::Receiver<GuiToAgentPacket>,
     output: AgentOutput,
     alive: Arc<AtomicBool>,
+    agent_is_system: bool,
 ) -> Result<()> {
     let mut runtime = None;
     let mut heartbeat = AgentHeartbeat::new(Instant::now());
     let mut heartbeat_stalled = false;
-    let mut paused = false;
+    let mut secure_desktop = false;
     let mut desktop_tick = time::interval(Duration::from_millis(250));
     desktop_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -384,16 +399,29 @@ async fn run_agent_loop(
                         heartbeat_stalled = false;
                         tracing::info!("Windows 输入代理 GUI 心跳已恢复");
                     }
-                    let current_paused = !is_default_input_desktop();
-                    if current_paused != paused {
-                        paused = current_paused;
-                        if paused
+                    let current_secure = !super::super::desktop::current_input_desktop_is_default();
+                    if current_secure != secure_desktop {
+                        secure_desktop = current_secure;
+                        super::super::desktop::set_input_desktop_secure(secure_desktop);
+                        if secure_desktop
                             && let Some(runtime) = runtime.as_ref()
                         {
-                            let _ = runtime.backend.set_capture(false);
                             let _ = runtime.backend.release_all();
+                            if !agent_is_system {
+                                let _ = runtime.backend.set_capture(false);
+                            }
                         }
-                        output.send_reliable(AgentToGuiPacket::SecureDesktopPaused(paused))?;
+                        let primary = if secure_desktop {
+                            runtime
+                                .as_ref()
+                                .and_then(|runtime| runtime.backend.primary_rect())
+                        } else {
+                            None
+                        };
+                        output.send_reliable(AgentToGuiPacket::SecureDesktopChanged {
+                            secure: secure_desktop,
+                            primary,
+                        })?;
                     }
                 }
             }
@@ -573,40 +601,4 @@ fn agent_backend(runtime: &Option<NativeAgentRuntime>) -> Result<&Arc<dyn InputB
         .as_ref()
         .map(|runtime| &runtime.backend)
         .context("Windows input agent runtime is not started")
-}
-
-fn is_default_input_desktop() -> bool {
-    use windows_sys::Win32::System::StationsAndDesktops::{
-        CloseDesktop, DESKTOP_READOBJECTS, GetUserObjectInformationW, OpenInputDesktop, UOI_NAME,
-    };
-
-    let desktop = unsafe { OpenInputDesktop(0, 0, DESKTOP_READOBJECTS) };
-    if desktop.is_null() {
-        return false;
-    }
-    let mut needed = 0u32;
-    unsafe {
-        GetUserObjectInformationW(desktop, UOI_NAME, std::ptr::null_mut(), 0, &mut needed);
-    }
-    let mut buffer = vec![0u16; (needed as usize / 2).max(1)];
-    let ok = unsafe {
-        GetUserObjectInformationW(
-            desktop,
-            UOI_NAME,
-            buffer.as_mut_ptr().cast::<c_void>(),
-            needed,
-            &mut needed,
-        )
-    };
-    unsafe {
-        CloseDesktop(desktop);
-    }
-    if ok == 0 {
-        return false;
-    }
-    let end = buffer
-        .iter()
-        .position(|value| *value == 0)
-        .unwrap_or(buffer.len());
-    String::from_utf16_lossy(&buffer[..end]).eq_ignore_ascii_case("Default")
 }

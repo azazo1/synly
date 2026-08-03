@@ -35,3 +35,13 @@ Windows 输入代理原先在 Tokio named pipe 上进行持续双向读写. 在�
 - macOS `cargo test --all-features`: 186 passed, 0 failed.
 - macOS `cargo clippy --all-targets --all-features`: 通过, 无警告.
 - macOS 到 Windows 的真实控制链路已确认可正常跨屏, 点击和持续控制.
+
+## SYSTEM 输入服务与安全桌面控制
+
+- 新增 `SynlyInputService` (LocalSystem, 延迟自动启动), 与 GUI 同一 exe 以隐藏 `__service` 入口运行, 控制管道为 `\\.\pipe\synly-input-service`.
+- GUI 首次申请提权时若服务缺失, 通过一次 UAC 执行 `service install`; 之后服务按需以 SYSTEM 身份在控制台会话的 `winsta0\default` 拉起 `__input-agent`, 不再弹 UAC. 用户拒绝安装时回退到原有 UAC 提权代理路径.
+- 服务请求只接受映像路径与服务相同且会话等于控制台会话的客户端, 管道名与 token 必须是 UUID 格式; 服务通过 `GetNamedPipeClientProcessId` 自行取得客户端 PID 并传给代理握手, 不信任客户端自报.
+- 代理以 SYSTEM 身份运行时, 注入采用 Sunshine 式桌面跟随: `SendInput` 失败后 `OpenInputDesktop` + `SetThreadDesktop` 并重试一次, 因此 UAC 弹窗与锁屏期间可继续注入.
+- 安全桌面状态通知从 `SecureDesktopPaused` 改为 `SecureDesktopChanged { secure, primary }`; SYSTEM 代理进入安全桌面时释放注入状态并保持控制, 非 SYSTEM 回退代理保持旧的暂停加紧急收回行为.
+- 接收端在安全桌面期间抑制外边缘返回并把逻辑光标钳制到主显示器 (主屏矩形由代理在通知中携带), 离开后通过 `cursor_position` 重新锚定; 发送端收到 `InputMessage::SecureDesktop` 后忽略对端返回请求, 避免光标碰到主屏边缘就掉出控制.
+- 服务停止或崩溃时, `KILL_ON_JOB_CLOSE` job 会连带结束 SYSTEM 代理, GUI 侧按连接断开处理并自动回退或重试.

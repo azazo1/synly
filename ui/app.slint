@@ -98,6 +98,8 @@ export component AppWindow inherits Window {
     in property <bool> input-elevation-ready: true;
     in property <string> input-elevation-hint: "基础控制可用, 授权后可控制管理员窗口";
     in property <string> input-elevation-button: "增强授权";
+    in property <bool> input-service-installed: false;
+    in property <string> input-service-hint: "输入服务已安装, 用于 UAC 与锁屏输入控制";
     in property <string> desired-summary: "";
     in property <string> applied-summary: "";
     in property <string> pending-summary: "";
@@ -174,6 +176,7 @@ export component AppWindow inherits Window {
     callback set-audio-mode(int);
     callback set-input-mode(int);
     callback request-input-elevation();
+    callback uninstall-input-service();
     callback revoke-trust(string);
     callback interaction-accept();
     callback interaction-reject();
@@ -372,6 +375,18 @@ export component AppWindow inherits Window {
                         padding: 8px;
                         Text { text: root.input-elevation-hint; horizontal-stretch: 1; vertical-alignment: center; color: #315442; }
                         Button { text: root.input-elevation-button; clicked => { root.request-input-elevation(); } }
+                    }
+                }
+                if root.input-service-installed: Rectangle {
+                    height: 42px;
+                    background: #eef5f1;
+                    border-color: #8aab99;
+                    border-width: 1px;
+                    border-radius: 5px;
+                    HorizontalLayout {
+                        padding: 8px;
+                        Text { text: root.input-service-hint; horizontal-stretch: 1; vertical-alignment: center; color: #315442; }
+                        Button { text: "卸载输入服务"; clicked => { root.uninstall-input-service(); } }
                     }
                 }
                 Rectangle { vertical-stretch: 1; }

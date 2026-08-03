@@ -310,6 +310,11 @@ fn wire_window_callbacks(
     });
 
     let commands = handle.commands();
+    window.on_uninstall_input_service(move || {
+        send_command(&commands, AppCommand::UninstallInputService)
+    });
+
+    let commands = handle.commands();
     window.on_revoke_trust(move |device_id| match Uuid::parse_str(device_id.as_str()) {
         Ok(device_id) => send_command(&commands, AppCommand::RevokeTrust(device_id)),
         Err(error) => tracing::warn!(error = %error, "忽略无效的可信设备 ID"),
@@ -540,6 +545,7 @@ fn apply_snapshot(
     window.set_session_active(active);
     window.set_current_peer(peer_label.into());
     window.set_input_elevation_ready(snapshot.input_elevation_ready);
+    window.set_input_service_installed(snapshot.input_service_installed);
     window.set_clipboard_mode_index(clipboard_mode_index(snapshot.desired.clipboard_mode));
     window.set_audio_mode_index(audio_mode_index(snapshot.desired.audio_mode));
     window.set_input_mode_index(input_mode_index(snapshot.desired.input.mode));

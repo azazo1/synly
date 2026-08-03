@@ -315,6 +315,7 @@ unsafe extern "system" {
 struct WindowsState {
     context: CaptureContext,
     layout: Mutex<Option<DesktopLayout>>,
+    primary: Mutex<Option<DisplayRect>>,
     cursor: Mutex<Option<CursorCaptureTracker>>,
     physical_pressed: Mutex<BTreeSet<u16>>,
     physical_buttons: Mutex<BTreeSet<u8>>,
@@ -337,6 +338,7 @@ pub(super) fn start(context: CaptureContext) -> Result<Arc<dyn InputBackend>> {
     let state = Arc::new(WindowsState {
         context,
         layout: Mutex::new(None),
+        primary: Mutex::new(None),
         cursor: Mutex::new(None),
         physical_pressed: Mutex::new(BTreeSet::new()),
         physical_buttons: Mutex::new(BTreeSet::new()),
@@ -370,7 +372,7 @@ fn run_message_loop(state: Arc<WindowsState>, ready: std::sync::mpsc::SyncSender
     if previous_dpi_context == 0 {
         tracing::warn!("Windows 输入线程无法启用 per-monitor DPI awareness");
     }
-    let (layout, anchor) = match collect_display_snapshot() {
+    let (layout, anchor, primary) = match collect_display_snapshot() {
         Ok(snapshot) => snapshot,
         Err(error) => {
             if previous_dpi_context != 0 {
@@ -382,6 +384,7 @@ fn run_message_loop(state: Arc<WindowsState>, ready: std::sync::mpsc::SyncSender
     };
     let initial_point = read_cursor_position().ok();
     *state.layout.lock().unwrap() = Some(layout.clone());
+    *state.primary.lock().unwrap() = primary;
     *state.cursor.lock().unwrap() = Some(CursorCaptureTracker::new(
         layout.clone(),
         anchor,
@@ -844,6 +847,14 @@ impl InputBackend for WindowsBackend {
             .context("Windows display layout cache is empty")
     }
 
+    fn primary_rect(&self) -> Option<DisplayRect> {
+        self.state
+            .primary
+            .lock()
+            .ok()
+            .and_then(|primary| *primary)
+    }
+
     fn cursor_position(&self) -> Result<Point> {
         with_per_monitor_dpi(read_cursor_position)
     }
@@ -916,7 +927,15 @@ impl InputBackend for WindowsBackend {
 
     fn inject_cursor(&self, point: Point) -> Result<()> {
         let layout = self.layout()?;
-        let bounded = layout.move_within_layout(point, 0, 0);
+        let mut bounded = layout.move_within_layout(point, 0, 0);
+        if super::desktop::input_desktop_is_secure()
+            && let Some(primary) = *self.state.primary.lock().unwrap()
+        {
+            bounded = Point {
+                x: bounded.x.clamp(primary.x, primary.right().saturating_sub(1)),
+                y: bounded.y.clamp(primary.y, primary.bottom().saturating_sub(1)),
+            };
+        }
         if bounded != point {
             tracing::warn!(requested = ?point, bounded = ?bounded, "Windows 远端光标坐标超出显示器布局, 已裁剪");
         }
@@ -1186,7 +1205,7 @@ unsafe extern "system" fn monitor_callback(
     1
 }
 
-fn collect_display_snapshot() -> Result<(DesktopLayout, Point)> {
+fn collect_display_snapshot() -> Result<(DesktopLayout, Point, Option<DisplayRect>)> {
     let mut displays = Vec::new();
     let data = &mut displays as *mut Vec<MonitorDisplay> as isize;
     let ok = unsafe { EnumDisplayMonitors(0, ptr::null(), Some(monitor_callback), data) };
@@ -1207,11 +1226,11 @@ fn collect_display_snapshot() -> Result<(DesktopLayout, Point)> {
         .map(|display| display.rect);
     let anchor = select_capture_anchor(primary, &rects)
         .context("Windows 显示器布局缺少光标捕获锚点")?;
-    Ok((DesktopLayout::new(rects)?, anchor))
+    Ok((DesktopLayout::new(rects)?, anchor, primary))
 }
 
 fn refresh_display_layout(state: &WindowsState) -> Result<()> {
-    let (layout, anchor) = collect_display_snapshot()?;
+    let (layout, anchor, primary) = collect_display_snapshot()?;
     let changed = {
         let mut cursor = state.cursor.lock().unwrap();
         let cursor = cursor
@@ -1220,6 +1239,7 @@ fn refresh_display_layout(state: &WindowsState) -> Result<()> {
         cursor.update_layout(layout.clone(), anchor)
     };
     *state.layout.lock().unwrap() = Some(layout.clone());
+    *state.primary.lock().unwrap() = primary;
     if !changed {
         return Ok(());
     }
@@ -1263,10 +1283,7 @@ fn send_keyboard(scan: u16, flags: u32) -> Result<()> {
             },
         },
     };
-    if unsafe { SendInput(1, &input, size_of::<InputRaw>() as i32) } != 1 {
-        bail!("Windows SendInput 键盘注入失败");
-    }
-    Ok(())
+    send_input_with_desktop_sync(&input)
 }
 
 fn send_mouse(dx: i32, dy: i32, mouse_data: u32, flags: u32) -> Result<()> {
@@ -1283,8 +1300,18 @@ fn send_mouse(dx: i32, dy: i32, mouse_data: u32, flags: u32) -> Result<()> {
             },
         },
     };
-    if unsafe { SendInput(1, &input, size_of::<InputRaw>() as i32) } != 1 {
-        bail!("Windows SendInput 鼠标注入失败");
+    send_input_with_desktop_sync(&input)
+}
+
+/// 参考 Sunshine 的 send_input: 先直接注入, 失败时把当前线程切换到输入桌面
+/// (UAC/锁屏期间是 Winlogon 安全桌面) 后重试一次.
+fn send_input_with_desktop_sync(input: &InputRaw) -> Result<()> {
+    if unsafe { SendInput(1, input, size_of::<InputRaw>() as i32) } == 1 {
+        return Ok(());
+    }
+    super::desktop::sync_thread_input_desktop()?;
+    if unsafe { SendInput(1, input, size_of::<InputRaw>() as i32) } != 1 {
+        bail!("Windows SendInput 注入失败");
     }
     Ok(())
 }

@@ -33,7 +33,12 @@ const BUILD_VERSION: &str = env!("SYNLY_BUILD_VERSION");
 fn main() -> Result<()> {
     let cli = cli::Cli::parse();
     if let Some(command) = &cli.command
-        && matches!(command, cli::Command::InputAgent { .. })
+        && matches!(
+            command,
+            cli::Command::InputAgent { .. }
+                | cli::Command::Service { .. }
+                | cli::Command::ServiceEntry
+        )
     {
         return run_internal_command(command);
     }
@@ -92,6 +97,44 @@ fn run_internal_command(command: &cli::Command) -> Result<()> {
         }
         cli::Command::Host | cli::Command::Join { .. } => {
             anyhow::bail!("host/join 子命令不是内部命令")
+        }
+        cli::Command::Service { action } => {
+            #[cfg(windows)]
+            {
+                match action {
+                    cli::ServiceAction::Install => {
+                        input::install_windows_input_service()?;
+                        println!("Synly 输入服务已安装并启动");
+                        Ok(())
+                    }
+                    cli::ServiceAction::Uninstall => {
+                        input::uninstall_windows_input_service()?;
+                        println!("Synly 输入服务已卸载");
+                        Ok(())
+                    }
+                    cli::ServiceAction::Status => {
+                        let status = input::windows_input_service_status()?;
+                        println!("Synly 输入服务状态: {}", status.label());
+                        Ok(())
+                    }
+                }
+            }
+            #[cfg(not(windows))]
+            {
+                let _ = action;
+                anyhow::bail!("输入服务管理命令仅支持 Windows")
+            }
+        }
+        cli::Command::ServiceEntry => {
+            #[cfg(windows)]
+            {
+                let _tracing_guard = input::init_windows_service_tracing()?;
+                input::run_windows_input_service()
+            }
+            #[cfg(not(windows))]
+            {
+                anyhow::bail!("输入服务入口仅支持 Windows")
+            }
         }
     }
 }

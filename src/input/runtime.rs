@@ -3,7 +3,8 @@ use super::mapping::KeyMapper;
 use super::platform::{self, NativeEvent, ScrollSource};
 use super::protocol::{InputMessage, read_message, write_message};
 use super::{
-    Hotkey, InputMode, InputPlatform, KeyMappingConfig, KeySnapshot, LocalInputRole, ScreenEdge,
+    DisplayRect, Hotkey, InputMode, InputPlatform, KeyMappingConfig, KeySnapshot, LocalInputRole,
+    ScreenEdge,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -477,6 +478,7 @@ pub(super) async fn run_sender(
     let mut motion_logged = false;
     let mut last_activation_ready = None;
     let mut press_blocked = false;
+    let mut secure_desktop = false;
 
     tracing::info!(
         edge = ?source_edge,
@@ -491,7 +493,10 @@ pub(super) async fn run_sender(
                 let message = message.context("输入辅助读取任务已停止")??;
                 match message {
                     InputMessage::ReturnRequest { generation: remote_generation, edge_position }
-                        if control.active && remote_generation == control.generation => {
+                        if control.active
+                            && remote_generation == control.generation
+                            && !secure_desktop =>
+                    {
                             if options.block_switch_on_press && !control.local_pressed.is_empty() {
                                 control.pending_return_request =
                                     Some((control.generation, edge_position));
@@ -531,6 +536,15 @@ pub(super) async fn run_sender(
                     | InputMessage::Deactivate { .. } => {}
                     InputMessage::Return { .. } => {}
                     InputMessage::Hello { .. } => {}
+                    InputMessage::SecureDesktop { active } => {
+                        if secure_desktop != active {
+                            secure_desktop = active;
+                            tracing::info!(secure_desktop, "对端安全桌面状态变化");
+                        }
+                        if active {
+                            control.pending_return_request = None;
+                        }
+                    }
                     InputMessage::Proof { .. } => bail!("输入通道收到重复认证消息"),
                     _ => {}
                 }
@@ -560,13 +574,15 @@ pub(super) async fn run_sender(
                                 repeat: mapped.repeat,
                             })?;
                         }
-                        finish_pending_sender_return(
-                            tx,
-                            platform,
-                            &local_layout,
-                            source_edge,
-                            &mut control,
-                        )?;
+                        if !secure_desktop {
+                            finish_pending_sender_return(
+                                tx,
+                                platform,
+                                &local_layout,
+                                source_edge,
+                                &mut control,
+                            )?;
+                        }
                     }
                     NativeEvent::Button { button, down } if control.active => {
                         control.local_pressed.button(button, down);
@@ -575,13 +591,15 @@ pub(super) async fn run_sender(
                             button,
                             down,
                         })?;
-                        finish_pending_sender_return(
-                            tx,
-                            platform,
-                            &local_layout,
-                            source_edge,
-                            &mut control,
-                        )?;
+                        if !secure_desktop {
+                            finish_pending_sender_return(
+                                tx,
+                                platform,
+                                &local_layout,
+                                source_edge,
+                                &mut control,
+                            )?;
+                        }
                     }
                     NativeEvent::Wheel { x, y, source } if control.active => {
                         let (x, y) = transform_scroll(
@@ -888,6 +906,8 @@ pub(super) async fn run_receiver(
     let mut active = false;
     let mut return_edge = ScreenEdge::Left;
     let mut cursor = None;
+    let mut secure_desktop = false;
+    let mut secure_primary = None;
     let mut cursor_mode_active = match options.cursor_mode {
         CursorMode::Desktop => false,
         CursorMode::Auto => foreground_captured(),
@@ -1035,12 +1055,18 @@ pub(super) async fn run_receiver(
                                 &mut cursor,
                                 dx,
                                 dy,
+                                secure_desktop,
+                                secure_primary,
                             )? {
                                 enqueue_message(tx, InputMessage::ReturnRequest { generation, edge_position })?;
                             }
                     }
                     InputMessage::Proof { .. } => bail!("输入通道收到重复认证消息"),
                     InputMessage::Hello { .. } => {}
+                    InputMessage::SecureDesktop { active } if secure_desktop != active => {
+                        secure_desktop = active;
+                        tracing::info!(secure_desktop, "对端安全桌面状态变化");
+                    }
                     _ => {}
                 }
             }
@@ -1058,6 +1084,8 @@ pub(super) async fn run_receiver(
                         &mut cursor,
                         motion.dx,
                         motion.dy,
+                        secure_desktop,
+                        secure_primary,
                     )? {
                         enqueue_message(tx, InputMessage::ReturnRequest { generation, edge_position })?;
                     }
@@ -1077,6 +1105,29 @@ pub(super) async fn run_receiver(
                                 edge_position,
                             });
                             tracing::info!(generation, "接收端紧急热键已停止远程控制");
+                        }
+                    }
+                    NativeEvent::SecureDesktop {
+                        active: secure,
+                        primary,
+                    } => {
+                        secure_desktop = secure;
+                        secure_primary = primary;
+                        if secure {
+                            if let Some(cursor) = cursor.as_mut()
+                                && let Some(primary) = primary
+                            {
+                                *cursor = clamp_point(*cursor, primary);
+                            }
+                            tracing::info!(generation, "本机进入安全桌面, 保持远程控制");
+                        } else {
+                            if active && cursor.is_some() {
+                                cursor = Some(platform.backend.cursor_position()?);
+                            }
+                            tracing::info!(generation, "本机已离开安全桌面, 重新锚定光标");
+                        }
+                        if active {
+                            enqueue_message(tx, InputMessage::SecureDesktop { active: secure })?;
                         }
                     }
                     NativeEvent::ReliableQueueOverflow => {
@@ -1118,6 +1169,7 @@ fn transform_scroll(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_receiver_motion(
     backend: &dyn platform::InputBackend,
     layout: &super::DesktopLayout,
@@ -1125,9 +1177,11 @@ fn apply_receiver_motion(
     cursor: &mut Option<super::Point>,
     dx: i32,
     dy: i32,
+    secure_desktop: bool,
+    secure_primary: Option<DisplayRect>,
 ) -> Result<Option<f32>> {
     let point = cursor.context("输入接收端缺少逻辑光标位置")?;
-    match receiver_motion(layout, return_edge, point, dx, dy) {
+    match receiver_motion(layout, return_edge, point, dx, dy, secure_desktop) {
         ReceiverMotion::Return(edge_position) => {
             let target = layout.move_within_layout(point, dx, dy);
             backend.inject_cursor(target)?;
@@ -1135,10 +1189,25 @@ fn apply_receiver_motion(
             Ok(Some(edge_position))
         }
         ReceiverMotion::Move(target) => {
+            let target = clamp_secure_target(target, secure_primary);
             backend.inject_cursor(target)?;
             *cursor = Some(target);
             Ok(None)
         }
+    }
+}
+
+fn clamp_secure_target(target: super::Point, primary: Option<DisplayRect>) -> super::Point {
+    match primary {
+        Some(primary) => clamp_point(target, primary),
+        None => target,
+    }
+}
+
+fn clamp_point(point: super::Point, primary: DisplayRect) -> super::Point {
+    super::Point {
+        x: point.x.clamp(primary.x, primary.right().saturating_sub(1)),
+        y: point.y.clamp(primary.y, primary.bottom().saturating_sub(1)),
     }
 }
 
@@ -1154,8 +1223,11 @@ fn receiver_motion(
     point: super::Point,
     dx: i32,
     dy: i32,
+    secure_desktop: bool,
 ) -> ReceiverMotion {
-    if let Some(edge_position) = layout.crossed_outer_edge_position(return_edge, point, dx, dy) {
+    if !secure_desktop
+        && let Some(edge_position) = layout.crossed_outer_edge_position(return_edge, point, dx, dy)
+    {
         ReceiverMotion::Return(edge_position)
     } else {
         ReceiverMotion::Move(layout.move_within_layout(point, dx, dy))
@@ -2453,14 +2525,53 @@ mod tests {
             Point { x: 8, y: 40 },
             30,
             5,
+            false,
         );
         assert_eq!(first, ReceiverMotion::Move(Point { x: 38, y: 45 }));
         let ReceiverMotion::Move(point) = first else {
             panic!("第一次移动不应返回本机");
         };
         assert_eq!(
-            receiver_motion(&layout, ScreenEdge::Left, point, 30, 5),
+            receiver_motion(&layout, ScreenEdge::Left, point, 30, 5, false),
             ReceiverMotion::Move(Point { x: 68, y: 50 }),
+        );
+    }
+
+    #[test]
+    fn receiver_suppresses_edge_return_on_secure_desktop() {
+        let layout = DesktopLayout::new(vec![DisplayRect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        }])
+        .unwrap();
+        let point = Point { x: 5, y: 50 };
+        assert_eq!(
+            receiver_motion(&layout, ScreenEdge::Left, point, -10, 0, false),
+            ReceiverMotion::Return(0.5),
+        );
+        assert_eq!(
+            receiver_motion(&layout, ScreenEdge::Left, point, -10, 0, true),
+            ReceiverMotion::Move(Point { x: 0, y: 50 }),
+        );
+    }
+
+    #[test]
+    fn secure_primary_clamp_keeps_cursor_on_primary_monitor() {
+        let primary = DisplayRect {
+            x: 0,
+            y: 0,
+            width: 1920,
+            height: 1080,
+        };
+        assert_eq!(
+            super::clamp_point(Point { x: -10, y: 500 }, primary),
+            Point { x: 0, y: 500 },
+        );
+        assert_eq!(
+            super::clamp_point(Point { x: 2500, y: 2000 }, primary),
+            Point { x: 1919, y: 1079 },
         );
     }
 

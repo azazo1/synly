@@ -76,9 +76,11 @@ $env:VCPKG_ROOT="C:\path\to\vcpkg"
 just dist
 ```
 
-Windows 主 GUI 使用 `asInvoker` manifest 以普通权限运行. 需要管理员输入能力时, 若主进程已持有提升令牌, GUI 会直接启动继承该令牌的隐藏输入代理, 不显示 UAC. 否则 GUI 通过 `ShellExecuteW("runas")` 启动当前 `synly.exe` 的隐藏输入代理子进程, 并使用命名管道完成握手. 主进程与子进程来自同一个构建产物, 避免 IPC 协议版本错配. 配置 `input.elevate_on_start = true` 后, 主实例会在恢复会话前请求 UAC, 授权失败时本次启动直接失败.
+Windows 主 GUI 使用 `asInvoker` manifest 以普通权限运行. 需要管理员输入能力时, GUI 优先请求本机 SYSTEM 输入服务 (`SynlyInputService`) 以 SYSTEM 身份拉起隐藏输入代理, 不弹 UAC. 服务未安装时, 首次授权会通过一次 UAC 自动安装并启动该服务 (延迟自动启动), 之后不再弹窗; 拒绝安装时回退到 `ShellExecuteW("runas")` 启动的 UAC 提权代理, 若主进程已持有提升令牌则直接继承当前令牌. 主进程与代理来自同一个构建产物, 避免 IPC 协议版本错配. 配置 `input.elevate_on_start = true` 后, 主实例会在恢复会话前完成上述提权, 失败时本次启动直接失败.
 
-GUI 和提权子进程通过随机命名管道与随机 token 通信. 管道 DACL 只允许当前用户和 SYSTEM, 双方校验 IPC 版本, PID, session ID, 映像路径和安装目录. Windows release 不要求 Authenticode 签名, 因此请仅从可信来源获取程序, 并避免在其他用户可写目录中运行. 管道断开, 心跳超时, 子进程退出或进入非 `Default` 输入桌面时会立即释放输入状态.
+SYSTEM 输入代理在 `SendInput` 失败时会跟随当前输入桌面 (`OpenInputDesktop` + `SetThreadDesktop`, 参考 Sunshine 的设计), 因此 UAC 弹窗与锁屏期间可以继续注入鼠标键盘, 控制不中断. 安全桌面期间光标会钳制在主显示器并抑制边缘返回, 离开后重新锚定光标; `Ctrl+Alt+Del` 属于 Windows 安全注意序列, 无法通过 `SendInput` 注入. 服务管理命令为 `synly service install`, `synly service uninstall` 和 `synly service status`, GUI 设置页也提供卸载入口. 非 SYSTEM 的 UAC 回退代理进入安全桌面时仍会暂停控制并触发紧急收回.
+
+GUI 和提权子进程通过随机命名管道与随机 token 通信. 管道 DACL 只允许当前用户和 SYSTEM, 双方校验 IPC 版本, PID, session ID, 映像路径和安装目录. 服务控制管道只接受同目录 `synly.exe` 且位于当前控制台会话的请求, 拉起参数仅允许 UUID 管道名与 token. Windows release 不要求 Authenticode 签名, 因此请仅从可信来源获取程序, 并避免在其他用户可写目录中运行. 管道断开, 心跳超时或子进程退出时会立即释放输入状态.
 
 ### macOS
 
@@ -236,8 +238,8 @@ cargo test
 cargo clippy --all-targets --all-features
 ```
 
-协议热协商测试覆盖 generation 并发更新, stale epoch, ack 和 capability 开关状态. Windows 原生构建应运行 `cargo clippy --all-targets --all-features`, `cargo test` 和 `cargo build --bins`. 输入代理仍需要在普通应用, 管理员应用, UAC 拒绝, 代理崩溃, 签名发布包和安全桌面切换场景中进行真机验证.
+协议热协商测试覆盖 generation 并发更新, stale epoch, ack 和 capability 开关状态. Windows 原生构建应运行 `cargo clippy --all-targets --all-features`, `cargo test` 和 `cargo build --bins`. 输入代理仍需要在普通应用, 管理员应用, 服务安装与卸载, UAC 拒绝, 代理崩溃, 签名发布包, UAC 弹窗与锁屏输入控制场景中进行真机验证.
 
 ## 协议兼容
 
-当前协议版本为 `18`. 本版本不提供旧协议兼容层. 发现结果会携带协议版本, GUI 在连接前禁用不兼容设备.
+当前协议版本为 `21`. 本版本不提供旧协议兼容层. 发现结果会携带协议版本, GUI 在连接前禁用不兼容设备.

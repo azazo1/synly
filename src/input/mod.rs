@@ -70,6 +70,18 @@ pub use platform::windows::{request_elevation as request_windows_input_elevation
 pub use platform::windows::init_agent_tracing as init_windows_agent_tracing;
 
 #[cfg(windows)]
+pub use platform::windows::{
+    service_installed as windows_input_service_installed,
+    uninstall_via_uac as request_windows_input_service_uninstall_via_uac,
+    mark_install_attempted as mark_windows_input_service_install_attempted,
+    init_tracing as init_windows_service_tracing,
+    install as install_windows_input_service,
+    uninstall as uninstall_windows_input_service,
+    status as windows_input_service_status,
+    run_service as run_windows_input_service,
+};
+
+#[cfg(windows)]
 pub fn windows_input_agent_ready() -> bool {
     platform::windows::agent_ready()
 }

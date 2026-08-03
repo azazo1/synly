@@ -1,7 +1,7 @@
 mod client;
-mod pipe;
-mod protocol;
-mod security;
+pub(crate) mod pipe;
+pub(crate) mod protocol;
+pub(crate) mod security;
 mod server;
 mod tracing;
 

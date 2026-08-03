@@ -360,6 +360,14 @@ async fn run_mock_peer(
                         last_event = format!("滚轮 x={x}, y={y}");
                     }
                     InputMessage::Heartbeat { .. } => {}
+                    InputMessage::SecureDesktop { active } => {
+                        last_event = if active {
+                            "对端进入安全桌面".to_string()
+                        } else {
+                            "对端离开安全桌面".to_string()
+                        };
+                        tracing::info!(active, "mock 收到对端安全桌面状态");
+                    }
                     InputMessage::Hello { .. }
                     | InputMessage::Proof { .. }
                     | InputMessage::ReturnRequest { .. }

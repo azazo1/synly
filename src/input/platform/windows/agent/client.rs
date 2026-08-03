@@ -71,6 +71,7 @@ pub(super) struct AgentClient {
     pub(super) lifecycle: Mutex<()>,
     pub(super) next_lease: AtomicU64,
     pub(super) active_lease: AtomicU64,
+    pub(super) is_system: AtomicBool,
 }
 
 struct GuiTransportStart {
@@ -110,9 +111,18 @@ pub(super) struct AgentBackend {
 pub fn request_elevation() -> Result<()> {
     if let Some(client) = current_client() {
         if client.request(AgentRequest::Health).is_ok() {
-            return Ok(());
+            if client.is_system.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            if !super::super::service::is_available() {
+                tracing::warn!("SYSTEM 输入服务不可用, 继续复用现有普通提权输入代理");
+                return Ok(());
+            }
+            tracing::info!("检测到旧的非 SYSTEM 输入代理, 将通过服务替换为 SYSTEM 代理");
+            client.alive.store(false, Ordering::Release);
+        } else {
+            mark_agent_unavailable(&client.alive, "Health", "elevation-recheck");
         }
-        mark_agent_unavailable(&client.alive, "Health", "elevation-recheck");
     }
 
     let connection_id = Uuid::new_v4();
@@ -129,18 +139,14 @@ pub fn request_elevation() -> Result<()> {
     transport.wait_until_created()?;
 
     let executable = agent_executable()?;
-    if current_process_is_elevated()? {
-        tracing::info!("当前 Synly 进程已提升, 直接启动隐藏输入代理");
-        launch_with_current_token(
-            &executable,
-            &command_pipe_name,
-            &event_pipe_name,
-            &token,
-            parent_pid,
-        )?;
-    } else {
-        tracing::info!("当前 Synly 进程未提升, 请求 UAC 启动输入代理");
-        launch_elevated(
+    let service_spawned = spawn_agent_via_service(
+        &command_pipe_name,
+        &event_pipe_name,
+        &token,
+        parent_pid,
+    );
+    if !service_spawned {
+        launch_legacy_agent(
             &executable,
             &command_pipe_name,
             &event_pipe_name,
@@ -154,6 +160,86 @@ pub fn request_elevation() -> Result<()> {
     *slot.lock().map_err(|_| anyhow!("Windows input agent state poisoned"))? = Some(client);
     ELEVATION_REQUESTED.store(true, Ordering::Release);
     Ok(())
+}
+
+fn spawn_agent_via_service(
+    command_pipe_name: &str,
+    event_pipe_name: &str,
+    token: &str,
+    parent_pid: u32,
+) -> bool {
+    if !super::super::service::is_available() {
+        tracing::warn!("SYSTEM 输入服务未安装或未运行, 尝试自动安装");
+        if !try_install_service_once() {
+            return false;
+        }
+    }
+    match super::super::service::spawn_agent(
+        command_pipe_name,
+        event_pipe_name,
+        token,
+        parent_pid,
+    ) {
+        Ok(()) => {
+            tracing::info!("已通过 SYSTEM 输入服务启动隐藏输入代理");
+            true
+        }
+        Err(error) => {
+            let detail = format!("{error:#}");
+            tracing::warn!(error = %detail, "SYSTEM 输入服务拉起代理失败");
+            false
+        }
+    }
+}
+
+fn try_install_service_once() -> bool {
+    if super::super::service::install_attempted() {
+        return super::super::service::is_available();
+    }
+    super::super::service::mark_install_attempted();
+    match super::super::service::install_via_uac() {
+        Ok(true) => {
+            tracing::info!("SYSTEM 输入服务安装成功");
+            true
+        }
+        Ok(false) => {
+            tracing::warn!("用户拒绝安装 SYSTEM 输入服务, 回退到现有 UAC 提权路径");
+            false
+        }
+        Err(error) => {
+            let detail = format!("{error:#}");
+            tracing::warn!(error = %detail, "SYSTEM 输入服务安装失败, 回退到现有 UAC 提权路径");
+            false
+        }
+    }
+}
+
+fn launch_legacy_agent(
+    executable: &std::path::Path,
+    command_pipe_name: &str,
+    event_pipe_name: &str,
+    token: &str,
+    parent_pid: u32,
+) -> Result<()> {
+    if current_process_is_elevated()? {
+        tracing::info!("当前 Synly 进程已提升, 直接启动隐藏输入代理");
+        launch_with_current_token(
+            executable,
+            command_pipe_name,
+            event_pipe_name,
+            token,
+            parent_pid,
+        )
+    } else {
+        tracing::info!("当前 Synly 进程未提升, 请求 UAC 启动输入代理");
+        launch_elevated(
+            executable,
+            command_pipe_name,
+            event_pipe_name,
+            token,
+            parent_pid,
+        )
+    }
 }
 
 pub(in crate::input) fn ensure_ready(mode: InputMode) -> Result<()> {
@@ -490,6 +576,7 @@ fn start_gui_transport(
         lifecycle: Mutex::new(()),
         next_lease: AtomicU64::new(1),
         active_lease: AtomicU64::new(0),
+        is_system: AtomicBool::new(false),
     });
     let (created_tx, created_rx) = std::sync::mpsc::sync_channel(2);
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(2);
@@ -642,6 +729,7 @@ fn gui_event_owner(
         agent_pid,
         parent_pid: incoming_parent,
         agent_path,
+        agent_is_system,
     } = hello
     else {
         bail!("Windows input agent sent an invalid handshake");
@@ -650,6 +738,7 @@ fn gui_event_owner(
         bail!("Windows input agent handshake token or parent mismatch");
     }
     validate_pipe_client(&pipe, agent_pid, &agent_path)?;
+    client.is_system.store(agent_is_system, Ordering::Release);
     hello_sender
         .send(AgentHello {
             agent_pid,
@@ -668,10 +757,17 @@ fn gui_event_owner(
             );
         }
     }
+    let client_is_system = client.is_system.load(Ordering::Acquire);
     ready
         .send(Ok(client))
         .map_err(|_| anyhow!("Windows input agent readiness receiver closed"))?;
-    client_event_reader_loop(pipe, pending, context, alive)
+    client_event_reader_loop(
+        pipe,
+        pending,
+        context,
+        alive,
+        client_is_system,
+    )
 }
 
 pub(super) fn client_event_reader_loop(
@@ -679,6 +775,7 @@ pub(super) fn client_event_reader_loop(
     pending: PendingResponses,
     context: Arc<Mutex<Option<CaptureContext>>>,
     alive: Arc<AtomicBool>,
+    is_system: bool,
 ) -> Result<()> {
     while alive.load(Ordering::Acquire) {
         let packet = match read_packet::<AgentToGuiPacket>(&mut pipe, AGENT_HEARTBEAT_TIMEOUT) {
@@ -735,14 +832,20 @@ pub(super) fn client_event_reader_loop(
                     }
                 }
             }
-            AgentToGuiPacket::SecureDesktopPaused(paused) => {
+            AgentToGuiPacket::SecureDesktopChanged { secure, primary } => {
                 if let Ok(context) = context.lock()
                     && let Some(context) = context.as_ref()
-                    && paused
                 {
-                    context.emit_reliable(NativeEvent::Emergency);
+                    if is_system {
+                        context.emit_reliable(NativeEvent::SecureDesktop {
+                            active: secure,
+                            primary,
+                        });
+                    } else if secure {
+                        context.emit_reliable(NativeEvent::Emergency);
+                    }
                 }
-                tracing::warn!(paused, "Windows 输入代理安全桌面状态变化");
+                tracing::warn!(secure, system_agent = is_system, "Windows 输入代理安全桌面状态变化");
             }
             _ => bail!("Windows input agent sent an unexpected packet"),
         }

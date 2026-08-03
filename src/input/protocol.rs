@@ -65,6 +65,9 @@ pub enum InputMessage {
         x: i32,
         y: i32,
     },
+    SecureDesktop {
+        active: bool,
+    },
 }
 
 pub async fn write_message<W>(writer: &mut W, message: &InputMessage) -> Result<()>
