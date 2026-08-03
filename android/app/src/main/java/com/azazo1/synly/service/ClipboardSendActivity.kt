@@ -13,6 +13,7 @@ import androidx.core.content.FileProvider
 import androidx.lifecycle.lifecycleScope
 import com.azazo1.synly.R
 import com.azazo1.synly.core.ClipboardSend
+import com.azazo1.synly.core.SynlyLog
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -25,10 +26,10 @@ import kotlinx.coroutines.launch
 class ClipboardSendActivity : ComponentActivity() {
     private var pendingCaptureUri: Uri? = null
 
-    private val pickFileLauncher =
-        registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-            if (uri != null) {
-                sendUris(listOf(uri))
+    private val pickFilesLauncher =
+        registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+            if (uris.isNotEmpty()) {
+                sendUris(uris)
             } else {
                 finish()
             }
@@ -38,6 +39,7 @@ class ClipboardSendActivity : ComponentActivity() {
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) { result ->
             val uri = pendingCaptureUri
             pendingCaptureUri = null
+            SynlyLog.i(TAG, "拍照返回 resultCode=${result.resultCode} uri=$uri")
             if (result.resultCode == Activity.RESULT_OK && uri != null) {
                 sendUris(listOf(uri))
             } else {
@@ -50,7 +52,7 @@ class ClipboardSendActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         pendingCaptureUri = savedInstanceState?.getParcelable(KEY_CAPTURE_URI)
         when (intent.action) {
-            ACTION_PICK_FILE -> pickFileLauncher.launch(arrayOf("*/*"))
+            ACTION_PICK_FILE -> pickFilesLauncher.launch(arrayOf("*/*"))
             ACTION_CAPTURE_PHOTO -> startCapture()
             Intent.ACTION_SEND, Intent.ACTION_SEND_MULTIPLE -> handleShare(intent)
             else -> {
@@ -89,15 +91,24 @@ class ClipboardSendActivity : ComponentActivity() {
     }
 
     private fun sendUris(uris: List<Uri>) {
+        SynlyLog.i(TAG, "准备发送文件 uris=$uris")
         lifecycleScope.launch {
             val result = ClipboardSend.send(applicationContext, uris)
             val message = result.fold(
                 onSuccess = { it },
                 onFailure = { getString(R.string.send_file_failed, it.message ?: "未知错误") },
             )
+            result.fold(
+                onSuccess = { SynlyLog.i(TAG, "文件已通过剪贴板发送: $it") },
+                onFailure = { SynlyLog.w(TAG, "文件发送失败: $message", it) },
+            )
             toast(message)
             deleteCapture()
-            finish()
+            if (result.isSuccess) {
+                finish()
+            } else {
+                window.decorView.postDelayed({ finish() }, 1200)
+            }
         }
     }
 
@@ -131,6 +142,7 @@ class ClipboardSendActivity : ComponentActivity() {
         const val ACTION_PICK_FILE = "com.azazo1.synly.action.PICK_FILE"
         const val ACTION_CAPTURE_PHOTO = "com.azazo1.synly.action.CAPTURE_PHOTO"
 
+        private const val TAG = "ClipboardSendActivity"
         private const val KEY_CAPTURE_URI = "capture_uri"
     }
 }

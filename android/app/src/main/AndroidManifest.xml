@@ -46,7 +46,6 @@
             android:name=".service.ClipboardSendActivity"
             android:exported="true"
             android:excludeFromRecents="true"
-            android:noHistory="true"
             android:taskAffinity=""
             android:theme="@style/Theme.Synly.Translucent">
             <intent-filter>

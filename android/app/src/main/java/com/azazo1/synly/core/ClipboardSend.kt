@@ -17,6 +17,7 @@ object ClipboardSend {
                 if (files.isEmpty()) {
                     error("没有收到文件")
                 }
+                SynlyLog.i("ClipboardSend", "已读取 ${files.size} 个文件")
                 val payload = ClipboardPayload(files = files)
                 val clipUris = ClipboardCache.writeLocal(context, files)
                 val clip = ClipData.newUri(
@@ -31,7 +32,9 @@ object ClipboardSend {
                 if (!SynlyEngine.sendClipboard(payload)) {
                     error("发送失败")
                 }
-                "已发送 ${files.size} 个文件"
+                val message = "已发送 ${files.size} 个文件"
+                SynlyLog.i("ClipboardSend", message)
+                message
             }
         }
     }

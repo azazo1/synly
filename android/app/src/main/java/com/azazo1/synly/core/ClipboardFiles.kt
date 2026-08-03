@@ -86,7 +86,7 @@ object ClipboardFiles {
                     if (column >= 0) {
                         val name = cursor.getString(column)
                         if (!name.isNullOrBlank()) {
-                            return safeName(name)
+                            return name.trim()
                         }
                     }
                 }

@@ -3,7 +3,6 @@ package com.azazo1.synly.core
 import android.content.Context
 import androidx.core.content.FileProvider
 import java.io.File
-import java.util.UUID
 
 object ClipboardCache {
     fun writeLocal(context: Context, files: List<ClipboardFile>): List<android.net.Uri> {
@@ -47,12 +46,26 @@ object ClipboardCache {
         val writtenFiles = mutableListOf<File>()
         val uris = files.map { file ->
             val safeName = ClipboardFiles.safeName(file.name)
-            val target = File(directory, "$prefix-${UUID.randomUUID()}-$safeName")
+            val target = uniqueCacheFile(directory, safeName)
             target.writeBytes(file.bytes)
             writtenFiles += target
             FileProvider.getUriForFile(context, "${context.packageName}.files", target)
         }
         prune(context, writtenFiles.toSet())
         return uris
+    }
+
+    private fun uniqueCacheFile(directory: File, name: String): File {
+        var candidate = File(directory, name)
+        if (!candidate.exists()) return candidate
+        val dot = name.lastIndexOf('.')
+        val stem = if (dot > 0) name.substring(0, dot) else name
+        val extension = if (dot > 0) name.substring(dot) else ""
+        var index = 2
+        while (true) {
+            candidate = File(directory, "$stem-$index$extension")
+            if (!candidate.exists()) return candidate
+            index += 1
+        }
     }
 }
