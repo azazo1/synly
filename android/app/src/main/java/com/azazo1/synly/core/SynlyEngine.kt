@@ -74,10 +74,14 @@ object SynlyEngine {
         }
     }
 
-    fun start(context: Context) {
+    fun start(context: Context, allowAutoReconnect: Boolean = true) {
         val settings = SettingsStore.load(context)
         val target = settings.lastTarget ?: run {
             SynlyLog.i(TAG, "尚无目标设备, 等待用户连接")
+            return
+        }
+        if (allowAutoReconnect && !settings.autoReconnect) {
+            SynlyLog.i(TAG, "自动重连已关闭, 跳过上次目标设备")
             return
         }
         if (target == currentTarget) {
@@ -188,7 +192,8 @@ object SynlyEngine {
                 runCatching { oldHandle.stop() }
             }
         }
-        if (SettingsStore.load(context).lastTarget == null) {
+        val settings = SettingsStore.load(context)
+        if (settings.lastTarget == null || !settings.autoReconnect) {
             clearUiState()
             return
         }
@@ -271,7 +276,7 @@ object SynlyEngine {
     fun connect(context: Context, target: SynlyTarget) {
         val settings = SettingsStore.load(context).copy(lastTarget = target)
         SettingsStore.save(context, settings)
-        start(context)
+        start(context, allowAutoReconnect = false)
     }
 
     private fun targetLabel(context: Context, target: SynlyTarget): String {

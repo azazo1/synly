@@ -9,7 +9,9 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.ContextCompat
+import com.azazo1.synly.core.SettingsStore
 import com.azazo1.synly.core.SynlyEngine
+import com.azazo1.synly.service.ClipboardSyncService
 import com.azazo1.synly.ui.MainScreen
 
 class MainActivity : ComponentActivity() {
@@ -20,6 +22,10 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         SynlyEngine.init(applicationContext)
         requestNotificationPermissionIfNeeded()
+        val settings = SettingsStore.load(applicationContext)
+        if (settings.autoReconnect && settings.lastTarget != null) {
+            ClipboardSyncService.start(this)
+        }
         onBackPressedDispatcher.addCallback(
             this,
             object : OnBackPressedCallback(true) {

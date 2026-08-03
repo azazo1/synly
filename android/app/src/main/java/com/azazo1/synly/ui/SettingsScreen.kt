@@ -177,6 +177,32 @@ fun SettingsScreen(onBack: () -> Unit) {
             item {
                 Card {
                     Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text("自动重连", style = MaterialTheme.typography.titleSmall)
+                                Text(
+                                    "启动后自动连接上次连接的设备",
+                                    style = MaterialTheme.typography.bodySmall,
+                                )
+                            }
+                            Switch(
+                                checked = settings.autoReconnect,
+                                onCheckedChange = {
+                                    settings = settings.copy(autoReconnect = it)
+                                    SettingsStore.save(context, settings)
+                                },
+                            )
+                        }
+                    }
+                }
+            }
+
+            item {
+                Card {
+                    Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         ByteSizeField(
                             valueBytes = settings.maxClipboardBytes,
                             onCommit = { bytes ->
@@ -490,6 +516,7 @@ private fun ConfigImportPreview(backup: ConfigBackup.Backup) {
         )
         PreviewLine("mDNS 发现", if (settings.mdnsEnabled) "开启" else "关闭")
         PreviewLine("LND 发现", if (settings.lndEnabled) "开启" else "关闭")
+        PreviewLine("自动重连", if (settings.autoReconnect) "开启" else "关闭")
         if (settings.lndEnabled) {
             PreviewLine("LND 服务器", settings.lndServerUrl ?: "未配置")
             PreviewLine("LND Token", if (settings.lndBearerToken.isNullOrBlank()) "未配置" else "已配置")

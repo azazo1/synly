@@ -17,6 +17,7 @@ data class SynlySettings(
     val maxClipboardBytes: Long = 100L * 1024 * 1024,
     val maxClipboardCacheBytes: Long = 512L * 1024 * 1024,
     val deviceName: String = DEFAULT_DEVICE_NAME,
+    val autoReconnect: Boolean = true,
     val lastTarget: SynlyTarget? = null,
 )
 
@@ -60,6 +61,7 @@ object SettingsStore {
                 512L * 1024 * 1024,
             ),
             deviceName = prefs.getString("device_name", null) ?: DEFAULT_DEVICE_NAME,
+            autoReconnect = prefs.getBoolean("auto_reconnect", true),
             lastTarget = lastTarget,
         )
     }
@@ -85,6 +87,7 @@ object SettingsStore {
             .putLong("max_clipboard_bytes", settings.maxClipboardBytes)
             .putLong("max_clipboard_cache_bytes", settings.maxClipboardCacheBytes)
             .putString("device_name", settings.deviceName)
+            .putBoolean("auto_reconnect", settings.autoReconnect)
             .putString("last_target", target.orEmpty())
             .apply()
         ClipboardCache.prune(context)

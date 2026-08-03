@@ -68,6 +68,7 @@ object ConfigBackup {
             .put("max_clipboard_bytes", settings.maxClipboardBytes)
             .put("max_clipboard_cache_bytes", settings.maxClipboardCacheBytes)
             .put("device_name", settings.deviceName)
+            .put("auto_reconnect", settings.autoReconnect)
             .put("last_target", targetJson(settings.lastTarget))
     }
 
@@ -90,6 +91,7 @@ object ConfigBackup {
             maxClipboardBytes = maxClipboardBytes,
             maxClipboardCacheBytes = maxClipboardCacheBytes,
             deviceName = obj.optString("device_name", DEFAULT_DEVICE_NAME),
+            autoReconnect = obj.optBoolean("auto_reconnect", true),
             lastTarget = parseTarget(obj.optJSONObject("last_target")),
         )
     }
