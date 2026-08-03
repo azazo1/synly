@@ -1,6 +1,6 @@
 [package]
 name = "synly-core"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 license = "MIT"
 description = "Synly 的跨平台核心库: 协议, 加密, 设备发现与能力协商"
