@@ -19,7 +19,7 @@ bincode = "1.3.3"
 clap = { version = "4.5.58", features = ["derive"] }
 hmac = "0.12.1"
 if-addrs = "0.15.0"
-lnd = { git = "https://github.com/azazo1/lnd.git", rev = "736a2142cf807767fe7c3586163d04c67e0f16f7" }
+lnd-core = "0.1.0"
 mdns-sd = "0.18.2"
 rand = "0.10.0"
 rcgen = { version = "0.14.7", default-features = false, features = ["crypto", "ring"] }
