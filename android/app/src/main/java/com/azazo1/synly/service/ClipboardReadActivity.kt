@@ -2,8 +2,12 @@ package com.azazo1.synly.service
 
 import android.app.Activity
 import android.os.Bundle
+import androidx.lifecycle.lifecycleScope
 import com.azazo1.synly.core.ClipboardReader
 import com.azazo1.synly.core.SynlyEngine
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /**
  * 透明的剪贴板读取界面.
@@ -25,14 +29,19 @@ class ClipboardReadActivity : Activity() {
     }
 
     private fun readAndFinish() {
-        runCatching {
-            if (SynlyEngine.canSend()) {
-                ClipboardReader.takePending(applicationContext) { payload ->
-                    SynlyEngine.sendClipboard(payload)
+        lifecycleScope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    if (SynlyEngine.canSend()) {
+                        ClipboardReader.takePending(applicationContext) { payload ->
+                            SynlyEngine.sendClipboard(payload)
+                        }
+                    }
                 }
+            } finally {
+                finish()
             }
         }
-        finish()
     }
 
     companion object {

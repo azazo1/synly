@@ -16,6 +16,7 @@ import uniffi.synly_core.FfiClientHandle
 import uniffi.synly_core.FfiClientListener
 import uniffi.synly_core.FfiClientState
 import uniffi.synly_core.FfiClientTarget
+import uniffi.synly_core.FfiClipboardFile
 import uniffi.synly_core.FfiClipboardMode
 import uniffi.synly_core.FfiDiscoveryConfig
 import uniffi.synly_core.FfiDiscoveredPeer
@@ -127,7 +128,7 @@ object SynlyEngine {
             trustedDevices = trusted,
             maxMetaLen = 20u * 1024u * 1024u,
             maxFrameDataLen = 128u * 1024u * 1024u,
-            maxClipboardBinaryLen = settings.maxImageBytes.toUInt(),
+            maxClipboardBinaryLen = settings.maxClipboardBytes.toUInt(),
             clipboardMode = settings.clipboardMode,
             instanceName = null,
             requestTrust = true,
@@ -221,11 +222,15 @@ object SynlyEngine {
             .onFailure { SynlyLog.e(TAG, "更新剪贴板模式失败", it) }
     }
 
-    fun sendClipboard(payload: ClipboardPayload) {
-        if (payload.isEmpty()) return
-        runCatching {
-            handle?.sendClipboard(payload.text, payload.html, payload.imagePng)
-        }.onFailure { SynlyLog.e(TAG, "发送剪贴板失败", it) }
+    fun sendClipboard(payload: ClipboardPayload): Boolean {
+        if (payload.isEmpty()) return false
+        val result = runCatching {
+            val files = payload.files.map { FfiClipboardFile(it.name, it.bytes) }
+            handle?.sendClipboard(payload.text, payload.html, payload.imagePng, files)
+        }
+        return result
+            .onFailure { SynlyLog.e(TAG, "发送剪贴板失败", it) }
+            .isSuccess && handle != null
     }
 
     fun canSend(): Boolean = _uiState.value.canSend
@@ -319,7 +324,12 @@ object SynlyEngine {
             }
 
             is FfiClientEvent.ClipboardReceived -> {
-                val payload = ClipboardPayload(event.text, event.html, event.imagePng)
+                val payload = ClipboardPayload(
+                    text = event.text,
+                    html = event.html,
+                    imagePng = event.imagePng,
+                    files = event.files.map { ClipboardFile(it.name, it.bytes) },
+                )
                 val context = SynlyApplication.instance
                 if (context != null) {
                     ClipboardWriter.applyRemote(context, payload)

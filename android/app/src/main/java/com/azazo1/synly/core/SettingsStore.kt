@@ -14,7 +14,8 @@ data class SynlySettings(
     val lndServerUrl: String? = null,
     val lndBearerToken: String? = null,
     val lndDiscoveryDomain: String? = null,
-    val maxImageBytes: Long = 20L * 1024 * 1024,
+    val maxClipboardBytes: Long = 100L * 1024 * 1024,
+    val maxClipboardCacheBytes: Long = 512L * 1024 * 1024,
     val deviceName: String = DEFAULT_DEVICE_NAME,
     val lastTarget: SynlyTarget? = null,
 )
@@ -53,7 +54,11 @@ object SettingsStore {
             lndServerUrl = prefs.getString("lnd_server_url", null)?.takeIf { it.isNotBlank() },
             lndBearerToken = prefs.getString("lnd_bearer_token", null)?.takeIf { it.isNotBlank() },
             lndDiscoveryDomain = prefs.getString("lnd_discovery_domain", null)?.takeIf { it.isNotBlank() },
-            maxImageBytes = prefs.getLong("max_image_bytes", 20L * 1024 * 1024),
+            maxClipboardBytes = prefs.getLong("max_clipboard_bytes", 100L * 1024 * 1024),
+            maxClipboardCacheBytes = prefs.getLong(
+                "max_clipboard_cache_bytes",
+                512L * 1024 * 1024,
+            ),
             deviceName = prefs.getString("device_name", null) ?: DEFAULT_DEVICE_NAME,
             lastTarget = lastTarget,
         )
@@ -77,10 +82,12 @@ object SettingsStore {
             .putString("lnd_server_url", settings.lndServerUrl.orEmpty())
             .putString("lnd_bearer_token", settings.lndBearerToken.orEmpty())
             .putString("lnd_discovery_domain", settings.lndDiscoveryDomain.orEmpty())
-            .putLong("max_image_bytes", settings.maxImageBytes)
+            .putLong("max_clipboard_bytes", settings.maxClipboardBytes)
+            .putLong("max_clipboard_cache_bytes", settings.maxClipboardCacheBytes)
             .putString("device_name", settings.deviceName)
             .putString("last_target", target.orEmpty())
             .apply()
+        ClipboardCache.prune(context)
     }
 
     private fun parseMode(raw: String?): FfiClipboardMode {

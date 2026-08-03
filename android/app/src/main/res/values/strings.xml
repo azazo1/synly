@@ -9,4 +9,9 @@
     <string name="sync_notification_reconnecting">重连 %1$s 中</string>
     <string name="sync_notification_connected">已连接 %1$s</string>
     <string name="sync_notification_unknown">未知设备</string>
+    <string name="sync_notification_action_pick_file">选择文件</string>
+    <string name="sync_notification_action_capture_photo">拍照</string>
+    <string name="send_file_only">仅支持文件分享</string>
+    <string name="send_file_failed">发送失败: %1$s</string>
+    <string name="send_action_unknown">不支持的操作</string>
 </resources>

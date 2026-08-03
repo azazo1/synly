@@ -138,6 +138,14 @@ class ClipboardSyncService : android.app.Service() {
             Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE,
         )
+        val pickFilePending = notificationAction(
+            1,
+            ClipboardSendActivity.ACTION_PICK_FILE,
+        )
+        val capturePhotoPending = notificationAction(
+            2,
+            ClipboardSendActivity.ACTION_CAPTURE_PHOTO,
+        )
         val target = targetLabel ?: getString(R.string.sync_notification_unknown)
         val statusText = when (state) {
             FfiClientState.CONNECTING -> getString(R.string.sync_notification_connecting, target)
@@ -153,8 +161,27 @@ class ClipboardSyncService : android.app.Service() {
             .setContentTitle(getString(R.string.sync_notification_title))
             .setContentText(statusText)
             .setContentIntent(pending)
+            .addAction(
+                0,
+                getString(R.string.sync_notification_action_pick_file),
+                pickFilePending,
+            )
+            .addAction(
+                0,
+                getString(R.string.sync_notification_action_capture_photo),
+                capturePhotoPending,
+            )
             .setOngoing(true)
             .build()
+    }
+
+    private fun notificationAction(requestCode: Int, action: String): PendingIntent {
+        return PendingIntent.getActivity(
+            this,
+            requestCode,
+            Intent(this, ClipboardSendActivity::class.java).setAction(action),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
     }
 
     private fun acquireMulticastLock() {

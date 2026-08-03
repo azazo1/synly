@@ -736,7 +736,7 @@ internal object UniffiLib {
     ): Unit
     external fun uniffi_synly_core_fn_method_fficlienthandle_cancel_pin(`ptr`: Long,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
-    external fun uniffi_synly_core_fn_method_fficlienthandle_send_clipboard(`ptr`: Long,`text`: RustBuffer.ByValue,`html`: RustBuffer.ByValue,`imagePng`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    external fun uniffi_synly_core_fn_method_fficlienthandle_send_clipboard(`ptr`: Long,`text`: RustBuffer.ByValue,`html`: RustBuffer.ByValue,`imagePng`: RustBuffer.ByValue,`files`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     external fun uniffi_synly_core_fn_method_fficlienthandle_set_clipboard_mode(`ptr`: Long,`mode`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
@@ -904,7 +904,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_synly_core_checksum_method_fficlienthandle_cancel_pin() != 20967) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_synly_core_checksum_method_fficlienthandle_send_clipboard() != 61678) {
+    if (lib.uniffi_synly_core_checksum_method_fficlienthandle_send_clipboard() != 6615) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_synly_core_checksum_method_fficlienthandle_set_clipboard_mode() != 15831) {
@@ -1388,7 +1388,7 @@ public interface FfiClientHandleInterface {
     
     fun `cancelPin`()
     
-    fun `sendClipboard`(`text`: kotlin.String?, `html`: kotlin.String?, `imagePng`: kotlin.ByteArray?)
+    fun `sendClipboard`(`text`: kotlin.String?, `html`: kotlin.String?, `imagePng`: kotlin.ByteArray?, `files`: List<FfiClipboardFile>)
     
     fun `setClipboardMode`(`mode`: FfiClipboardMode)
     
@@ -1513,13 +1513,13 @@ open class FfiClientHandle: Disposable, AutoCloseable, FfiClientHandleInterface
     
 
     
-    @Throws(FfiException::class)override fun `sendClipboard`(`text`: kotlin.String?, `html`: kotlin.String?, `imagePng`: kotlin.ByteArray?)
+    @Throws(FfiException::class)override fun `sendClipboard`(`text`: kotlin.String?, `html`: kotlin.String?, `imagePng`: kotlin.ByteArray?, `files`: List<FfiClipboardFile>)
         = 
     callWithHandle {
     uniffiRustCallWithError(FfiException) { _status ->
     UniffiLib.uniffi_synly_core_fn_method_fficlienthandle_send_clipboard(
         it,
-        FfiConverterOptionalString.lower(`text`),FfiConverterOptionalString.lower(`html`),FfiConverterOptionalByteArray.lower(`imagePng`),_status)
+        FfiConverterOptionalString.lower(`text`),FfiConverterOptionalString.lower(`html`),FfiConverterOptionalByteArray.lower(`imagePng`),FfiConverterSequenceTypeFfiClipboardFile.lower(`files`),_status)
 }
     }
     
@@ -1741,6 +1741,44 @@ public object FfiConverterTypeFfiClientTarget: FfiConverterRustBuffer<FfiClientT
             FfiConverterSequenceString.write(value.`addresses`, buf)
             FfiConverterUShort.write(value.`port`, buf)
             FfiConverterOptionalString.write(value.`peerDeviceId`, buf)
+    }
+}
+
+
+
+data class FfiClipboardFile (
+    var `name`: kotlin.String
+    , 
+    var `bytes`: kotlin.ByteArray
+    
+){
+    
+
+    
+
+    
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeFfiClipboardFile: FfiConverterRustBuffer<FfiClipboardFile> {
+    override fun read(buf: ByteBuffer): FfiClipboardFile {
+        return FfiClipboardFile(
+            FfiConverterString.read(buf),
+            FfiConverterByteArray.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: FfiClipboardFile) = (
+            FfiConverterString.allocationSize(value.`name`) +
+            FfiConverterByteArray.allocationSize(value.`bytes`)
+    )
+
+    override fun write(value: FfiClipboardFile, buf: ByteBuffer) {
+            FfiConverterString.write(value.`name`, buf)
+            FfiConverterByteArray.write(value.`bytes`, buf)
     }
 }
 
@@ -2074,7 +2112,8 @@ sealed class FfiClientEvent {
     data class ClipboardReceived(
         val `text`: kotlin.String?, 
         val `html`: kotlin.String?, 
-        val `imagePng`: kotlin.ByteArray?) : FfiClientEvent()
+        val `imagePng`: kotlin.ByteArray?, 
+        val `files`: List<uniffi.synly_core.FfiClipboardFile>) : FfiClientEvent()
         
     {
         
@@ -2139,6 +2178,7 @@ public object FfiConverterTypeFfiClientEvent : FfiConverterRustBuffer<FfiClientE
                 FfiConverterOptionalString.read(buf),
                 FfiConverterOptionalString.read(buf),
                 FfiConverterOptionalByteArray.read(buf),
+                FfiConverterSequenceTypeFfiClipboardFile.read(buf),
                 )
             6 -> FfiClientEvent.Disconnected(
                 FfiConverterString.read(buf),
@@ -2193,6 +2233,7 @@ public object FfiConverterTypeFfiClientEvent : FfiConverterRustBuffer<FfiClientE
                 + FfiConverterOptionalString.allocationSize(value.`text`)
                 + FfiConverterOptionalString.allocationSize(value.`html`)
                 + FfiConverterOptionalByteArray.allocationSize(value.`imagePng`)
+                + FfiConverterSequenceTypeFfiClipboardFile.allocationSize(value.`files`)
             )
         }
         is FfiClientEvent.Disconnected -> {
@@ -2245,6 +2286,7 @@ public object FfiConverterTypeFfiClientEvent : FfiConverterRustBuffer<FfiClientE
                 FfiConverterOptionalString.write(value.`text`, buf)
                 FfiConverterOptionalString.write(value.`html`, buf)
                 FfiConverterOptionalByteArray.write(value.`imagePng`, buf)
+                FfiConverterSequenceTypeFfiClipboardFile.write(value.`files`, buf)
                 Unit
             }
             is FfiClientEvent.Disconnected -> {
@@ -2654,6 +2696,34 @@ public object FfiConverterSequenceString: FfiConverterRustBuffer<List<kotlin.Str
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterString.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeFfiClipboardFile: FfiConverterRustBuffer<List<FfiClipboardFile>> {
+    override fun read(buf: ByteBuffer): List<FfiClipboardFile> {
+        val len = buf.getInt()
+        return List<FfiClipboardFile>(len) {
+            FfiConverterTypeFfiClipboardFile.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<FfiClipboardFile>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeFfiClipboardFile.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<FfiClipboardFile>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeFfiClipboardFile.write(it, buf)
         }
     }
 }

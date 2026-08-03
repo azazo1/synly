@@ -28,9 +28,28 @@ class ClipboardPayloadTest {
     }
 
     @Test
+    fun signature_covers_files() {
+        val first = ClipboardPayload(
+            files = listOf(ClipboardFile("a.txt", byteArrayOf(1, 2))),
+        ).signature()
+        val second = ClipboardPayload(
+            files = listOf(ClipboardFile("a.txt", byteArrayOf(1, 3))),
+        ).signature()
+        val third = ClipboardPayload(
+            files = listOf(ClipboardFile("b.txt", byteArrayOf(1, 2))),
+        ).signature()
+        assertNotEquals(first, second)
+        assertNotEquals(first, third)
+    }
+
+    @Test
     fun empty_payload_detection() {
         assertTrue(ClipboardPayload().isEmpty())
         assertTrue(!ClipboardPayload(text = "x").isEmpty())
+        assertTrue(
+            !ClipboardPayload(
+                files = listOf(ClipboardFile("a.txt", byteArrayOf(1))),
+            ).isEmpty(),
+        )
     }
 }
-

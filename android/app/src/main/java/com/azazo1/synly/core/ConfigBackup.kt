@@ -10,7 +10,8 @@ import uniffi.synly_core.FfiTrustedDeviceConfig
 object ConfigBackup {
     private const val FORMAT = "synly-config"
     private const val VERSION = 1
-    private const val MAX_IMAGE_BYTES = 100L * 1024 * 1024
+    private const val MAX_CLIPBOARD_BYTES = 100L * 1024 * 1024
+    private const val MAX_CLIPBOARD_CACHE_BYTES = 4096L * 1024 * 1024
 
     data class Backup(
         val settings: SynlySettings,
@@ -64,7 +65,8 @@ object ConfigBackup {
             .put("lnd_server_url", settings.lndServerUrl ?: JSONObject.NULL)
             .put("lnd_bearer_token", settings.lndBearerToken ?: JSONObject.NULL)
             .put("lnd_discovery_domain", settings.lndDiscoveryDomain ?: JSONObject.NULL)
-            .put("max_image_bytes", settings.maxImageBytes)
+            .put("max_clipboard_bytes", settings.maxClipboardBytes)
+            .put("max_clipboard_cache_bytes", settings.maxClipboardCacheBytes)
             .put("device_name", settings.deviceName)
             .put("last_target", targetJson(settings.lastTarget))
     }
@@ -73,8 +75,11 @@ object ConfigBackup {
         val mode = obj.optString("clipboard_mode")
         val clipboardMode = runCatching { FfiClipboardMode.valueOf(mode) }
             .getOrElse { error("clipboard_mode 无效") }
-        val maxImageBytes = obj.optLong("max_image_bytes", 20L * 1024 * 1024)
-            .coerceIn(1L, MAX_IMAGE_BYTES)
+        val maxClipboardBytes = obj.optLong("max_clipboard_bytes", 100L * 1024 * 1024)
+            .coerceIn(1L, MAX_CLIPBOARD_BYTES)
+        val maxClipboardCacheBytes =
+            obj.optLong("max_clipboard_cache_bytes", 512L * 1024 * 1024)
+                .coerceIn(1L, MAX_CLIPBOARD_CACHE_BYTES)
         return SynlySettings(
             clipboardMode = clipboardMode,
             mdnsEnabled = obj.optBoolean("mdns_enabled", true),
@@ -82,7 +87,8 @@ object ConfigBackup {
             lndServerUrl = obj.optString("lnd_server_url").takeIf { it.isNotBlank() },
             lndBearerToken = obj.optString("lnd_bearer_token").takeIf { it.isNotBlank() },
             lndDiscoveryDomain = obj.optString("lnd_discovery_domain").takeIf { it.isNotBlank() },
-            maxImageBytes = maxImageBytes,
+            maxClipboardBytes = maxClipboardBytes,
+            maxClipboardCacheBytes = maxClipboardCacheBytes,
             deviceName = obj.optString("device_name", DEFAULT_DEVICE_NAME),
             lastTarget = parseTarget(obj.optJSONObject("last_target")),
         )

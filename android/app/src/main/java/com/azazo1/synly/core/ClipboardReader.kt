@@ -49,11 +49,22 @@ object ClipboardReader {
             val bytes = readImageBytes(context, uri) ?: return null
             return ClipboardPayload(text = null, html = null, imagePng = bytes)
         }
+        val uris = (0 until clip.itemCount).mapNotNull { clip.getItemAt(it).uri }
+        if (uris.isNotEmpty()) {
+            val files = runCatching { ClipboardFiles.read(context, uris) }.getOrNull()
+            if (!files.isNullOrEmpty()) {
+                return ClipboardPayload(files = files)
+            }
+        }
         return null
     }
 
     fun suppress(payload: ClipboardPayload) {
         suppressSignature = payload.signature()
+    }
+
+    fun markSent(payload: ClipboardPayload) {
+        lastSignature = payload.signature()
     }
 
     fun reset() {
@@ -62,7 +73,7 @@ object ClipboardReader {
     }
 
     private fun readImageBytes(context: Context, uri: android.net.Uri): ByteArray? {
-        val max = SettingsStore.load(context).maxImageBytes
+        val max = SettingsStore.load(context).maxClipboardBytes
         val bytes = runCatching {
             context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
         }.getOrNull() ?: return null

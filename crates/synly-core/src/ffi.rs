@@ -1,6 +1,8 @@
 use crate::client;
 use crate::device::{DeviceConfig, DiscoveryConfig, LndDiscoveryConfig, TrustedDeviceConfig};
-use crate::protocol::{ClipboardImage, ClipboardPayload, DeviceIdentity, TransferLimits};
+use crate::protocol::{
+    ClipboardFile, ClipboardImage, ClipboardPayload, DeviceIdentity, TransferLimits,
+};
 use crate::settings::ClipboardMode;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
@@ -160,6 +162,12 @@ pub struct FfiDeviceIdentity {
     pub instance_name: Option<String>,
     pub identity_public_key: String,
     pub tls_root_certificate: String,
+}
+
+#[derive(uniffi::Record)]
+pub struct FfiClipboardFile {
+    pub name: String,
+    pub bytes: Vec<u8>,
 }
 
 impl From<DeviceIdentity> for FfiDeviceIdentity {
@@ -347,6 +355,7 @@ pub enum FfiClientEvent {
         text: Option<String>,
         html: Option<String>,
         image_png: Option<Vec<u8>>,
+        files: Vec<FfiClipboardFile>,
     },
     Disconnected {
         message: String,
@@ -391,6 +400,14 @@ impl From<client::ClientEvent> for FfiClientEvent {
                 text: payload.text,
                 html: payload.html,
                 image_png: payload.image.map(|image| image.png_bytes),
+                files: payload
+                    .files
+                    .into_iter()
+                    .map(|file| FfiClipboardFile {
+                        name: file.name,
+                        bytes: file.bytes,
+                    })
+                    .collect(),
             },
             client::ClientEvent::Disconnected { message } => Self::Disconnected { message },
             client::ClientEvent::TrustEstablished(device) => Self::TrustEstablished {
@@ -477,13 +494,20 @@ impl FfiClientHandle {
         text: Option<String>,
         html: Option<String>,
         image_png: Option<Vec<u8>>,
+        files: Vec<FfiClipboardFile>,
     ) -> Result<(), FfiError> {
         let payload = ClipboardPayload {
             text,
             rich_text: None,
             html,
             image: image_png.map(|png_bytes| ClipboardImage { png_bytes }),
-            files: Vec::new(),
+            files: files
+                .into_iter()
+                .map(|file| ClipboardFile {
+                    name: file.name,
+                    bytes: file.bytes,
+                })
+                .collect(),
         };
         self.inner.send_clipboard(payload).map_err(Into::into)
     }

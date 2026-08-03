@@ -12,6 +12,21 @@ object ClipboardWriter {
         if (payload.isEmpty()) return false
         val clipboard = context.getSystemService(ClipboardManager::class.java)
         val clip = when {
+            payload.files.isNotEmpty() -> {
+                val uris = ClipboardCache.writeRemote(context, payload.files)
+                if (uris.isEmpty()) {
+                    null
+                } else {
+                    val uriClip = ClipData.newUri(
+                        context.contentResolver,
+                        "synly files",
+                        uris.first(),
+                    )
+                    uris.drop(1).forEach { uriClip.addItem(ClipData.Item(it)) }
+                    uriClip
+                }
+            }
+
             payload.imagePng != null -> {
                 val uri = writePng(context, payload.imagePng!!)
                 uri?.let { ClipData.newUri(context.contentResolver, "synly image", it) }
@@ -39,10 +54,10 @@ object ClipboardWriter {
             file.writeBytes(bytes)
             FileProvider.getUriForFile(context, "${context.packageName}.files", file)
         }.getOrNull()
+            ?.also { ClipboardCache.prune(context) }
     }
 
     private fun htmlToText(html: String): String {
         return html.replace(Regex("<[^>]+>"), " ").replace(Regex("\\s+"), " ").trim()
     }
 }
-

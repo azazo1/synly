@@ -174,13 +174,26 @@ fun SettingsScreen(onBack: () -> Unit) {
                 Card {
                     Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         OutlinedTextField(
-                            value = (settings.maxImageBytes / 1024 / 1024).toString(),
+                            value = (settings.maxClipboardBytes / 1024 / 1024).toString(),
                             onValueChange = {
                                 val mb = it.toLongOrNull()?.coerceIn(1, 100) ?: return@OutlinedTextField
-                                settings = settings.copy(maxImageBytes = mb * 1024 * 1024)
+                                settings = settings.copy(maxClipboardBytes = mb * 1024 * 1024)
                                 SettingsStore.save(context, settings)
                             },
-                            label = { Text("图片大小上限 (MB)") },
+                            label = { Text("剪贴板大小上限 (MB)") },
+                            singleLine = true,
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                        OutlinedTextField(
+                            value = (settings.maxClipboardCacheBytes / 1024 / 1024).toString(),
+                            onValueChange = {
+                                val mb = it.toLongOrNull()?.coerceIn(1, 4096)
+                                    ?: return@OutlinedTextField
+                                settings = settings.copy(maxClipboardCacheBytes = mb * 1024 * 1024)
+                                SettingsStore.save(context, settings)
+                            },
+                            label = { Text("剪贴板缓存上限 (MB)") },
                             singleLine = true,
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                             modifier = Modifier.fillMaxWidth(),
@@ -435,7 +448,8 @@ private fun ConfigImportPreview(backup: ConfigBackup.Backup) {
         Text("将覆盖当前设置, 身份和可信设备", style = MaterialTheme.typography.bodySmall)
         PreviewLine("设备名称", settings.deviceName)
         PreviewLine("剪贴板模式", settings.clipboardMode.name)
-        PreviewLine("图片大小上限", "${settings.maxImageBytes / 1024 / 1024} MB")
+        PreviewLine("剪贴板大小上限", "${settings.maxClipboardBytes / 1024 / 1024} MB")
+        PreviewLine("剪贴板缓存上限", "${settings.maxClipboardCacheBytes / 1024 / 1024} MB")
         PreviewLine("mDNS 发现", if (settings.mdnsEnabled) "开启" else "关闭")
         PreviewLine("LND 发现", if (settings.lndEnabled) "开启" else "关闭")
         if (settings.lndEnabled) {
