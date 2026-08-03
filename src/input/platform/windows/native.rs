@@ -855,6 +855,13 @@ impl InputBackend for WindowsBackend {
             .and_then(|primary| *primary)
     }
 
+    fn secure_desktop_state(&self) -> (bool, Option<DisplayRect>) {
+        (
+            super::desktop::input_desktop_is_secure(),
+            self.primary_rect(),
+        )
+    }
+
     fn cursor_position(&self) -> Result<Point> {
         with_per_monitor_dpi(read_cursor_position)
     }

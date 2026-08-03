@@ -59,7 +59,11 @@ impl AgentRequest {
 pub(super) enum AgentResponse {
     Ok,
     Pong,
-    Started { layout: DesktopLayout },
+    Started {
+        layout: DesktopLayout,
+        secure_desktop: bool,
+        primary: Option<DisplayRect>,
+    },
     Point(Point),
     Snapshot(KeySnapshot),
     Error(String),

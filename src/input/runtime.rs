@@ -494,8 +494,7 @@ pub(super) async fn run_sender(
                 match message {
                     InputMessage::ReturnRequest { generation: remote_generation, edge_position }
                         if control.active
-                            && remote_generation == control.generation
-                            && !secure_desktop =>
+                            && remote_generation == control.generation =>
                     {
                             if options.block_switch_on_press && !control.local_pressed.is_empty() {
                                 control.pending_return_request =
@@ -574,15 +573,13 @@ pub(super) async fn run_sender(
                                 repeat: mapped.repeat,
                             })?;
                         }
-                        if !secure_desktop {
-                            finish_pending_sender_return(
-                                tx,
-                                platform,
-                                &local_layout,
-                                source_edge,
-                                &mut control,
-                            )?;
-                        }
+                        finish_pending_sender_return(
+                            tx,
+                            platform,
+                            &local_layout,
+                            source_edge,
+                            &mut control,
+                        )?;
                     }
                     NativeEvent::Button { button, down } if control.active => {
                         control.local_pressed.button(button, down);
@@ -591,15 +588,13 @@ pub(super) async fn run_sender(
                             button,
                             down,
                         })?;
-                        if !secure_desktop {
-                            finish_pending_sender_return(
-                                tx,
-                                platform,
-                                &local_layout,
-                                source_edge,
-                                &mut control,
-                            )?;
-                        }
+                        finish_pending_sender_return(
+                            tx,
+                            platform,
+                            &local_layout,
+                            source_edge,
+                            &mut control,
+                        )?;
                     }
                     NativeEvent::Wheel { x, y, source } if control.active => {
                         let (x, y) = transform_scroll(
@@ -906,8 +901,7 @@ pub(super) async fn run_receiver(
     let mut active = false;
     let mut return_edge = ScreenEdge::Left;
     let mut cursor = None;
-    let mut secure_desktop = false;
-    let mut secure_primary = None;
+    let (mut secure_desktop, mut secure_primary) = platform.backend.secure_desktop_state();
     let mut cursor_mode_active = match options.cursor_mode {
         CursorMode::Desktop => false,
         CursorMode::Auto => foreground_captured(),
@@ -992,6 +986,31 @@ pub(super) async fn run_receiver(
                                 edge = ?return_edge,
                                 "游戏光标模式接管, 跳过边缘定位"
                             );
+                        } else if secure_desktop {
+                            // 安全桌面期间窗口消息 warp 不可用, 跳过窗口定位,
+                            // 用实际光标位置锚定并钳制到主屏.
+                            let entry = local_layout.point_inside_edge(
+                                return_edge,
+                                edge_position,
+                                EDGE_INSET,
+                            );
+                            let anchor = match platform.backend.cursor_position() {
+                                Ok(point) => point,
+                                Err(error) => {
+                                    tracing::warn!(
+                                        generation,
+                                        error = %error,
+                                        "安全桌面下无法读取实际光标位置, 回退到边缘入口"
+                                    );
+                                    entry
+                                }
+                            };
+                            cursor = Some(clamp_secure_target(anchor, secure_primary));
+                            tracing::info!(
+                                generation,
+                                point = ?cursor,
+                                "安全桌面接管, 跳过窗口 warp, 使用实际光标位置锚定"
+                            );
                         } else {
                             let entry = local_layout.point_inside_edge(
                                 return_edge,
@@ -1055,7 +1074,6 @@ pub(super) async fn run_receiver(
                                 &mut cursor,
                                 dx,
                                 dy,
-                                secure_desktop,
                                 secure_primary,
                             )? {
                                 enqueue_message(tx, InputMessage::ReturnRequest { generation, edge_position })?;
@@ -1084,7 +1102,6 @@ pub(super) async fn run_receiver(
                         &mut cursor,
                         motion.dx,
                         motion.dy,
-                        secure_desktop,
                         secure_primary,
                     )? {
                         enqueue_message(tx, InputMessage::ReturnRequest { generation, edge_position })?;
@@ -1122,7 +1139,18 @@ pub(super) async fn run_receiver(
                             tracing::info!(generation, "本机进入安全桌面, 保持远程控制");
                         } else {
                             if active && cursor.is_some() {
-                                cursor = Some(platform.backend.cursor_position()?);
+                                match platform.backend.cursor_position() {
+                                    Ok(point) => cursor = Some(point),
+                                    Err(error) => {
+                                        // 桌面切换瞬间 GetCursorPos 可能暂时失败,
+                                        // 保留原锚点并继续控制, 避免辅助连接被误杀.
+                                        tracing::warn!(
+                                            error = %error,
+                                            generation,
+                                            "离开安全桌面后暂时无法读取光标位置, 保留原锚点"
+                                        );
+                                    }
+                                }
                             }
                             tracing::info!(generation, "本机已离开安全桌面, 重新锚定光标");
                         }
@@ -1177,11 +1205,10 @@ fn apply_receiver_motion(
     cursor: &mut Option<super::Point>,
     dx: i32,
     dy: i32,
-    secure_desktop: bool,
     secure_primary: Option<DisplayRect>,
 ) -> Result<Option<f32>> {
     let point = cursor.context("输入接收端缺少逻辑光标位置")?;
-    match receiver_motion(layout, return_edge, point, dx, dy, secure_desktop) {
+    match receiver_motion(layout, return_edge, point, dx, dy) {
         ReceiverMotion::Return(edge_position) => {
             let target = layout.move_within_layout(point, dx, dy);
             backend.inject_cursor(target)?;
@@ -1223,11 +1250,8 @@ fn receiver_motion(
     point: super::Point,
     dx: i32,
     dy: i32,
-    secure_desktop: bool,
 ) -> ReceiverMotion {
-    if !secure_desktop
-        && let Some(edge_position) = layout.crossed_outer_edge_position(return_edge, point, dx, dy)
-    {
+    if let Some(edge_position) = layout.crossed_outer_edge_position(return_edge, point, dx, dy) {
         ReceiverMotion::Return(edge_position)
     } else {
         ReceiverMotion::Move(layout.move_within_layout(point, dx, dy))
@@ -2525,20 +2549,19 @@ mod tests {
             Point { x: 8, y: 40 },
             30,
             5,
-            false,
         );
         assert_eq!(first, ReceiverMotion::Move(Point { x: 38, y: 45 }));
         let ReceiverMotion::Move(point) = first else {
             panic!("第一次移动不应返回本机");
         };
         assert_eq!(
-            receiver_motion(&layout, ScreenEdge::Left, point, 30, 5, false),
+            receiver_motion(&layout, ScreenEdge::Left, point, 30, 5),
             ReceiverMotion::Move(Point { x: 68, y: 50 }),
         );
     }
 
     #[test]
-    fn receiver_suppresses_edge_return_on_secure_desktop() {
+    fn receiver_still_allows_edge_return_on_secure_desktop() {
         let layout = DesktopLayout::new(vec![DisplayRect {
             x: 0,
             y: 0,
@@ -2548,12 +2571,12 @@ mod tests {
         .unwrap();
         let point = Point { x: 5, y: 50 };
         assert_eq!(
-            receiver_motion(&layout, ScreenEdge::Left, point, -10, 0, false),
+            receiver_motion(&layout, ScreenEdge::Left, point, -10, 0),
             ReceiverMotion::Return(0.5),
         );
         assert_eq!(
-            receiver_motion(&layout, ScreenEdge::Left, point, -10, 0, true),
-            ReceiverMotion::Move(Point { x: 0, y: 50 }),
+            receiver_motion(&layout, ScreenEdge::Left, point, -10, 0),
+            ReceiverMotion::Return(0.5),
         );
     }
 

@@ -52,6 +52,8 @@ fn test_client(
         next_lease: AtomicU64::new(1),
         active_lease: AtomicU64::new(0),
         is_system: AtomicBool::new(false),
+        secure_desktop: AtomicBool::new(false),
+        secure_primary: Mutex::new(None),
     }
 }
 
@@ -187,11 +189,13 @@ fn native_dual_pipe_transport_survives_cursor_lifecycle_and_event_pressure() {
     let event_context = Arc::clone(&context);
     let event_created = created_tx;
     let event_server_name = event_name.clone();
+    let event_commands = commands.clone();
     let gui_event = std::thread::spawn(move || -> Result<()> {
         let mut pipe = create_test_server(&event_server_name, PipeDirection::ClientToServer);
         event_created.send(()).unwrap();
         pipe.connect_server(CONNECT_TIMEOUT)?;
-        client_event_reader_loop(pipe, event_pending, event_context, event_alive, false)
+        let event_client = Arc::new(test_client(event_commands, Arc::clone(&event_alive)));
+        client_event_reader_loop(pipe, event_pending, event_context, event_alive, event_client)
     });
 
     created_rx.recv_timeout(CONNECT_TIMEOUT).unwrap();

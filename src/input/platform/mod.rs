@@ -56,6 +56,11 @@ pub trait InputBackend: Send + Sync {
     fn primary_rect(&self) -> Option<DisplayRect> {
         None
     }
+    /// 当前是否处于安全桌面, 以及安全桌面期间光标应钳制的主屏矩形.
+    /// 仅在 Windows SYSTEM 输入代理下有意义, 其他平台默认不处于安全桌面.
+    fn secure_desktop_state(&self) -> (bool, Option<DisplayRect>) {
+        (false, None)
+    }
     fn cursor_position(&self) -> Result<Point>;
     fn snapshot(&self) -> KeySnapshot;
     fn set_capture(&self, active: bool) -> Result<()>;

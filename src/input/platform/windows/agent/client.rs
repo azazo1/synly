@@ -11,7 +11,7 @@ use super::{
     REQUEST_DELIVERY_TIMEOUT,
 };
 use super::super::super::{CaptureContext, InputBackend, NativeEvent};
-use crate::input::{DesktopLayout, InputMode, KeySnapshot, ModifierMask, Point};
+use crate::input::{DesktopLayout, DisplayRect, InputMode, KeySnapshot, ModifierMask, Point};
 use anyhow::{Context, Result, anyhow, bail};
 use std::collections::HashMap;
 use std::os::windows::process::CommandExt;
@@ -72,6 +72,8 @@ pub(super) struct AgentClient {
     pub(super) next_lease: AtomicU64,
     pub(super) active_lease: AtomicU64,
     pub(super) is_system: AtomicBool,
+    pub(super) secure_desktop: AtomicBool,
+    pub(super) secure_primary: Mutex<Option<DisplayRect>>,
 }
 
 struct GuiTransportStart {
@@ -316,13 +318,25 @@ pub(in crate::input) fn start_client(context: CaptureContext) -> Result<Arc<dyn 
         .lifecycle
         .lock()
         .map_err(|_| anyhow!("Windows input agent lifecycle poisoned"))?;
-    let layout = match client.request(AgentRequest::Start {
+    let (layout, secure_desktop, primary) = match client.request(AgentRequest::Start {
         mode: context.mode,
         hotkey: context.hotkey,
     })? {
-        AgentResponse::Started { layout } => layout,
+        AgentResponse::Started {
+            layout,
+            secure_desktop,
+            primary,
+        } => (layout, secure_desktop, primary),
         _ => bail!("Windows input agent returned an invalid Start response"),
     };
+    client
+        .secure_desktop
+        .store(secure_desktop, Ordering::Release);
+    *client
+        .secure_primary
+        .lock()
+        .map_err(|_| anyhow!("Windows input agent secure desktop state poisoned"))? =
+        primary;
     let lease = client.next_lease.fetch_add(1, Ordering::AcqRel);
     client.active_lease.store(lease, Ordering::Release);
     *client
@@ -464,6 +478,17 @@ impl InputBackend for AgentBackend {
             bail!("Windows input agent connection is closed");
         }
         Ok(())
+    }
+
+    fn secure_desktop_state(&self) -> (bool, Option<DisplayRect>) {
+        (
+            self.client.secure_desktop.load(Ordering::Acquire),
+            self.client
+                .secure_primary
+                .lock()
+                .ok()
+                .and_then(|primary| *primary),
+        )
     }
 
     fn layout(&self) -> Result<DesktopLayout> {
@@ -624,6 +649,8 @@ fn start_gui_transport(
         next_lease: AtomicU64::new(1),
         active_lease: AtomicU64::new(0),
         is_system: AtomicBool::new(false),
+        secure_desktop: AtomicBool::new(false),
+        secure_primary: Mutex::new(None),
     });
     let (created_tx, created_rx) = std::sync::mpsc::sync_channel(2);
     let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(2);
@@ -804,16 +831,15 @@ fn gui_event_owner(
             );
         }
     }
-    let client_is_system = client.is_system.load(Ordering::Acquire);
     ready
-        .send(Ok(client))
+        .send(Ok(Arc::clone(&client)))
         .map_err(|_| anyhow!("Windows input agent readiness receiver closed"))?;
     client_event_reader_loop(
         pipe,
         pending,
         context,
         alive,
-        client_is_system,
+        client,
     )
 }
 
@@ -822,8 +848,9 @@ pub(super) fn client_event_reader_loop(
     pending: PendingResponses,
     context: Arc<Mutex<Option<CaptureContext>>>,
     alive: Arc<AtomicBool>,
-    is_system: bool,
+    client: Arc<AgentClient>,
 ) -> Result<()> {
+    let is_system = client.is_system.load(Ordering::Acquire);
     while alive.load(Ordering::Acquire) {
         let packet = match read_packet::<AgentToGuiPacket>(&mut pipe, AGENT_HEARTBEAT_TIMEOUT) {
             Ok(packet) => packet,
@@ -880,6 +907,10 @@ pub(super) fn client_event_reader_loop(
                 }
             }
             AgentToGuiPacket::SecureDesktopChanged { secure, primary } => {
+                client.secure_desktop.store(secure, Ordering::Release);
+                if let Ok(mut state) = client.secure_primary.lock() {
+                    *state = primary;
+                }
                 if let Ok(context) = context.lock()
                     && let Some(context) = context.as_ref()
                 {

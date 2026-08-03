@@ -497,7 +497,18 @@ async fn handle_agent_request(
             }
             *runtime = Some(start_native_runtime(mode, hotkey, outgoing)?);
             let layout = agent_backend(runtime)?.layout()?;
-            Ok(AgentResponse::Started { layout })
+            let secure_desktop =
+                !super::super::desktop::current_input_desktop_is_default();
+            let primary = if secure_desktop {
+                agent_backend(runtime)?.primary_rect()
+            } else {
+                None
+            };
+            Ok(AgentResponse::Started {
+                layout,
+                secure_desktop,
+                primary,
+            })
         }
         AgentRequest::Stop => {
             if let Some(previous) = runtime.take() {
