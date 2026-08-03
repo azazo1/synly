@@ -52,7 +52,7 @@ cargo run --
 
 ### GitHub 发布
 
-发布工作流在 branch 和 pull request 上执行跨平台编译, 在 tag 或手动指定已有 tag 时生成发布产物. Linux 只做 release 编译, Windows 上传带 exe 图标的 zip, macOS 上传 Intel 和 Apple Silicon 的 app dmg.
+发布工作流在 branch 和 pull request 上执行跨平台编译, 在 tag 或手动指定已有 tag 时生成发布产物. Linux 只做 release 编译, Windows 上传带 exe 图标的 zip, macOS 上传 Intel 和 Apple Silicon 的 app dmg, Android 上传 arm64 APK.
 
 创建版本时先提交 `docs/changelog/VERSION.md`, 再创建 annotated tag:
 
