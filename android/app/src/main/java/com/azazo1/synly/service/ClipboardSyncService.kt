@@ -102,6 +102,14 @@ class ClipboardSyncService : android.app.Service() {
         return START_STICKY
     }
 
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        super.onTaskRemoved(rootIntent)
+        stopping = true
+        SynlyEngine.stop()
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
     override fun onDestroy() {
         stopForeground(STOP_FOREGROUND_REMOVE)
         getSystemService(ClipboardManager::class.java)

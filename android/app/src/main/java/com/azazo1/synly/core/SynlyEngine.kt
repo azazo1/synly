@@ -158,11 +158,14 @@ object SynlyEngine {
     }
 
     fun stop() {
-        scope.launch {
-            runCatching { handle?.stop() }
-            handle = null
-            currentTarget = null
-            clearUiState()
+        val handleToStop = handle
+        handle = null
+        currentTarget = null
+        clearUiState()
+        if (handleToStop != null) {
+            scope.launch {
+                runCatching { handleToStop.stop() }
+            }
         }
     }
 
