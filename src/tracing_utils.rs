@@ -10,7 +10,7 @@ use tracing_subscriber::Registry;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-const GUI_LOG_CAPACITY: usize = 500;
+const GUI_LOG_CAPACITY: usize = 200;
 static GUI_LOGS: OnceLock<Arc<Mutex<VecDeque<String>>>> = OnceLock::new();
 static FILTER_HANDLE: OnceLock<reload::Handle<EnvFilter, Registry>> = OnceLock::new();
 
@@ -119,4 +119,14 @@ pub fn recent_logs() -> String {
         .and_then(|logs| logs.lock().ok())
         .map(|logs| logs.iter().cloned().collect::<Vec<_>>().join("\n"))
         .unwrap_or_default()
+}
+
+pub fn clear_logs() {
+    let Some(logs) = GUI_LOGS.get() else {
+        return;
+    };
+    let Ok(mut logs) = logs.lock() else {
+        return;
+    };
+    logs.clear();
 }

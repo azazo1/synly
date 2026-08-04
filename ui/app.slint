@@ -109,6 +109,7 @@ export component AppWindow inherits Window {
     in property <[SessionRow]> sessions;
     in property <[TrustedRow]> trusted-devices;
     in property <string> log-text;
+    in-out property <string> log-action-text;
     in property <string> about-version: "";
 
     in-out property <int> connection-index: 0;
@@ -172,6 +173,7 @@ export component AppWindow inherits Window {
     callback quit-application();
     callback apply-settings();
     callback choose-path();
+    callback clear-log-view();
     callback set-clipboard-mode(int);
     callback set-audio-mode(int);
     callback set-input-mode(int);
@@ -632,6 +634,11 @@ export component AppWindow inherits Window {
                 padding: 18px;
                 spacing: 8px;
                 Text { text: "日志"; font-size: 22px; font-weight: 680; color: #202523; height: 34px; }
+                HorizontalLayout {
+                    Rectangle { horizontal-stretch: 1; }
+                    Button { text: "清空显示"; clicked => { root.clear-log-view(); } }
+                }
+                if root.log-action-text != "": Text { text: root.log-action-text; color: #7c8380; font-size: 12px; }
                 TextEdit {
                     text: root.log-text;
                     read-only: true;

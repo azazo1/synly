@@ -280,6 +280,15 @@ fn wire_window_callbacks(
         }
     });
 
+    let weak = window.as_weak();
+    window.on_clear_log_view(move || {
+        crate::tracing_utils::clear_logs();
+        if let Some(window) = weak.upgrade() {
+            window.set_log_text(String::new().into());
+            window.set_log_action_text("已清空日志显示".into());
+        }
+    });
+
     let commands = handle.commands();
     window.on_set_clipboard_mode(move |index| {
         send_command(
