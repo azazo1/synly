@@ -1,6 +1,7 @@
 use super::identity::{generate_keypair, validate_keypair};
+use super::migrations;
 use super::schema::{
-    ClipboardConfig, DeviceConfig, DiscoveryConfig, InputConfig, NotificationConfig,
+    ClipboardConfig, DeviceConfig, DiscoveryConfig, GuiState, InputConfig, NotificationConfig,
     RuntimeConfig, SynlyConfig, TransferConfig, TrustedDeviceConfig, UiConfig,
 };
 use crate::path_expand::home_dir;
@@ -16,12 +17,14 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 const CONFIG_FILE_NAME: &str = "config.toml";
+const GUI_STATE_FILE_NAME: &str = "gui-state.toml";
 const IDENTITY_FILE_NAME: &str = "identity.toml";
 const TRUSTED_DEVICES_FILE_NAME: &str = "trusted-devices.toml";
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct MainConfigFile {
+    version: u32,
     device: DeviceFileConfig,
     clipboard: ClipboardConfig,
     transfer: TransferConfig,
@@ -64,6 +67,7 @@ struct RuntimeFileConfig {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IdentityFile {
+    version: u32,
     device_id: Uuid,
     private_key: String,
     public_key: String,
@@ -72,7 +76,17 @@ struct IdentityFile {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TrustedDevicesFile {
+    version: u32,
     devices: Vec<TrustedDeviceConfig>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GuiStateFile {
+    version: u32,
+    first_run_completed: bool,
+    window_width: u32,
+    window_height: u32,
 }
 
 pub(super) fn load_or_create() -> Result<SynlyConfig> {
@@ -92,64 +106,113 @@ pub(super) fn save_trusted_devices(config: &SynlyConfig) -> Result<()> {
     write_toml_atomic(
         &config_dir()?.join(TRUSTED_DEVICES_FILE_NAME),
         &TrustedDevicesFile {
+            version: migrations::TRUSTED_DEVICES_VERSION,
             devices: config.trusted_devices.clone(),
         },
     )
 }
 
+pub(super) fn save_gui_state(config: &SynlyConfig) -> Result<()> {
+    write_toml_atomic(
+        &config_dir()?.join(GUI_STATE_FILE_NAME),
+        &GuiStateFile::from(&config.gui_state),
+    )
+}
+
 fn load_or_create_in_dir(dir: &Path) -> Result<SynlyConfig> {
     let main_path = dir.join(CONFIG_FILE_NAME);
+    let gui_state_path = dir.join(GUI_STATE_FILE_NAME);
     let identity_path = dir.join(IDENTITY_FILE_NAME);
     let trusted_path = dir.join(TRUSTED_DEVICES_FILE_NAME);
 
-    // 先解析所有现存文件, 避免旧格式或损坏文件导致部分新文件落盘.
-    let existing_main = read_optional_toml::<MainConfigFile>(&main_path)?;
-    let existing_identity = read_optional_toml::<IdentityFile>(&identity_path)?;
-    let existing_trusted = read_optional_toml::<TrustedDevicesFile>(&trusted_path)?;
+    let existing_main = read_optional_main(&main_path)?;
+    let existing_gui_state =
+        read_optional_toml::<GuiStateFile>(&gui_state_path, migrations::migrate_gui_state)?;
+    let existing_identity =
+        read_optional_toml::<IdentityFile>(&identity_path, migrations::migrate_identity)?;
+    let existing_trusted = read_optional_toml::<TrustedDevicesFile>(
+        &trusted_path,
+        migrations::migrate_trusted_devices,
+    )?;
+    let main_missing = existing_main.is_none();
+    let main_migrated = existing_main
+        .as_ref()
+        .is_some_and(|loaded| loaded.migrated);
+    let identity_missing = existing_identity.is_none();
+    let identity_migrated = existing_identity
+        .as_ref()
+        .is_some_and(|loaded| loaded.migrated);
+    let trusted_missing = existing_trusted.is_none();
+    let trusted_migrated = existing_trusted
+        .as_ref()
+        .is_some_and(|loaded| loaded.migrated);
+    let gui_state_missing = existing_gui_state.is_none();
+    let legacy_gui_state = existing_main
+        .as_ref()
+        .and_then(|loaded| loaded.legacy_gui_state.clone());
     if let Some(identity) = &existing_identity {
-        validate_keypair(&identity.private_key, &identity.public_key)
+        validate_keypair(&identity.value.private_key, &identity.value.public_key)
             .with_context(|| format!("invalid identity at {}", identity_path.display()))?;
     }
     if let Some(trusted) = &existing_trusted {
-        validate_trusted_devices(&trusted.devices)
+        validate_trusted_devices(&trusted.value.devices)
             .with_context(|| format!("invalid trusted devices at {}", trusted_path.display()))?;
     }
 
     let identity = match existing_identity {
-        Some(identity) => identity,
+        Some(identity) => identity.value,
         None => {
             let (private_key, public_key) = generate_keypair()?;
             IdentityFile {
+                version: migrations::IDENTITY_VERSION,
                 device_id: Uuid::new_v4(),
                 private_key,
                 public_key,
             }
         }
     };
-    let main = existing_main.unwrap_or_else(|| MainConfigFile::new(identity.device_id));
+    let main = existing_main
+        .map(|loaded| loaded.value)
+        .unwrap_or_else(|| MainConfigFile::new(identity.device_id));
     validate_main_file(&main)?;
-    let trusted = existing_trusted.unwrap_or(TrustedDevicesFile {
-        devices: Vec::new(),
-    });
+    let trusted = existing_trusted
+        .map(|loaded| loaded.value)
+        .unwrap_or(TrustedDevicesFile {
+            version: migrations::TRUSTED_DEVICES_VERSION,
+            devices: Vec::new(),
+        });
+    let gui_state = existing_gui_state
+        .map(|loaded| loaded.value.into_runtime())
+        .or(legacy_gui_state)
+        .unwrap_or_default();
+    let config = main.into_runtime(
+        identity.clone(),
+        trusted.devices.clone(),
+        gui_state,
+    );
 
     fs::create_dir_all(dir)
         .with_context(|| format!("failed to create config dir {}", dir.display()))?;
-    if !main_path.exists() {
-        write_toml_atomic(&main_path, &main)?;
+    if gui_state_missing {
+        write_toml_atomic(&gui_state_path, &GuiStateFile::from(&config.gui_state))?;
     }
-    if !identity_path.exists() {
+    if identity_missing || identity_migrated {
         write_toml_atomic(&identity_path, &identity)?;
     }
-    if !trusted_path.exists() {
+    if trusted_missing || trusted_migrated {
         write_toml_atomic(&trusted_path, &trusted)?;
     }
+    if main_missing || main_migrated {
+        write_toml_atomic(&main_path, &MainConfigFile::from(&config))?;
+    }
 
-    Ok(main.into_runtime(identity, trusted.devices))
+    Ok(config)
 }
 
 impl MainConfigFile {
     fn new(device_id: Uuid) -> Self {
         Self {
+            version: migrations::MAIN_CONFIG_VERSION,
             device: DeviceFileConfig {
                 device_name: detect_device_name(device_id),
             },
@@ -168,6 +231,7 @@ impl MainConfigFile {
         self,
         identity: IdentityFile,
         trusted_devices: Vec<TrustedDeviceConfig>,
+        gui_state: GuiState,
     ) -> SynlyConfig {
         SynlyConfig {
             device: DeviceConfig {
@@ -181,6 +245,7 @@ impl MainConfigFile {
             notifications: self.notifications,
             discovery: self.discovery,
             ui: self.ui,
+            gui_state,
             runtime: self.runtime.into_runtime(self.input),
             trusted_devices,
             preferred_active: self.preferred_active,
@@ -191,6 +256,7 @@ impl MainConfigFile {
 impl From<&SynlyConfig> for MainConfigFile {
     fn from(config: &SynlyConfig) -> Self {
         Self {
+            version: migrations::MAIN_CONFIG_VERSION,
             device: DeviceFileConfig {
                 device_name: config.device.device_name.clone(),
             },
@@ -202,6 +268,27 @@ impl From<&SynlyConfig> for MainConfigFile {
             runtime: RuntimeFileConfig::from(&config.runtime),
             input: config.runtime.input.clone(),
             preferred_active: config.preferred_active,
+        }
+    }
+}
+
+impl From<&GuiState> for GuiStateFile {
+    fn from(gui_state: &GuiState) -> Self {
+        Self {
+            version: migrations::GUI_STATE_VERSION,
+            first_run_completed: gui_state.first_run_completed,
+            window_width: gui_state.window_width,
+            window_height: gui_state.window_height,
+        }
+    }
+}
+
+impl GuiStateFile {
+    fn into_runtime(self) -> GuiState {
+        GuiState {
+            first_run_completed: self.first_run_completed,
+            window_width: self.window_width,
+            window_height: self.window_height,
         }
     }
 }
@@ -258,14 +345,59 @@ impl From<&RuntimeConfig> for RuntimeFileConfig {
     }
 }
 
-fn read_optional_toml<T: DeserializeOwned>(path: &Path) -> Result<Option<T>> {
+struct LoadedDocument<T> {
+    value: T,
+    migrated: bool,
+}
+
+struct LoadedMainConfig {
+    value: MainConfigFile,
+    migrated: bool,
+    legacy_gui_state: Option<GuiState>,
+}
+
+fn read_optional_main(path: &Path) -> Result<Option<LoadedMainConfig>> {
+    let Some(raw) = read_optional_raw(path)? else {
+        return Ok(None);
+    };
+    let migration = migrations::migrate_main_config(&raw)
+        .with_context(|| format!("failed to migrate config at {}", path.display()))?;
+    let value = migration
+        .document
+        .try_into()
+        .with_context(|| format!("failed to parse migrated config at {}", path.display()))?;
+    Ok(Some(LoadedMainConfig {
+        value,
+        migrated: migration.migrated,
+        legacy_gui_state: migration.legacy_gui_state,
+    }))
+}
+
+fn read_optional_toml<T: DeserializeOwned>(
+    path: &Path,
+    migrate: fn(&str) -> Result<migrations::MigrationDocument>,
+) -> Result<Option<LoadedDocument<T>>> {
+    let Some(raw) = read_optional_raw(path)? else {
+        return Ok(None);
+    };
+    let migration = migrate(&raw)
+        .with_context(|| format!("failed to migrate config at {}", path.display()))?;
+    let value = migration
+        .document
+        .try_into()
+        .with_context(|| format!("failed to parse migrated config at {}", path.display()))?;
+    Ok(Some(LoadedDocument {
+        value,
+        migrated: migration.migrated,
+    }))
+}
+
+fn read_optional_raw(path: &Path) -> Result<Option<String>> {
     if !path.exists() {
         return Ok(None);
     }
-    let raw = fs::read_to_string(path)
-        .with_context(|| format!("failed to read config at {}", path.display()))?;
-    toml::from_str(&raw)
-        .with_context(|| format!("failed to parse config at {}", path.display()))
+    fs::read_to_string(path)
+        .with_context(|| format!("failed to read config at {}", path.display()))
         .map(Some)
 }
 
@@ -400,10 +532,11 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
-    fn first_start_creates_three_strict_files() {
+    fn first_start_creates_four_strict_files() {
         let dir = unique_test_dir("first-start");
         let config = load_or_create_in_dir(&dir).unwrap();
         assert!(dir.join(CONFIG_FILE_NAME).exists());
+        assert!(dir.join(GUI_STATE_FILE_NAME).exists());
         assert!(dir.join(IDENTITY_FILE_NAME).exists());
         assert!(dir.join(TRUSTED_DEVICES_FILE_NAME).exists());
         assert_eq!(
@@ -415,6 +548,159 @@ mod tests {
         let reloaded = load_or_create_in_dir(&dir).unwrap();
         assert_eq!(reloaded.device.device_id, config.device.device_id);
         assert_eq!(reloaded.runtime, config.runtime);
+        assert_eq!(reloaded.gui_state, config.gui_state);
+        assert!(fs::read_to_string(dir.join(CONFIG_FILE_NAME))
+            .unwrap()
+            .contains("version = 1"));
+        assert!(fs::read_to_string(dir.join(GUI_STATE_FILE_NAME))
+            .unwrap()
+            .contains("version = 1"));
+        assert!(fs::read_to_string(dir.join(IDENTITY_FILE_NAME))
+            .unwrap()
+            .contains("version = 1"));
+        assert!(fs::read_to_string(dir.join(TRUSTED_DEVICES_FILE_NAME))
+            .unwrap()
+            .contains("version = 1"));
+        cleanup_dir(&dir);
+    }
+
+    #[test]
+    fn legacy_files_migrate_to_version_one_and_split_gui_state() {
+        let dir = unique_test_dir("legacy-migration");
+        let config = load_or_create_in_dir(&dir).unwrap();
+        let device_id = config.device.device_id;
+
+        let mut main: toml::Value =
+            toml::from_str(&fs::read_to_string(dir.join(CONFIG_FILE_NAME)).unwrap()).unwrap();
+        let main_table = main.as_table_mut().unwrap();
+        main_table.remove("version");
+        let ui = main_table
+            .get_mut("ui")
+            .and_then(toml::Value::as_table_mut)
+            .unwrap();
+        ui.insert("first_run_completed".to_string(), toml::Value::Boolean(true));
+        ui.insert("window_width".to_string(), toml::Value::Integer(900));
+        ui.insert("window_height".to_string(), toml::Value::Integer(600));
+        fs::write(
+            dir.join(CONFIG_FILE_NAME),
+            toml::to_string_pretty(&main).unwrap(),
+        )
+        .unwrap();
+        fs::remove_file(dir.join(GUI_STATE_FILE_NAME)).unwrap();
+
+        for file_name in [IDENTITY_FILE_NAME, TRUSTED_DEVICES_FILE_NAME] {
+            let path = dir.join(file_name);
+            let mut document: toml::Value =
+                toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+            document.as_table_mut().unwrap().remove("version");
+            fs::write(&path, toml::to_string_pretty(&document).unwrap()).unwrap();
+        }
+
+        let migrated = load_or_create_in_dir(&dir).unwrap();
+        assert_eq!(migrated.device.device_id, device_id);
+        assert_eq!(
+            migrated.gui_state,
+            GuiState {
+                first_run_completed: true,
+                window_width: 900,
+                window_height: 600,
+            }
+        );
+
+        let main: toml::Value =
+            toml::from_str(&fs::read_to_string(dir.join(CONFIG_FILE_NAME)).unwrap()).unwrap();
+        assert_eq!(main["version"].as_integer(), Some(1));
+        assert!(!main["ui"].as_table().unwrap().contains_key("first_run_completed"));
+        assert!(!main["ui"].as_table().unwrap().contains_key("window_width"));
+        assert!(!main["ui"].as_table().unwrap().contains_key("window_height"));
+        let gui_state: GuiStateFile =
+            toml::from_str(&fs::read_to_string(dir.join(GUI_STATE_FILE_NAME)).unwrap()).unwrap();
+        assert_eq!(gui_state.version, migrations::GUI_STATE_VERSION);
+        assert_eq!(gui_state.window_width, 900);
+        assert_eq!(gui_state.window_height, 600);
+        assert_eq!(
+            toml::from_str::<IdentityFile>(
+                &fs::read_to_string(dir.join(IDENTITY_FILE_NAME)).unwrap()
+            )
+            .unwrap()
+            .version,
+            migrations::IDENTITY_VERSION
+        );
+        assert_eq!(
+            toml::from_str::<TrustedDevicesFile>(
+                &fs::read_to_string(dir.join(TRUSTED_DEVICES_FILE_NAME)).unwrap()
+            )
+            .unwrap()
+            .version,
+            migrations::TRUSTED_DEVICES_VERSION
+        );
+
+        let main_after = fs::read_to_string(dir.join(CONFIG_FILE_NAME)).unwrap();
+        let gui_after = fs::read_to_string(dir.join(GUI_STATE_FILE_NAME)).unwrap();
+        let reloaded = load_or_create_in_dir(&dir).unwrap();
+        assert_eq!(reloaded.gui_state, migrated.gui_state);
+        assert_eq!(fs::read_to_string(dir.join(CONFIG_FILE_NAME)).unwrap(), main_after);
+        assert_eq!(
+            fs::read_to_string(dir.join(GUI_STATE_FILE_NAME)).unwrap(),
+            gui_after
+        );
+        cleanup_dir(&dir);
+    }
+
+    #[test]
+    fn existing_gui_state_wins_over_legacy_main_fields() {
+        let dir = unique_test_dir("gui-state-precedence");
+        load_or_create_in_dir(&dir).unwrap();
+        let mut main: toml::Value =
+            toml::from_str(&fs::read_to_string(dir.join(CONFIG_FILE_NAME)).unwrap()).unwrap();
+        let main_table = main.as_table_mut().unwrap();
+        main_table.remove("version");
+        let ui = main_table
+            .get_mut("ui")
+            .and_then(toml::Value::as_table_mut)
+            .unwrap();
+        ui.insert("first_run_completed".to_string(), toml::Value::Boolean(false));
+        ui.insert("window_width".to_string(), toml::Value::Integer(900));
+        ui.insert("window_height".to_string(), toml::Value::Integer(600));
+        fs::write(
+            dir.join(CONFIG_FILE_NAME),
+            toml::to_string_pretty(&main).unwrap(),
+        )
+        .unwrap();
+        let gui_state = GuiStateFile {
+            version: migrations::GUI_STATE_VERSION,
+            first_run_completed: true,
+            window_width: 1000,
+            window_height: 700,
+        };
+        write_toml_atomic(&dir.join(GUI_STATE_FILE_NAME), &gui_state).unwrap();
+
+        let loaded = load_or_create_in_dir(&dir).unwrap();
+        assert_eq!(loaded.gui_state.window_width, 1000);
+        assert_eq!(loaded.gui_state.window_height, 700);
+        let main: toml::Value =
+            toml::from_str(&fs::read_to_string(dir.join(CONFIG_FILE_NAME)).unwrap()).unwrap();
+        assert_eq!(main["version"].as_integer(), Some(1));
+        assert!(!main["ui"].as_table().unwrap().contains_key("window_width"));
+        cleanup_dir(&dir);
+    }
+
+    #[test]
+    fn gui_state_serialization_does_not_change_main_config() {
+        let dir = unique_test_dir("gui-state-isolation");
+        let mut config = load_or_create_in_dir(&dir).unwrap();
+        let main_before = fs::read_to_string(dir.join(CONFIG_FILE_NAME)).unwrap();
+        config.gui_state.window_width = 1000;
+        config.gui_state.window_height = 700;
+        write_toml_atomic(
+            &dir.join(GUI_STATE_FILE_NAME),
+            &GuiStateFile::from(&config.gui_state),
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.join(CONFIG_FILE_NAME)).unwrap(),
+            main_before
+        );
         cleanup_dir(&dir);
     }
 
@@ -503,6 +789,7 @@ mod tests {
         write_toml_atomic(
             &dir.join(TRUSTED_DEVICES_FILE_NAME),
             &TrustedDevicesFile {
+                version: migrations::TRUSTED_DEVICES_VERSION,
                 devices: config.trusted_devices,
             },
         )

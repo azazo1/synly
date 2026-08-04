@@ -25,6 +25,7 @@ pub struct SynlyConfig {
     pub notifications: NotificationConfig,
     pub discovery: DiscoveryConfig,
     pub ui: UiConfig,
+    pub gui_state: GuiState,
     pub runtime: RuntimeConfig,
     pub trusted_devices: Vec<TrustedDeviceConfig>,
     /// 首选活跃设备, 跨 host 重启保留.
@@ -69,12 +70,17 @@ pub struct InputConfig {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct UiConfig {
-    pub first_run_completed: bool,
     pub start_hidden: bool,
     pub close_to_tray: bool,
     pub launch_at_login: bool,
     pub resume_last_session: bool,
     pub log_level: LogLevel,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GuiState {
+    pub first_run_completed: bool,
     pub window_width: u32,
     pub window_height: u32,
 }
@@ -147,12 +153,19 @@ impl Default for NotificationConfig {
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
-            first_run_completed: false,
             start_hidden: false,
             close_to_tray: true,
             launch_at_login: false,
             resume_last_session: false,
             log_level: LogLevel::Info,
+        }
+    }
+}
+
+impl Default for GuiState {
+    fn default() -> Self {
+        Self {
+            first_run_completed: false,
             window_width: 1080,
             window_height: 720,
         }
@@ -209,6 +222,10 @@ impl SynlyConfig {
 
     pub fn save_trusted_devices(&self) -> Result<()> {
         super::store::save_trusted_devices(self)
+    }
+
+    pub fn save_gui_state(&self) -> Result<()> {
+        super::store::save_gui_state(self)
     }
 
     pub fn trusted_device(&self, device_id: &Uuid) -> Option<&TrustedDeviceConfig> {

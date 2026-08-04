@@ -1,5 +1,5 @@
 use crate::config::{
-    ClipboardConfig, DiscoveryConfig, LndDiscoveryConfig, RuntimeConfig, SynlyConfig,
+    ClipboardConfig, DiscoveryConfig, GuiState, LndDiscoveryConfig, RuntimeConfig, SynlyConfig,
     TransferConfig, UiConfig,
 };
 use crate::core::{AppCommand, AppSettings, AppSnapshot, AppSupervisor};
@@ -53,7 +53,7 @@ pub fn run(config: SynlyConfig, force_start: bool) -> Result<()> {
     let window = AppWindow::new().context("failed to create Slint main window")?;
     window.set_monospace_font_family(system_monospace_font_family().into());
     window.set_about_version(crate::BUILD_VERSION.into());
-    window.window().set_size(restored_window_size(&config.ui));
+    window.window().set_size(restored_window_size(&config.gui_state));
     let _single_instance_guard =
         single_instance::SingleInstanceGuard::start(listener, window.as_weak())?;
     let tray = tray::TrayController::new(&window, &handle);
@@ -91,7 +91,7 @@ pub fn run(config: SynlyConfig, force_start: bool) -> Result<()> {
     }
 
     tray.start();
-    if !config.ui.first_run_completed || !config.ui.start_hidden {
+    if !config.gui_state.first_run_completed || !config.ui.start_hidden {
         show_main_window(&window).context("failed to show Slint window")?;
     } else {
         let window = window.as_weak();
@@ -989,16 +989,12 @@ fn settings_from_window(
         mdns_enabled: window.get_mdns_enabled(),
         lnd,
     };
-    let (window_width, window_height) = logical_window_size(window);
     let ui = UiConfig {
-        first_run_completed: true,
         start_hidden: window.get_start_hidden(),
         close_to_tray: window.get_close_to_tray(),
         launch_at_login: window.get_launch_at_login(),
         resume_last_session: window.get_resume_last_session(),
         log_level: log_level_from_index(window.get_log_level_index()),
-        window_width,
-        window_height,
     };
     let settings = AppSettings {
         device_name,
@@ -1028,14 +1024,14 @@ fn save_window_state(
     );
 }
 
-fn restored_window_size(ui: &UiConfig) -> LogicalSize {
-    if !ui.first_run_completed {
+fn restored_window_size(gui_state: &GuiState) -> LogicalSize {
+    if !gui_state.first_run_completed {
         return LogicalSize::new(DEFAULT_WINDOW_WIDTH, DEFAULT_WINDOW_HEIGHT);
     }
 
     normalized_restored_window_size(
-        ui.window_width as f32,
-        ui.window_height as f32,
+        gui_state.window_width as f32,
+        gui_state.window_height as f32,
     )
 }
 

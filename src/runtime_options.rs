@@ -221,8 +221,8 @@ fn normalize_optional_text(value: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::config::{
-        ClipboardConfig, DeviceConfig, DiscoveryConfig, NotificationConfig, TransferConfig,
-        UiConfig,
+        ClipboardConfig, DeviceConfig, DiscoveryConfig, GuiState, NotificationConfig,
+        TransferConfig, UiConfig,
     };
     use crate::input::ScreenEdge;
     use crate::settings::InitialSyncMode;
@@ -318,6 +318,7 @@ mod tests {
             notifications: NotificationConfig::default(),
             discovery: DiscoveryConfig::default(),
             ui: UiConfig::default(),
+            gui_state: GuiState::default(),
             runtime: RuntimeConfig::default(),
             trusted_devices: Vec::new(),
             preferred_active: None,

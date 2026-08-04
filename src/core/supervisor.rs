@@ -132,10 +132,9 @@ impl AppSupervisor {
     }
 
     pub async fn run(mut self) {
-        if !self.snapshot.settings.ui.first_run_completed {
-            self.snapshot.settings.ui.first_run_completed = true;
-            self.config.ui.first_run_completed = true;
-            self.save_settings();
+        if !self.config.gui_state.first_run_completed {
+            self.config.gui_state.first_run_completed = true;
+            self.save_gui_state();
             self.publish();
         }
         self.spawn_discovery_loop();
@@ -431,11 +430,9 @@ impl AppSupervisor {
                 {}
             }
             AppCommand::SaveWindowState { width, height } => {
-                self.snapshot.settings.ui.window_width = width;
-                self.snapshot.settings.ui.window_height = height;
-                self.config.ui.window_width = width;
-                self.config.ui.window_height = height;
-                self.save_settings();
+                self.config.gui_state.window_width = width;
+                self.config.gui_state.window_height = height;
+                self.save_gui_state();
                 self.publish();
             }
             AppCommand::Shutdown => return true,
@@ -899,6 +896,12 @@ impl AppSupervisor {
         }
     }
 
+    fn save_gui_state(&mut self) {
+        if let Err(error) = self.config.save_gui_state() {
+            self.set_error(format!("无法保存 GUI 状态: {error:#}"));
+        }
+    }
+
     fn save_trusted_devices(&mut self) {
         if let Err(error) = self.config.save_trusted_devices() {
             self.set_error(format!("无法保存可信设备: {error:#}"));
@@ -1026,8 +1029,8 @@ fn peer_view(peer: DiscoveredPeer, config: &SynlyConfig) -> DiscoveredPeerView {
 mod tests {
     use super::*;
     use crate::config::{
-        ClipboardConfig, DeviceConfig, DiscoveryConfig, NotificationConfig, TransferConfig,
-        UiConfig,
+        ClipboardConfig, DeviceConfig, DiscoveryConfig, GuiState, NotificationConfig,
+        TransferConfig, UiConfig,
     };
     use crate::input::InputMode;
     use crate::protocol::CapabilityEpoch;
@@ -1198,6 +1201,7 @@ mod tests {
             notifications: NotificationConfig::default(),
             discovery: DiscoveryConfig::default(),
             ui: UiConfig::default(),
+            gui_state: GuiState::default(),
             runtime: RuntimeConfig::default(),
             trusted_devices: Vec::new(),
             preferred_active: None,

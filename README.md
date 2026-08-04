@@ -188,19 +188,21 @@ synly --headless join demo-device
 
 ## 配置文件
 
-Synly 使用固定的三文件配置目录:
+Synly 使用固定的四文件配置目录, 每个文件的顶层都有独立的 `version` 字段:
 
 ```text
 ~/.config/synly/
 ├── config.toml
+├── gui-state.toml
 ├── identity.toml
 └── trusted-devices.toml
 ```
 
-- `config.toml` 保存用户设置和运行参数. 输入方向, 屏幕边缘, 热键, 启动提权, 按键映射, 滚动反向, 按住拦截开关, 光标模式(`cursor_mode`, 三选一: `desktop`/`auto`/`game`)都位于 `[input]`.
-- `identity.toml` 保存 `device_id`, `private_key`, `public_key`. 文件缺失时自动生成, 已存在但密钥无效时启动失败.
-- `trusted-devices.toml` 使用 `[[devices]]` 保存可信设备和会话统计.
-- 配置采用严格 schema. 未知字段, 缺失必填字段和旧单文件格式都会导致启动失败, 不会自动迁移或覆盖.
+- `config.toml` 保存用户设置和运行参数. 当前格式版本为 `1`. 输入方向, 屏幕边缘, 热键, 启动提权, 按键映射, 滚动反向, 按住拦截开关, 光标模式(`cursor_mode`, 三选一: `desktop`/`auto`/`game`)都位于 `[input]`.
+- `gui-state.toml` 保存桌面 GUI 的首次运行标记和窗口尺寸. 当前格式版本为 `1`.
+- `identity.toml` 保存 `device_id`, `private_key`, `public_key`. 当前格式版本为 `1`. 文件缺失时自动生成, 已存在但密钥无效时启动失败.
+- `trusted-devices.toml` 使用 `[[devices]]` 保存可信设备和会话统计. 当前格式版本为 `1`.
+- 未带版本号的已知旧文件按版本 `0` 迁移. 迁移由独立 migration 模块按版本顺序执行. 未知字段, 缺失必填字段和高于当前版本的文件都会导致启动失败, 不会被覆盖.
 
 默认跨平台映射为 `Option <-> Win`, `Command <-> Alt`. 映射由发送端应用, 仅在 macOS 与 Windows 之间生效. 两张方向表均支持修改或清空; 多个来源键可以映射到同一个目标键, 同时按下时后按的来源键会被忽略, 直到最后一个来源键松开才释放目标键.
 

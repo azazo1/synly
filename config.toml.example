@@ -1,3 +1,5 @@
+version = 1
+
 # 每台设备的 UUID 和身份密钥由 identity.toml 保存.
 # 首选活跃设备 ID, 由程序写入, host 重启后保持其活跃身份.
 # preferred_active = "00000000-0000-0000-0000-000000000000"
@@ -20,13 +22,10 @@ enabled = true
 
 [ui]
 log_level = "info"
-first_run_completed = false
 start_hidden = false
 close_to_tray = true
 launch_at_login = false
 resume_last_session = false
-window_width = 1080
-window_height = 720
 
 [runtime]
 connection = "host"
