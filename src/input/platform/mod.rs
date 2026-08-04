@@ -51,6 +51,12 @@ pub trait InputBackend: Send + Sync {
         Ok(())
     }
 
+    /// 当前平台是否处于安全输入模式, 如 macOS Secure Input.
+    /// 该状态可能随时间变化, 输入运行时应当暂停同步而不是终止会话.
+    fn secure_input_state(&self) -> bool {
+        false
+    }
+
     fn layout(&self) -> Result<DesktopLayout>;
     /// 当前是否处于安全桌面, 以及安全桌面期间光标应钳制的主屏矩形.
     /// 仅在 Windows SYSTEM 输入代理下有意义, 其他平台默认不处于安全桌面.

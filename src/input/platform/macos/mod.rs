@@ -162,6 +162,7 @@ struct MacState {
     injected_pressed: Mutex<BTreeSet<u16>>,
     injected_buttons: Mutex<BTreeSet<u8>>,
     injected_cursor: Mutex<Option<Point>>,
+    secure_input: AtomicBool,
     keyboard_capture: AtomicBool,
     tap: Mutex<Option<usize>>,
     run_loop: Mutex<Option<usize>>,
@@ -188,9 +189,6 @@ pub fn ensure_permissions(_mode: InputMode) -> Result<()> {
     if !permissions::is_accessibility_trusted() {
         bail!("鼠标键盘同步需要在系统设置中授予 Synly 辅助功能权限")
     }
-    if unsafe { IsSecureEventInputEnabled() } {
-        bail!("macOS Secure Input 已启用, 无法安全启动鼠标键盘同步")
-    }
     Ok(())
 }
 
@@ -203,6 +201,7 @@ pub fn start(context: CaptureContext) -> Result<Arc<dyn InputBackend>> {
         injected_pressed: Mutex::new(BTreeSet::new()),
         injected_buttons: Mutex::new(BTreeSet::new()),
         injected_cursor: Mutex::new(None),
+        secure_input: AtomicBool::new(false),
         keyboard_capture: AtomicBool::new(false),
         tap: Mutex::new(None),
         run_loop: Mutex::new(None),
@@ -294,9 +293,13 @@ unsafe extern "C" fn event_callback(
         return event;
     }
     if event_type == EVENT_TAP_DISABLED_USER_INPUT {
-        state.context.emit_reliable(NativeEvent::Failed(
-            "Quartz event tap 被系统禁用".to_string(),
-        ));
+        if unsafe { IsSecureEventInputEnabled() } {
+            tracing::warn!("macOS 事件 tap 因 Secure Input 暂停, 等待系统恢复输入");
+        } else {
+            state.context.emit_reliable(NativeEvent::Failed(
+                "Quartz event tap 被系统禁用".to_string(),
+            ));
+        }
         return event;
     }
     if unsafe { CGEventGetIntegerValueField(event, FIELD_SOURCE_USER_DATA) } == EVENT_TAG {
@@ -480,17 +483,24 @@ fn enable_background_cursor_updates() {
 
 impl InputBackend for MacBackend {
     fn health_check(&self) -> Result<()> {
-        let result = if !permissions::is_accessibility_trusted() {
-            Err(anyhow::anyhow!("macOS 辅助功能权限已撤销"))
-        } else if unsafe { IsSecureEventInputEnabled() } {
-            Err(anyhow::anyhow!("macOS Secure Input 已启用"))
-        } else {
-            Ok(())
-        };
-        if result.is_err() {
+        if !permissions::is_accessibility_trusted() {
+            let error = anyhow::anyhow!("macOS 辅助功能权限已撤销");
             self.state.context.failed.store(true, Ordering::Release);
+            return Err(error);
         }
-        result
+        Ok(())
+    }
+
+    fn secure_input_state(&self) -> bool {
+        let active = unsafe { IsSecureEventInputEnabled() };
+        let was_active = self.state.secure_input.swap(active, Ordering::AcqRel);
+        if !active && was_active
+            && let Some(tap) = *self.state.tap.lock().unwrap()
+        {
+            unsafe { CGEventTapEnable(tap as CFMachPortRef, true) };
+            tracing::info!("macOS Secure Input 已关闭, 重新启用输入事件 tap");
+        }
+        active
     }
 
     fn layout(&self) -> Result<DesktopLayout> {
@@ -873,6 +883,7 @@ mod tests {
             injected_pressed: Mutex::new(BTreeSet::new()),
             injected_buttons: Mutex::new(BTreeSet::new()),
             injected_cursor: Mutex::new(None),
+            secure_input: AtomicBool::new(false),
             keyboard_capture: AtomicBool::new(false),
             tap: Mutex::new(None),
             run_loop: Mutex::new(None),

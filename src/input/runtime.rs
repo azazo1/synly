@@ -13,6 +13,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::net::TcpStream;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::error::TrySendError;
@@ -225,6 +226,7 @@ async fn run_established(
         while let Some(message) = rx.recv().await {
             write_message(&mut writer, &message).await?;
         }
+        writer.shutdown().await?;
         Result::<()>::Ok(())
     });
     let _writer_abort = AbortOnDrop(writer_task.abort_handle());
@@ -275,20 +277,19 @@ async fn run_established(
     reader_task.abort();
     let _ = reader_task.await;
     drop(tx);
-    if session.is_err() {
-        writer_task.abort();
-        let _ = writer_task.await;
-        return session;
-    }
-    match writer_task.await {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) => {
-            return Err(err);
+    let writer_result = match time::timeout(Duration::from_secs(2), writer_task).await {
+        Ok(result) => result,
+        Err(_) => {
+            tracing::warn!("输入辅助通道关闭超时, 强制断开");
+            return if session.is_err() {
+                session
+            } else {
+                Err(anyhow::anyhow!("输入辅助通道关闭超时"))
+            };
         }
-        Err(err) => {
-            return Err(err.into());
-        }
-    }
+    };
+    let writer_result = writer_result.map_err(anyhow::Error::from)?;
+    writer_result?;
     session
 }
 
@@ -479,6 +480,7 @@ pub(super) async fn run_sender(
     let mut last_activation_ready = None;
     let mut press_blocked = false;
     let mut secure_desktop = false;
+    let mut secure_input = false;
 
     tracing::info!(
         edge = ?source_edge,
@@ -629,6 +631,9 @@ pub(super) async fn run_sender(
                 }
             }
             _ = motion_tick.tick() => {
+                if secure_input {
+                    continue;
+                }
                 let sample = platform.motion.take();
                 if control.active {
                     if sample.dx == 0 && sample.dy == 0 {
@@ -726,6 +731,25 @@ pub(super) async fn run_sender(
             }
             _ = overflow_poll.tick() => {
                 platform.backend.health_check()?;
+                let secure_input_active = platform.backend.secure_input_state();
+                if secure_input_active != secure_input {
+                    secure_input = secure_input_active;
+                    if secure_input_active {
+                        if control.active {
+                            control.recovery.recover();
+                            control.deactivate();
+                            key_mapper.clear();
+                            let _ = tx.try_send(InputMessage::Deactivate {
+                                generation: control.generation,
+                                edge_position: None,
+                            });
+                        }
+                        tracing::warn!("macOS Secure Input 已启用, 输入同步已暂停");
+                    } else {
+                        last_activation_ready = None;
+                        tracing::info!("macOS Secure Input 已关闭, 输入同步已恢复");
+                    }
+                }
                 if platform.overflowed.load(std::sync::atomic::Ordering::Acquire) {
                     if control.active {
                         control.recovery.recover();
@@ -902,6 +926,7 @@ pub(super) async fn run_receiver(
     let mut return_edge = ScreenEdge::Left;
     let mut cursor = None;
     let (mut secure_desktop, mut secure_primary) = platform.backend.secure_desktop_state();
+    let mut secure_input = false;
     let mut cursor_mode_active = match options.cursor_mode {
         CursorMode::Desktop => false,
         CursorMode::Auto => foreground_captured(),
@@ -937,6 +962,28 @@ pub(super) async fn run_receiver(
             }
             _ = overflow_poll.tick() => {
                 platform.backend.health_check()?;
+                let secure_input_active = platform.backend.secure_input_state();
+                if secure_input_active != secure_input {
+                    secure_input = secure_input_active;
+                    if secure_input_active {
+                        if active {
+                            let edge_position =
+                                cursor.map(|point| local_layout.edge_position(return_edge, point));
+                            if let Err(error) = platform.backend.release_all() {
+                                tracing::warn!(error = %error, "暂停 Secure Input 时释放按键失败");
+                            }
+                            active = false;
+                            cursor = None;
+                            let _ = tx.try_send(InputMessage::Deactivate {
+                                generation,
+                                edge_position,
+                            });
+                        }
+                        tracing::warn!("macOS Secure Input 已启用, 输入同步已暂停");
+                    } else {
+                        tracing::info!("macOS Secure Input 已关闭, 输入同步已恢复");
+                    }
+                }
                 if platform.overflowed.load(std::sync::atomic::Ordering::Acquire) {
                     let _ = platform.backend.release_all();
                     bail!("本机输入可靠事件队列已满, 已停止远程控制");
@@ -971,7 +1018,8 @@ pub(super) async fn run_receiver(
             message = incoming.recv() => {
                 let message = message.context("输入辅助读取任务已停止")??;
                 match message {
-                    InputMessage::Activate { generation: incoming_generation, source_edge, edge_position, pressed } => {
+                    InputMessage::Activate { generation: incoming_generation, source_edge, edge_position, pressed }
+                        if !secure_input => {
                         if incoming_generation <= generation {
                             continue;
                         }
@@ -1299,9 +1347,14 @@ mod tests {
         recovery_actions: Mutex<Vec<&'static str>>,
         pressed: Mutex<Option<KeySnapshot>>,
         motions: Mutex<Vec<(i32, i32)>>,
+        secure_input: AtomicBool,
     }
 
     impl InputBackend for FakeBackend {
+        fn secure_input_state(&self) -> bool {
+            self.secure_input.load(Ordering::Acquire)
+        }
+
         fn layout(&self) -> Result<DesktopLayout> {
             DesktopLayout::new(vec![DisplayRect { x: 0, y: 0, width: 100, height: 100 }])
         }
@@ -1557,6 +1610,210 @@ mod tests {
         .expect("松开后应正常激活");
         assert_eq!(edge_position, 0.5);
         assert!(*backend.capture.lock().unwrap());
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn sender_pauses_and_resumes_when_secure_input_changes() {
+        let backend = Arc::new(FakeBackend::default());
+        let layout = backend.layout().unwrap();
+        let motion = Arc::new(MotionAccumulator::default());
+        let (_events_tx, events) = mpsc::channel(1);
+        let mut platform = PlatformHandle {
+            backend: Arc::clone(&backend) as Arc<dyn InputBackend>,
+            events,
+            motion: Arc::clone(&motion),
+            overflowed: Arc::new(AtomicBool::new(false)),
+            failed: Arc::new(AtomicBool::new(false)),
+        };
+        let (_incoming_tx, mut incoming) = mpsc::channel(1);
+        let (outgoing, mut messages) = mpsc::channel(8);
+        let input_options = test_input_options(ScreenEdge::Right);
+
+        let task = tokio::spawn(async move {
+            run_sender(
+                &mut incoming,
+                &outgoing,
+                &mut platform,
+                layout.clone(),
+                ScreenEdge::Right,
+                InputPlatform::current(),
+                &input_options,
+            )
+            .await
+        });
+
+        motion.add_at(4, 0, Point { x: 97, y: 50 });
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if let InputMessage::Activate { .. } =
+                    messages.recv().await.expect("sender 不应提前停止")
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("sender 应正常激活");
+        assert!(*backend.capture.lock().unwrap());
+
+        backend.secure_input.store(true, Ordering::Release);
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if let InputMessage::Deactivate { .. } =
+                    messages.recv().await.expect("sender 不应提前停止")
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("Secure Input 应触发 Deactivate");
+        assert!(!*backend.capture.lock().unwrap());
+
+        backend.secure_input.store(false, Ordering::Release);
+        sleep(Duration::from_millis(350)).await;
+        motion.add_at(4, 0, Point { x: 97, y: 50 });
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if let InputMessage::Activate { .. } =
+                    messages.recv().await.expect("sender 不应提前停止")
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("Secure Input 结束后 sender 应恢复激活");
+        assert!(*backend.capture.lock().unwrap());
+
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn receiver_pauses_and_resumes_when_secure_input_changes() {
+        let backend = Arc::new(FakeBackend::default());
+        let layout = backend.layout().unwrap();
+        let motion = Arc::new(MotionAccumulator::default());
+        let incoming_motion = Arc::new(IncomingMotion::default());
+        let (_events_tx, events) = mpsc::channel(1);
+        let mut platform = PlatformHandle {
+            backend: Arc::clone(&backend) as Arc<dyn InputBackend>,
+            events,
+            motion: Arc::clone(&motion),
+            overflowed: Arc::new(AtomicBool::new(false)),
+            failed: Arc::new(AtomicBool::new(false)),
+        };
+        let (incoming_tx, mut incoming) = mpsc::channel(8);
+        let (outgoing, mut messages) = mpsc::channel(8);
+        let mut input_options = test_input_options(ScreenEdge::Right);
+        input_options.mode = InputMode::Receive;
+        input_options.cursor_mode = super::CursorMode::Game;
+
+        let task = tokio::spawn(async move {
+            run_receiver(
+                &mut incoming,
+                &incoming_motion,
+                &outgoing,
+                &mut platform,
+                layout.clone(),
+                &input_options,
+                || false,
+            )
+            .await
+        });
+
+        incoming_tx
+            .send(Ok(InputMessage::Activate {
+                generation: 1,
+                source_edge: ScreenEdge::Left,
+                edge_position: 0.5,
+                pressed: KeySnapshot {
+                    usages: Vec::new(),
+                    modifiers: ModifierMask::default(),
+                    buttons: Vec::new(),
+                },
+            }))
+            .await
+            .unwrap();
+        incoming_tx
+            .send(Ok(InputMessage::Motion {
+                generation: 1,
+                dx: 5,
+                dy: 0,
+            }))
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if backend.motions.lock().unwrap().contains(&(5, 0)) {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("receiver 应接受对端控制");
+
+        backend.secure_input.store(true, Ordering::Release);
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if let InputMessage::Deactivate { .. } =
+                    messages.recv().await.expect("receiver 不应提前停止")
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("Secure Input 应触发 receiver 返回控制");
+        incoming_tx
+            .send(Ok(InputMessage::Motion {
+                generation: 1,
+                dx: 3,
+                dy: 0,
+            }))
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(backend.motions.lock().unwrap().len(), 1);
+
+        backend.secure_input.store(false, Ordering::Release);
+        sleep(Duration::from_millis(100)).await;
+        incoming_tx
+            .send(Ok(InputMessage::Activate {
+                generation: 2,
+                source_edge: ScreenEdge::Left,
+                edge_position: 0.5,
+                pressed: KeySnapshot {
+                    usages: Vec::new(),
+                    modifiers: ModifierMask::default(),
+                    buttons: Vec::new(),
+                },
+            }))
+            .await
+            .unwrap();
+        incoming_tx
+            .send(Ok(InputMessage::Motion {
+                generation: 2,
+                dx: 7,
+                dy: 0,
+            }))
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if backend.motions.lock().unwrap().len() >= 2 {
+                    break;
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("Secure Input 结束后 receiver 应恢复接受控制");
+
         task.abort();
         let _ = task.await;
     }
