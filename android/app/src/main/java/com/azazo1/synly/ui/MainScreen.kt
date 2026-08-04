@@ -149,6 +149,7 @@ private fun HomeScreen(onOpenSettings: () -> Unit, onOpenLogs: () -> Unit) {
                     StatusCard(
                         state = uiState.state,
                         targetLabel = uiState.targetLabel,
+                        onClick = { SynlyEngine.reconnect(context) },
                         modifier = Modifier.weight(1f),
                     )
                     Button(
@@ -516,6 +517,7 @@ private fun isIgnoringBatteryOptimizations(context: Context): Boolean {
 private fun StatusCard(
     state: FfiClientState?,
     targetLabel: String?,
+    onClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val label = when (state) {
@@ -525,9 +527,18 @@ private fun StatusCard(
         FfiClientState.RECONNECTING -> targetLabel?.let { "重连 $it 中" } ?: "重连中"
         null -> "未连接"
     }
-    Card(modifier = modifier) {
+    val content: @Composable () -> Unit = {
         Column(Modifier.padding(16.dp)) {
             Text(label, style = MaterialTheme.typography.titleMedium)
+        }
+    }
+    if (state == FfiClientState.CONNECTED) {
+        Card(onClick = onClick, modifier = modifier) {
+            content()
+        }
+    } else {
+        Card(modifier = modifier) {
+            content()
         }
     }
 }

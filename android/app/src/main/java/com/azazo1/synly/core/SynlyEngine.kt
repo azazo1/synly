@@ -187,6 +187,14 @@ object SynlyEngine {
     }
 
     fun reloadConfiguration(context: Context) {
+        restartClient(context, requireAutoReconnect = true)
+    }
+
+    fun reconnect(context: Context) {
+        restartClient(context, requireAutoReconnect = false)
+    }
+
+    private fun restartClient(context: Context, requireAutoReconnect: Boolean) {
         val oldHandle = handle
         handle = null
         currentTarget = null
@@ -196,11 +204,11 @@ object SynlyEngine {
             }
         }
         val settings = SettingsStore.load(context)
-        if (settings.lastTarget == null || !settings.autoReconnect) {
+        if (settings.lastTarget == null || (requireAutoReconnect && !settings.autoReconnect)) {
             clearUiState()
             return
         }
-        start(context)
+        start(context, allowAutoReconnect = requireAutoReconnect)
     }
 
     private fun clearUiState() {

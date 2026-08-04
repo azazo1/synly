@@ -22,6 +22,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import uniffi.synly_core.FfiClientState
 
@@ -30,6 +31,8 @@ class ClipboardSyncService : android.app.Service() {
         private const val TAG = "ClipboardSyncService"
         private const val CHANNEL_ID = "synly_sync"
         private const val NOTIFICATION_ID = 1
+        private const val NOTIFICATION_REFRESH_INTERVAL_MS = 60_000L
+
         fun start(context: Context) {
             ContextCompat.startForegroundService(
                 context,
@@ -46,6 +49,7 @@ class ClipboardSyncService : android.app.Service() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var notificationJob: Job? = null
+    private var notificationRefreshJob: Job? = null
     private var lastNotificationState: FfiClientState? = null
     private var lastNotificationDevice: String? = null
     private var lastNotificationTarget: String? = null
@@ -83,12 +87,12 @@ class ClipboardSyncService : android.app.Service() {
                         lastNotificationState = state
                         lastNotificationDevice = device
                         lastNotificationTarget = target
-                        getSystemService(NotificationManager::class.java)
-                            .notify(NOTIFICATION_ID, buildNotification(state, device, target))
+                        showNotification(state, device, target)
                     }
                 }
             }
         }
+        scheduleNotificationRefresh()
         return START_STICKY
     }
 
@@ -99,6 +103,8 @@ class ClipboardSyncService : android.app.Service() {
         releaseMulticastLock()
         notificationJob?.cancel()
         notificationJob = null
+        notificationRefreshJob?.cancel()
+        notificationRefreshJob = null
         scope.cancel()
         SynlyEngine.stop()
         super.onDestroy()
@@ -122,7 +128,7 @@ class ClipboardSyncService : android.app.Service() {
         connectedDevice: String?,
         targetLabel: String?,
     ): Notification {
-        val pending = PendingIntent.getActivity(
+        val openAppPending = PendingIntent.getActivity(
             this,
             0,
             Intent(this, MainActivity::class.java),
@@ -157,7 +163,7 @@ class ClipboardSyncService : android.app.Service() {
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(getString(R.string.sync_notification_title))
             .setContentText(statusText)
-            .setContentIntent(pending)
+            .setContentIntent(openAppPending)
             .addAction(
                 0,
                 getString(R.string.sync_notification_action_pick_file),
@@ -174,6 +180,9 @@ class ClipboardSyncService : android.app.Service() {
                 sendClipboardPending,
             )
             .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setShowWhen(true)
+            .setWhen(System.currentTimeMillis())
             .build()
     }
 
@@ -198,6 +207,26 @@ class ClipboardSyncService : android.app.Service() {
     private fun releaseMulticastLock() {
         multicastLock?.takeIf { it.isHeld }?.release()
         multicastLock = null
+    }
+
+    private fun scheduleNotificationRefresh() {
+        if (notificationRefreshJob != null) return
+        notificationRefreshJob = scope.launch {
+            while (true) {
+                delay(NOTIFICATION_REFRESH_INTERVAL_MS)
+                val ui = SynlyEngine.uiState.value
+                showNotification(ui.state, ui.connectedDevice, ui.targetLabel)
+            }
+        }
+    }
+
+    private fun showNotification(
+        state: FfiClientState?,
+        connectedDevice: String?,
+        targetLabel: String?,
+    ) {
+        getSystemService(NotificationManager::class.java)
+            .notify(NOTIFICATION_ID, buildNotification(state, connectedDevice, targetLabel))
     }
 
     private fun maybeReadClipboard() {
