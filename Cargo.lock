@@ -6565,7 +6565,7 @@ dependencies = [
 
 [[package]]
 name = "synly"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -6616,11 +6616,11 @@ dependencies = [
 
 [[package]]
 name = "synly-build-version"
-version = "0.6.0"
+version = "0.7.0"
 
 [[package]]
 name = "synly-core"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "axum",
