@@ -493,9 +493,6 @@ export component AppWindow inherits Window {
                     spacing: 10px;
                     Text { text: "同步设置"; font-size: 22px; font-weight: 680; color: #202523; height: 34px; }
                     HorizontalLayout {
-                        preferred-height: 286px;
-                        min-height: 286px;
-                        max-height: 286px;
                         vertical-stretch: 0;
                         spacing: 10px;
                         Panel {
@@ -542,13 +539,14 @@ export component AppWindow inherits Window {
                                 text: "macOS -> Windows 原生滚动";
                                 checked <=> root.native-scroll-macos-to-windows;
                                 enabled: root.native-scroll-macos-to-windows-enabled;
+                                Tooltip { text: @markdown("发送端生效"); }
                             }
                             CheckBox {
                                 text: "Windows -> macOS 原生滚动";
                                 checked <=> root.native-scroll-windows-to-macos;
                                 enabled: root.native-scroll-windows-to-macos-enabled;
+                                Tooltip { text: @markdown("发送端生效"); }
                             }
-                            Text { text: "两个开关都在发送端生效"; color: #737b77; font-size: 11px; }
                             Text { text: "光标模式"; color: #737b77; font-size: 11px; }
                             ComboBox { model: ["桌面光标", "自动切换", "游戏光标"]; current-index <=> root.cursor-mode-index; }
                         }
