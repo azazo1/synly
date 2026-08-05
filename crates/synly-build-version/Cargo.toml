@@ -1,6 +1,6 @@
 [package]
 name = "synly-build-version"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2024"
 license = "MIT"
 description = "Synly 构建版本号生成逻辑, 供各平台构建脚本复用"
