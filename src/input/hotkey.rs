@@ -168,7 +168,7 @@ fn parse_named_key(value: &str) -> Result<u16> {
     Ok(usage)
 }
 
-fn key_name(usage: u16) -> String {
+pub(super) fn key_name(usage: u16) -> String {
     match usage {
         0x04..=0x1d => char::from(b'a' + (usage - 0x04) as u8).to_string(),
         0x1e..=0x26 => char::from(b'1' + (usage - 0x1e) as u8).to_string(),
@@ -178,6 +178,18 @@ fn key_name(usage: u16) -> String {
         0x2a => "backspace".to_string(),
         0x2b => "tab".to_string(),
         0x2c => "space".to_string(),
+        0x2d => "minus".to_string(),
+        0x2e => "equal".to_string(),
+        0x2f => "left_bracket".to_string(),
+        0x30 => "right_bracket".to_string(),
+        0x31 => "backslash".to_string(),
+        0x33 => "semicolon".to_string(),
+        0x34 => "apostrophe".to_string(),
+        0x35 => "grave".to_string(),
+        0x36 => "comma".to_string(),
+        0x37 => "period".to_string(),
+        0x38 => "slash".to_string(),
+        0x39 => "caps_lock".to_string(),
         0x3a..=0x45 => format!("f{}", usage - 0x3a + 1),
         0x49 => "insert".to_string(),
         0x4a => "home".to_string(),
@@ -189,6 +201,14 @@ fn key_name(usage: u16) -> String {
         0x50 => "left".to_string(),
         0x51 => "down".to_string(),
         0x52 => "up".to_string(),
+        0xe0 => "left_ctrl".to_string(),
+        0xe1 => "left_shift".to_string(),
+        0xe2 => "left_option".to_string(),
+        0xe3 => "left_command".to_string(),
+        0xe4 => "right_ctrl".to_string(),
+        0xe5 => "right_shift".to_string(),
+        0xe6 => "right_option".to_string(),
+        0xe7 => "right_command".to_string(),
         0x68..=0x73 => format!("f{}", usage - 0x68 + 13),
         _ => format!("hid-{usage}"),
     }

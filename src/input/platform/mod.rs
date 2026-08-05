@@ -65,6 +65,11 @@ pub trait InputBackend: Send + Sync {
     }
     fn cursor_position(&self) -> Result<Point>;
     fn snapshot(&self) -> KeySnapshot;
+    /// 按平台能力校准本机真实按下状态, 并返回校准后的快照.
+    /// 默认实现不校准, 只返回当前事件累计快照.
+    fn refresh_pressed_state(&self) -> Result<KeySnapshot> {
+        Ok(self.snapshot())
+    }
     fn set_capture(&self, active: bool) -> Result<()>;
     /// 仅监听键盘事件而不进入完整捕获: 不隐藏光标, 不分离鼠标, 不吞掉按键.
     /// 用于需要读取本机方向键但不想改变光标状态的工具, 默认不做任何事.

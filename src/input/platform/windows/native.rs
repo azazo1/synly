@@ -23,6 +23,8 @@ type LResult = isize;
 
 const WH_KEYBOARD_LL: i32 = 13;
 const WH_MOUSE_LL: i32 = 14;
+const MAPVK_VSC_TO_VK: u32 = 1;
+const MAPVK_VSC_TO_VK_EX: u32 = 3;
 const HC_ACTION: i32 = 0;
 const WM_QUIT: u32 = 0x0012;
 const WM_DISPLAYCHANGE: u32 = 0x007e;
@@ -285,6 +287,7 @@ unsafe extern "system" {
     fn SetThreadDpiAwarenessContext(context: isize) -> isize;
     fn SendInput(count: u32, inputs: *const InputRaw, size: i32) -> u32;
     fn GetAsyncKeyState(vk: i32) -> i16;
+    fn MapVirtualKeyW(code: u32, map_type: u32) -> u32;
     fn GetSystemMetrics(index: i32) -> i32;
     fn EnumDisplayMonitors(
         dc: Hdc,
@@ -877,6 +880,11 @@ impl InputBackend for WindowsBackend {
         }
     }
 
+    fn refresh_pressed_state(&self) -> Result<KeySnapshot> {
+        refresh_windows_pressed_state(&self.state);
+        Ok(self.snapshot())
+    }
+
     fn set_capture(&self, active: bool) -> Result<()> {
         let phase = capture_phase(&self.state);
         if (active && phase == CapturePhase::Relaying)
@@ -1278,6 +1286,62 @@ fn usage_is_modifier(usage: u16) -> bool {
 
 fn key_down(vk: i32) -> bool {
     (unsafe { GetAsyncKeyState(vk) }) < 0
+}
+
+fn mouse_button_down(button: u8) -> bool {
+    let vk = match button {
+        1 => 0x01,
+        2 => 0x04,
+        3 => 0x02,
+        4 => 0x05,
+        5 => 0x06,
+        _ => return true,
+    };
+    key_down(vk)
+}
+
+fn hid_to_windows_vk(usage: u16) -> Option<i32> {
+    let direct = (0x01..=0xfeu16)
+        .find(|vk| vk_to_hid(*vk) == usage)
+        .map(i32::from);
+    let mapped = hid_to_windows_scan(usage).and_then(|(scan, extended)| {
+        let map_type = if extended {
+            MAPVK_VSC_TO_VK_EX
+        } else {
+            MAPVK_VSC_TO_VK
+        };
+        let vk = unsafe { MapVirtualKeyW(u32::from(scan), map_type) } as i32;
+        (vk != 0).then_some(vk)
+    });
+    direct.or(mapped)
+}
+
+fn refresh_windows_pressed_state(state: &WindowsState) {
+    let mut pressed = state.physical_pressed.lock().unwrap();
+    let mut next = BTreeSet::new();
+    for usage in 0x04..=0xe7u16 {
+        if let Some(vk) = hid_to_windows_vk(usage)
+            && key_down(vk)
+        {
+            next.insert(usage);
+        }
+    }
+    for usage in pressed.iter().copied() {
+        if hid_to_windows_vk(usage).is_none() {
+            next.insert(usage);
+        }
+    }
+    *pressed = next;
+    drop(pressed);
+
+    let mut buttons = state.physical_buttons.lock().unwrap();
+    let mut next_buttons = BTreeSet::new();
+    for button in 1..=5u8 {
+        if mouse_button_down(button) {
+            next_buttons.insert(button);
+        }
+    }
+    *buttons = next_buttons;
 }
 
 fn send_keyboard(scan: u16, flags: u32) -> Result<()> {

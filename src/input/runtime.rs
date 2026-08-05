@@ -25,6 +25,7 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(250);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(1);
 const ACTIVATION_TIMEOUT: Duration = Duration::from_secs(5);
 const RETURN_COOLDOWN: Duration = Duration::from_millis(300);
+const PRESSED_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 const GAME_MODE_POLL: Duration = Duration::from_millis(500);
 const EDGE_INSET: i32 = 8;
 const JUMP_ZONE_SIZE: i32 = 1;
@@ -416,6 +417,49 @@ impl PressedState {
             self.buttons.remove(&button);
         }
     }
+
+    fn describe(&self) -> String {
+        describe_pressed(
+            &self.keys.iter().copied().collect::<Vec<_>>(),
+            &self.buttons.iter().copied().collect::<Vec<_>>(),
+        )
+    }
+}
+
+fn describe_pressed(usages: &[u16], buttons: &[u8]) -> String {
+    let mut parts = Vec::new();
+    if !usages.is_empty() {
+        let keys = usages
+            .iter()
+            .map(|usage| super::hotkey::key_name(*usage))
+            .collect::<Vec<_>>()
+            .join(",");
+        parts.push(format!("keys={keys}"));
+    }
+    if !buttons.is_empty() {
+        let names = buttons
+            .iter()
+            .map(|button| mouse_button_name(*button))
+            .collect::<Vec<_>>()
+            .join(",");
+        parts.push(format!("buttons={names}"));
+    }
+    if parts.is_empty() {
+        "none".to_string()
+    } else {
+        parts.join(" ")
+    }
+}
+
+fn mouse_button_name(button: u8) -> &'static str {
+    match button {
+        1 => "left",
+        2 => "middle",
+        3 => "right",
+        4 => "x1",
+        5 => "x2",
+        _ => "unknown",
+    }
 }
 
 struct SenderControl {
@@ -474,6 +518,8 @@ pub(super) async fn run_sender(
     motion_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut heartbeat = time::interval(HEARTBEAT_INTERVAL);
     heartbeat.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    let mut pressed_poll = time::interval(PRESSED_REFRESH_INTERVAL);
+    pressed_poll.set_missed_tick_behavior(MissedTickBehavior::Skip);
     let mut overflow_poll = time::interval(OVERFLOW_POLL);
     let mut timeout_tick = time::interval(HEARTBEAT_INTERVAL);
     let mut motion_logged = false;
@@ -501,8 +547,10 @@ pub(super) async fn run_sender(
                             if options.block_switch_on_press && !control.local_pressed.is_empty() {
                                 control.pending_return_request =
                                     Some((control.generation, edge_position));
+                                let pressed = control.local_pressed.describe();
                                 tracing::info!(
                                     generation = control.generation,
+                                    pressed,
                                     "对端请求返回但本机按键/鼠标处于按下状态, 等待松开"
                                 );
                             } else {
@@ -684,14 +732,29 @@ pub(super) async fn run_sender(
                         motion_logged = true;
                     }
                     if let Some(edge_position) = activation_edge_position {
+                        let snapshot = if options.block_switch_on_press {
+                            match platform.backend.refresh_pressed_state() {
+                                Ok(snapshot) => snapshot,
+                                Err(error) => {
+                                    tracing::warn!(
+                                        error = %error,
+                                        "刷新本机按键状态失败, 使用事件累计状态"
+                                    );
+                                    platform.backend.snapshot()
+                                }
+                            }
+                        } else {
+                            platform.backend.snapshot()
+                        };
                         if options.block_switch_on_press {
-                            let snapshot = platform.backend.snapshot();
                             let blocked = !snapshot.usages.is_empty()
                                 || !snapshot.buttons.is_empty();
                             if blocked && !press_blocked {
+                                let pressed = describe_pressed(&snapshot.usages, &snapshot.buttons);
                                 tracing::info!(
                                     point = ?point,
                                     edge = ?source_edge,
+                                    pressed,
                                     "边缘已就绪但按键/鼠标处于按下状态, 等待松开后切换"
                                 );
                             }
@@ -701,7 +764,6 @@ pub(super) async fn run_sender(
                             }
                         }
                         control.generation = control.generation.wrapping_add(1).max(1);
-                        let snapshot = platform.backend.snapshot();
                         let pressed = key_mapper.map_snapshot(&snapshot);
                         control.local_pressed = PressedState::from_snapshot(&snapshot);
                         control.pending_return_request = None;
@@ -759,6 +821,26 @@ pub(super) async fn run_sender(
                         });
                     }
                     bail!("本机输入可靠事件队列已满, 已停止远程控制");
+                }
+            }
+            _ = pressed_poll.tick() => {
+                if !options.block_switch_on_press {
+                    continue;
+                }
+                match platform.backend.refresh_pressed_state() {
+                    Ok(snapshot) => {
+                        control.local_pressed = PressedState::from_snapshot(&snapshot);
+                        finish_pending_sender_return(
+                            tx,
+                            platform,
+                            &local_layout,
+                            source_edge,
+                            &mut control,
+                        )?;
+                    }
+                    Err(error) => {
+                        tracing::warn!(error = %error, "刷新本机按键状态失败, 保留事件累计状态");
+                    }
                 }
             }
             _ = timeout_tick.tick() => {
@@ -1320,9 +1402,9 @@ fn apply_snapshot(backend: &dyn platform::InputBackend, snapshot: &KeySnapshot) 
 mod tests {
     use super::{
         ACTIVATION_TIMEOUT, AbortOnDrop, EDGE_INSET, HEARTBEAT_TIMEOUT, ReceiverMotion,
-        IncomingMotion, PressedState, SenderRecoveryGuard, enqueue_message, receiver_motion,
-        run_receiver, run_sender, sender_activation_edge_position, sender_heartbeat_timeout,
-        spawn_input_reader, transform_scroll,
+        IncomingMotion, PressedState, SenderRecoveryGuard, describe_pressed, enqueue_message,
+        receiver_motion, run_receiver, run_sender, sender_activation_edge_position,
+        sender_heartbeat_timeout, spawn_input_reader, transform_scroll,
     };
     use crate::input::platform::{InputBackend, MotionAccumulator, NativeEvent, PlatformHandle};
     use crate::input::platform::ScrollSource;
@@ -1942,6 +2024,15 @@ mod tests {
             buttons: vec![1],
         });
         assert!(!from_snapshot.is_empty());
+    }
+
+    #[test]
+    fn describe_pressed_lists_key_and_button_names() {
+        assert_eq!(
+            describe_pressed(&[0x04, 0xe1], &[1, 3]),
+            "keys=a,left_shift buttons=left,right"
+        );
+        assert_eq!(describe_pressed(&[], &[]), "none");
     }
 
     #[tokio::test]
@@ -2611,6 +2702,11 @@ mod tests {
         .expect("sender 应激活");
 
         // 本机按下按钮, 对端请求返回: 应被拦截.
+        *backend.pressed.lock().unwrap() = Some(KeySnapshot {
+            usages: Vec::new(),
+            modifiers: ModifierMask::default(),
+            buttons: vec![1],
+        });
         events_tx
             .send(NativeEvent::Button { button: 1, down: true })
             .await
@@ -2647,6 +2743,7 @@ mod tests {
         assert!(*backend.capture.lock().unwrap());
 
         // 松开按钮: 应批准返回并恢复本机.
+        *backend.pressed.lock().unwrap() = None;
         events_tx
             .send(NativeEvent::Button { button: 1, down: false })
             .await

@@ -523,6 +523,13 @@ impl InputBackend for AgentBackend {
         }
     }
 
+    fn refresh_pressed_state(&self) -> Result<KeySnapshot> {
+        match self.request(AgentRequest::RefreshPressedState)? {
+            AgentResponse::Snapshot(snapshot) => Ok(snapshot),
+            _ => bail!("Windows input agent returned an invalid refreshed snapshot"),
+        }
+    }
+
     fn set_capture(&self, active: bool) -> Result<()> {
         self.request(AgentRequest::SetCapture(active))?;
         Ok(())

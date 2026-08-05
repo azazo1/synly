@@ -79,6 +79,7 @@ const FLAG_CONTROL: u64 = 1 << 18;
 const FLAG_ALT: u64 = 1 << 19;
 const FLAG_META: u64 = 1 << 20;
 const EVENT_TAG: i64 = 0x5359_4e4c_5949_4e50;
+const CG_EVENT_SOURCE_COMBINED_SESSION_STATE: i32 = 0;
 
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
@@ -97,6 +98,8 @@ unsafe extern "C" {
     fn CGEventSetFlags(event: CGEventRef, flags: CGEventFlags);
     fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
     fn CGEventCreate(source: *const c_void) -> CGEventRef;
+    fn CGEventSourceKeyState(state: i32, keycode: u16) -> bool;
+    fn CGEventSourceButtonState(state: i32, button: u32) -> bool;
     fn CGEventCreateKeyboardEvent(source: *const c_void, key: CGKeyCode, down: bool) -> CGEventRef;
     fn CGEventCreateMouseEvent(
         source: *const c_void,
@@ -445,6 +448,29 @@ fn update_set<T: Ord + Copy>(set: &Mutex<BTreeSet<T>>, value: T, down: bool) {
     }
 }
 
+fn refresh_mac_pressed_state(state: &MacState) {
+    let mut pressed = state.physical_pressed.lock().unwrap();
+    pressed.clear();
+    for keycode in 0..=127u16 {
+        let Some(usage) = mac_keycode_to_hid(keycode) else {
+            continue;
+        };
+        if unsafe { CGEventSourceKeyState(CG_EVENT_SOURCE_COMBINED_SESSION_STATE, keycode) } {
+            pressed.insert(usage);
+        }
+    }
+    drop(pressed);
+
+    let mut buttons = state.physical_buttons.lock().unwrap();
+    buttons.clear();
+    for button in 1..=5u8 {
+        if unsafe { CGEventSourceButtonState(CG_EVENT_SOURCE_COMBINED_SESSION_STATE, mac_mouse_button(button)) }
+        {
+            buttons.insert(button);
+        }
+    }
+}
+
 fn mac_mouse_button(button: u8) -> u32 {
     match button {
         1 => 0,
@@ -549,6 +575,11 @@ impl InputBackend for MacBackend {
         };
         let buttons = self.state.physical_buttons.lock().unwrap().iter().copied().collect();
         KeySnapshot { usages, modifiers, buttons }
+    }
+
+    fn refresh_pressed_state(&self) -> Result<KeySnapshot> {
+        refresh_mac_pressed_state(&self.state);
+        Ok(self.snapshot())
     }
 
     fn set_capture(&self, active: bool) -> Result<()> {

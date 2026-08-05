@@ -16,6 +16,7 @@ pub(super) enum AgentRequest {
     Health,
     CursorPosition,
     Snapshot,
+    RefreshPressedState,
     SetCapture(bool),
     WarpCursor(Point),
     InjectKey {
@@ -39,6 +40,7 @@ impl AgentRequest {
             Self::Health => "Health",
             Self::CursorPosition => "CursorPosition",
             Self::Snapshot => "Snapshot",
+            Self::RefreshPressedState => "RefreshPressedState",
             Self::SetCapture(_) => "SetCapture",
             Self::WarpCursor(_) => "WarpCursor",
             Self::InjectKey { .. } => "InjectKey",

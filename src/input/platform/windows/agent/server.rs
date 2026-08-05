@@ -521,6 +521,9 @@ async fn handle_agent_request(
             Ok(AgentResponse::Point(agent_backend(runtime)?.cursor_position()?))
         }
         AgentRequest::Snapshot => Ok(AgentResponse::Snapshot(agent_backend(runtime)?.snapshot())),
+        AgentRequest::RefreshPressedState => Ok(AgentResponse::Snapshot(
+            agent_backend(runtime)?.refresh_pressed_state()?,
+        )),
         AgentRequest::SetCapture(active) => {
             agent_backend(runtime)?.set_capture(active)?;
             Ok(AgentResponse::Ok)
