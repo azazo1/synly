@@ -93,7 +93,7 @@ impl ScrollTransformer {
     }
 
     fn trackpad_axis_to_notch(delta: i32, remainder: &mut f64) -> i32 {
-        *remainder += accelerated_scroll(delta as f64) / TRACKPAD_PIXELS_PER_NOTCH;
+        *remainder += delta as f64 / TRACKPAD_PIXELS_PER_NOTCH;
         let notches = remainder.trunc();
         *remainder -= notches;
         rounded_i32(notches)
@@ -202,6 +202,23 @@ mod tests {
                 false,
             ),
             (0, 1)
+        );
+    }
+
+    #[test]
+    fn trackpad_to_windows_does_not_apply_acceleration_curve() {
+        let mut transformer = transformer(true, false);
+        assert_eq!(
+            transformer.transform(
+                480,
+                240,
+                ScrollSource::Trackpad,
+                InputPlatform::Macos,
+                InputPlatform::Windows,
+                false,
+                false,
+            ),
+            (-10, 5)
         );
     }
 

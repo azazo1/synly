@@ -1,4 +1,4 @@
-import { Button, Palette } from "std-widgets.slint";
+import { Button, CheckBox, Palette } from "std-widgets.slint";
 
 component Metric inherits Rectangle {
     in property <string> label;
@@ -33,21 +33,22 @@ component ScrollGrid inherits Rectangle {
     in property <length> offset-x: 0px;
     in property <length> offset-y: 0px;
     background: transparent;
+    clip: true;
 
-    for col-index in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]: Rectangle {
-        x: col-index * 48px - root.offset-x;
+    for col-index in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31]: Rectangle {
+        x: col-index * 48px - mod(root.offset-x, 192px);
         y: 0px;
-        width: 1px;
+        width: 48px;
         height: 100%;
-        background: #3a4a44;
+        background: mod(col-index, 4) == 0 ? #26342f : mod(col-index, 4) == 1 ? #2d3d36 : mod(col-index, 4) == 2 ? #34463f : #3b4e46;
     }
 
-    for row-index in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]: Rectangle {
+    for row-index in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]: Rectangle {
         x: 0px;
-        y: row-index * 48px - root.offset-y;
+        y: row-index * 48px - mod(root.offset-y, 192px);
         width: 100%;
-        height: 1px;
-        background: #3a4a44;
+        height: 48px;
+        background: mod(row-index, 4) == 0 ? #26342f : mod(row-index, 4) == 1 ? #2d3d36 : mod(row-index, 4) == 2 ? #34463f : #3b4e46;
     }
 }
 
@@ -78,9 +79,13 @@ export component InputScreenMockWindow inherits Window {
     in property <int> wheel-y: 0;
     in property <length> grid-offset-x: 0px;
     in property <length> grid-offset-y: 0px;
+    in-out property <bool> smooth-scroll: false;
+    in-out property <bool> native-scroll-macos-to-windows: false;
+    in-out property <bool> native-scroll-windows-to-macos: false;
     in property <string> event-text: "正在启动";
 
     callback quit-requested();
+    callback native-scroll-toggled();
 
     VerticalLayout {
         padding: 18px;
@@ -133,6 +138,30 @@ export component InputScreenMockWindow inherits Window {
             }
         }
 
+        HorizontalLayout {
+            height: 34px;
+            spacing: 12px;
+
+            CheckBox {
+                text: "macOS -> Windows 原生滚动";
+                checked <=> root.native-scroll-macos-to-windows;
+                toggled => { root.native-scroll-toggled(); }
+            }
+
+            CheckBox {
+                text: "Windows -> macOS 原生滚动";
+                checked <=> root.native-scroll-windows-to-macos;
+                toggled => { root.native-scroll-toggled(); }
+            }
+
+            CheckBox {
+                text: "平滑滚动显示";
+                checked <=> root.smooth-scroll;
+            }
+
+            Rectangle { horizontal-stretch: 1; }
+        }
+
         Rectangle {
             horizontal-stretch: 1;
             vertical-stretch: 1;
@@ -154,6 +183,7 @@ export component InputScreenMockWindow inherits Window {
                 border-color: root.active ? #65b78e : #3a4641;
                 border-width: root.active ? 2px : 1px;
                 border-radius: 4px;
+                clip: true;
 
                 ScrollGrid {
                     x: 0px;

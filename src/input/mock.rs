@@ -18,7 +18,9 @@ slint::include_modules!();
 const GUI_INTERVAL: Duration = Duration::from_millis(16);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(250);
 const EDGE_INSET: i32 = 8;
-const GRID_CELL_SIZE: f32 = 48.0;
+const GRID_SCROLL_STEP: f32 = 8.0;
+const GRID_PATTERN_SIZE: f32 = 192.0;
+const GRID_SMOOTH_FACTOR: f32 = 0.18;
 
 #[derive(Clone, Debug)]
 pub struct ScreenMockOptions {
@@ -26,8 +28,12 @@ pub struct ScreenMockOptions {
     pub hotkey: Hotkey,
     pub width: i32,
     pub height: i32,
-    pub native_scroll_macos_to_windows: bool,
-    pub native_scroll_windows_to_macos: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct MockFlags {
+    native_macos_to_windows: bool,
+    native_windows_to_macos: bool,
 }
 
 pub fn run_screen_mock(options: ScreenMockOptions) -> Result<()> {
@@ -53,11 +59,23 @@ pub fn run_screen_mock(options: ScreenMockOptions) -> Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     wire_window_shutdown(&window, Arc::clone(&stop));
     spawn_signal_monitor(Arc::clone(&stop))?;
+    let (flags_tx, flags_rx) = tokio::sync::watch::channel(MockFlags::default());
+    let flags_weak = window.as_weak();
+    window.on_native_scroll_toggled(move || {
+        let Some(window) = flags_weak.upgrade() else {
+            return;
+        };
+        let _ = flags_tx.send(MockFlags {
+            native_macos_to_windows: window.get_native_scroll_macos_to_windows(),
+            native_windows_to_macos: window.get_native_scroll_windows_to_macos(),
+        });
+    });
 
     let presenter = GuiPresenter::new(window.as_weak(), options.width, options.height);
 
     let worker_stop = Arc::clone(&stop);
     let worker_presenter = presenter.clone();
+    let mut worker_flags = flags_rx;
     let worker = std::thread::Builder::new()
         .name("synly-input-screen-mock".to_string())
         .spawn(move || {
@@ -65,12 +83,24 @@ pub fn run_screen_mock(options: ScreenMockOptions) -> Result<()> {
                 .enable_all()
                 .build()
                 .context("无法创建输入虚拟屏幕运行时")?;
-            runtime.block_on(run_mock_worker(
-                options,
-                remote_platform,
-                worker_stop,
-                worker_presenter,
-            ))
+            runtime.block_on(async {
+                loop {
+                    match run_mock_worker(
+                        options.clone(),
+                        remote_platform,
+                        worker_stop.clone(),
+                        worker_presenter.clone(),
+                        &mut worker_flags,
+                    )
+                    .await
+                    {
+                        Err(error) if error.downcast_ref::<MockRestart>().is_some() => {
+                            tracing::info!("mock 输入设置已变化, 正在重启模拟");
+                        }
+                        result => return result,
+                    }
+                }
+            })
         })
         .context("无法启动输入虚拟屏幕线程")?;
 
@@ -147,6 +177,7 @@ async fn run_mock_worker(
     remote_platform: InputPlatform,
     stop: Arc<AtomicBool>,
     presenter: GuiPresenter,
+    flags: &mut tokio::sync::watch::Receiver<MockFlags>,
 ) -> Result<()> {
     let mut platform = match platform::start(InputMode::Send, options.hotkey) {
         Ok(platform) => platform,
@@ -174,14 +205,15 @@ async fn run_mock_worker(
     let observed_motion = Arc::clone(&platform.motion);
     let (incoming_tx, mut incoming_rx) = mpsc::channel(256);
     let (outgoing_tx, outgoing_rx) = mpsc::channel(256);
+    let mock_flags = *flags.borrow();
     let runtime_options = InputRuntimeOptions {
         mode: InputMode::Send,
         edge: options.edge,
         hotkey: options.hotkey,
         reverse_mouse_wheel: false,
         reverse_trackpad: false,
-        native_scroll_macos_to_windows: options.native_scroll_macos_to_windows,
-        native_scroll_windows_to_macos: options.native_scroll_windows_to_macos,
+        native_scroll_macos_to_windows: mock_flags.native_macos_to_windows,
+        native_scroll_windows_to_macos: mock_flags.native_windows_to_macos,
         block_switch_on_press: false,
         key_mapping: KeyMappingConfig::default(),
         cursor_mode: crate::input::CursorMode::Desktop,
@@ -209,13 +241,25 @@ async fn run_mock_worker(
     let result = tokio::select! {
         result = &mut sender => result,
         result = &mut peer => result,
+        _ = flags.changed() => Err(anyhow::anyhow!(MockRestart)),
     };
-    if let Err(error) = &result {
+    if let Err(error) = &result
+        && error.downcast_ref::<MockRestart>().is_none()
+    {
         tracing::error!(error = %error, "输入虚拟屏幕 mock 已停止");
         presenter.publish(GuiUpdate::idle(format!("运行失败: {error}")));
         wait_for_shutdown(&stop).await;
     }
     result
+}
+
+#[derive(Debug)]
+struct MockRestart;
+
+impl std::fmt::Display for MockRestart {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("mock input settings changed")
+    }
 }
 
 async fn run_mock_peer(
@@ -365,14 +409,8 @@ async fn run_mock_peer(
                     } if active && incoming_generation == generation => {
                         wheel.x = wheel.x.saturating_add(x);
                         wheel.y = wheel.y.saturating_add(y);
-                        let (grid_x, grid_y) = wheel_to_grid_delta(x, y, remote_platform);
-                        grid_offset.x = wrap_grid_offset(grid_offset.x + grid_x);
-                        grid_offset.y = wrap_grid_offset(grid_offset.y + grid_y);
-                        last_event = format!(
-                            "滚轮 x={x}, y={y}, grid=({:.1}, {:.1})",
-                            grid_offset.x,
-                            grid_offset.y,
-                        );
+                        grid_offset.add_wheel(x, y, remote_platform);
+                        last_event = format!("滚轮 x={x}, y={y}");
                     }
                     InputMessage::Heartbeat { .. } => {}
                     InputMessage::SecureDesktop { active } => {
@@ -484,12 +522,12 @@ fn wheel_to_grid_delta(x: i32, y: i32, remote_platform: InputPlatform) -> (f32, 
 
 fn grid_pixels_per_wheel_unit(remote_platform: InputPlatform) -> f32 {
     match remote_platform {
-        InputPlatform::Macos | InputPlatform::Windows => GRID_CELL_SIZE,
+        InputPlatform::Macos | InputPlatform::Windows => GRID_SCROLL_STEP,
     }
 }
 
-fn wrap_grid_offset(value: f32) -> f32 {
-    value.rem_euclid(GRID_CELL_SIZE)
+fn grid_phase(value: f32) -> f32 {
+    value.rem_euclid(GRID_PATTERN_SIZE)
 }
 
 #[derive(Clone, Copy, Default)]
@@ -498,11 +536,48 @@ struct GridOffset {
     y: f32,
 }
 
+impl GridOffset {
+    fn add_wheel(&mut self, x: i32, y: i32, remote_platform: InputPlatform) {
+        let (delta_x, delta_y) = wheel_to_grid_delta(x, y, remote_platform);
+        self.x += delta_x;
+        self.y += delta_y;
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct SmoothGridState {
+    x: f32,
+    y: f32,
+}
+
+impl SmoothGridState {
+    fn advance(&mut self, target_x: f32, target_y: f32) -> (f32, f32) {
+        self.x = smooth_toward(self.x, target_x);
+        self.y = smooth_toward(self.y, target_y);
+        (self.x, self.y)
+    }
+
+    fn snap(&mut self, target_x: f32, target_y: f32) {
+        self.x = target_x;
+        self.y = target_y;
+    }
+}
+
+fn smooth_toward(current: f32, target: f32) -> f32 {
+    let diff = target - current;
+    if diff.abs() < 0.05 {
+        target
+    } else {
+        current + diff * GRID_SMOOTH_FACTOR
+    }
+}
+
 #[derive(Clone)]
 struct GuiPresenter {
     window: slint::Weak<InputScreenMockWindow>,
     latest: Arc<Mutex<GuiUpdate>>,
     scheduled: Arc<AtomicBool>,
+    smooth: Arc<Mutex<SmoothGridState>>,
     width: i32,
     height: i32,
 }
@@ -513,6 +588,7 @@ impl GuiPresenter {
             window,
             latest: Arc::new(Mutex::new(GuiUpdate::idle("正在启动".to_string()))),
             scheduled: Arc::new(AtomicBool::new(false)),
+            smooth: Arc::new(Mutex::new(SmoothGridState::default())),
             width,
             height,
         }
@@ -532,6 +608,7 @@ impl GuiPresenter {
         let window = self.window.clone();
         let latest = Arc::clone(&self.latest);
         let scheduled = Arc::clone(&self.scheduled);
+        let smooth = Arc::clone(&self.smooth);
         let width = self.width;
         let height = self.height;
         if let Err(error) = slint::invoke_from_event_loop(move || {
@@ -541,7 +618,8 @@ impl GuiPresenter {
                 Err(_) => return,
             };
             if let Some(window) = window.upgrade() {
-                apply_gui_update(&window, &update, width, height);
+                let mut smooth = smooth.lock().unwrap_or_else(|error| error.into_inner());
+                apply_gui_update(&window, &update, width, height, &mut smooth);
             }
         }) {
             self.scheduled.store(false, Ordering::Release);
@@ -584,6 +662,7 @@ fn apply_gui_update(
     update: &GuiUpdate,
     width: i32,
     height: i32,
+    smooth: &mut SmoothGridState,
 ) {
     window.set_active(update.active);
     window.set_cursor_x(update.cursor.x);
@@ -596,8 +675,15 @@ fn apply_gui_update(
     window.set_button_summary(format!("0x{:08x}", update.button_mask).into());
     window.set_wheel_x(update.wheel.x);
     window.set_wheel_y(update.wheel.y);
-    window.set_grid_offset_x(update.grid_offset_x);
-    window.set_grid_offset_y(update.grid_offset_y);
+    if window.get_smooth_scroll() {
+        let (display_x, display_y) = smooth.advance(update.grid_offset_x, update.grid_offset_y);
+        window.set_grid_offset_x(grid_phase(display_x));
+        window.set_grid_offset_y(grid_phase(display_y));
+    } else {
+        smooth.snap(update.grid_offset_x, update.grid_offset_y);
+        window.set_grid_offset_x(grid_phase(update.grid_offset_x));
+        window.set_grid_offset_y(grid_phase(update.grid_offset_y));
+    }
     window.set_event_text(update.event.clone().into());
 }
 
@@ -611,8 +697,8 @@ fn normalized_coordinate(value: i32, extent: i32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        GRID_CELL_SIZE, button_mask, grid_pixels_per_wheel_unit, normalized_coordinate,
-        opposite_platform, wrap_grid_offset,
+        GRID_PATTERN_SIZE, GRID_SCROLL_STEP, SmoothGridState, button_mask, grid_phase,
+        grid_pixels_per_wheel_unit, normalized_coordinate, opposite_platform,
     };
     use crate::input::InputPlatform;
     use std::collections::BTreeSet;
@@ -637,10 +723,24 @@ mod tests {
     }
 
     #[test]
-    fn grid_offset_uses_one_cell_per_wheel_unit_and_wraps() {
-        assert_eq!(grid_pixels_per_wheel_unit(InputPlatform::Macos), GRID_CELL_SIZE);
-        assert_eq!(grid_pixels_per_wheel_unit(InputPlatform::Windows), GRID_CELL_SIZE);
-        assert_eq!(wrap_grid_offset(-60.0), 36.0);
-        assert_eq!(wrap_grid_offset(110.0), 14.0);
+    fn grid_offset_uses_small_step_and_wraps_phase() {
+        assert_eq!(grid_pixels_per_wheel_unit(InputPlatform::Macos), GRID_SCROLL_STEP);
+        assert_eq!(grid_pixels_per_wheel_unit(InputPlatform::Windows), GRID_SCROLL_STEP);
+        assert_eq!(grid_phase(-60.0), 132.0);
+        assert_eq!(grid_phase(48.0), 48.0);
+        assert_eq!(grid_phase(250.0), 58.0);
+        assert_eq!(grid_phase(GRID_PATTERN_SIZE), 0.0);
+    }
+
+    #[test]
+    fn smooth_grid_moves_toward_target_incrementally() {
+        let mut smooth = SmoothGridState::default();
+        let (first_x, _) = smooth.advance(8.0, 4.0);
+        assert!(first_x > 0.0 && first_x < 8.0);
+        for _ in 0..128 {
+            smooth.advance(8.0, 4.0);
+        }
+        assert_eq!(smooth.x, 8.0);
+        assert_eq!(smooth.y, 4.0);
     }
 }
