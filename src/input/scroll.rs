@@ -70,7 +70,7 @@ impl ScrollTransformer {
             (InputPlatform::Macos, InputPlatform::Windows, ScrollSource::MouseWheel)
                 if self.native_macos_to_windows =>
             {
-                (x, y)
+                (wheel_axis_to_notch(x), wheel_axis_to_notch(y))
             }
             (InputPlatform::Macos, InputPlatform::Windows, ScrollSource::Trackpad)
                 if self.native_macos_to_windows =>
@@ -93,11 +93,16 @@ impl ScrollTransformer {
     }
 
     fn trackpad_axis_to_notch(delta: i32, remainder: &mut f64) -> i32 {
-        *remainder += delta as f64 / TRACKPAD_PIXELS_PER_NOTCH;
+        let scaled = (delta as f64 / TRACKPAD_PIXELS_PER_NOTCH).clamp(-1.0, 1.0);
+        *remainder += scaled;
         let notches = remainder.trunc();
         *remainder -= notches;
         rounded_i32(notches)
     }
+}
+
+fn wheel_axis_to_notch(delta: i32) -> i32 {
+    delta.signum()
 }
 
 fn accelerated_scroll(value: f64) -> f64 {
@@ -206,7 +211,7 @@ mod tests {
     }
 
     #[test]
-    fn trackpad_to_windows_does_not_apply_acceleration_curve() {
+    fn trackpad_to_windows_caps_accelerated_magnitude() {
         let mut transformer = transformer(true, false);
         assert_eq!(
             transformer.transform(
@@ -218,7 +223,36 @@ mod tests {
                 false,
                 false,
             ),
-            (-10, 5)
+            (-1, 1)
+        );
+    }
+
+    #[test]
+    fn mouse_wheel_to_windows_uses_event_count_not_accelerated_magnitude() {
+        let mut transformer = transformer(true, false);
+        assert_eq!(
+            transformer.transform(
+                0,
+                9,
+                ScrollSource::MouseWheel,
+                InputPlatform::Macos,
+                InputPlatform::Windows,
+                false,
+                false,
+            ),
+            (0, 1)
+        );
+        assert_eq!(
+            transformer.transform(
+                0,
+                -9,
+                ScrollSource::MouseWheel,
+                InputPlatform::Macos,
+                InputPlatform::Windows,
+                false,
+                false,
+            ),
+            (0, -1)
         );
     }
 

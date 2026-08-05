@@ -210,7 +210,7 @@ Synly 使用固定的四文件配置目录, 每个文件的顶层都有独立的
 
 `reverse_mouse_wheel` 和 `reverse_trackpad` 会同时反转水平与垂直滚动. macOS 能区分普通滚轮和连续触控板滚动. Windows 发送端会将所有滚动视为鼠标滚轮, 因此 `reverse_trackpad` 在 Windows 上不生效. 这些配置在应用启动时读取, 修改后需要重启.
 
-`native_scroll_macos_to_windows` 和 `native_scroll_windows_to_macos` 是发送端生效的原生滚动开关. macOS 机开启前者后, 会把触控板连续像素滚动按固定 48px = 1 notch 换算成 Windows 滚轮档位, 不额外叠加加速度; Windows 机开启后者后, 会把滚轮档位按固定 macOS 风格曲线换算成 macOS line 滚动. 关闭时保持原有直通行为. 两个开关都可在 GUI 输入设置中修改, 修改后会自动重启输入任务.
+`native_scroll_macos_to_windows` 和 `native_scroll_windows_to_macos` 是发送端生效的原生滚动开关. macOS 机开启前者后, 会去掉平台增量中的加速度: 普通滚轮按事件数折算为 Windows 档位, 触控板按固定 48px = 1 notch 且单事件最多 1 档换算; Windows 机开启后者后, 会把滚轮档位按固定 macOS 风格曲线换算成 macOS line 滚动. 关闭时保持原有直通行为. 两个开关都可在 GUI 输入设置中修改, 修改后会自动重启输入任务.
 
 `input-screen-mock` 也可以模拟这个效果. 在 mock 界面勾选对应的原生滚动复选框后, 输入模拟会自动重启; mock 屏幕中的 48px 网格会根据滚轮输入平滑移动少量像素, 方便对比原生换算开启前后的滚动差异. 平滑滚动复选框只影响 mock 的显示层, 不会改变真实滚动逻辑.
 
