@@ -26,7 +26,7 @@ const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(1);
 const ACTIVATION_TIMEOUT: Duration = Duration::from_secs(5);
 const RETURN_COOLDOWN: Duration = Duration::from_millis(300);
 const PRESSED_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
-const GAME_MODE_POLL: Duration = Duration::from_millis(500);
+const GAME_MODE_POLL: Duration = Duration::from_millis(100);
 const EDGE_INSET: i32 = 8;
 const JUMP_ZONE_SIZE: i32 = 1;
 const OVERFLOW_POLL: Duration = Duration::from_millis(50);
@@ -1072,11 +1072,16 @@ pub(super) async fn run_receiver(
                 }
             }
             _ = monitor_tick.tick() => {
-                if options.cursor_mode == CursorMode::Game {
+                let mode = options.cursor_mode;
+                if mode == CursorMode::Game {
+                    if !cursor_mode_active {
+                        tracing::info!("已启用游戏光标模式");
+                    }
+                    cursor_mode_active = true;
                     continue;
                 }
                 let captured = foreground_captured();
-                let game = match options.cursor_mode {
+                let game = match mode {
                     CursorMode::Desktop => cursor_mode_active && captured,
                     CursorMode::Auto => captured,
                     CursorMode::Game => true,
@@ -1085,16 +1090,31 @@ pub(super) async fn run_receiver(
                     continue;
                 }
                 cursor_mode_active = game;
-                tracing::info!(
-                    game,
-                    foreground_cursor_captured = captured,
-                    "前台光标捕获状态变化, 游戏光标模式已切换"
-                );
                 if !game && active {
-                    if cursor.is_none() {
-                        cursor = Some(platform.backend.cursor_position()?);
+                    match platform.backend.cursor_position() {
+                        Ok(point) => {
+                            cursor = Some(point);
+                            tracing::info!(
+                                generation,
+                                point = ?cursor,
+                                "已切回桌面光标模式, 使用真实光标位置重新锚定"
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                error = %error,
+                                generation,
+                                "切回桌面光标模式时无法读取真实位置, 保留原锚点"
+                            );
+                        }
                     }
-                    tracing::info!(generation, "前台光标捕获状态结束, 已切回桌面光标模式");
+                } else {
+                    tracing::info!(
+                        game,
+                        foreground_cursor_captured = captured,
+                        mode = ?mode,
+                        "光标模式已切换"
+                    );
                 }
             }
             message = incoming.recv() => {
@@ -2432,7 +2452,7 @@ mod tests {
         let (outgoing, mut messages) = mpsc::channel(16);
         let mut options = test_input_options(ScreenEdge::Left);
         options.cursor_mode = super::CursorMode::Auto;
-        let captured = Arc::new(AtomicBool::new(true));
+        let captured = Arc::new(AtomicBool::new(false));
         incoming_tx
             .send(Ok(InputMessage::Activate {
                 generation: 7,
@@ -2475,7 +2495,11 @@ mod tests {
         .await
         .expect("接收端应确认激活");
 
-        // 前台光标捕获状态结束: 应切回桌面光标模式并保持远端控制, 不应释放.
+        // 先建立一段桌面逻辑光标, 再进入游戏捕获, 最后切回桌面时必须以真实位置重新锚定.
+        incoming_motion.push(7, 10, 0);
+        sleep(Duration::from_millis(50)).await;
+        captured.store(true, Ordering::Release);
+        sleep(Duration::from_millis(550)).await;
         incoming_tx
             .send(Ok(InputMessage::Heartbeat { generation: 7 }))
             .await
@@ -2487,7 +2511,26 @@ mod tests {
             .await
             .unwrap();
 
-        // 切回桌面模式后, 绝对移动仍应继续, 光标越过返回边时正常请求返回.
+        // 若还保留旧逻辑锚点, -30 会误触发返回; 真实锚点 (99, 50) 下仍应继续移动.
+        incoming_motion.push(7, -30, 0);
+        let no_premature_return = timeout(Duration::from_millis(300), async {
+            loop {
+                match messages.recv().await {
+                    Some(InputMessage::ReturnRequest { .. }) => {
+                        panic!("切回桌面模式后不应使用旧逻辑锚点")
+                    }
+                    Some(InputMessage::Deactivate { .. }) => {
+                        panic!("捕获状态结束后不应释放控制")
+                    }
+                    Some(_) => {}
+                    None => panic!("接收端不应提前停止"),
+                }
+            }
+        })
+        .await;
+        assert!(no_premature_return.is_err(), "应继续使用真实光标锚点");
+
+        // 从真实锚点越过返回边时正常请求返回.
         incoming_motion.push(7, -100, 0);
         let edge_position = timeout(Duration::from_millis(800), async {
             loop {

@@ -4710,6 +4710,9 @@ mod tests {
 
         assert!(!input_task_restart_required(&input, &input, 3, 3));
         assert!(input_task_restart_required(&input, &input, 3, 4));
+        let mut changed_mode = input.clone();
+        changed_mode.cursor_mode = crate::input::CursorMode::Game;
+        assert!(input_task_restart_required(&input, &changed_mode, 3, 3));
     }
 
     #[test]
