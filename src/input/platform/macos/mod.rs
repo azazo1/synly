@@ -81,6 +81,8 @@ const FLAG_META: u64 = 1 << 20;
 const EVENT_TAG: i64 = 0x5359_4e4c_5949_4e50;
 const CG_EVENT_SOURCE_COMBINED_SESSION_STATE: i32 = 0;
 const CG_EVENT_SOURCE_HID_SYSTEM_STATE: i32 = 1;
+const CAPTURE_MAINTENANCE_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(250);
 
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
@@ -100,6 +102,7 @@ unsafe extern "C" {
     fn CGEventGetLocation(event: CGEventRef) -> CGPoint;
     fn CGEventCreate(source: *const c_void) -> CGEventRef;
     fn CGEventSourceKeyState(state: i32, keycode: u16) -> bool;
+    fn CGCursorIsVisible() -> i32;
     fn CGEventSourceButtonState(state: i32, button: u32) -> bool;
     fn CGEventCreateKeyboardEvent(source: *const c_void, key: CGKeyCode, down: bool) -> CGEventRef;
     fn CGEventCreateMouseEvent(
@@ -168,6 +171,8 @@ struct MacState {
     injected_cursor: Mutex<Option<Point>>,
     secure_input: AtomicBool,
     keyboard_capture: AtomicBool,
+    capture_lock: Mutex<()>,
+    capture_maintenance: Mutex<Option<std::thread::JoinHandle<()>>>,
     tap: Mutex<Option<usize>>,
     run_loop: Mutex<Option<usize>>,
 }
@@ -207,6 +212,8 @@ pub fn start(context: CaptureContext) -> Result<Arc<dyn InputBackend>> {
         injected_cursor: Mutex::new(None),
         secure_input: AtomicBool::new(false),
         keyboard_capture: AtomicBool::new(false),
+        capture_lock: Mutex::new(()),
+        capture_maintenance: Mutex::new(None),
         tap: Mutex::new(None),
         run_loop: Mutex::new(None),
     });
@@ -512,6 +519,31 @@ fn enable_background_cursor_updates() {
     }
 }
 
+fn reassert_macos_capture(state: &MacState) {
+    let _guard = state.capture_lock.lock().unwrap();
+    if !state.context.capture_active.load(Ordering::Acquire) {
+        return;
+    }
+    unsafe {
+        CGSetLocalEventsSuppressionInterval(0.0001);
+        CGAssociateMouseAndMouseCursorPosition(false);
+        if CGCursorIsVisible() != 0 {
+            CGDisplayShowCursor(CGMainDisplayID());
+            CGDisplayHideCursor(CGMainDisplayID());
+        }
+    }
+}
+
+fn show_macos_cursor_until_visible() {
+    let display = unsafe { CGMainDisplayID() };
+    for _ in 0..8 {
+        if unsafe { CGCursorIsVisible() } != 0 {
+            break;
+        }
+        unsafe { CGDisplayShowCursor(display) };
+    }
+}
+
 impl InputBackend for MacBackend {
     fn health_check(&self) -> Result<()> {
         if !permissions::is_accessibility_trusted() {
@@ -590,8 +622,15 @@ impl InputBackend for MacBackend {
     fn set_capture(&self, active: bool) -> Result<()> {
         let previous = self.state.context.capture_active.swap(active, Ordering::AcqRel);
         if previous == active {
+            if !active {
+                *self.state.capture_maintenance.lock().unwrap() = None;
+            }
             return Ok(());
         }
+        if !active {
+            *self.state.capture_maintenance.lock().unwrap() = None;
+        }
+        let _guard = self.state.capture_lock.lock().unwrap();
         let display = unsafe { CGMainDisplayID() };
         enable_background_cursor_updates();
         let visibility_result = if active {
@@ -623,6 +662,29 @@ impl InputBackend for MacBackend {
             bail!(
                 "切换 macOS 光标捕获状态失败, visibility={visibility_result}, association={association_result}"
             );
+        }
+        if !active {
+            show_macos_cursor_until_visible();
+        } else {
+            drop(_guard);
+            let maintenance_state = Arc::clone(&self.state);
+            let handle = std::thread::Builder::new()
+                .name("synly-macos-capture-maintain".to_string())
+                .spawn(move || {
+                    while maintenance_state.context.capture_active.load(Ordering::Acquire) {
+                        reassert_macos_capture(&maintenance_state);
+                        std::thread::sleep(CAPTURE_MAINTENANCE_INTERVAL);
+                    }
+                })
+                .context("无法启动 macOS 光标捕获维持线程");
+            let handle = match handle {
+                Ok(handle) => handle,
+                Err(error) => {
+                    let _ = self.set_capture(false);
+                    return Err(error);
+                }
+            };
+            *self.state.capture_maintenance.lock().unwrap() = Some(handle);
         }
         Ok(())
     }
@@ -921,6 +983,8 @@ mod tests {
             injected_cursor: Mutex::new(None),
             secure_input: AtomicBool::new(false),
             keyboard_capture: AtomicBool::new(false),
+            capture_lock: Mutex::new(()),
+            capture_maintenance: Mutex::new(None),
             tap: Mutex::new(None),
             run_loop: Mutex::new(None),
         });
