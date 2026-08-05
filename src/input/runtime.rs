@@ -631,20 +631,22 @@ pub(super) async fn run_sender(
                             &mut control,
                         )?;
                     }
-                    NativeEvent::Button { button, down } if control.active => {
+                    NativeEvent::Button { button, down } => {
                         control.local_pressed.button(button, down);
-                        enqueue_message(tx, InputMessage::Button {
-                            generation: control.generation,
-                            button,
-                            down,
-                        })?;
-                        finish_pending_sender_return(
-                            tx,
-                            platform,
-                            &local_layout,
-                            source_edge,
-                            &mut control,
-                        )?;
+                        if control.active {
+                            enqueue_message(tx, InputMessage::Button {
+                                generation: control.generation,
+                                button,
+                                down,
+                            })?;
+                            finish_pending_sender_return(
+                                tx,
+                                platform,
+                                &local_layout,
+                                source_edge,
+                                &mut control,
+                            )?;
+                        }
                     }
                     NativeEvent::Wheel { x, y, source } if control.active => {
                         let (x, y) = transform_scroll(
@@ -747,8 +749,14 @@ pub(super) async fn run_sender(
                             platform.backend.snapshot()
                         };
                         if options.block_switch_on_press {
-                            let blocked = !snapshot.usages.is_empty()
-                                || !snapshot.buttons.is_empty();
+                            let mut refreshed = PressedState::from_snapshot(&snapshot);
+                            for button in control.local_pressed.buttons.iter().copied() {
+                                if button > 3 {
+                                    refreshed.buttons.insert(button);
+                                }
+                            }
+                            control.local_pressed = refreshed;
+                            let blocked = !control.local_pressed.is_empty();
                             if blocked && !press_blocked {
                                 let pressed = describe_pressed(&snapshot.usages, &snapshot.buttons);
                                 tracing::info!(
@@ -829,7 +837,13 @@ pub(super) async fn run_sender(
                 }
                 match platform.backend.refresh_pressed_state() {
                     Ok(snapshot) => {
-                        control.local_pressed = PressedState::from_snapshot(&snapshot);
+                        let mut refreshed = PressedState::from_snapshot(&snapshot);
+                        for button in control.local_pressed.buttons.iter().copied() {
+                            if button > 3 {
+                                refreshed.buttons.insert(button);
+                            }
+                        }
+                        control.local_pressed = refreshed;
                         finish_pending_sender_return(
                             tx,
                             platform,

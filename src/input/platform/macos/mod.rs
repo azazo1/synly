@@ -80,6 +80,7 @@ const FLAG_ALT: u64 = 1 << 19;
 const FLAG_META: u64 = 1 << 20;
 const EVENT_TAG: i64 = 0x5359_4e4c_5949_4e50;
 const CG_EVENT_SOURCE_COMBINED_SESSION_STATE: i32 = 0;
+const CG_EVENT_SOURCE_HID_SYSTEM_STATE: i32 = 1;
 
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
@@ -347,8 +348,8 @@ unsafe extern "C" fn event_callback(
             };
             let down = matches!(event_type, EVENT_LEFT_DOWN | EVENT_RIGHT_DOWN | EVENT_OTHER_DOWN);
             update_set(&state.physical_buttons, button, down);
+            state.context.emit_reliable(NativeEvent::Button { button, down });
             if active {
-                state.context.emit_reliable(NativeEvent::Button { button, down });
                 ptr::null_mut()
             } else {
                 event
@@ -449,26 +450,30 @@ fn update_set<T: Ord + Copy>(set: &Mutex<BTreeSet<T>>, value: T, down: bool) {
 }
 
 fn refresh_mac_pressed_state(state: &MacState) {
-    let mut pressed = state.physical_pressed.lock().unwrap();
-    pressed.clear();
+    let mut os_pressed = BTreeSet::new();
     for keycode in 0..=127u16 {
         let Some(usage) = mac_keycode_to_hid(keycode) else {
             continue;
         };
-        if unsafe { CGEventSourceKeyState(CG_EVENT_SOURCE_COMBINED_SESSION_STATE, keycode) } {
-            pressed.insert(usage);
+        if unsafe { CGEventSourceKeyState(CG_EVENT_SOURCE_HID_SYSTEM_STATE, keycode) } {
+            os_pressed.insert(usage);
         }
     }
+
+    let mut pressed = state.physical_pressed.lock().unwrap();
+    // 只清理事件流残留, 不把系统状态里的幽灵按键写回按下集合.
+    pressed.retain(|usage| os_pressed.contains(usage));
     drop(pressed);
 
-    let mut buttons = state.physical_buttons.lock().unwrap();
-    buttons.clear();
-    for button in 1..=5u8 {
-        if unsafe { CGEventSourceButtonState(CG_EVENT_SOURCE_COMBINED_SESSION_STATE, mac_mouse_button(button)) }
-        {
-            buttons.insert(button);
+    let mut os_buttons = BTreeSet::new();
+    for button in 1..=3u8 {
+        if unsafe { CGEventSourceButtonState(CG_EVENT_SOURCE_COMBINED_SESSION_STATE, mac_mouse_button(button)) } {
+            os_buttons.insert(button);
         }
     }
+    let mut buttons = state.physical_buttons.lock().unwrap();
+    // 4/5 及以上的扩展键没有可靠的系统状态查询, 保留事件 tap 记录.
+    buttons.retain(|button| *button <= 3 && os_buttons.contains(button));
 }
 
 fn mac_mouse_button(button: u8) -> u32 {
