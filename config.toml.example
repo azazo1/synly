@@ -1,4 +1,4 @@
-version = 1
+version = 2
 
 # 每台设备的 UUID 和身份密钥由 identity.toml 保存.
 # 首选活跃设备 ID, 由程序写入, host 重启后保持其活跃身份.
@@ -48,6 +48,9 @@ hotkey = "ctrl+alt+shift+esc"
 elevate_on_start = false
 reverse_mouse_wheel = false
 reverse_trackpad = false
+# 发送端生效: macOS 机控制 macOS -> Windows, Windows 机控制 Windows -> macOS.
+native_scroll_macos_to_windows = false
+native_scroll_windows_to_macos = false
 block_switch_on_press = false
 # 光标模式三选一: desktop 固定桌面光标, auto 按前台光标捕获状态自动切换, game 固定游戏光标(相对增量注入).
 cursor_mode = "auto"

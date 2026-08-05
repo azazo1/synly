@@ -18,6 +18,7 @@ slint::include_modules!();
 const GUI_INTERVAL: Duration = Duration::from_millis(16);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(250);
 const EDGE_INSET: i32 = 8;
+const GRID_CELL_SIZE: f32 = 48.0;
 
 #[derive(Clone, Debug)]
 pub struct ScreenMockOptions {
@@ -25,6 +26,8 @@ pub struct ScreenMockOptions {
     pub hotkey: Hotkey,
     pub width: i32,
     pub height: i32,
+    pub native_scroll_macos_to_windows: bool,
+    pub native_scroll_windows_to_macos: bool,
 }
 
 pub fn run_screen_mock(options: ScreenMockOptions) -> Result<()> {
@@ -177,6 +180,8 @@ async fn run_mock_worker(
         hotkey: options.hotkey,
         reverse_mouse_wheel: false,
         reverse_trackpad: false,
+        native_scroll_macos_to_windows: options.native_scroll_macos_to_windows,
+        native_scroll_windows_to_macos: options.native_scroll_windows_to_macos,
         block_switch_on_press: false,
         key_mapping: KeyMappingConfig::default(),
         cursor_mode: crate::input::CursorMode::Desktop,
@@ -196,6 +201,7 @@ async fn run_mock_worker(
         observed_motion,
         incoming_tx,
         outgoing_rx,
+        remote_platform,
         &stop,
         &presenter,
     );
@@ -217,6 +223,7 @@ async fn run_mock_peer(
     motion: Arc<platform::MotionAccumulator>,
     incoming: mpsc::Sender<Result<InputMessage>>,
     mut outgoing: mpsc::Receiver<InputMessage>,
+    remote_platform: InputPlatform,
     stop: &AtomicBool,
     presenter: &GuiPresenter,
 ) -> Result<()> {
@@ -233,6 +240,7 @@ async fn run_mock_peer(
     let mut keys = BTreeSet::new();
     let mut buttons = BTreeSet::new();
     let mut wheel = Point::default();
+    let mut grid_offset = GridOffset::default();
     let mut last_event = "等待输入".to_string();
 
     loop {
@@ -357,7 +365,14 @@ async fn run_mock_peer(
                     } if active && incoming_generation == generation => {
                         wheel.x = wheel.x.saturating_add(x);
                         wheel.y = wheel.y.saturating_add(y);
-                        last_event = format!("滚轮 x={x}, y={y}");
+                        let (grid_x, grid_y) = wheel_to_grid_delta(x, y, remote_platform);
+                        grid_offset.x = wrap_grid_offset(grid_offset.x + grid_x);
+                        grid_offset.y = wrap_grid_offset(grid_offset.y + grid_y);
+                        last_event = format!(
+                            "滚轮 x={x}, y={y}, grid=({:.1}, {:.1})",
+                            grid_offset.x,
+                            grid_offset.y,
+                        );
                     }
                     InputMessage::Heartbeat { .. } => {}
                     InputMessage::SecureDesktop { active } => {
@@ -420,6 +435,8 @@ async fn run_mock_peer(
                     key_count: keys.len() as u32,
                     button_mask: button_mask(&buttons),
                     wheel,
+                    grid_offset_x: grid_offset.x,
+                    grid_offset_y: grid_offset.y,
                     event: last_event.clone(),
                 });
             }
@@ -458,6 +475,27 @@ fn button_mask(buttons: &BTreeSet<u8>) -> u32 {
             .checked_shl(u32::from(button.saturating_sub(1)))
             .unwrap_or(0)
     })
+}
+
+fn wheel_to_grid_delta(x: i32, y: i32, remote_platform: InputPlatform) -> (f32, f32) {
+    let scale = grid_pixels_per_wheel_unit(remote_platform);
+    (x as f32 * scale, y as f32 * scale)
+}
+
+fn grid_pixels_per_wheel_unit(remote_platform: InputPlatform) -> f32 {
+    match remote_platform {
+        InputPlatform::Macos | InputPlatform::Windows => GRID_CELL_SIZE,
+    }
+}
+
+fn wrap_grid_offset(value: f32) -> f32 {
+    value.rem_euclid(GRID_CELL_SIZE)
+}
+
+#[derive(Clone, Copy, Default)]
+struct GridOffset {
+    x: f32,
+    y: f32,
 }
 
 #[derive(Clone)]
@@ -520,6 +558,8 @@ struct GuiUpdate {
     key_count: u32,
     button_mask: u32,
     wheel: Point,
+    grid_offset_x: f32,
+    grid_offset_y: f32,
     event: String,
 }
 
@@ -532,6 +572,8 @@ impl GuiUpdate {
             key_count: 0,
             button_mask: 0,
             wheel: Point::default(),
+            grid_offset_x: 0.0,
+            grid_offset_y: 0.0,
             event,
         }
     }
@@ -554,6 +596,8 @@ fn apply_gui_update(
     window.set_button_summary(format!("0x{:08x}", update.button_mask).into());
     window.set_wheel_x(update.wheel.x);
     window.set_wheel_y(update.wheel.y);
+    window.set_grid_offset_x(update.grid_offset_x);
+    window.set_grid_offset_y(update.grid_offset_y);
     window.set_event_text(update.event.clone().into());
 }
 
@@ -566,7 +610,10 @@ fn normalized_coordinate(value: i32, extent: i32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{button_mask, normalized_coordinate, opposite_platform};
+    use super::{
+        GRID_CELL_SIZE, button_mask, grid_pixels_per_wheel_unit, normalized_coordinate,
+        opposite_platform, wrap_grid_offset,
+    };
     use crate::input::InputPlatform;
     use std::collections::BTreeSet;
 
@@ -587,5 +634,13 @@ mod tests {
         assert_eq!(normalized_coordinate(-4, 100), 0.0);
         assert_eq!(normalized_coordinate(99, 100), 1.0);
         assert_eq!(button_mask(&BTreeSet::from([1, 3])), 0b101);
+    }
+
+    #[test]
+    fn grid_offset_uses_one_cell_per_wheel_unit_and_wraps() {
+        assert_eq!(grid_pixels_per_wheel_unit(InputPlatform::Macos), GRID_CELL_SIZE);
+        assert_eq!(grid_pixels_per_wheel_unit(InputPlatform::Windows), GRID_CELL_SIZE);
+        assert_eq!(wrap_grid_offset(-60.0), 36.0);
+        assert_eq!(wrap_grid_offset(110.0), 14.0);
     }
 }

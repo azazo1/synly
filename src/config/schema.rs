@@ -61,6 +61,8 @@ pub struct InputConfig {
     pub elevate_on_start: bool,
     pub reverse_mouse_wheel: bool,
     pub reverse_trackpad: bool,
+    pub native_scroll_macos_to_windows: bool,
+    pub native_scroll_windows_to_macos: bool,
     #[serde(default)]
     pub block_switch_on_press: bool,
     pub key_mapping: KeyMappingConfig,
@@ -116,6 +118,8 @@ impl Default for InputConfig {
             elevate_on_start: false,
             reverse_mouse_wheel: false,
             reverse_trackpad: false,
+            native_scroll_macos_to_windows: false,
+            native_scroll_windows_to_macos: false,
             block_switch_on_press: false,
             key_mapping: KeyMappingConfig::default(),
             cursor_mode: CursorMode::default(),

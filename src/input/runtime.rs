@@ -1,7 +1,8 @@
 use super::channel::{InputChannelOffer, InputHostChannel};
 use super::mapping::KeyMapper;
-use super::platform::{self, NativeEvent, ScrollSource};
+use super::platform::{self, NativeEvent};
 use super::protocol::{InputMessage, read_message, write_message};
+use super::scroll::ScrollTransformer;
 use super::{
     DisplayRect, Hotkey, InputMode, InputPlatform, KeyMappingConfig, KeySnapshot, LocalInputRole,
     ScreenEdge,
@@ -41,6 +42,8 @@ pub struct InputRuntimeOptions {
     pub hotkey: Hotkey,
     pub reverse_mouse_wheel: bool,
     pub reverse_trackpad: bool,
+    pub native_scroll_macos_to_windows: bool,
+    pub native_scroll_windows_to_macos: bool,
     pub block_switch_on_press: bool,
     pub key_mapping: KeyMappingConfig,
     pub cursor_mode: CursorMode,
@@ -527,6 +530,11 @@ pub(super) async fn run_sender(
     let mut press_blocked = false;
     let mut secure_desktop = false;
     let mut secure_input = false;
+    let mut scroll_transformer =
+        ScrollTransformer::new(
+            options.native_scroll_macos_to_windows,
+            options.native_scroll_windows_to_macos,
+        );
 
     tracing::info!(
         edge = ?source_edge,
@@ -649,7 +657,7 @@ pub(super) async fn run_sender(
                         }
                     }
                     NativeEvent::Wheel { x, y, source } if control.active => {
-                        let (x, y) = transform_scroll(
+                        let (x, y) = scroll_transformer.transform(
                             x,
                             y,
                             source,
@@ -782,6 +790,7 @@ pub(super) async fn run_sender(
                             pressed,
                         })?;
                         platform.backend.set_capture(true)?;
+                        scroll_transformer.reset();
                         control.active = true;
                         control.activation_confirmed = false;
                         last_heartbeat = Instant::now();
@@ -1335,32 +1344,6 @@ pub(super) async fn run_receiver(
     }
 }
 
-fn transform_scroll(
-    x: i32,
-    y: i32,
-    source: ScrollSource,
-    local_platform: InputPlatform,
-    remote_platform: InputPlatform,
-    reverse_mouse_wheel: bool,
-    reverse_trackpad: bool,
-) -> (i32, i32) {
-    // macOS 和 Windows 的水平滚动 API 符号相反, 同平台传输保持原生值.
-    let x = if local_platform == remote_platform {
-        x
-    } else {
-        x.saturating_neg()
-    };
-    let reverse = match source {
-        ScrollSource::MouseWheel => reverse_mouse_wheel,
-        ScrollSource::Trackpad => reverse_trackpad,
-    };
-    if reverse {
-        (x.saturating_neg(), y.saturating_neg())
-    } else {
-        (x, y)
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn apply_receiver_motion(
     backend: &dyn platform::InputBackend,
@@ -1438,10 +1421,9 @@ mod tests {
         ACTIVATION_TIMEOUT, AbortOnDrop, EDGE_INSET, HEARTBEAT_TIMEOUT, ReceiverMotion,
         IncomingMotion, PressedState, SenderRecoveryGuard, describe_pressed, enqueue_message,
         receiver_motion, run_receiver, run_sender, sender_activation_edge_position,
-        sender_heartbeat_timeout, spawn_input_reader, transform_scroll,
+        sender_heartbeat_timeout, spawn_input_reader,
     };
     use crate::input::platform::{InputBackend, MotionAccumulator, NativeEvent, PlatformHandle};
-    use crate::input::platform::ScrollSource;
     use crate::input::protocol::{InputMessage, write_message};
     use crate::input::{
         DesktopLayout, DisplayRect, Hotkey, InputMode, InputPlatform, InputRuntimeOptions,
@@ -1934,98 +1916,6 @@ mod tests {
         let _ = task.await;
     }
 
-    #[test]
-    fn scroll_reversal_is_selected_by_source() {
-        assert_eq!(
-            transform_scroll(
-                4,
-                -7,
-                ScrollSource::MouseWheel,
-                InputPlatform::Macos,
-                InputPlatform::Macos,
-                true,
-                false,
-            ),
-            (-4, 7)
-        );
-        assert_eq!(
-            transform_scroll(
-                4,
-                -7,
-                ScrollSource::Trackpad,
-                InputPlatform::Macos,
-                InputPlatform::Macos,
-                true,
-                false,
-            ),
-            (4, -7)
-        );
-        assert_eq!(
-            transform_scroll(
-                i32::MIN,
-                i32::MAX,
-                ScrollSource::Trackpad,
-                InputPlatform::Macos,
-                InputPlatform::Macos,
-                false,
-                true,
-            ),
-            (i32::MAX, -i32::MAX)
-        );
-    }
-
-    #[test]
-    fn cross_platform_scroll_flips_only_horizontal_axis() {
-        assert_eq!(
-            transform_scroll(
-                4,
-                -7,
-                ScrollSource::Trackpad,
-                InputPlatform::Macos,
-                InputPlatform::Macos,
-                false,
-                false,
-            ),
-            (4, -7)
-        );
-        assert_eq!(
-            transform_scroll(
-                4,
-                -7,
-                ScrollSource::Trackpad,
-                InputPlatform::Macos,
-                InputPlatform::Windows,
-                false,
-                false,
-            ),
-            (-4, -7)
-        );
-        assert_eq!(
-            transform_scroll(
-                4,
-                -7,
-                ScrollSource::Trackpad,
-                InputPlatform::Windows,
-                InputPlatform::Macos,
-                false,
-                false,
-            ),
-            (-4, -7)
-        );
-        assert_eq!(
-            transform_scroll(
-                4,
-                -7,
-                ScrollSource::Trackpad,
-                InputPlatform::Windows,
-                InputPlatform::Windows,
-                false,
-                false,
-            ),
-            (4, -7)
-        );
-    }
-
     fn test_input_options(edge: ScreenEdge) -> InputRuntimeOptions {
         InputRuntimeOptions {
             mode: InputMode::Send,
@@ -2033,6 +1923,8 @@ mod tests {
             hotkey: Hotkey::DEFAULT.parse().unwrap(),
             reverse_mouse_wheel: false,
             reverse_trackpad: false,
+            native_scroll_macos_to_windows: false,
+            native_scroll_windows_to_macos: false,
             block_switch_on_press: false,
             key_mapping: KeyMappingConfig::default(),
             cursor_mode: super::CursorMode::Desktop,

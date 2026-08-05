@@ -14,6 +14,7 @@ pub mod receiver_mock;
 mod platform;
 mod protocol;
 mod runtime;
+mod scroll;
 #[cfg(windows)]
 pub use platform::windows as windows_agent;
 #[cfg(target_os = "macos")]

@@ -58,6 +58,7 @@ gradlew *args:
     bash scripts/android-gradle.sh {{ args }}
 
 # just input-screen-mock --edge right
+# just input-screen-mock --native-scroll-macos-to-windows
 # 使用 Slint 虚拟屏幕验证当前平台的输入捕获和返回.
 input-screen-mock *args:
     cargo run --features input-screen-mock --bin input-screen-mock -- {{ args }}

@@ -183,6 +183,8 @@ pub async fn run_receiver_mock(options: ReceiverMockOptions) -> Result<()> {
         hotkey: options.hotkey,
         reverse_mouse_wheel: false,
         reverse_trackpad: false,
+        native_scroll_macos_to_windows: false,
+        native_scroll_windows_to_macos: false,
         block_switch_on_press: false,
         key_mapping: KeyMappingConfig::default(),
         cursor_mode: options.cursor_mode,

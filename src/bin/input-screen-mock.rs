@@ -24,6 +24,10 @@ struct Cli {
     width: i32,
     #[arg(long, default_value_t = 720, help = "mock 虚拟屏幕高度")]
     height: i32,
+    #[arg(long, help = "启用 macOS -> Windows 原生滚动换算")]
+    native_scroll_macos_to_windows: bool,
+    #[arg(long, help = "启用 Windows -> macOS 原生滚动换算")]
+    native_scroll_windows_to_macos: bool,
 }
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -41,6 +45,8 @@ fn main() -> Result<()> {
         hotkey: Hotkey::from_str(&cli.hotkey)?,
         width: cli.width,
         height: cli.height,
+        native_scroll_macos_to_windows: cli.native_scroll_macos_to_windows,
+        native_scroll_windows_to_macos: cli.native_scroll_windows_to_macos,
     })
 }
 

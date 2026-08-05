@@ -551,7 +551,7 @@ mod tests {
         assert_eq!(reloaded.gui_state, config.gui_state);
         assert!(fs::read_to_string(dir.join(CONFIG_FILE_NAME))
             .unwrap()
-            .contains("version = 1"));
+            .contains("version = 2"));
         assert!(fs::read_to_string(dir.join(GUI_STATE_FILE_NAME))
             .unwrap()
             .contains("version = 1"));
@@ -609,7 +609,7 @@ mod tests {
 
         let main: toml::Value =
             toml::from_str(&fs::read_to_string(dir.join(CONFIG_FILE_NAME)).unwrap()).unwrap();
-        assert_eq!(main["version"].as_integer(), Some(1));
+        assert_eq!(main["version"].as_integer(), Some(2));
         assert!(!main["ui"].as_table().unwrap().contains_key("first_run_completed"));
         assert!(!main["ui"].as_table().unwrap().contains_key("window_width"));
         assert!(!main["ui"].as_table().unwrap().contains_key("window_height"));
@@ -680,7 +680,7 @@ mod tests {
         assert_eq!(loaded.gui_state.window_height, 700);
         let main: toml::Value =
             toml::from_str(&fs::read_to_string(dir.join(CONFIG_FILE_NAME)).unwrap()).unwrap();
-        assert_eq!(main["version"].as_integer(), Some(1));
+        assert_eq!(main["version"].as_integer(), Some(2));
         assert!(!main["ui"].as_table().unwrap().contains_key("window_width"));
         cleanup_dir(&dir);
     }
@@ -851,6 +851,8 @@ mod tests {
         assert_eq!(config.input.key_mapping, crate::input::KeyMappingConfig::default());
         assert!(!config.input.elevate_on_start);
         assert!(!config.input.block_switch_on_press);
+        assert!(!config.input.native_scroll_macos_to_windows);
+        assert!(!config.input.native_scroll_windows_to_macos);
         assert_eq!(config.input.cursor_mode, crate::input::CursorMode::Auto);
     }
 

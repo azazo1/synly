@@ -3,7 +3,7 @@ use crate::config::{
     TransferConfig, UiConfig,
 };
 use crate::core::{AppCommand, AppSettings, AppSnapshot, AppSupervisor};
-use crate::input::{CursorMode, InputMode, ScreenEdge};
+use crate::input::{CursorMode, InputMode, InputPlatform, ScreenEdge};
 use crate::runtime_control::{InteractionRequest, InteractionResponse};
 use crate::runtime_options::normalize_pin;
 use crate::settings::{
@@ -868,6 +868,11 @@ fn apply_settings_to_window(
     window.set_input_edge_index(input_edge_index(runtime.input.edge));
     window.set_input_hotkey(runtime.input.hotkey.clone().into());
     window.set_block_switch_on_press(runtime.input.block_switch_on_press);
+    let local_platform = InputPlatform::current();
+    window.set_native_scroll_macos_to_windows(runtime.input.native_scroll_macos_to_windows);
+    window.set_native_scroll_macos_to_windows_enabled(local_platform == InputPlatform::Macos);
+    window.set_native_scroll_windows_to_macos(runtime.input.native_scroll_windows_to_macos);
+    window.set_native_scroll_windows_to_macos_enabled(local_platform == InputPlatform::Windows);
     window.set_cursor_mode_index(cursor_mode_index(runtime.input.cursor_mode));
     window.set_accept_untrusted(runtime.accept);
     window.set_trust_device(runtime.trust_device);
@@ -986,6 +991,8 @@ fn settings_from_window(
             elevate_on_start: current_input.elevate_on_start,
             reverse_mouse_wheel: current_input.reverse_mouse_wheel,
             reverse_trackpad: current_input.reverse_trackpad,
+            native_scroll_macos_to_windows: window.get_native_scroll_macos_to_windows(),
+            native_scroll_windows_to_macos: window.get_native_scroll_windows_to_macos(),
             block_switch_on_press: window.get_block_switch_on_press(),
             key_mapping: current_input.key_mapping.clone(),
             cursor_mode: cursor_mode_from_index(window.get_cursor_mode_index()),

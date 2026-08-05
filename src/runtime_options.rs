@@ -60,6 +60,8 @@ pub fn runtime_options_from_config(
         hotkey: runtime.input.hotkey.parse()?,
         reverse_mouse_wheel: runtime.input.reverse_mouse_wheel,
         reverse_trackpad: runtime.input.reverse_trackpad,
+        native_scroll_macos_to_windows: runtime.input.native_scroll_macos_to_windows,
+        native_scroll_windows_to_macos: runtime.input.native_scroll_windows_to_macos,
         block_switch_on_press: runtime.input.block_switch_on_press,
         key_mapping: runtime.input.key_mapping.clone(),
         cursor_mode: runtime.input.cursor_mode,

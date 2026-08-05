@@ -29,6 +29,28 @@ component Metric inherits Rectangle {
     }
 }
 
+component ScrollGrid inherits Rectangle {
+    in property <length> offset-x: 0px;
+    in property <length> offset-y: 0px;
+    background: transparent;
+
+    for col-index in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28]: Rectangle {
+        x: col-index * 48px - root.offset-x;
+        y: 0px;
+        width: 1px;
+        height: 100%;
+        background: #3a4a44;
+    }
+
+    for row-index in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]: Rectangle {
+        x: 0px;
+        y: row-index * 48px - root.offset-y;
+        width: 100%;
+        height: 1px;
+        background: #3a4a44;
+    }
+}
+
 export component InputScreenMockWindow inherits Window {
     init => { Palette.color-scheme = ColorScheme.light; }
     title: "Synly input screen mock";
@@ -54,6 +76,8 @@ export component InputScreenMockWindow inherits Window {
     in property <string> button-summary: "0x00000000";
     in property <int> wheel-x: 0;
     in property <int> wheel-y: 0;
+    in property <length> grid-offset-x: 0px;
+    in property <length> grid-offset-y: 0px;
     in property <string> event-text: "正在启动";
 
     callback quit-requested();
@@ -130,6 +154,31 @@ export component InputScreenMockWindow inherits Window {
                 border-color: root.active ? #65b78e : #3a4641;
                 border-width: root.active ? 2px : 1px;
                 border-radius: 4px;
+
+                ScrollGrid {
+                    x: 0px;
+                    y: 0px;
+                    width: 100%;
+                    height: 100%;
+                    offset-x: root.grid-offset-x;
+                    offset-y: root.grid-offset-y;
+                }
+
+                Rectangle {
+                    x: parent.width / 2 - 1px;
+                    y: 0px;
+                    width: 2px;
+                    height: 100%;
+                    background: #567066;
+                }
+
+                Rectangle {
+                    x: 0px;
+                    y: parent.height / 2 - 1px;
+                    width: 100%;
+                    height: 2px;
+                    background: #567066;
+                }
 
                 Text {
                     x: 12px;

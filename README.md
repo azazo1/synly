@@ -198,7 +198,7 @@ Synly 使用固定的四文件配置目录, 每个文件的顶层都有独立的
 └── trusted-devices.toml
 ```
 
-- `config.toml` 保存用户设置和运行参数. 当前格式版本为 `1`. 输入方向, 屏幕边缘, 热键, 启动提权, 按键映射, 滚动反向, 按住拦截开关, 光标模式(`cursor_mode`, 三选一: `desktop`/`auto`/`game`)都位于 `[input]`.
+- `config.toml` 保存用户设置和运行参数. 当前格式版本为 `2`. 输入方向, 屏幕边缘, 热键, 启动提权, 按键映射, 滚动反向, 原生滚动, 按住拦截开关, 光标模式(`cursor_mode`, 三选一: `desktop`/`auto`/`game`)都位于 `[input]`.
 - `gui-state.toml` 保存桌面 GUI 的首次运行标记和窗口尺寸. 当前格式版本为 `1`.
 - `identity.toml` 保存 `device_id`, `private_key`, `public_key`. 当前格式版本为 `1`. 文件缺失时自动生成, 已存在但密钥无效时启动失败.
 - `trusted-devices.toml` 使用 `[[devices]]` 保存可信设备和会话统计. 当前格式版本为 `1`.
@@ -209,6 +209,10 @@ Synly 使用固定的四文件配置目录, 每个文件的顶层都有独立的
 普通键使用 `a` 到 `z`, `0` 到 `9`, `f1` 到 `f12`, `enter`, `escape`, `backspace`, `tab`, `space`, `minus`, `equal`, `left_bracket`, `right_bracket`, `backslash`, `semicolon`, `apostrophe`, `comma`, `period`, `slash`, `caps_lock`, `insert`, `home`, `page_up`, `delete`, `end`, `page_down` 和方向键名称. 修饰键按平台使用 `left_ctrl`, `left_shift`, `left_option`, `left_command`, `left_alt`, `left_win` 及对应的 `right_` 名称. 实际可用键位仍受源端捕获和目标端注入能力限制.
 
 `reverse_mouse_wheel` 和 `reverse_trackpad` 会同时反转水平与垂直滚动. macOS 能区分普通滚轮和连续触控板滚动. Windows 发送端会将所有滚动视为鼠标滚轮, 因此 `reverse_trackpad` 在 Windows 上不生效. 这些配置在应用启动时读取, 修改后需要重启.
+
+`native_scroll_macos_to_windows` 和 `native_scroll_windows_to_macos` 是发送端生效的原生滚动开关. macOS 机开启前者后, 会把触控板连续像素滚动按固定曲线换算成 Windows 滚轮档位; Windows 机开启后者后, 会把滚轮档位按固定 macOS 风格曲线换算成 macOS line 滚动. 关闭时保持原有直通行为. 两个开关都可在 GUI 输入设置中修改, 修改后会自动重启输入任务.
+
+`input-screen-mock` 也可以模拟这个效果. macOS 上运行 `just input-screen-mock --native-scroll-macos-to-windows`, Windows 上运行 `just input-screen-mock --native-scroll-windows-to-macos`, mock 屏幕中的 48px 网格会根据滚轮输入移动, 方便对比原生换算开启前后的滚动差异.
 
 `elevate_on_start` 仅在 Windows 生效. 设置为 `true` 后, GUI 主实例和 Headless 都会在启动会话前请求 UAC 并启动管理员输入代理. macOS 和 Linux 会保存但忽略该字段.
 
