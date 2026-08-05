@@ -289,6 +289,16 @@ fn wire_window_callbacks(
         }
     });
 
+    let weak = window.as_weak();
+    window.on_scroll_log_to_bottom(move || {
+        if let Some(window) = weak.upgrade() {
+            window.set_log_auto_scroll(true);
+            let visible_height = window.get_log_visible_height();
+            let viewport_height = window.get_log_viewport_height();
+            window.set_log_viewport_y(-(viewport_height - visible_height).max(0.0));
+        }
+    });
+
     let commands = handle.commands();
     window.on_set_clipboard_mode(move |index| {
         send_command(
@@ -671,15 +681,40 @@ fn apply_snapshot(
 
 fn spawn_log_presenter(runtime: &tokio::runtime::Runtime, window: &AppWindow) {
     let window = window.as_weak();
+    let previous_viewport_y = Arc::new(Mutex::new(None::<f32>));
     runtime.spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(500));
         loop {
             ticker.tick().await;
             let logs = crate::tracing_utils::recent_logs();
             let window = window.clone();
+            let previous_viewport_y = Arc::clone(&previous_viewport_y);
             if slint::invoke_from_event_loop(move || {
-                if let Some(window) = window.upgrade() {
-                    window.set_log_text(logs.into());
+                let Some(window) = window.upgrade() else {
+                    return;
+                };
+                let mut auto_scroll = window.get_log_auto_scroll();
+                let visible_height = window.get_log_visible_height();
+                let viewport_height = window.get_log_viewport_height();
+                let viewport_y = window.get_log_viewport_y();
+                let max_scroll = (viewport_height - visible_height).max(0.0);
+                let at_bottom = visible_height > 0.0
+                    && (max_scroll <= 0.0 || -viewport_y >= max_scroll - 1.0);
+                if let Ok(mut previous) = previous_viewport_y.lock() {
+                    if visible_height > 0.0 {
+                        let user_scrolled_up = match *previous {
+                            Some(previous_y) => viewport_y > previous_y + 1.0,
+                            None => false,
+                        };
+                        auto_scroll =
+                            next_log_auto_scroll(auto_scroll, at_bottom, user_scrolled_up);
+                    }
+                    *previous = Some(viewport_y);
+                }
+                window.set_log_auto_scroll(auto_scroll);
+                window.set_log_text(logs.into());
+                if auto_scroll && visible_height > 0.0 {
+                    window.set_log_viewport_y(-max_scroll);
                 }
             })
             .is_err()
@@ -688,6 +723,16 @@ fn spawn_log_presenter(runtime: &tokio::runtime::Runtime, window: &AppWindow) {
             }
         }
     });
+}
+
+fn next_log_auto_scroll(auto_scroll: bool, at_bottom: bool, user_scrolled_up: bool) -> bool {
+    if user_scrolled_up {
+        false
+    } else if at_bottom {
+        true
+    } else {
+        auto_scroll
+    }
 }
 
 fn apply_interaction(
@@ -1256,7 +1301,9 @@ fn log_level_from_index(index: i32) -> LogLevel {
 
 #[cfg(test)]
 mod tests {
-    use super::{interaction_notification_text, normalized_restored_window_size};
+    use super::{
+        interaction_notification_text, next_log_auto_scroll, normalized_restored_window_size,
+    };
     use crate::runtime_control::InteractionRequest;
     use uuid::Uuid;
 
@@ -1278,6 +1325,14 @@ mod tests {
         assert!(!title.contains("123456"));
         assert!(!body.contains("123456"));
         assert!(body.contains("ABCD"));
+    }
+
+    #[test]
+    fn log_auto_scroll_stops_on_up_and_resumes_at_bottom() {
+        assert!(!next_log_auto_scroll(true, false, true));
+        assert!(!next_log_auto_scroll(false, false, false));
+        assert!(next_log_auto_scroll(false, true, false));
+        assert!(next_log_auto_scroll(true, false, false));
     }
 
     #[test]
