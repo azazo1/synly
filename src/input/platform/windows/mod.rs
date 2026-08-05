@@ -9,7 +9,7 @@ use crate::input::InputMode;
 use anyhow::{Context, Result, bail};
 use std::sync::Arc;
 
-pub use agent::{request_elevation, run_agent};
+pub use agent::{request_elevation, request_elevation_for_auto_recovery, run_agent};
 pub use service::{
     install, init_tracing, mark_install_attempted, run_service, service_installed, status,
     uninstall, uninstall_via_uac,

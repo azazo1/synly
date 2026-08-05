@@ -1,4 +1,5 @@
 use super::super::agent::security::wide;
+use super::client::{mark_manual_uninstall, mark_service_seen_installed};
 use anyhow::{Context, Result, bail};
 use std::ffi::c_void;
 use std::time::{Duration, Instant};
@@ -163,6 +164,7 @@ pub fn install() -> Result<()> {
             return Err(error).context("启动 Synly 输入服务失败");
         }
     }
+    mark_service_seen_installed();
     tracing::info!("Synly 输入服务已安装并启动");
     Ok(())
 }
@@ -292,6 +294,7 @@ pub fn uninstall() -> Result<()> {
     if unsafe { DeleteService(service.0) } == 0 {
         return Err(std::io::Error::last_os_error()).context("删除 Synly 输入服务失败");
     }
+    mark_manual_uninstall();
     tracing::info!("Synly 输入服务已卸载");
     Ok(())
 }

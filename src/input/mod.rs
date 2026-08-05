@@ -64,7 +64,11 @@ pub fn ensure_platform_supported(mode: InputMode) -> Result<()> {
 }
 
 #[cfg(windows)]
-pub use platform::windows::{request_elevation as request_windows_input_elevation, run_agent};
+pub use platform::windows::{
+    request_elevation as request_windows_input_elevation,
+    request_elevation_for_auto_recovery as request_windows_input_elevation_for_auto_recovery,
+    run_agent,
+};
 
 #[cfg(windows)]
 pub use platform::windows::init_agent_tracing as init_windows_agent_tracing;

@@ -13,5 +13,5 @@ pub use client::{
 };
 pub(crate) use client::{
     install_attempted, install_via_uac, is_available, mark_path_repair_attempted,
-    path_repair_attempted, spawn_agent,
+    manual_uninstall_requested, path_repair_attempted, spawn_agent,
 };

@@ -19,6 +19,8 @@ const ELEVATED_ACTION_TIMEOUT_MS: u32 = 30_000;
 
 static INSTALL_ATTEMPTED: AtomicBool = AtomicBool::new(false);
 static PATH_REPAIR_ATTEMPTED: AtomicBool = AtomicBool::new(false);
+static SERVICE_SEEN_INSTALLED: AtomicBool = AtomicBool::new(false);
+static SERVICE_MANUALLY_UNINSTALLED: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn install_attempted() -> bool {
     INSTALL_ATTEMPTED.load(Ordering::Acquire)
@@ -36,15 +38,55 @@ pub(crate) fn mark_path_repair_attempted() {
     PATH_REPAIR_ATTEMPTED.store(true, Ordering::Release);
 }
 
+pub(crate) fn manual_uninstall_requested() -> bool {
+    SERVICE_MANUALLY_UNINSTALLED.load(Ordering::Acquire)
+}
+
+pub(crate) fn mark_manual_uninstall() {
+    mark_install_attempted();
+    SERVICE_MANUALLY_UNINSTALLED.store(true, Ordering::Release);
+}
+
+pub(crate) fn mark_service_seen_installed() {
+    SERVICE_SEEN_INSTALLED.store(true, Ordering::Release);
+}
+
+fn note_service_not_installed() {
+    if SERVICE_SEEN_INSTALLED.load(Ordering::Acquire) {
+        SERVICE_MANUALLY_UNINSTALLED.store(true, Ordering::Release);
+    }
+}
+
 pub fn is_installed() -> bool {
-    matches!(
-        status(),
-        Ok(ServiceStatus::Stopped | ServiceStatus::Running)
-    )
+    match status() {
+        Ok(ServiceStatus::Stopped | ServiceStatus::Running) => {
+            mark_service_seen_installed();
+            true
+        }
+        Ok(ServiceStatus::NotInstalled) => {
+            note_service_not_installed();
+            false
+        }
+        Err(_) => false,
+    }
 }
 
 pub(crate) fn is_available() -> bool {
-    matches!(status(), Ok(ServiceStatus::Running))
+    match status() {
+        Ok(ServiceStatus::Running) => {
+            mark_service_seen_installed();
+            true
+        }
+        Ok(ServiceStatus::Stopped) => {
+            mark_service_seen_installed();
+            false
+        }
+        Ok(ServiceStatus::NotInstalled) => {
+            note_service_not_installed();
+            false
+        }
+        Err(_) => false,
+    }
 }
 
 pub(crate) fn spawn_agent(
@@ -74,11 +116,19 @@ pub(crate) fn spawn_agent(
 }
 
 pub(crate) fn install_via_uac() -> Result<bool> {
-    run_elevated("service install")
+    let installed = run_elevated("service install")?;
+    if installed {
+        mark_service_seen_installed();
+    }
+    Ok(installed)
 }
 
 pub fn uninstall_via_uac() -> Result<bool> {
-    run_elevated("service uninstall")
+    let uninstalled = run_elevated("service uninstall")?;
+    if uninstalled {
+        mark_manual_uninstall();
+    }
+    Ok(uninstalled)
 }
 
 fn run_elevated(parameters: &str) -> Result<bool> {

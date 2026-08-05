@@ -852,7 +852,8 @@ impl AppSupervisor {
                             tracing::warn!("Windows 输入代理连接丢失, 自动尝试恢复");
                             let internal = internal.clone();
                             tokio::task::spawn_blocking(move || {
-                                match crate::windows_input_agent::request_elevation() {
+                                match crate::windows_input_agent::request_elevation_for_auto_recovery()
+                                {
                                     Ok(()) => {
                                         let _ =
                                             internal.send(InternalEvent::InputElevation(true));

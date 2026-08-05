@@ -4,6 +4,10 @@ pub fn request_elevation() -> Result<()> {
     synly::input::request_windows_input_elevation()
 }
 
+pub fn request_elevation_for_auto_recovery() -> Result<()> {
+    synly::input::request_windows_input_elevation_for_auto_recovery()
+}
+
 pub fn request_startup_elevation() -> Result<()> {
     tracing::info!("配置要求启动 Windows 输入管理员代理");
     request_elevation()

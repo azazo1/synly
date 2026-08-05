@@ -111,6 +111,22 @@ pub(super) struct AgentBackend {
 }
 
 pub fn request_elevation() -> Result<()> {
+    request_elevation_inner(false)
+}
+
+pub fn request_elevation_for_auto_recovery() -> Result<()> {
+    request_elevation_inner(true)
+}
+
+fn request_elevation_inner(automatic: bool) -> Result<()> {
+    if automatic
+        && super::super::service::manual_uninstall_requested()
+        && !super::super::service::is_available()
+    {
+        tracing::warn!("输入服务已在本会话手动卸载, 自动恢复时不再请求提权");
+        return Err(anyhow!("输入服务已在本会话手动卸载, 自动恢复被跳过"));
+    }
+
     if let Some(client) = current_client() {
         if client.request(AgentRequest::Health).is_ok() {
             if client.is_system.load(Ordering::Acquire) {
@@ -148,6 +164,10 @@ pub fn request_elevation() -> Result<()> {
         parent_pid,
     );
     if !service_spawned {
+        if automatic && super::super::service::manual_uninstall_requested() {
+            tracing::warn!("输入服务已在本会话手动卸载, 自动恢复时跳过 UAC 回退");
+            return Err(anyhow!("输入服务已在本会话手动卸载, UAC 回退被跳过"));
+        }
         launch_legacy_agent(
             &executable,
             &command_pipe_name,
@@ -171,6 +191,10 @@ fn spawn_agent_via_service(
     parent_pid: u32,
 ) -> bool {
     if !super::super::service::is_available() {
+        if super::super::service::manual_uninstall_requested() {
+            tracing::warn!("输入服务已在本会话手动卸载, 不再自动安装");
+            return false;
+        }
         tracing::warn!("SYSTEM 输入服务未安装或未运行, 尝试自动安装");
         if !try_install_service_once() {
             return false;
