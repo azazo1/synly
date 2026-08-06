@@ -345,7 +345,7 @@ pub(in crate::input) fn start_client(context: CaptureContext) -> Result<Arc<dyn 
     let (layout, secure_desktop, primary) = match client.request(AgentRequest::Start {
         mode: context.mode,
         hotkey: context.hotkey,
-        filter_app_events: context.filter_app_events.load(Ordering::Acquire),
+        filter_app_events: context.filter_app_events,
     })? {
         AgentResponse::Started {
             layout,

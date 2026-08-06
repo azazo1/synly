@@ -234,7 +234,7 @@ pub struct CaptureContext {
     pub capture_active: Arc<AtomicBool>,
     pub overflowed: Arc<AtomicBool>,
     pub failed: Arc<AtomicBool>,
-    pub filter_app_events: Arc<AtomicBool>,
+    pub filter_app_events: bool,
 }
 
 impl CaptureContext {
@@ -264,7 +264,6 @@ pub fn start_with_filter(
     let capture_active = Arc::new(AtomicBool::new(false));
     let overflowed = Arc::new(AtomicBool::new(false));
     let failed = Arc::new(AtomicBool::new(false));
-    let filter_app_events = Arc::new(AtomicBool::new(filter_app_events));
     let context = CaptureContext {
         mode,
         hotkey,

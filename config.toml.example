@@ -52,7 +52,7 @@ reverse_trackpad = false
 native_scroll_macos_to_windows = false
 native_scroll_windows_to_macos = false
 block_switch_on_press = false
-filter_app_events = false
+filter_app_events = true
 # 光标模式三选一: desktop 固定桌面光标, auto 按前台光标捕获状态自动切换, game 固定游戏光标(相对增量注入).
 cursor_mode = "auto"
 # 映射由发送端应用, 仅在 macOS 与 Windows 之间生效. 清空两张表即可禁用映射;

@@ -321,7 +321,7 @@ unsafe extern "C" fn event_callback(
     }
 
     let active = state.context.capture_active.load(Ordering::Acquire);
-    if state.context.filter_app_events.load(Ordering::Acquire) {
+    if state.context.filter_app_events {
         let source_pid = unsafe {
             CGEventGetIntegerValueField(event, FIELD_SOURCE_UNIX_PROCESS_ID)
         };
@@ -477,27 +477,18 @@ fn update_set<T: Ord + Copy>(set: &Mutex<BTreeSet<T>>, value: T, down: bool) {
 
 fn refresh_mac_pressed_state(state: &MacState) {
     let mut os_pressed = BTreeSet::new();
-    let mut os_combined_pressed = BTreeSet::new();
     for keycode in 0..=127u16 {
         let Some(usage) = mac_keycode_to_hid(keycode) else {
             continue;
         };
-        let hid_pressed =
-            unsafe { CGEventSourceKeyState(CG_EVENT_SOURCE_HID_SYSTEM_STATE, keycode) };
-        let combined_pressed = unsafe {
-            CGEventSourceKeyState(CG_EVENT_SOURCE_COMBINED_SESSION_STATE, keycode)
-        };
-        if hid_pressed {
+        if unsafe { CGEventSourceKeyState(CG_EVENT_SOURCE_HID_SYSTEM_STATE, keycode) } {
             os_pressed.insert(usage);
-        }
-        if combined_pressed {
-            os_combined_pressed.insert(usage);
         }
     }
 
     let mut pressed = state.physical_pressed.lock().unwrap();
     // 只清理事件流残留, 不把系统状态里的幽灵按键写回按下集合.
-    pressed.retain(|usage| os_pressed.contains(usage) && os_combined_pressed.contains(usage));
+    pressed.retain(|usage| os_pressed.contains(usage));
     drop(pressed);
 
     let mut os_buttons = BTreeSet::new();
@@ -1013,7 +1004,7 @@ mod tests {
                 capture_active: Arc::new(AtomicBool::new(false)),
                 overflowed: Arc::new(AtomicBool::new(false)),
                 failed: Arc::new(AtomicBool::new(false)),
-                filter_app_events: Arc::new(AtomicBool::new(false)),
+                filter_app_events: false,
             },
             physical_pressed: Mutex::new(BTreeSet::from([0xe0])),
             physical_buttons: Mutex::new(BTreeSet::from([1])),

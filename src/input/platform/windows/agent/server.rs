@@ -590,7 +590,7 @@ fn start_native_runtime(
         capture_active: Arc::new(AtomicBool::new(false)),
         overflowed: Arc::new(AtomicBool::new(false)),
         failed: Arc::new(AtomicBool::new(false)),
-        filter_app_events: Arc::new(AtomicBool::new(filter_app_events)),
+        filter_app_events,
     };
     let backend = super::super::native::start(context)?;
     let task = tokio::spawn(async move {

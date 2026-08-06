@@ -122,7 +122,7 @@ impl Default for InputConfig {
             native_scroll_macos_to_windows: false,
             native_scroll_windows_to_macos: false,
             block_switch_on_press: false,
-            filter_app_events: false,
+            filter_app_events: true,
             key_mapping: KeyMappingConfig::default(),
             cursor_mode: CursorMode::default(),
         }

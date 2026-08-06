@@ -545,7 +545,7 @@ mod tests {
         );
         assert!(!config.runtime.input.elevate_on_start);
         assert!(!config.runtime.input.block_switch_on_press);
-        assert!(!config.runtime.input.filter_app_events);
+        assert!(config.runtime.input.filter_app_events);
         let reloaded = load_or_create_in_dir(&dir).unwrap();
         assert_eq!(reloaded.device.device_id, config.device.device_id);
         assert_eq!(reloaded.runtime, config.runtime);
@@ -734,15 +734,15 @@ mod tests {
     fn filter_app_events_round_trips() {
         let dir = unique_test_dir("filter-app-events");
         let mut config = load_or_create_in_dir(&dir).unwrap();
-        assert!(!config.runtime.input.filter_app_events);
-        config.runtime.input.filter_app_events = true;
+        assert!(config.runtime.input.filter_app_events);
+        config.runtime.input.filter_app_events = false;
         write_toml_atomic(
             &dir.join(CONFIG_FILE_NAME),
             &MainConfigFile::from(&config),
         )
         .unwrap();
         let reloaded = load_or_create_in_dir(&dir).unwrap();
-        assert!(reloaded.runtime.input.filter_app_events);
+        assert!(!reloaded.runtime.input.filter_app_events);
         cleanup_dir(&dir);
     }
 
@@ -870,7 +870,7 @@ mod tests {
         assert!(!config.input.block_switch_on_press);
         assert!(!config.input.native_scroll_macos_to_windows);
         assert!(!config.input.native_scroll_windows_to_macos);
-        assert!(!config.input.filter_app_events);
+        assert!(config.input.filter_app_events);
         assert_eq!(config.input.cursor_mode, crate::input::CursorMode::Auto);
     }
 

@@ -194,7 +194,7 @@ fn insert_main_v3_filter_app_events(document: &mut toml::Value) -> Result<()> {
         .and_then(toml::Value::as_table_mut)
         .context("config.toml input must be a TOML table")?;
     if !input.contains_key("filter_app_events") {
-        input.insert("filter_app_events".to_string(), toml::Value::Boolean(false));
+        input.insert("filter_app_events".to_string(), toml::Value::Boolean(true));
     }
     Ok(())
 }
@@ -242,7 +242,7 @@ mod tests {
         );
         assert_eq!(
             input.get("filter_app_events"),
-            Some(&toml::Value::Boolean(false))
+            Some(&toml::Value::Boolean(true))
         );
     }
 
@@ -275,7 +275,7 @@ mod tests {
         );
         assert_eq!(
             input.get("filter_app_events"),
-            Some(&toml::Value::Boolean(false))
+            Some(&toml::Value::Boolean(true))
         );
     }
 
@@ -289,7 +289,7 @@ mod tests {
         let input = table.get("input").and_then(toml::Value::as_table).unwrap();
         assert_eq!(
             input.get("filter_app_events"),
-            Some(&toml::Value::Boolean(false))
+            Some(&toml::Value::Boolean(true))
         );
         assert_eq!(
             input.get("block_switch_on_press"),

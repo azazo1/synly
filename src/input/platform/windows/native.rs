@@ -609,7 +609,7 @@ unsafe extern "system" fn keyboard_callback(code: i32, w_param: WParam, l_param:
         return unsafe { CallNextHookEx(0, code, w_param, l_param) };
     }
     let context = unsafe { &*context };
-    if context.context.filter_app_events.load(Ordering::Acquire)
+    if context.context.filter_app_events
         && state.flags & (LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED) != 0
     {
         return unsafe { CallNextHookEx(0, code, w_param, l_param) };
@@ -654,7 +654,7 @@ unsafe extern "system" fn mouse_callback(code: i32, w_param: WParam, l_param: LP
         return unsafe { CallNextHookEx(0, code, w_param, l_param) };
     }
     let context = unsafe { &*context };
-    if context.context.filter_app_events.load(Ordering::Acquire)
+    if context.context.filter_app_events
         && event.flags & (LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED) != 0
     {
         return unsafe { CallNextHookEx(0, code, w_param, l_param) };
