@@ -410,6 +410,9 @@ unsafe extern "C" fn event_callback(
             if keycode == 0 || matches!(keycode, 105 | 107 | 113) {
                 let system_pressed =
                     unsafe { CGEventSourceKeyState(CG_EVENT_SOURCE_HID_SYSTEM_STATE, keycode) };
+                let system_combined_pressed = unsafe {
+                    CGEventSourceKeyState(CG_EVENT_SOURCE_COMBINED_SESSION_STATE, keycode)
+                };
                 let pressed = state.physical_pressed.lock().unwrap();
                 tracing::info!(
                     keycode,
@@ -419,6 +422,7 @@ unsafe extern "C" fn event_callback(
                     down,
                     repeat,
                     system_pressed,
+                    system_combined_pressed,
                     pressed = ?pressed,
                     "macOS event tap 关键按键事件"
                 );
@@ -488,35 +492,51 @@ fn update_set<T: Ord + Copy>(set: &Mutex<BTreeSet<T>>, value: T, down: bool) {
 
 fn refresh_mac_pressed_state(state: &MacState) {
     let mut os_pressed = BTreeSet::new();
+    let mut os_combined_pressed = BTreeSet::new();
     for keycode in 0..=127u16 {
         let Some(usage) = mac_keycode_to_hid(keycode) else {
             continue;
         };
-        if unsafe { CGEventSourceKeyState(CG_EVENT_SOURCE_HID_SYSTEM_STATE, keycode) } {
+        let hid_pressed =
+            unsafe { CGEventSourceKeyState(CG_EVENT_SOURCE_HID_SYSTEM_STATE, keycode) };
+        let combined_pressed = unsafe {
+            CGEventSourceKeyState(CG_EVENT_SOURCE_COMBINED_SESSION_STATE, keycode)
+        };
+        if hid_pressed {
             if keycode == 0 {
                 tracing::info!(
                     keycode,
                     usage_hex = format!("0x{usage:04x}"),
+                    combined_pressed,
                     "CGEventSourceKeyState 探测到 keycode 0 按下"
                 );
             }
             os_pressed.insert(usage);
+        }
+        if combined_pressed {
+            os_combined_pressed.insert(usage);
         }
     }
 
     let mut pressed = state.physical_pressed.lock().unwrap();
     let before_pressed: BTreeSet<u16> = pressed.iter().copied().collect();
     // 只清理事件流残留, 不把系统状态里的幽灵按键写回按下集合.
-    pressed.retain(|usage| os_pressed.contains(usage));
+    pressed.retain(|usage| os_pressed.contains(usage) && os_combined_pressed.contains(usage));
     let after_pressed: BTreeSet<u16> = pressed.iter().copied().collect();
     let had_usage_a = before_pressed.contains(&0x04);
     let kept_usage_a = after_pressed.contains(&0x04);
-    if had_usage_a || kept_usage_a || os_pressed.contains(&0x04) {
+    if had_usage_a
+        || kept_usage_a
+        || os_pressed.contains(&0x04)
+        || os_combined_pressed.contains(&0x04)
+    {
         tracing::info!(
             had_usage_a,
             kept_usage_a,
             os_usage_a = os_pressed.contains(&0x04),
+            os_combined_usage_a = os_combined_pressed.contains(&0x04),
             os_pressed = ?os_pressed,
+            os_combined_pressed = ?os_combined_pressed,
             before_pressed = ?before_pressed,
             after_pressed = ?after_pressed,
             "macOS 按键校准 usage a"
@@ -956,8 +976,10 @@ fn mac_keycode_to_hid(code: u16) -> Option<u16> {
         27 => 0x2d, 33 => 0x2f, 30 => 0x30, 42 => 0x31, 41 => 0x33, 39 => 0x34,
         43 => 0x36, 47 => 0x37, 44 => 0x38, 57 => 0x39, 122 => 0x3a, 120 => 0x3b,
         99 => 0x3c, 118 => 0x3d, 96 => 0x3e, 97 => 0x3f, 98 => 0x40, 100 => 0x41,
-        101 => 0x42, 109 => 0x43, 103 => 0x44, 111 => 0x45, 105 => 0x46, 107 => 0x47,
-        113 => 0x48, 114 => 0x49, 115 => 0x4a, 116 => 0x4b, 117 => 0x4c, 119 => 0x4d,
+        101 => 0x42, 109 => 0x43, 103 => 0x44, 111 => 0x45, 105 => 0x68, 107 => 0x69,
+        113 => 0x6a, 106 => 0x6b, 64 => 0x6c, 79 => 0x6d, 80 => 0x6e, 90 => 0x6f,
+        87 => 0x70, 86 => 0x71, 89 => 0x72, 91 => 0x73,
+        114 => 0x49, 115 => 0x4a, 116 => 0x4b, 117 => 0x4c, 119 => 0x4d,
         121 => 0x4e, 124 => 0x4f, 123 => 0x50, 125 => 0x51, 126 => 0x52,
         59 => 0xe0, 56 => 0xe1, 58 => 0xe2, 55 => 0xe3, 62 => 0xe4, 60 => 0xe5,
         61 => 0xe6, 54 => 0xe7,
@@ -996,6 +1018,14 @@ mod tests {
     fn grave_key_roundtrips_between_macos_and_hid() {
         assert_eq!(mac_keycode_to_hid(50), Some(0x35));
         assert_eq!(hid_to_mac_keycode(0x35), Some(50));
+    }
+
+    #[test]
+    fn f13_and_f14_roundtrip_between_macos_and_hid() {
+        assert_eq!(mac_keycode_to_hid(105), Some(0x68));
+        assert_eq!(hid_to_mac_keycode(0x68), Some(105));
+        assert_eq!(mac_keycode_to_hid(107), Some(0x69));
+        assert_eq!(hid_to_mac_keycode(0x69), Some(107));
     }
 
     #[test]

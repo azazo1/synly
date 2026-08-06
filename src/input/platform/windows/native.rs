@@ -1497,6 +1497,7 @@ fn vk_to_hid(vk: u16) -> u16 {
         0x27 => 0x4f,
         0x28 => 0x51,
         0x70..=0x7b => 0x3a + (vk - 0x70),
+        0x7c..=0x87 => 0x68 + (vk - 0x7c),
         0x30..=0x39 => if vk == 0x30 { 0x27 } else { 0x1e + (vk - 0x31) },
         0x41..=0x5a => 0x04 + (vk - 0x41),
         0xa2 => 0xe0,
@@ -1571,6 +1572,18 @@ fn hid_to_windows_scan(usage: u16) -> Option<(u16, bool)> {
         0x3a..=0x43 => (0x3b + usage - 0x3a, false),
         0x44 => (0x57, false),
         0x45 => (0x58, false),
+        0x68 => (0x64, false),
+        0x69 => (0x65, false),
+        0x6a => (0x66, false),
+        0x6b => (0x67, false),
+        0x6c => (0x68, false),
+        0x6d => (0x69, false),
+        0x6e => (0x6a, false),
+        0x6f => (0x6b, false),
+        0x70 => (0x6c, false),
+        0x71 => (0x6d, false),
+        0x72 => (0x6e, false),
+        0x73 => (0x76, false),
         0x49 => (0x52, true),
         0x4a => (0x47, true),
         0x4b => (0x49, true),
@@ -1596,11 +1609,22 @@ fn hid_to_windows_scan(usage: u16) -> Option<(u16, bool)> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::allow_native_fallback;
+    use super::super::{allow_native_fallback, hid_to_windows_scan, vk_to_hid};
 
     #[test]
     fn elevated_receiver_failure_does_not_fallback_to_native_input() {
         assert!(!allow_native_fallback(true));
         assert!(allow_native_fallback(false));
+    }
+
+    #[test]
+    fn f13_to_f24_map_to_extended_hid_usages_and_scancodes() {
+        for vk in 0x7c..=0x87u16 {
+            let usage = vk_to_hid(vk);
+            assert!((0x68..=0x73).contains(&usage));
+            assert!(hid_to_windows_scan(usage).is_some());
+        }
+        assert_eq!(vk_to_hid(0x7c), 0x68);
+        assert_eq!(vk_to_hid(0x87), 0x73);
     }
 }

@@ -225,9 +225,13 @@ fn parse_common_key_name(name: &str) -> Option<u16> {
         }
     }
     if let Some(number) = name.strip_prefix('f').and_then(|value| value.parse::<u16>().ok())
-        && (1..=15).contains(&number)
+        && (1..=24).contains(&number)
     {
-        return Some(0x3a + number - 1);
+        return Some(if number <= 12 {
+            0x3a + number - 1
+        } else {
+            0x68 + number - 13
+        });
     }
     Some(match name {
         "enter" => 0x28,
@@ -283,11 +287,11 @@ fn platform_supports_usage(platform: InputPlatform, usage: u16) -> bool {
     match platform {
         InputPlatform::Macos => matches!(
             usage,
-            0x04..=0x31 | 0x33..=0x52 | 0xe0..=0xe7
+            0x04..=0x31 | 0x33..=0x52 | 0x68..=0x73 | 0xe0..=0xe7
         ),
         InputPlatform::Windows => matches!(
             usage,
-            0x04..=0x31 | 0x33..=0x45 | 0x49..=0x52 | 0xe0..=0xe7
+            0x04..=0x31 | 0x33..=0x45 | 0x49..=0x52 | 0x68..=0x73 | 0xe0..=0xe7
         ),
     }
 }
@@ -387,6 +391,14 @@ mod tests {
     fn grave_is_a_valid_mapping_key_on_both_platforms() {
         assert!(parse_key_name(InputPlatform::Macos, "grave").is_some());
         assert!(parse_key_name(InputPlatform::Windows, "grave").is_some());
+    }
+
+    #[test]
+    fn function_keys_beyond_f12_use_extended_hid_usages() {
+        assert_eq!(parse_key_name(InputPlatform::Macos, "f13"), Some(0x68));
+        assert_eq!(parse_key_name(InputPlatform::Windows, "f14"), Some(0x69));
+        assert_eq!(parse_key_name(InputPlatform::Macos, "f24"), Some(0x73));
+        assert_eq!(parse_key_name(InputPlatform::Windows, "f24"), Some(0x73));
     }
 
     #[test]
