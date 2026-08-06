@@ -407,47 +407,9 @@ unsafe extern "C" fn event_callback(
                 CGEventGetIntegerValueField(event, FIELD_SOURCE_STATE_ID)
             };
             if keycode == 0 && (source_pid != 0 || source_state != HID_SOURCE_STATE_ID) {
-                tracing::info!(
-                    keycode,
-                    usage_hex = format!("0x{usage:04x}"),
-                    source_pid,
-                    source_state,
-                    "忽略非 HID 来源的 keycode 0 事件"
-                );
                 return if active { ptr::null_mut() } else { event };
             }
             update_set(&state.physical_pressed, usage, down);
-            tracing::debug!(
-                keycode,
-                usage_hex = format!("0x{usage:04x}"),
-                event_type,
-                flags,
-                down,
-                repeat,
-                "macOS event tap 键盘事件"
-            );
-            if keycode == 0 || matches!(keycode, 105 | 107 | 113) {
-                let system_pressed =
-                    unsafe { CGEventSourceKeyState(CG_EVENT_SOURCE_HID_SYSTEM_STATE, keycode) };
-                let system_combined_pressed = unsafe {
-                    CGEventSourceKeyState(CG_EVENT_SOURCE_COMBINED_SESSION_STATE, keycode)
-                };
-                let pressed = state.physical_pressed.lock().unwrap();
-                tracing::info!(
-                    keycode,
-                    usage_hex = format!("0x{usage:04x}"),
-                    event_type,
-                    flags,
-                    down,
-                    repeat,
-                    system_pressed,
-                    system_combined_pressed,
-                    source_pid,
-                    source_state,
-                    pressed = ?pressed,
-                    "macOS event tap 关键按键事件"
-                );
-            }
             if state.context.hotkey.matches(usage, modifiers) {
                 if down && !repeat {
                     state.context.emit_reliable(NativeEvent::Emergency);
@@ -524,14 +486,6 @@ fn refresh_mac_pressed_state(state: &MacState) {
             CGEventSourceKeyState(CG_EVENT_SOURCE_COMBINED_SESSION_STATE, keycode)
         };
         if hid_pressed {
-            if keycode == 0 {
-                tracing::info!(
-                    keycode,
-                    usage_hex = format!("0x{usage:04x}"),
-                    combined_pressed,
-                    "CGEventSourceKeyState 探测到 keycode 0 按下"
-                );
-            }
             os_pressed.insert(usage);
         }
         if combined_pressed {
@@ -540,29 +494,8 @@ fn refresh_mac_pressed_state(state: &MacState) {
     }
 
     let mut pressed = state.physical_pressed.lock().unwrap();
-    let before_pressed: BTreeSet<u16> = pressed.iter().copied().collect();
     // 只清理事件流残留, 不把系统状态里的幽灵按键写回按下集合.
     pressed.retain(|usage| os_pressed.contains(usage) && os_combined_pressed.contains(usage));
-    let after_pressed: BTreeSet<u16> = pressed.iter().copied().collect();
-    let had_usage_a = before_pressed.contains(&0x04);
-    let kept_usage_a = after_pressed.contains(&0x04);
-    if had_usage_a
-        || kept_usage_a
-        || os_pressed.contains(&0x04)
-        || os_combined_pressed.contains(&0x04)
-    {
-        tracing::info!(
-            had_usage_a,
-            kept_usage_a,
-            os_usage_a = os_pressed.contains(&0x04),
-            os_combined_usage_a = os_combined_pressed.contains(&0x04),
-            os_pressed = ?os_pressed,
-            os_combined_pressed = ?os_combined_pressed,
-            before_pressed = ?before_pressed,
-            after_pressed = ?after_pressed,
-            "macOS 按键校准 usage a"
-        );
-    }
     drop(pressed);
 
     let mut os_buttons = BTreeSet::new();
