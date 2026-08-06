@@ -73,7 +73,10 @@ const FIELD_SCROLL_DELTA_X: u32 = 12;
 const FIELD_SCROLL_IS_CONTINUOUS: u32 = 88;
 const FIELD_KEY_AUTOREPEAT: u32 = 8;
 const FIELD_KEY_CODE: u32 = 9;
+const FIELD_SOURCE_UNIX_PROCESS_ID: u32 = 41;
 const FIELD_SOURCE_USER_DATA: u32 = 42;
+const FIELD_SOURCE_STATE_ID: u32 = 45;
+const HID_SOURCE_STATE_ID: i64 = 1;
 const FLAG_SHIFT: u64 = 1 << 17;
 const FLAG_CONTROL: u64 = 1 << 18;
 const FLAG_ALT: u64 = 1 << 19;
@@ -397,6 +400,22 @@ unsafe extern "C" fn event_callback(
             };
             let repeat = event_type == EVENT_KEY_DOWN
                 && unsafe { CGEventGetIntegerValueField(event, FIELD_KEY_AUTOREPEAT) } != 0;
+            let source_pid = unsafe {
+                CGEventGetIntegerValueField(event, FIELD_SOURCE_UNIX_PROCESS_ID)
+            };
+            let source_state = unsafe {
+                CGEventGetIntegerValueField(event, FIELD_SOURCE_STATE_ID)
+            };
+            if keycode == 0 && (source_pid != 0 || source_state != HID_SOURCE_STATE_ID) {
+                tracing::info!(
+                    keycode,
+                    usage_hex = format!("0x{usage:04x}"),
+                    source_pid,
+                    source_state,
+                    "忽略非 HID 来源的 keycode 0 事件"
+                );
+                return if active { ptr::null_mut() } else { event };
+            }
             update_set(&state.physical_pressed, usage, down);
             tracing::debug!(
                 keycode,
@@ -423,6 +442,8 @@ unsafe extern "C" fn event_callback(
                     repeat,
                     system_pressed,
                     system_combined_pressed,
+                    source_pid,
+                    source_state,
                     pressed = ?pressed,
                     "macOS event tap 关键按键事件"
                 );
