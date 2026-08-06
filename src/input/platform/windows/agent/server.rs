@@ -491,11 +491,20 @@ async fn handle_agent_request(
     outgoing: AgentOutput,
 ) -> Result<AgentResponse> {
     match request {
-        AgentRequest::Start { mode, hotkey } => {
+        AgentRequest::Start {
+            mode,
+            hotkey,
+            filter_app_events,
+        } => {
             if let Some(previous) = runtime.take() {
                 previous.stop().await;
             }
-            *runtime = Some(start_native_runtime(mode, hotkey, outgoing)?);
+            *runtime = Some(start_native_runtime(
+                mode,
+                hotkey,
+                filter_app_events,
+                outgoing,
+            )?);
             let layout = agent_backend(runtime)?.layout()?;
             let secure_desktop =
                 !super::super::desktop::current_input_desktop_is_default();
@@ -567,6 +576,7 @@ async fn handle_agent_request(
 fn start_native_runtime(
     mode: InputMode,
     hotkey: Hotkey,
+    filter_app_events: bool,
     outgoing: AgentOutput,
 ) -> Result<NativeAgentRuntime> {
     let send_motion = mode == InputMode::Send;
@@ -580,6 +590,7 @@ fn start_native_runtime(
         capture_active: Arc::new(AtomicBool::new(false)),
         overflowed: Arc::new(AtomicBool::new(false)),
         failed: Arc::new(AtomicBool::new(false)),
+        filter_app_events: Arc::new(AtomicBool::new(filter_app_events)),
     };
     let backend = super::super::native::start(context)?;
     let task = tokio::spawn(async move {

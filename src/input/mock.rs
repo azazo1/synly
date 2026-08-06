@@ -52,6 +52,7 @@ struct MockSettings {
     height: i32,
     native_macos_to_windows: bool,
     native_windows_to_macos: bool,
+    filter_app_events: bool,
 }
 
 impl MockSettings {
@@ -64,6 +65,7 @@ impl MockSettings {
             height: window.get_virtual_height(),
             native_macos_to_windows: window.get_native_scroll_macos_to_windows(),
             native_windows_to_macos: window.get_native_scroll_windows_to_macos(),
+            filter_app_events: window.get_filter_app_events(),
         })
     }
 }
@@ -124,6 +126,7 @@ pub fn run_screen_mock(options: ScreenMockOptions) -> Result<()> {
         window.set_native_scroll_macos_to_windows(false);
         window.set_native_scroll_windows_to_macos(false);
         window.set_smooth_scroll(false);
+        window.set_filter_app_events(true);
         window.set_event_text("已恢复 mock 默认设置".into());
         window.invoke_settings_changed();
     });
@@ -236,7 +239,11 @@ async fn run_mock_worker(
 ) -> Result<()> {
     let mock_settings = (*settings.borrow_and_update()).clone();
     presenter.set_size(mock_settings.width, mock_settings.height);
-    let mut platform = match platform::start(InputMode::Send, mock_settings.hotkey) {
+    let mut platform = match platform::start_with_filter(
+        InputMode::Send,
+        mock_settings.hotkey,
+        mock_settings.filter_app_events,
+    ) {
         Ok(platform) => platform,
         Err(error) => {
             tracing::error!(error = %error, "输入虚拟屏幕 mock 启动失败");
@@ -272,6 +279,7 @@ async fn run_mock_worker(
         native_scroll_macos_to_windows: mock_settings.native_macos_to_windows,
         native_scroll_windows_to_macos: mock_settings.native_windows_to_macos,
         block_switch_on_press: false,
+        filter_app_events: mock_settings.filter_app_events,
         key_mapping: KeyMappingConfig::default(),
         cursor_mode: crate::input::CursorMode::Desktop,
     };

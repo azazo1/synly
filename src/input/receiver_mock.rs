@@ -186,6 +186,7 @@ pub async fn run_receiver_mock(options: ReceiverMockOptions) -> Result<()> {
         native_scroll_macos_to_windows: false,
         native_scroll_windows_to_macos: false,
         block_switch_on_press: false,
+        filter_app_events: false,
         key_mapping: KeyMappingConfig::default(),
         cursor_mode: options.cursor_mode,
     };

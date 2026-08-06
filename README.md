@@ -198,7 +198,7 @@ Synly 使用固定的四文件配置目录, 每个文件的顶层都有独立的
 └── trusted-devices.toml
 ```
 
-- `config.toml` 保存用户设置和运行参数. 当前格式版本为 `2`. 输入方向, 屏幕边缘, 热键, 启动提权, 按键映射, 滚动反向, 原生滚动, 按住拦截开关, 光标模式(`cursor_mode`, 三选一: `desktop`/`auto`/`game`)都位于 `[input]`.
+- `config.toml` 保存用户设置和运行参数. 当前格式版本为 `3`. 输入方向, 屏幕边缘, 热键, 启动提权, 按键映射, 滚动反向, 原生滚动, 按住拦截开关, 应用事件过滤, 光标模式(`cursor_mode`, 三选一: `desktop`/`auto`/`game`)都位于 `[input]`.
 - `gui-state.toml` 保存桌面 GUI 的首次运行标记和窗口尺寸. 当前格式版本为 `1`.
 - `identity.toml` 保存 `device_id`, `private_key`, `public_key`. 当前格式版本为 `1`. 文件缺失时自动生成, 已存在但密钥无效时启动失败.
 - `trusted-devices.toml` 使用 `[[devices]]` 保存可信设备和会话统计. 当前格式版本为 `1`.
@@ -211,6 +211,8 @@ Synly 使用固定的四文件配置目录, 每个文件的顶层都有独立的
 `reverse_mouse_wheel` 和 `reverse_trackpad` 会同时反转水平与垂直滚动. macOS 能区分普通滚轮和连续触控板滚动. Windows 发送端会将所有滚动视为鼠标滚轮, 因此 `reverse_trackpad` 在 Windows 上不生效. 这些配置在应用启动时读取, 修改后需要重启.
 
 `native_scroll_macos_to_windows` 和 `native_scroll_windows_to_macos` 是发送端生效的原生滚动开关. macOS 机开启前者后, 会去掉平台增量中的加速度: 普通滚轮按事件数折算为 Windows 档位, 触控板按固定 48px = 1 notch 且单事件最多 1 档换算; Windows 机开启后者后, 会把滚轮档位按固定 macOS 风格曲线换算成 macOS line 滚动. 关闭时保持原有直通行为. 两个开关都可在 GUI 输入设置中修改, 修改后会自动重启输入任务.
+
+`filter_app_events` 开启后, 仅控制端输入捕获会过滤非 HID 来源的合成按键和鼠标事件, 可用于规避 macOS IMK 在部分功能键后产生的幽灵按键; 该选项可在 GUI 输入设置中修改, 修改后会自动重启输入任务.
 
 `input-screen-mock` 也可以模拟这个效果. 在 mock 界面勾选对应的原生滚动复选框后, 输入模拟会自动重启; mock 屏幕中的 48px 网格会根据滚轮输入平滑移动少量像素, 方便对比原生换算开启前后的滚动差异. 平滑滚动复选框只影响 mock 的显示层, 不会改变真实滚动逻辑.
 

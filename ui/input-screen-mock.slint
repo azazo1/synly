@@ -89,6 +89,7 @@ export component InputScreenMockWindow inherits Window {
     in-out property <bool> smooth-scroll: false;
     in-out property <bool> native-scroll-macos-to-windows: false;
     in-out property <bool> native-scroll-windows-to-macos: false;
+    in-out property <bool> filter-app-events: true;
     in property <string> event-text: "正在启动";
 
     callback quit-requested();
@@ -341,6 +342,12 @@ export component InputScreenMockWindow inherits Window {
                     checked <=> root.smooth-scroll;
                 }
                 Rectangle { horizontal-stretch: 1; }
+            }
+
+            CheckBox {
+                text: "过滤应用产生的按键/鼠标事件";
+                checked <=> root.filter-app-events;
+                toggled => { root.settings-changed(); }
             }
 
             Rectangle { vertical-stretch: 1; }

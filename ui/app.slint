@@ -173,6 +173,7 @@ export component AppWindow inherits Window {
     in-out property <int> input-edge-index: 1;
     in-out property <string> input-hotkey: "ctrl+alt+shift+esc";
     in-out property <bool> block-switch-on-press: false;
+    in-out property <bool> filter-app-events: false;
     in-out property <bool> native-scroll-macos-to-windows: false;
     in property <bool> native-scroll-macos-to-windows-enabled: true;
     in-out property <bool> native-scroll-windows-to-macos: false;
@@ -535,6 +536,11 @@ export component AppWindow inherits Window {
                             Text { text: "紧急收回热键"; color: #737b77; font-size: 11px; }
                             LineEdit { text <=> root.input-hotkey; placeholder-text: "紧急收回热键"; }
                             CheckBox { text: "按住按键或鼠标按钮时不切换"; checked <=> root.block-switch-on-press; }
+                            CheckBox {
+                                text: "过滤应用产生的按键/鼠标事件";
+                                checked <=> root.filter-app-events;
+                                Tooltip { text: @markdown("仅控制端生效: 过滤非 HID 来源的合成输入, 避免 IMK 幽灵键阻塞边缘切换"); }
+                            }
                             CheckBox {
                                 text: "macOS -> Windows 原生滚动";
                                 checked <=> root.native-scroll-macos-to-windows;

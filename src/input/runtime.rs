@@ -45,6 +45,7 @@ pub struct InputRuntimeOptions {
     pub native_scroll_macos_to_windows: bool,
     pub native_scroll_windows_to_macos: bool,
     pub block_switch_on_press: bool,
+    pub filter_app_events: bool,
     pub key_mapping: KeyMappingConfig,
     pub cursor_mode: CursorMode,
 }
@@ -123,7 +124,9 @@ pub async fn run_input_session(
     local_role: LocalInputRole,
     options: InputRuntimeOptions,
 ) -> Result<()> {
-    let mut platform = platform::start(options.mode, options.hotkey)?;
+    let filter_app_events = options.filter_app_events && matches!(local_role, LocalInputRole::Send);
+    let mut platform =
+        platform::start_with_filter(options.mode, options.hotkey, filter_app_events)?;
     tracing::info!(role = ?local_role, "输入同步运行时已启动");
     match context {
         InputSessionContext::Host {
@@ -1926,6 +1929,7 @@ mod tests {
             native_scroll_macos_to_windows: false,
             native_scroll_windows_to_macos: false,
             block_switch_on_press: false,
+            filter_app_events: false,
             key_mapping: KeyMappingConfig::default(),
             cursor_mode: super::CursorMode::Desktop,
         }

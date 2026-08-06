@@ -63,6 +63,7 @@ pub fn runtime_options_from_config(
         native_scroll_macos_to_windows: runtime.input.native_scroll_macos_to_windows,
         native_scroll_windows_to_macos: runtime.input.native_scroll_windows_to_macos,
         block_switch_on_press: runtime.input.block_switch_on_press,
+        filter_app_events: runtime.input.filter_app_events,
         key_mapping: runtime.input.key_mapping.clone(),
         cursor_mode: runtime.input.cursor_mode,
     };

@@ -11,7 +11,11 @@ pub(crate) const IPC_MAX_FRAME: usize = 1024 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) enum AgentRequest {
-    Start { mode: InputMode, hotkey: Hotkey },
+    Start {
+        mode: InputMode,
+        hotkey: Hotkey,
+        filter_app_events: bool,
+    },
     Stop,
     Health,
     CursorPosition,

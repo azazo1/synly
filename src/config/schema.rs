@@ -65,6 +65,7 @@ pub struct InputConfig {
     pub native_scroll_windows_to_macos: bool,
     #[serde(default)]
     pub block_switch_on_press: bool,
+    pub filter_app_events: bool,
     pub key_mapping: KeyMappingConfig,
     pub cursor_mode: CursorMode,
 }
@@ -121,6 +122,7 @@ impl Default for InputConfig {
             native_scroll_macos_to_windows: false,
             native_scroll_windows_to_macos: false,
             block_switch_on_press: false,
+            filter_app_events: false,
             key_mapping: KeyMappingConfig::default(),
             cursor_mode: CursorMode::default(),
         }

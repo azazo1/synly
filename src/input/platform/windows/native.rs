@@ -48,6 +48,8 @@ const WM_MOUSEWHEEL: u32 = 0x020a;
 const WM_MOUSEHWHEEL: u32 = 0x020e;
 const LLKHF_INJECTED: u32 = 0x10;
 const LLKHF_LOWER_IL_INJECTED: u32 = 0x02;
+const LLMHF_INJECTED: u32 = 0x0001;
+const LLMHF_LOWER_IL_INJECTED: u32 = 0x0002;
 const KEYEVENTF_EXTENDEDKEY: u32 = 0x0001;
 const KEYEVENTF_KEYUP: u32 = 0x0002;
 const KEYEVENTF_SCANCODE: u32 = 0x0008;
@@ -599,9 +601,7 @@ unsafe extern "system" fn keyboard_callback(code: i32, w_param: WParam, l_param:
         return unsafe { CallNextHookEx(0, code, w_param, l_param) };
     }
     let state = unsafe { &*(l_param as *const KeyboardLl) };
-    if state.extra_info == EVENT_TAG
-        || state.flags & (LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED) != 0
-    {
+    if state.extra_info == EVENT_TAG {
         return unsafe { CallNextHookEx(0, code, w_param, l_param) };
     }
     let context = HOOK_STATE.load(Ordering::Acquire);
@@ -609,6 +609,11 @@ unsafe extern "system" fn keyboard_callback(code: i32, w_param: WParam, l_param:
         return unsafe { CallNextHookEx(0, code, w_param, l_param) };
     }
     let context = unsafe { &*context };
+    if context.context.filter_app_events.load(Ordering::Acquire)
+        && state.flags & (LLKHF_INJECTED | LLKHF_LOWER_IL_INJECTED) != 0
+    {
+        return unsafe { CallNextHookEx(0, code, w_param, l_param) };
+    }
     let usage = windows_scan_to_hid(state.scan_code as u16, state.vk_code as u16);
     let Some(usage) = usage else {
         return unsafe { CallNextHookEx(0, code, w_param, l_param) };
@@ -649,6 +654,11 @@ unsafe extern "system" fn mouse_callback(code: i32, w_param: WParam, l_param: LP
         return unsafe { CallNextHookEx(0, code, w_param, l_param) };
     }
     let context = unsafe { &*context };
+    if context.context.filter_app_events.load(Ordering::Acquire)
+        && event.flags & (LLMHF_INJECTED | LLMHF_LOWER_IL_INJECTED) != 0
+    {
+        return unsafe { CallNextHookEx(0, code, w_param, l_param) };
+    }
     let suppressing = capture_phase(context).suppresses_local_input();
     let thread_id = context.thread_id.load(Ordering::Acquire);
     let mut posted = true;

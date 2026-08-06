@@ -868,6 +868,7 @@ fn apply_settings_to_window(
     window.set_input_edge_index(input_edge_index(runtime.input.edge));
     window.set_input_hotkey(runtime.input.hotkey.clone().into());
     window.set_block_switch_on_press(runtime.input.block_switch_on_press);
+    window.set_filter_app_events(runtime.input.filter_app_events);
     let local_platform = InputPlatform::current();
     window.set_native_scroll_macos_to_windows(runtime.input.native_scroll_macos_to_windows);
     window.set_native_scroll_macos_to_windows_enabled(local_platform == InputPlatform::Macos);
@@ -994,6 +995,7 @@ fn settings_from_window(
             native_scroll_macos_to_windows: window.get_native_scroll_macos_to_windows(),
             native_scroll_windows_to_macos: window.get_native_scroll_windows_to_macos(),
             block_switch_on_press: window.get_block_switch_on_press(),
+            filter_app_events: window.get_filter_app_events(),
             key_mapping: current_input.key_mapping.clone(),
             cursor_mode: cursor_mode_from_index(window.get_cursor_mode_index()),
         },

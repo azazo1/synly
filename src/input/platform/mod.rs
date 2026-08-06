@@ -234,6 +234,7 @@ pub struct CaptureContext {
     pub capture_active: Arc<AtomicBool>,
     pub overflowed: Arc<AtomicBool>,
     pub failed: Arc<AtomicBool>,
+    pub filter_app_events: Arc<AtomicBool>,
 }
 
 impl CaptureContext {
@@ -248,12 +249,22 @@ impl CaptureContext {
     }
 }
 
+#[allow(dead_code)]
 pub fn start(mode: InputMode, hotkey: Hotkey) -> Result<PlatformHandle> {
+    start_with_filter(mode, hotkey, false)
+}
+
+pub fn start_with_filter(
+    mode: InputMode,
+    hotkey: Hotkey,
+    filter_app_events: bool,
+) -> Result<PlatformHandle> {
     let (events_tx, events_rx) = mpsc::channel(EVENT_QUEUE_CAPACITY);
     let motion = Arc::new(MotionAccumulator::default());
     let capture_active = Arc::new(AtomicBool::new(false));
     let overflowed = Arc::new(AtomicBool::new(false));
     let failed = Arc::new(AtomicBool::new(false));
+    let filter_app_events = Arc::new(AtomicBool::new(filter_app_events));
     let context = CaptureContext {
         mode,
         hotkey,
@@ -262,6 +273,7 @@ pub fn start(mode: InputMode, hotkey: Hotkey) -> Result<PlatformHandle> {
         capture_active,
         overflowed: Arc::clone(&overflowed),
         failed: Arc::clone(&failed),
+        filter_app_events,
     };
     #[cfg(target_os = "macos")]
     let backend = macos::start(context)?;

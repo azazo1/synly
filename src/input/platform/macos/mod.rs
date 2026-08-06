@@ -321,6 +321,17 @@ unsafe extern "C" fn event_callback(
     }
 
     let active = state.context.capture_active.load(Ordering::Acquire);
+    if state.context.filter_app_events.load(Ordering::Acquire) {
+        let source_pid = unsafe {
+            CGEventGetIntegerValueField(event, FIELD_SOURCE_UNIX_PROCESS_ID)
+        };
+        let source_state = unsafe {
+            CGEventGetIntegerValueField(event, FIELD_SOURCE_STATE_ID)
+        };
+        if source_pid != 0 || source_state != HID_SOURCE_STATE_ID {
+            return if active { ptr::null_mut() } else { event };
+        }
+    }
     match event_type {
         EVENT_MOUSE_MOVED | EVENT_LEFT_DRAGGED | EVENT_RIGHT_DRAGGED | EVENT_OTHER_DRAGGED => {
             let dx = unsafe { CGEventGetIntegerValueField(event, FIELD_MOUSE_DELTA_X) } as i32;
@@ -400,15 +411,6 @@ unsafe extern "C" fn event_callback(
             };
             let repeat = event_type == EVENT_KEY_DOWN
                 && unsafe { CGEventGetIntegerValueField(event, FIELD_KEY_AUTOREPEAT) } != 0;
-            let source_pid = unsafe {
-                CGEventGetIntegerValueField(event, FIELD_SOURCE_UNIX_PROCESS_ID)
-            };
-            let source_state = unsafe {
-                CGEventGetIntegerValueField(event, FIELD_SOURCE_STATE_ID)
-            };
-            if keycode == 0 && (source_pid != 0 || source_state != HID_SOURCE_STATE_ID) {
-                return if active { ptr::null_mut() } else { event };
-            }
             update_set(&state.physical_pressed, usage, down);
             if state.context.hotkey.matches(usage, modifiers) {
                 if down && !repeat {
@@ -1011,6 +1013,7 @@ mod tests {
                 capture_active: Arc::new(AtomicBool::new(false)),
                 overflowed: Arc::new(AtomicBool::new(false)),
                 failed: Arc::new(AtomicBool::new(false)),
+                filter_app_events: Arc::new(AtomicBool::new(false)),
             },
             physical_pressed: Mutex::new(BTreeSet::from([0xe0])),
             physical_buttons: Mutex::new(BTreeSet::from([1])),

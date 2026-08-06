@@ -2119,6 +2119,7 @@ fn input_task_restart_required(
         || previous.native_scroll_macos_to_windows != next.native_scroll_macos_to_windows
         || previous.native_scroll_windows_to_macos != next.native_scroll_windows_to_macos
         || previous.block_switch_on_press != next.block_switch_on_press
+        || previous.filter_app_events != next.filter_app_events
         || previous.key_mapping != next.key_mapping
         || previous.cursor_mode != next.cursor_mode
         || previous_backend_generation != next_backend_generation
@@ -4708,6 +4709,7 @@ mod tests {
             native_scroll_macos_to_windows: false,
             native_scroll_windows_to_macos: false,
             block_switch_on_press: false,
+            filter_app_events: false,
             key_mapping: crate::input::KeyMappingConfig::default(),
             cursor_mode: crate::input::CursorMode::Desktop,
         };
@@ -4723,6 +4725,9 @@ mod tests {
         let mut changed_reverse = input.clone();
         changed_reverse.native_scroll_windows_to_macos = true;
         assert!(input_task_restart_required(&input, &changed_reverse, 3, 3));
+        let mut changed_filter = input.clone();
+        changed_filter.filter_app_events = true;
+        assert!(input_task_restart_required(&input, &changed_filter, 3, 3));
     }
 
     #[test]
@@ -5448,6 +5453,7 @@ mod tests {
                     native_scroll_macos_to_windows: false,
                     native_scroll_windows_to_macos: false,
                     block_switch_on_press: false,
+                    filter_app_events: false,
                     key_mapping: crate::input::KeyMappingConfig::default(),
                     cursor_mode: crate::input::CursorMode::Desktop,
                 },

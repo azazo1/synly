@@ -1,7 +1,7 @@
 use super::schema::GuiState;
 use anyhow::{Context, Result, bail};
 
-pub(super) const MAIN_CONFIG_VERSION: u32 = 2;
+pub(super) const MAIN_CONFIG_VERSION: u32 = 3;
 pub(super) const GUI_STATE_VERSION: u32 = 1;
 pub(super) const IDENTITY_VERSION: u32 = 1;
 pub(super) const TRUSTED_DEVICES_VERSION: u32 = 1;
@@ -33,6 +33,12 @@ pub(super) fn migrate_main_config(raw: &str) -> Result<MainMigration> {
             1 => {
                 insert_main_v2_scroll_fields(&mut document)?;
                 version = 2;
+                set_version(&mut document, version, "config.toml")?;
+                migrated = true;
+            }
+            2 => {
+                insert_main_v3_filter_app_events(&mut document)?;
+                version = 3;
                 set_version(&mut document, version, "config.toml")?;
                 migrated = true;
             }
@@ -176,6 +182,23 @@ fn insert_main_v2_scroll_fields(document: &mut toml::Value) -> Result<()> {
     Ok(())
 }
 
+fn insert_main_v3_filter_app_events(document: &mut toml::Value) -> Result<()> {
+    let table = document
+        .as_table_mut()
+        .context("config.toml must contain a TOML table")?;
+    if !table.contains_key("input") {
+        table.insert("input".to_string(), toml::Value::Table(Default::default()));
+    }
+    let input = table
+        .get_mut("input")
+        .and_then(toml::Value::as_table_mut)
+        .context("config.toml input must be a TOML table")?;
+    if !input.contains_key("filter_app_events") {
+        input.insert("filter_app_events".to_string(), toml::Value::Boolean(false));
+    }
+    Ok(())
+}
+
 fn take_value(
     table: &mut toml::map::Map<String, toml::Value>,
     key: &str,
@@ -203,7 +226,7 @@ mod tests {
             })
         );
         let table = migration.document.as_table().unwrap();
-        assert_eq!(table.get("version").and_then(toml::Value::as_integer), Some(2));
+        assert_eq!(table.get("version").and_then(toml::Value::as_integer), Some(3));
         let ui = table.get("ui").and_then(toml::Value::as_table).unwrap();
         assert!(!ui.contains_key("first_run_completed"));
         assert!(!ui.contains_key("window_width"));
@@ -217,22 +240,26 @@ mod tests {
             input.get("native_scroll_windows_to_macos"),
             Some(&toml::Value::Boolean(false))
         );
+        assert_eq!(
+            input.get("filter_app_events"),
+            Some(&toml::Value::Boolean(false))
+        );
     }
 
     #[test]
     fn current_main_config_is_not_migrated() {
-        let migration = migrate_main_config("version = 2\n").unwrap();
+        let migration = migrate_main_config("version = 3\n").unwrap();
         assert!(!migration.migrated);
         assert!(migration.legacy_gui_state.is_none());
     }
 
     #[test]
-    fn main_v1_adds_native_scroll_fields_and_version_two() {
+    fn main_v1_adds_native_scroll_fields_and_version_three() {
         let migration =
             migrate_main_config("version = 1\n[input]\nreverse_mouse_wheel = true\n").unwrap();
         assert!(migration.migrated);
         let table = migration.document.as_table().unwrap();
-        assert_eq!(table.get("version").and_then(toml::Value::as_integer), Some(2));
+        assert_eq!(table.get("version").and_then(toml::Value::as_integer), Some(3));
         let input = table.get("input").and_then(toml::Value::as_table).unwrap();
         assert_eq!(
             input.get("native_scroll_macos_to_windows"),
@@ -246,6 +273,28 @@ mod tests {
             input.get("reverse_mouse_wheel"),
             Some(&toml::Value::Boolean(true))
         );
+        assert_eq!(
+            input.get("filter_app_events"),
+            Some(&toml::Value::Boolean(false))
+        );
+    }
+
+    #[test]
+    fn main_v2_adds_filter_app_events_and_version_three() {
+        let migration =
+            migrate_main_config("version = 2\n[input]\nblock_switch_on_press = true\n").unwrap();
+        assert!(migration.migrated);
+        let table = migration.document.as_table().unwrap();
+        assert_eq!(table.get("version").and_then(toml::Value::as_integer), Some(3));
+        let input = table.get("input").and_then(toml::Value::as_table).unwrap();
+        assert_eq!(
+            input.get("filter_app_events"),
+            Some(&toml::Value::Boolean(false))
+        );
+        assert_eq!(
+            input.get("block_switch_on_press"),
+            Some(&toml::Value::Boolean(true))
+        );
     }
 
     #[test]
@@ -257,6 +306,6 @@ mod tests {
     fn future_versions_are_rejected() {
         assert!(migrate_identity("version = 2\n").is_err());
         assert!(migrate_trusted_devices("version = 2\n").is_err());
-        assert!(migrate_main_config("version = 3\n").is_err());
+        assert!(migrate_main_config("version = 4\n").is_err());
     }
 }
