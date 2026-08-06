@@ -1,4 +1,4 @@
-import { Button, CheckBox, Palette } from "std-widgets.slint";
+import { Button, CheckBox, ComboBox, LineEdit, Palette, SpinBox } from "std-widgets.slint";
 
 component Metric inherits Rectangle {
     in property <string> label;
@@ -63,8 +63,8 @@ export component InputScreenMockWindow inherits Window {
 
     in property <string> route-text: "-";
     in property <string> source-edge: "right";
-    in property <int> virtual-width: 1280;
-    in property <int> virtual-height: 720;
+    in-out property <int> virtual-width: 1280;
+    in-out property <int> virtual-height: 720;
     in property <float> virtual-aspect-ratio: 1.7777778;
     in property <bool> active: false;
     in property <int> cursor-x: 0;
@@ -75,17 +75,25 @@ export component InputScreenMockWindow inherits Window {
     in property <int> delta-y: 0;
     in property <int> key-count: 0;
     in property <string> button-summary: "0x00000000";
+    in property <string> host-keys: "无";
+    in property <string> host-buttons: "无";
+    in property <string> remote-keys: "无";
+    in property <string> remote-buttons: "无";
     in property <int> wheel-x: 0;
     in property <int> wheel-y: 0;
     in property <length> grid-offset-x: 0px;
     in property <length> grid-offset-y: 0px;
+    in-out property <int> edge-index: 1;
+    in-out property <int> selected-page: 0;
+    in-out property <string> hotkey-text: "ctrl+alt+shift+esc";
     in-out property <bool> smooth-scroll: false;
     in-out property <bool> native-scroll-macos-to-windows: false;
     in-out property <bool> native-scroll-windows-to-macos: false;
     in property <string> event-text: "正在启动";
 
     callback quit-requested();
-    callback native-scroll-toggled();
+    callback settings-changed();
+    callback restore-defaults();
 
     VerticalLayout {
         padding: 18px;
@@ -133,136 +141,218 @@ export component InputScreenMockWindow inherits Window {
             }
 
             Button {
+                text: root.selected-page == 0 ? "设置" : "返回";
+                clicked => { root.selected-page = root.selected-page == 0 ? 1 : 0; }
+            }
+
+            Button {
                 text: "退出";
                 clicked => { root.quit-requested(); }
             }
         }
 
-        HorizontalLayout {
-            height: 34px;
-            spacing: 12px;
-
-            CheckBox {
-                text: "macOS -> Windows 原生滚动";
-                checked <=> root.native-scroll-macos-to-windows;
-                toggled => { root.native-scroll-toggled(); }
-            }
-
-            CheckBox {
-                text: "Windows -> macOS 原生滚动";
-                checked <=> root.native-scroll-windows-to-macos;
-                toggled => { root.native-scroll-toggled(); }
-            }
-
-            CheckBox {
-                text: "平滑滚动显示";
-                checked <=> root.smooth-scroll;
-            }
-
-            Rectangle { horizontal-stretch: 1; }
-        }
-
-        Rectangle {
+        if root.selected-page == 0: Rectangle {
             horizontal-stretch: 1;
             vertical-stretch: 1;
-            background: #121816;
-            border-color: #77817c;
-            border-width: 1px;
-            border-radius: 6px;
-
-            screen := Rectangle {
-                width: root.virtual-aspect-ratio > (parent.width - 20px) / (parent.height - 20px)
-                    ? parent.width - 20px
-                    : (parent.height - 20px) * root.virtual-aspect-ratio;
-                height: root.virtual-aspect-ratio > (parent.width - 20px) / (parent.height - 20px)
-                    ? (parent.width - 20px) / root.virtual-aspect-ratio
-                    : parent.height - 20px;
-                x: (parent.width - self.width) / 2;
-                y: (parent.height - self.height) / 2;
-                background: #202a26;
-                border-color: root.active ? #65b78e : #3a4641;
-                border-width: root.active ? 2px : 1px;
-                border-radius: 4px;
-                clip: true;
-
-                ScrollGrid {
-                    x: 0px;
-                    y: 0px;
-                    width: 100%;
-                    height: 100%;
-                    offset-x: root.grid-offset-x;
-                    offset-y: root.grid-offset-y;
-                }
+            VerticalLayout {
+                spacing: 10px;
 
                 Rectangle {
-                    x: parent.width / 2 - 1px;
-                    y: 0px;
-                    width: 2px;
-                    height: 100%;
-                    background: #567066;
-                }
-
-                Rectangle {
-                    x: 0px;
-                    y: parent.height / 2 - 1px;
-                    width: 100%;
-                    height: 2px;
-                    background: #567066;
-                }
-
-                Text {
-                    x: 12px;
-                    y: 10px;
-                    text: root.virtual-width + " x " + root.virtual-height;
-                    color: #aeb8b3;
-                    font-size: 11px;
-                }
-
-                Rectangle {
-                    x: parent.width * root.cursor-ratio-x - self.width / 2;
-                    y: parent.height * root.cursor-ratio-y - self.height / 2;
-                    width: 13px;
-                    height: 13px;
-                    background: root.active ? #79d6a7 : #89938e;
-                    border-color: #f4fff9;
-                    border-width: 2px;
+                    horizontal-stretch: 1;
+                    vertical-stretch: 1;
+                    background: #121816;
+                    border-color: #77817c;
+                    border-width: 1px;
                     border-radius: 6px;
+
+                    screen := Rectangle {
+                        width: root.virtual-aspect-ratio > (parent.width - 20px) / (parent.height - 20px)
+                            ? parent.width - 20px
+                            : (parent.height - 20px) * root.virtual-aspect-ratio;
+                        height: root.virtual-aspect-ratio > (parent.width - 20px) / (parent.height - 20px)
+                            ? (parent.width - 20px) / root.virtual-aspect-ratio
+                            : parent.height - 20px;
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2;
+                        background: #202a26;
+                        border-color: root.active ? #65b78e : #3a4641;
+                        border-width: root.active ? 2px : 1px;
+                        border-radius: 4px;
+                        clip: true;
+
+                        ScrollGrid {
+                            x: 0px;
+                            y: 0px;
+                            width: 100%;
+                            height: 100%;
+                            offset-x: root.grid-offset-x;
+                            offset-y: root.grid-offset-y;
+                        }
+
+                        Rectangle {
+                            x: parent.width / 2 - 1px;
+                            y: 0px;
+                            width: 2px;
+                            height: 100%;
+                            background: #567066;
+                        }
+
+                        Rectangle {
+                            x: 0px;
+                            y: parent.height / 2 - 1px;
+                            width: 100%;
+                            height: 2px;
+                            background: #567066;
+                        }
+
+                        Text {
+                            x: 12px;
+                            y: 10px;
+                            text: root.virtual-width + " x " + root.virtual-height;
+                            color: #aeb8b3;
+                            font-size: 11px;
+                        }
+
+                        Rectangle {
+                            x: parent.width * root.cursor-ratio-x - self.width / 2;
+                            y: parent.height * root.cursor-ratio-y - self.height / 2;
+                            width: 13px;
+                            height: 13px;
+                            background: root.active ? #79d6a7 : #89938e;
+                            border-color: #f4fff9;
+                            border-width: 2px;
+                            border-radius: 6px;
+                        }
+                    }
+                }
+
+                HorizontalLayout {
+                    height: 58px;
+                    spacing: 8px;
+
+                    Metric { label: "虚拟光标"; value: "x=" + root.cursor-x + ", y=" + root.cursor-y; horizontal-stretch: 2; }
+                    Metric { label: "原始增量"; value: "dx=" + root.delta-x + ", dy=" + root.delta-y; horizontal-stretch: 2; }
+                    Metric { label: "按键 / 按钮"; value: root.key-count + " / " + root.button-summary; horizontal-stretch: 2; }
+                    Metric { label: "滚轮累计"; value: "x=" + root.wheel-x + ", y=" + root.wheel-y; horizontal-stretch: 2; }
+                }
+
+                Rectangle {
+                    height: 78px;
+                    background: #ffffff;
+                    border-color: #d8dedb;
+                    border-width: 1px;
+                    border-radius: 5px;
+
+                    HorizontalLayout {
+                        padding: 10px;
+                        spacing: 12px;
+                        VerticalLayout {
+                            spacing: 2px;
+                            Text { text: "本机(发送端)按下"; color: #6a736f; font-size: 11px; }
+                            Text { text: "按键: " + root.host-keys; color: #29312d; font-size: 12px; overflow: elide; }
+                            Text { text: "鼠标: " + root.host-buttons; color: #29312d; font-size: 12px; overflow: elide; }
+                        }
+                        Rectangle { width: 1px; background: #d8dedb; }
+                        VerticalLayout {
+                            spacing: 2px;
+                            Text { text: "对端(mock)按下"; color: #6a736f; font-size: 11px; }
+                            Text { text: "按键: " + root.remote-keys; color: #29312d; font-size: 12px; overflow: elide; }
+                            Text { text: "鼠标: " + root.remote-buttons; color: #29312d; font-size: 12px; overflow: elide; }
+                        }
+                    }
+                }
+
+                Rectangle {
+                    height: 54px;
+                    background: #ffffff;
+                    border-color: #d8dedb;
+                    border-width: 1px;
+                    border-radius: 5px;
+
+                    VerticalLayout {
+                        padding: 9px;
+                        spacing: 3px;
+
+                        Text {
+                            text: "最近事件";
+                            color: #6a736f;
+                            font-size: 11px;
+                        }
+
+                        Text {
+                            text: root.event-text;
+                            color: #29312d;
+                            font-size: 12px;
+                            overflow: elide;
+                        }
+                    }
                 }
             }
         }
 
-        HorizontalLayout {
-            height: 58px;
-            spacing: 8px;
+        if root.selected-page == 1: VerticalLayout {
+            spacing: 10px;
+            Text { text: "Mock 设置"; font-size: 22px; font-weight: 680; color: #202523; height: 34px; vertical-alignment: center; }
 
-            Metric { label: "虚拟光标"; value: "x=" + root.cursor-x + ", y=" + root.cursor-y; horizontal-stretch: 2; }
-            Metric { label: "原始增量"; value: "dx=" + root.delta-x + ", dy=" + root.delta-y; horizontal-stretch: 2; }
-            Metric { label: "按键 / 按钮"; value: root.key-count + " / " + root.button-summary; horizontal-stretch: 2; }
-            Metric { label: "滚轮累计"; value: "x=" + root.wheel-x + ", y=" + root.wheel-y; horizontal-stretch: 2; }
-        }
-
-        Rectangle {
-            height: 54px;
-            background: #ffffff;
-            border-color: #d8dedb;
-            border-width: 1px;
-            border-radius: 5px;
-
-            VerticalLayout {
-                padding: 9px;
-                spacing: 3px;
-
-                Text {
-                    text: "最近事件";
-                    color: #6a736f;
-                    font-size: 11px;
+            HorizontalLayout {
+                spacing: 8px;
+                Text { text: "接入边缘"; width: 56px; vertical-alignment: center; }
+                edge-box := ComboBox {
+                    model: ["左侧", "右侧", "顶部", "底部"];
+                    current-index <=> root.edge-index;
+                    selected(_) => { root.settings-changed(); }
                 }
+                Text { text: "宽度"; width: 40px; vertical-alignment: center; }
+                width-box := SpinBox {
+                    value <=> root.virtual-width;
+                    minimum: 320;
+                    maximum: 7680;
+                    edited(value) => { root.settings-changed(); }
+                }
+                Text { text: "高度"; width: 40px; vertical-alignment: center; }
+                height-box := SpinBox {
+                    value <=> root.virtual-height;
+                    minimum: 240;
+                    maximum: 4320;
+                    edited(value) => { root.settings-changed(); }
+                }
+            }
 
-                Text {
-                    text: root.event-text;
-                    color: #29312d;
-                    font-size: 12px;
-                    overflow: elide;
+            HorizontalLayout {
+                spacing: 8px;
+                Text { text: "紧急热键"; width: 56px; vertical-alignment: center; }
+                hotkey-edit := LineEdit {
+                    text <=> root.hotkey-text;
+                    placeholder-text: "ctrl+alt+shift+esc";
+                    edited(text) => { root.settings-changed(); }
+                }
+                CheckBox {
+                    text: "macOS -> Windows 原生滚动";
+                    checked <=> root.native-scroll-macos-to-windows;
+                    toggled => { root.settings-changed(); }
+                }
+                CheckBox {
+                    text: "Windows -> macOS 原生滚动";
+                    checked <=> root.native-scroll-windows-to-macos;
+                    toggled => { root.settings-changed(); }
+                }
+                CheckBox {
+                    text: "平滑滚动显示";
+                    checked <=> root.smooth-scroll;
+                }
+                Rectangle { horizontal-stretch: 1; }
+            }
+
+            Rectangle { vertical-stretch: 1; }
+            HorizontalLayout {
+                Rectangle { horizontal-stretch: 1; }
+                Button {
+                    text: "恢复默认设置";
+                    clicked => { root.restore-defaults(); }
+                }
+                Button {
+                    text: "返回主界面";
+                    clicked => { root.selected-page = 0; }
                 }
             }
         }

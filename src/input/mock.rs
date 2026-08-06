@@ -7,6 +7,7 @@ use super::{
 use anyhow::{Context, Result, bail};
 use slint::{CloseRequestResponse, ComponentHandle};
 use std::collections::BTreeSet;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -30,10 +31,41 @@ pub struct ScreenMockOptions {
     pub height: i32,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-struct MockFlags {
+impl Default for ScreenMockOptions {
+    fn default() -> Self {
+        Self {
+            edge: ScreenEdge::Right,
+            hotkey: Hotkey::DEFAULT
+                .parse()
+                .expect("默认紧急热键必须有效"),
+            width: 1280,
+            height: 720,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MockSettings {
+    edge: ScreenEdge,
+    hotkey: Hotkey,
+    width: i32,
+    height: i32,
     native_macos_to_windows: bool,
     native_windows_to_macos: bool,
+}
+
+impl MockSettings {
+    fn from_window(window: &InputScreenMockWindow) -> Result<Self> {
+        let hotkey = Hotkey::from_str(window.get_hotkey_text().trim())?;
+        Ok(Self {
+            edge: edge_from_index(window.get_edge_index()),
+            hotkey,
+            width: window.get_virtual_width(),
+            height: window.get_virtual_height(),
+            native_macos_to_windows: window.get_native_scroll_macos_to_windows(),
+            native_windows_to_macos: window.get_native_scroll_windows_to_macos(),
+        })
+    }
 }
 
 pub fn run_screen_mock(options: ScreenMockOptions) -> Result<()> {
@@ -50,6 +82,8 @@ pub fn run_screen_mock(options: ScreenMockOptions) -> Result<()> {
         .into(),
     );
     window.set_source_edge(options.edge.as_arg().into());
+    window.set_edge_index(edge_index(options.edge));
+    window.set_hotkey_text(options.hotkey.to_string().into());
     window.set_virtual_width(options.width);
     window.set_virtual_height(options.height);
     window.set_virtual_aspect_ratio(options.width as f32 / options.height as f32);
@@ -59,23 +93,46 @@ pub fn run_screen_mock(options: ScreenMockOptions) -> Result<()> {
     let stop = Arc::new(AtomicBool::new(false));
     wire_window_shutdown(&window, Arc::clone(&stop));
     spawn_signal_monitor(Arc::clone(&stop))?;
-    let (flags_tx, flags_rx) = tokio::sync::watch::channel(MockFlags::default());
-    let flags_weak = window.as_weak();
-    window.on_native_scroll_toggled(move || {
-        let Some(window) = flags_weak.upgrade() else {
+    let (settings_tx, settings_rx) =
+        tokio::sync::watch::channel(MockSettings::from_window(&window)?);
+    let settings_weak = window.as_weak();
+    window.on_settings_changed(move || {
+        let Some(window) = settings_weak.upgrade() else {
             return;
         };
-        let _ = flags_tx.send(MockFlags {
-            native_macos_to_windows: window.get_native_scroll_macos_to_windows(),
-            native_windows_to_macos: window.get_native_scroll_windows_to_macos(),
-        });
+        match MockSettings::from_window(&window) {
+            Ok(settings) => {
+                window.set_source_edge(settings.edge.as_arg().into());
+                window
+                    .set_virtual_aspect_ratio(settings.width as f32 / settings.height as f32);
+                let _ = settings_tx.send(settings);
+            }
+            Err(error) => {
+                window.set_event_text(format!("设置无效: {error}").into());
+            }
+        }
+    });
+    let restore_weak = window.as_weak();
+    window.on_restore_defaults(move || {
+        let Some(window) = restore_weak.upgrade() else {
+            return;
+        };
+        window.set_edge_index(edge_index(ScreenEdge::Right));
+        window.set_virtual_width(1280);
+        window.set_virtual_height(720);
+        window.set_hotkey_text(Hotkey::DEFAULT.into());
+        window.set_native_scroll_macos_to_windows(false);
+        window.set_native_scroll_windows_to_macos(false);
+        window.set_smooth_scroll(false);
+        window.set_event_text("已恢复 mock 默认设置".into());
+        window.invoke_settings_changed();
     });
 
     let presenter = GuiPresenter::new(window.as_weak(), options.width, options.height);
 
     let worker_stop = Arc::clone(&stop);
     let worker_presenter = presenter.clone();
-    let mut worker_flags = flags_rx;
+    let mut worker_settings = settings_rx;
     let worker = std::thread::Builder::new()
         .name("synly-input-screen-mock".to_string())
         .spawn(move || {
@@ -86,11 +143,10 @@ pub fn run_screen_mock(options: ScreenMockOptions) -> Result<()> {
             runtime.block_on(async {
                 loop {
                     match run_mock_worker(
-                        options.clone(),
                         remote_platform,
                         worker_stop.clone(),
                         worker_presenter.clone(),
-                        &mut worker_flags,
+                        &mut worker_settings,
                     )
                     .await
                     {
@@ -173,13 +229,14 @@ fn spawn_signal_monitor(stop: Arc<AtomicBool>) -> Result<()> {
 }
 
 async fn run_mock_worker(
-    options: ScreenMockOptions,
     remote_platform: InputPlatform,
     stop: Arc<AtomicBool>,
     presenter: GuiPresenter,
-    flags: &mut tokio::sync::watch::Receiver<MockFlags>,
+    settings: &mut tokio::sync::watch::Receiver<MockSettings>,
 ) -> Result<()> {
-    let mut platform = match platform::start(InputMode::Send, options.hotkey) {
+    let mock_settings = (*settings.borrow_and_update()).clone();
+    presenter.set_size(mock_settings.width, mock_settings.height);
+    let mut platform = match platform::start(InputMode::Send, mock_settings.hotkey) {
         Ok(platform) => platform,
         Err(error) => {
             tracing::error!(error = %error, "输入虚拟屏幕 mock 启动失败");
@@ -192,28 +249,28 @@ async fn run_mock_worker(
     let mock_layout = DesktopLayout::new(vec![DisplayRect {
         x: 0,
         y: 0,
-        width: options.width,
-        height: options.height,
+        width: mock_settings.width,
+        height: mock_settings.height,
     }])?;
     tracing::info!(
         local_platform = platform_label(InputPlatform::current()),
         remote_platform = platform_label(remote_platform),
-        edge = options.edge.as_arg(),
+        edge = mock_settings.edge.as_arg(),
         "输入虚拟屏幕 mock 已启动"
     );
 
     let observed_motion = Arc::clone(&platform.motion);
+    let local_backend = Arc::clone(&platform.backend);
     let (incoming_tx, mut incoming_rx) = mpsc::channel(256);
     let (outgoing_tx, outgoing_rx) = mpsc::channel(256);
-    let mock_flags = *flags.borrow();
     let runtime_options = InputRuntimeOptions {
         mode: InputMode::Send,
-        edge: options.edge,
-        hotkey: options.hotkey,
+        edge: mock_settings.edge,
+        hotkey: mock_settings.hotkey,
         reverse_mouse_wheel: false,
         reverse_trackpad: false,
-        native_scroll_macos_to_windows: mock_flags.native_macos_to_windows,
-        native_scroll_windows_to_macos: mock_flags.native_windows_to_macos,
+        native_scroll_macos_to_windows: mock_settings.native_macos_to_windows,
+        native_scroll_windows_to_macos: mock_settings.native_windows_to_macos,
         block_switch_on_press: false,
         key_mapping: KeyMappingConfig::default(),
         cursor_mode: crate::input::CursorMode::Desktop,
@@ -223,7 +280,7 @@ async fn run_mock_worker(
         &outgoing_tx,
         &mut platform,
         local_layout,
-        options.edge,
+        mock_settings.edge,
         remote_platform,
         &runtime_options,
     );
@@ -231,6 +288,7 @@ async fn run_mock_worker(
     let peer = run_mock_peer(
         mock_layout,
         observed_motion,
+        local_backend,
         incoming_tx,
         outgoing_rx,
         remote_platform,
@@ -241,7 +299,7 @@ async fn run_mock_worker(
     let result = tokio::select! {
         result = &mut sender => result,
         result = &mut peer => result,
-        _ = flags.changed() => Err(anyhow::anyhow!(MockRestart)),
+        _ = settings.changed() => Err(anyhow::anyhow!(MockRestart)),
     };
     if let Err(error) = &result
         && error.downcast_ref::<MockRestart>().is_none()
@@ -262,9 +320,11 @@ impl std::fmt::Display for MockRestart {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_mock_peer(
     mock_layout: DesktopLayout,
     motion: Arc<platform::MotionAccumulator>,
+    local_backend: Arc<dyn platform::InputBackend>,
     incoming: mpsc::Sender<Result<InputMessage>>,
     mut outgoing: mpsc::Receiver<InputMessage>,
     remote_platform: InputPlatform,
@@ -466,6 +526,11 @@ async fn run_mock_peer(
                         }
                     }
                 }
+                let local_snapshot = local_backend.snapshot();
+                let local_keys =
+                    pressed_names(&local_snapshot.usages.iter().copied().collect());
+                let local_buttons =
+                    pressed_button_names(&local_snapshot.buttons.iter().copied().collect());
                 presenter.publish(GuiUpdate {
                     active,
                     cursor: remote_cursor,
@@ -476,6 +541,10 @@ async fn run_mock_peer(
                     grid_offset_x: grid_offset.x,
                     grid_offset_y: grid_offset.y,
                     event: last_event.clone(),
+                    host_keys: local_keys,
+                    host_buttons: local_buttons,
+                    remote_keys: pressed_names(&keys),
+                    remote_buttons: pressed_button_names(&buttons),
                 });
             }
         }
@@ -513,6 +582,53 @@ fn button_mask(buttons: &BTreeSet<u8>) -> u32 {
             .checked_shl(u32::from(button.saturating_sub(1)))
             .unwrap_or(0)
     })
+}
+
+fn edge_index(edge: ScreenEdge) -> i32 {
+    match edge {
+        ScreenEdge::Left => 0,
+        ScreenEdge::Right => 1,
+        ScreenEdge::Top => 2,
+        ScreenEdge::Bottom => 3,
+    }
+}
+
+fn edge_from_index(index: i32) -> ScreenEdge {
+    match index {
+        0 => ScreenEdge::Left,
+        2 => ScreenEdge::Top,
+        3 => ScreenEdge::Bottom,
+        _ => ScreenEdge::Right,
+    }
+}
+
+fn pressed_names(usages: &BTreeSet<u16>) -> String {
+    if usages.is_empty() {
+        return "无".to_string();
+    }
+    usages
+        .iter()
+        .map(|usage| super::hotkey::key_name(*usage))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn pressed_button_names(buttons: &BTreeSet<u8>) -> String {
+    if buttons.is_empty() {
+        return "无".to_string();
+    }
+    buttons
+        .iter()
+        .map(|button| match button {
+            1 => "left".to_string(),
+            2 => "middle".to_string(),
+            3 => "right".to_string(),
+            4 => "x1".to_string(),
+            5 => "x2".to_string(),
+            other => format!("button-{other}"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn wheel_to_grid_delta(x: i32, y: i32, remote_platform: InputPlatform) -> (f32, f32) {
@@ -578,8 +694,7 @@ struct GuiPresenter {
     latest: Arc<Mutex<GuiUpdate>>,
     scheduled: Arc<AtomicBool>,
     smooth: Arc<Mutex<SmoothGridState>>,
-    width: i32,
-    height: i32,
+    size: Arc<Mutex<(i32, i32)>>,
 }
 
 impl GuiPresenter {
@@ -589,8 +704,15 @@ impl GuiPresenter {
             latest: Arc::new(Mutex::new(GuiUpdate::idle("正在启动".to_string()))),
             scheduled: Arc::new(AtomicBool::new(false)),
             smooth: Arc::new(Mutex::new(SmoothGridState::default())),
-            width,
-            height,
+            size: Arc::new(Mutex::new((width, height))),
+        }
+    }
+
+    fn set_size(&self, width: i32, height: i32) {
+        if let Ok(mut size) = self.size.lock() {
+            *size = (width, height);
+        } else {
+            tracing::error!("输入 mock GUI 尺寸锁已损坏");
         }
     }
 
@@ -609,8 +731,13 @@ impl GuiPresenter {
         let latest = Arc::clone(&self.latest);
         let scheduled = Arc::clone(&self.scheduled);
         let smooth = Arc::clone(&self.smooth);
-        let width = self.width;
-        let height = self.height;
+        let (width, height) = match self.size.lock() {
+            Ok(size) => *size,
+            Err(_) => {
+                tracing::error!("输入 mock GUI 尺寸锁已损坏");
+                (0, 0)
+            }
+        };
         if let Err(error) = slint::invoke_from_event_loop(move || {
             scheduled.store(false, Ordering::Release);
             let update = match latest.lock() {
@@ -639,6 +766,10 @@ struct GuiUpdate {
     grid_offset_x: f32,
     grid_offset_y: f32,
     event: String,
+    host_keys: String,
+    host_buttons: String,
+    remote_keys: String,
+    remote_buttons: String,
 }
 
 impl GuiUpdate {
@@ -653,6 +784,10 @@ impl GuiUpdate {
             grid_offset_x: 0.0,
             grid_offset_y: 0.0,
             event,
+            host_keys: "无".to_string(),
+            host_buttons: "无".to_string(),
+            remote_keys: "无".to_string(),
+            remote_buttons: "无".to_string(),
         }
     }
 }
@@ -675,6 +810,10 @@ fn apply_gui_update(
     window.set_button_summary(format!("0x{:08x}", update.button_mask).into());
     window.set_wheel_x(update.wheel.x);
     window.set_wheel_y(update.wheel.y);
+    window.set_host_keys(update.host_keys.clone().into());
+    window.set_host_buttons(update.host_buttons.clone().into());
+    window.set_remote_keys(update.remote_keys.clone().into());
+    window.set_remote_buttons(update.remote_buttons.clone().into());
     if window.get_smooth_scroll() {
         let (display_x, display_y) = smooth.advance(update.grid_offset_x, update.grid_offset_y);
         window.set_grid_offset_x(grid_phase(display_x));
@@ -697,10 +836,11 @@ fn normalized_coordinate(value: i32, extent: i32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        GRID_PATTERN_SIZE, GRID_SCROLL_STEP, SmoothGridState, button_mask, grid_phase,
-        grid_pixels_per_wheel_unit, normalized_coordinate, opposite_platform,
+        GRID_PATTERN_SIZE, GRID_SCROLL_STEP, SmoothGridState, button_mask, edge_from_index,
+        edge_index, grid_phase, grid_pixels_per_wheel_unit, normalized_coordinate,
+        opposite_platform, pressed_button_names, pressed_names,
     };
-    use crate::input::InputPlatform;
+    use crate::input::{InputPlatform, ScreenEdge};
     use std::collections::BTreeSet;
 
     #[test]
@@ -720,6 +860,29 @@ mod tests {
         assert_eq!(normalized_coordinate(-4, 100), 0.0);
         assert_eq!(normalized_coordinate(99, 100), 1.0);
         assert_eq!(button_mask(&BTreeSet::from([1, 3])), 0b101);
+    }
+
+    #[test]
+    fn mock_edge_index_roundtrips() {
+        for edge in [
+            ScreenEdge::Left,
+            ScreenEdge::Right,
+            ScreenEdge::Top,
+            ScreenEdge::Bottom,
+        ] {
+            assert_eq!(edge_from_index(edge_index(edge)), edge);
+        }
+    }
+
+    #[test]
+    fn pressed_state_names_are_readable() {
+        assert_eq!(pressed_names(&BTreeSet::from([0x04, 0x45])), "a, f12");
+        assert_eq!(
+            pressed_button_names(&BTreeSet::from([1, 3, 5])),
+            "left, right, x2"
+        );
+        assert_eq!(pressed_names(&BTreeSet::new()), "无");
+        assert_eq!(pressed_button_names(&BTreeSet::new()), "无");
     }
 
     #[test]

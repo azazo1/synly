@@ -3,28 +3,15 @@ use anyhow::Result;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use clap::Parser;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-use std::str::FromStr;
-#[cfg(any(target_os = "macos", target_os = "windows"))]
 use synly::input::mock::{ScreenMockOptions, run_screen_mock};
-#[cfg(any(target_os = "macos", target_os = "windows"))]
-use synly::input::{Hotkey, ScreenEdge};
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 #[derive(Debug, Parser)]
 #[command(
     name = "input-screen-mock",
-    about = "使用 Slint 无连接虚拟屏幕验证本机输入捕获和返回"
+    about = "使用 Slint 无连接虚拟屏幕验证本机输入捕获和返回, 设置可在窗口内调整"
 )]
-struct Cli {
-    #[arg(long, value_enum, default_value = "right", help = "从本机接入 mock 的屏幕边缘")]
-    edge: ScreenEdge,
-    #[arg(long, default_value = Hotkey::DEFAULT, help = "恢复本机控制的紧急热键")]
-    hotkey: String,
-    #[arg(long, default_value_t = 1280, help = "mock 虚拟屏幕宽度")]
-    width: i32,
-    #[arg(long, default_value_t = 720, help = "mock 虚拟屏幕高度")]
-    height: i32,
-}
+struct Cli {}
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 fn main() -> Result<()> {
@@ -35,13 +22,8 @@ fn main() -> Result<()> {
         )
         .with_target(true)
         .init();
-    let cli = Cli::parse();
-    run_screen_mock(ScreenMockOptions {
-        edge: cli.edge,
-        hotkey: Hotkey::from_str(&cli.hotkey)?,
-        width: cli.width,
-        height: cli.height,
-    })
+    let _cli = Cli::parse();
+    run_screen_mock(ScreenMockOptions::default())
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
