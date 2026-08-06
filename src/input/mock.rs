@@ -346,6 +346,10 @@ async fn run_mock_peer(
     let mut wheel = Point::default();
     let mut grid_offset = GridOffset::default();
     let mut last_event = "等待输入".to_string();
+    let mut last_local_keys = BTreeSet::new();
+    let mut last_local_buttons = BTreeSet::new();
+    let mut last_remote_keys = BTreeSet::new();
+    let mut last_remote_buttons = BTreeSet::new();
 
     loop {
         tokio::select! {
@@ -516,7 +520,7 @@ async fn run_mock_peer(
                                 sample.dx,
                                 sample.dy,
                             );
-                            tracing::debug!(
+                            tracing::trace!(
                                 point = ?point,
                                 dx = sample.dx,
                                 dy = sample.dy,
@@ -527,10 +531,37 @@ async fn run_mock_peer(
                     }
                 }
                 let local_snapshot = local_backend.snapshot();
-                let local_keys =
-                    pressed_names(&local_snapshot.usages.iter().copied().collect());
-                let local_buttons =
-                    pressed_button_names(&local_snapshot.buttons.iter().copied().collect());
+                let local_keys: BTreeSet<u16> =
+                    local_snapshot.usages.iter().copied().collect();
+                let local_buttons: BTreeSet<u8> =
+                    local_snapshot.buttons.iter().copied().collect();
+                let local_keys_text = pressed_names(&local_keys);
+                let local_buttons_text = pressed_button_names(&local_buttons);
+                if local_keys != last_local_keys || local_buttons != last_local_buttons {
+                    tracing::info!(
+                        local_usages = ?local_keys,
+                        local_mouse = ?local_buttons,
+                        local_keys = %local_keys_text,
+                        local_buttons = %local_buttons_text,
+                        usage_a = local_keys.contains(&0x04),
+                        "mock 本机按下状态变化"
+                    );
+                    last_local_keys = local_keys.clone();
+                    last_local_buttons = local_buttons.clone();
+                }
+                if keys != last_remote_keys || buttons != last_remote_buttons {
+                    let remote_keys_text = pressed_names(&keys);
+                    let remote_buttons_text = pressed_button_names(&buttons);
+                    tracing::info!(
+                        remote_usages = ?keys,
+                        remote_buttons = ?buttons,
+                        remote_keys = %remote_keys_text,
+                        remote_mouse = %remote_buttons_text,
+                        "mock 对端按下状态变化"
+                    );
+                    last_remote_keys = keys.clone();
+                    last_remote_buttons = buttons.clone();
+                }
                 presenter.publish(GuiUpdate {
                     active,
                     cursor: remote_cursor,
@@ -541,8 +572,8 @@ async fn run_mock_peer(
                     grid_offset_x: grid_offset.x,
                     grid_offset_y: grid_offset.y,
                     event: last_event.clone(),
-                    host_keys: local_keys,
-                    host_buttons: local_buttons,
+                    host_keys: local_keys_text,
+                    host_buttons: local_buttons_text,
                     remote_keys: pressed_names(&keys),
                     remote_buttons: pressed_button_names(&buttons),
                 });

@@ -59,7 +59,7 @@ gradlew *args:
 
 # 使用 Slint 虚拟屏幕验证当前平台的输入捕获和返回.
 input-screen-mock:
-    cargo run --features input-screen-mock --bin input-screen-mock
+    RUST_LOG=synly=debug cargo run --features input-screen-mock --bin input-screen-mock
 
 # 完全捕获 macOS trackpad 事件并输出诊断日志, 按任意键退出.
 input-macos-trackpad-debug:
