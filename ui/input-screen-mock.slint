@@ -89,6 +89,8 @@ export component InputScreenMockWindow inherits Window {
     in-out property <bool> smooth-scroll: false;
     in-out property <bool> native-scroll-macos-to-windows: false;
     in-out property <bool> native-scroll-windows-to-macos: false;
+    in-out property <bool> reverse-mouse-wheel: false;
+    in-out property <bool> reverse-trackpad: false;
     in-out property <bool> filter-app-events: true;
     in property <string> event-text: "正在启动";
 
@@ -327,6 +329,20 @@ export component InputScreenMockWindow inherits Window {
                     placeholder-text: "ctrl+alt+shift+esc";
                     edited(text) => { root.settings-changed(); }
                 }
+                CheckBox {
+                    text: "反转鼠标滚轮";
+                    checked <=> root.reverse-mouse-wheel;
+                    toggled => { root.settings-changed(); }
+                }
+                CheckBox {
+                    text: "反转触控板滚动";
+                    checked <=> root.reverse-trackpad;
+                    toggled => { root.settings-changed(); }
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 8px;
                 CheckBox {
                     text: "macOS -> Windows 原生滚动";
                     checked <=> root.native-scroll-macos-to-windows;

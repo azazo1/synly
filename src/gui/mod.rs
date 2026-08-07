@@ -869,6 +869,8 @@ fn apply_settings_to_window(
     window.set_input_hotkey(runtime.input.hotkey.clone().into());
     window.set_block_switch_on_press(runtime.input.block_switch_on_press);
     window.set_filter_app_events(runtime.input.filter_app_events);
+    window.set_reverse_mouse_wheel(runtime.input.reverse_mouse_wheel);
+    window.set_reverse_trackpad(runtime.input.reverse_trackpad);
     let local_platform = InputPlatform::current();
     window.set_native_scroll_macos_to_windows(runtime.input.native_scroll_macos_to_windows);
     window.set_native_scroll_macos_to_windows_enabled(local_platform == InputPlatform::Macos);
@@ -990,8 +992,8 @@ fn settings_from_window(
             edge: input_edge_from_index(window.get_input_edge_index()),
             hotkey: window.get_input_hotkey().trim().to_string(),
             elevate_on_start: current_input.elevate_on_start,
-            reverse_mouse_wheel: current_input.reverse_mouse_wheel,
-            reverse_trackpad: current_input.reverse_trackpad,
+            reverse_mouse_wheel: window.get_reverse_mouse_wheel(),
+            reverse_trackpad: window.get_reverse_trackpad(),
             native_scroll_macos_to_windows: window.get_native_scroll_macos_to_windows(),
             native_scroll_windows_to_macos: window.get_native_scroll_windows_to_macos(),
             block_switch_on_press: window.get_block_switch_on_press(),

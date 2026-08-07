@@ -52,6 +52,8 @@ struct MockSettings {
     height: i32,
     native_macos_to_windows: bool,
     native_windows_to_macos: bool,
+    reverse_mouse_wheel: bool,
+    reverse_trackpad: bool,
     filter_app_events: bool,
 }
 
@@ -65,6 +67,8 @@ impl MockSettings {
             height: window.get_virtual_height(),
             native_macos_to_windows: window.get_native_scroll_macos_to_windows(),
             native_windows_to_macos: window.get_native_scroll_windows_to_macos(),
+            reverse_mouse_wheel: window.get_reverse_mouse_wheel(),
+            reverse_trackpad: window.get_reverse_trackpad(),
             filter_app_events: window.get_filter_app_events(),
         })
     }
@@ -125,6 +129,8 @@ pub fn run_screen_mock(options: ScreenMockOptions) -> Result<()> {
         window.set_hotkey_text(Hotkey::DEFAULT.into());
         window.set_native_scroll_macos_to_windows(false);
         window.set_native_scroll_windows_to_macos(false);
+        window.set_reverse_mouse_wheel(false);
+        window.set_reverse_trackpad(false);
         window.set_smooth_scroll(false);
         window.set_filter_app_events(true);
         window.set_event_text("已恢复 mock 默认设置".into());
@@ -274,8 +280,8 @@ async fn run_mock_worker(
         mode: InputMode::Send,
         edge: mock_settings.edge,
         hotkey: mock_settings.hotkey,
-        reverse_mouse_wheel: false,
-        reverse_trackpad: false,
+        reverse_mouse_wheel: mock_settings.reverse_mouse_wheel,
+        reverse_trackpad: mock_settings.reverse_trackpad,
         native_scroll_macos_to_windows: mock_settings.native_macos_to_windows,
         native_scroll_windows_to_macos: mock_settings.native_windows_to_macos,
         block_switch_on_press: false,

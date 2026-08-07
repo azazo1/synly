@@ -208,13 +208,13 @@ Synly 使用固定的四文件配置目录, 每个文件的顶层都有独立的
 
 普通键使用 `a` 到 `z`, `0` 到 `9`, `f1` 到 `f12`, `enter`, `escape`, `backspace`, `tab`, `space`, `minus`, `equal`, `left_bracket`, `right_bracket`, `backslash`, `semicolon`, `apostrophe`, `comma`, `period`, `slash`, `caps_lock`, `insert`, `home`, `page_up`, `delete`, `end`, `page_down` 和方向键名称. 修饰键按平台使用 `left_ctrl`, `left_shift`, `left_option`, `left_command`, `left_alt`, `left_win` 及对应的 `right_` 名称. 实际可用键位仍受源端捕获和目标端注入能力限制.
 
-`reverse_mouse_wheel` 和 `reverse_trackpad` 会同时反转水平与垂直滚动. macOS 和 Windows 都能区分普通滚轮与连续触控板滚动, 其中 Windows 通过事件附加信息识别触控板. 这些配置在应用启动时读取, 修改后需要重启.
+`reverse_mouse_wheel` 和 `reverse_trackpad` 会同时反转水平与垂直滚动. macOS 和 Windows 都能区分普通滚轮与连续触控板滚动, 其中 Windows 通过事件附加信息识别触控板. 两个开关都可在 GUI 输入设置中修改, 修改后会自动重启输入任务.
 
 `native_scroll_macos_to_windows` 和 `native_scroll_windows_to_macos` 是发送端生效的原生滚动开关, 只处理普通鼠标滚轮, 触控板始终按直通行为发送. macOS 机开启前者后, 普通滚轮按事件数折算为 Windows 档位; Windows 机开启后者后, 会把滚轮档位按固定 macOS 风格曲线换算成 macOS line 滚动. 关闭时保持原有直通行为. 两个开关都可在 GUI 输入设置中修改, 修改后会自动重启输入任务.
 
 `filter_app_events` 默认开启, 仅控制端输入捕获会过滤非 HID 来源的合成按键和鼠标事件, 可用于规避 macOS IMK 在部分功能键后产生的幽灵按键; 该选项可在 GUI 输入设置中修改, 修改后会自动重启输入任务.
 
-`input-screen-mock` 也可以模拟这个效果. 在 mock 界面勾选对应的原生滚动复选框后, 输入模拟会自动重启; mock 屏幕中的 48px 网格会根据滚轮输入平滑移动少量像素, 方便对比原生换算开启前后的滚动差异. 平滑滚动复选框只影响 mock 的显示层, 不会改变真实滚动逻辑.
+`input-screen-mock` 也可以模拟这个效果. 在 mock 界面勾选对应的原生滚动或反向滚动复选框后, 输入模拟会自动重启; mock 屏幕中的 48px 网格会根据滚轮输入平滑移动少量像素, 方便对比原生换算和方向设置前后的滚动差异. 平滑滚动复选框只影响 mock 的显示层, 不会改变真实滚动逻辑.
 
 `elevate_on_start` 仅在 Windows 生效. 设置为 `true` 后, GUI 主实例和 Headless 都会在启动会话前请求 UAC 并启动管理员输入代理. macOS 和 Linux 会保存但忽略该字段.
 
