@@ -545,13 +545,13 @@ export component AppWindow inherits Window {
                                 text: "macOS -> Windows 原生滚动";
                                 checked <=> root.native-scroll-macos-to-windows;
                                 enabled: root.native-scroll-macos-to-windows-enabled;
-                                Tooltip { text: @markdown("发送端生效"); }
+                                Tooltip { text: @markdown("发送端生效, 只处理普通鼠标滚轮, 触控板保持直通"); }
                             }
                             CheckBox {
                                 text: "Windows -> macOS 原生滚动";
                                 checked <=> root.native-scroll-windows-to-macos;
                                 enabled: root.native-scroll-windows-to-macos-enabled;
-                                Tooltip { text: @markdown("发送端生效"); }
+                                Tooltip { text: @markdown("发送端生效, 只处理普通鼠标滚轮, 触控板保持直通"); }
                             }
                             Text { text: "光标模式"; color: #737b77; font-size: 11px; }
                             ComboBox { model: ["桌面光标", "自动切换", "游戏光标"]; current-index <=> root.cursor-mode-index; }

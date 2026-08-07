@@ -533,7 +533,7 @@ pub(super) async fn run_sender(
     let mut press_blocked = false;
     let mut secure_desktop = false;
     let mut secure_input = false;
-    let mut scroll_transformer =
+    let scroll_transformer =
         ScrollTransformer::new(
             options.native_scroll_macos_to_windows,
             options.native_scroll_windows_to_macos,
@@ -793,7 +793,6 @@ pub(super) async fn run_sender(
                             pressed,
                         })?;
                         platform.backend.set_capture(true)?;
-                        scroll_transformer.reset();
                         control.active = true;
                         control.activation_confirmed = false;
                         last_heartbeat = Instant::now();

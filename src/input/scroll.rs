@@ -1,18 +1,16 @@
 use super::mapping::InputPlatform;
 use super::platform::ScrollSource;
 
-const TRACKPAD_PIXELS_PER_NOTCH: f64 = 48.0;
+const PIXELS_PER_NOTCH: f64 = 48.0;
 const CURVE_MEDIUM_THRESHOLD: f64 = 80.0;
 const CURVE_FAST_THRESHOLD: f64 = 240.0;
 const CURVE_MEDIUM_FACTOR: f64 = 1.25;
 const CURVE_FAST_FACTOR: f64 = 1.5;
 
-/// 把源平台滚动换算成目标平台原生滚动, 并保留触控板连续滚动的小数余数.
+/// 把源平台普通滚轮换算成目标平台原生滚动, 触控板保持直通.
 pub struct ScrollTransformer {
     native_macos_to_windows: bool,
     native_windows_to_macos: bool,
-    trackpad_x_remainder: f64,
-    trackpad_y_remainder: f64,
 }
 
 impl ScrollTransformer {
@@ -20,19 +18,12 @@ impl ScrollTransformer {
         Self {
             native_macos_to_windows,
             native_windows_to_macos,
-            trackpad_x_remainder: 0.0,
-            trackpad_y_remainder: 0.0,
         }
-    }
-
-    pub fn reset(&mut self) {
-        self.trackpad_x_remainder = 0.0;
-        self.trackpad_y_remainder = 0.0;
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn transform(
-        &mut self,
+        &self,
         x: i32,
         y: i32,
         source: ScrollSource,
@@ -59,7 +50,7 @@ impl ScrollTransformer {
     }
 
     fn native_transform(
-        &mut self,
+        &self,
         x: i32,
         y: i32,
         source: ScrollSource,
@@ -72,15 +63,7 @@ impl ScrollTransformer {
             {
                 (wheel_axis_to_notch(x), wheel_axis_to_notch(y))
             }
-            (InputPlatform::Macos, InputPlatform::Windows, ScrollSource::Trackpad)
-                if self.native_macos_to_windows =>
-            {
-                (
-                    Self::trackpad_axis_to_notch(x, &mut self.trackpad_x_remainder),
-                    Self::trackpad_axis_to_notch(y, &mut self.trackpad_y_remainder),
-                )
-            }
-            (InputPlatform::Windows, InputPlatform::Macos, _)
+            (InputPlatform::Windows, InputPlatform::Macos, ScrollSource::MouseWheel)
                 if self.native_windows_to_macos =>
             {
                 (
@@ -90,14 +73,6 @@ impl ScrollTransformer {
             }
             _ => (x, y),
         }
-    }
-
-    fn trackpad_axis_to_notch(delta: i32, remainder: &mut f64) -> i32 {
-        let scaled = (delta as f64 / TRACKPAD_PIXELS_PER_NOTCH).clamp(-1.0, 1.0);
-        *remainder += scaled;
-        let notches = remainder.trunc();
-        *remainder -= notches;
-        rounded_i32(notches)
     }
 }
 
@@ -118,8 +93,8 @@ fn accelerated_scroll(value: f64) -> f64 {
 }
 
 fn windows_notch_to_macos_line(delta: i32) -> i32 {
-    let pixels = delta as f64 * TRACKPAD_PIXELS_PER_NOTCH;
-    rounded_i32(accelerated_scroll(pixels) / TRACKPAD_PIXELS_PER_NOTCH)
+    let pixels = delta as f64 * PIXELS_PER_NOTCH;
+    rounded_i32(accelerated_scroll(pixels) / PIXELS_PER_NOTCH)
 }
 
 fn rounded_i32(value: f64) -> i32 {
@@ -142,7 +117,7 @@ mod tests {
 
     #[test]
     fn disabled_native_scroll_keeps_old_behavior() {
-        let mut transformer = transformer(false, false);
+        let transformer = transformer(false, false);
         assert_eq!(
             transformer.transform(
                 4,
@@ -170,66 +145,37 @@ mod tests {
     }
 
     #[test]
-    fn trackpad_pixels_accumulate_into_windows_notches() {
-        let mut transformer = transformer(true, false);
+    fn native_scroll_keeps_trackpad_unchanged() {
+        let transformer = transformer(true, true);
         assert_eq!(
             transformer.transform(
                 48,
-                48,
-                ScrollSource::Trackpad,
-                InputPlatform::Macos,
-                InputPlatform::Windows,
-                false,
-                false,
-            ),
-            (-1, 1)
-        );
-        assert_eq!(
-            transformer.transform(
-                0,
-                24,
-                ScrollSource::Trackpad,
-                InputPlatform::Macos,
-                InputPlatform::Windows,
-                false,
-                false,
-            ),
-            (0, 0)
-        );
-        assert_eq!(
-            transformer.transform(
-                0,
-                24,
-                ScrollSource::Trackpad,
-                InputPlatform::Macos,
-                InputPlatform::Windows,
-                false,
-                false,
-            ),
-            (0, 1)
-        );
-    }
-
-    #[test]
-    fn trackpad_to_windows_caps_accelerated_magnitude() {
-        let mut transformer = transformer(true, false);
-        assert_eq!(
-            transformer.transform(
                 480,
-                240,
                 ScrollSource::Trackpad,
                 InputPlatform::Macos,
                 InputPlatform::Windows,
                 false,
                 false,
             ),
-            (-1, 1)
+            (-48, 480)
+        );
+        assert_eq!(
+            transformer.transform(
+                3,
+                2,
+                ScrollSource::Trackpad,
+                InputPlatform::Windows,
+                InputPlatform::Macos,
+                false,
+                false,
+            ),
+            (-3, 2)
         );
     }
 
     #[test]
     fn mouse_wheel_to_windows_uses_event_count_not_accelerated_magnitude() {
-        let mut transformer = transformer(true, false);
+        let transformer = transformer(true, false);
         assert_eq!(
             transformer.transform(
                 0,
@@ -258,7 +204,7 @@ mod tests {
 
     #[test]
     fn windows_notches_apply_fixed_curve_to_macos_lines() {
-        let mut transformer = transformer(false, true);
+        let transformer = transformer(false, true);
         assert_eq!(
             transformer.transform(
                 1,
@@ -287,48 +233,18 @@ mod tests {
 
     #[test]
     fn native_conversion_runs_before_reverse() {
-        let mut transformer = transformer(true, false);
+        let transformer = transformer(true, false);
         assert_eq!(
             transformer.transform(
                 48,
                 48,
-                ScrollSource::Trackpad,
+                ScrollSource::MouseWheel,
                 InputPlatform::Macos,
                 InputPlatform::Windows,
-                false,
                 true,
+                false,
             ),
             (1, -1)
-        );
-    }
-
-    #[test]
-    fn reset_discards_pending_trackpad_remainder() {
-        let mut transformer = transformer(true, false);
-        assert_eq!(
-            transformer.transform(
-                24,
-                0,
-                ScrollSource::Trackpad,
-                InputPlatform::Macos,
-                InputPlatform::Windows,
-                false,
-                false,
-            ),
-            (0, 0)
-        );
-        transformer.reset();
-        assert_eq!(
-            transformer.transform(
-                24,
-                0,
-                ScrollSource::Trackpad,
-                InputPlatform::Macos,
-                InputPlatform::Windows,
-                false,
-                false,
-            ),
-            (0, 0)
         );
     }
 }

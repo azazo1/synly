@@ -35,6 +35,7 @@ const WM_SYNLY_PRE_WARP: u32 = 0x8004;
 const WM_SYNLY_POST_WARP: u32 = 0x8005;
 const WM_SYNLY_MOUSE_BUTTON: u32 = 0x8006;
 const WM_SYNLY_MOUSE_WHEEL: u32 = 0x8007;
+const WM_SYNLY_MOUSE_TRACKPAD_WHEEL: u32 = 0x8008;
 const WM_MOUSEMOVE: u32 = 0x0200;
 const WM_LBUTTONDOWN: u32 = 0x0201;
 const WM_LBUTTONUP: u32 = 0x0202;
@@ -50,6 +51,8 @@ const LLKHF_INJECTED: u32 = 0x10;
 const LLKHF_LOWER_IL_INJECTED: u32 = 0x02;
 const LLMHF_INJECTED: u32 = 0x0001;
 const LLMHF_LOWER_IL_INJECTED: u32 = 0x0002;
+const MOUSEEVENTF_FROMTOUCH: usize = 0xff51_5700;
+const MOUSEEVENTF_MASK: usize = 0xffff_ff00;
 const KEYEVENTF_EXTENDEDKEY: u32 = 0x0001;
 const KEYEVENTF_KEYUP: u32 = 0x0002;
 const KEYEVENTF_SCANCODE: u32 = 0x0008;
@@ -692,11 +695,13 @@ unsafe extern "system" fn mouse_callback(code: i32, w_param: WParam, l_param: LP
         }
         WM_MOUSEWHEEL => {
             let y = (event.mouse_data >> 16) as i16 as i32 / WHEEL_DELTA;
-            posted = post_thread_point(thread_id, WM_SYNLY_MOUSE_WHEEL, Point { x: 0, y });
+            let message = wheel_message(scroll_source_from_extra_info(event.extra_info));
+            posted = post_thread_point(thread_id, message, Point { x: 0, y });
         }
         WM_MOUSEHWHEEL => {
             let x = (event.mouse_data >> 16) as i16 as i32 / WHEEL_DELTA;
-            posted = post_thread_point(thread_id, WM_SYNLY_MOUSE_WHEEL, Point { x, y: 0 });
+            let message = wheel_message(scroll_source_from_extra_info(event.extra_info));
+            posted = post_thread_point(thread_id, message, Point { x, y: 0 });
         }
         _ => {}
     }
@@ -707,6 +712,21 @@ unsafe extern "system" fn mouse_callback(code: i32, w_param: WParam, l_param: LP
         1
     } else {
         unsafe { CallNextHookEx(0, code, w_param, l_param) }
+    }
+}
+
+fn scroll_source_from_extra_info(extra_info: usize) -> ScrollSource {
+    if extra_info & MOUSEEVENTF_MASK == MOUSEEVENTF_FROMTOUCH {
+        ScrollSource::Trackpad
+    } else {
+        ScrollSource::MouseWheel
+    }
+}
+
+fn wheel_message(source: ScrollSource) -> u32 {
+    match source {
+        ScrollSource::MouseWheel => WM_SYNLY_MOUSE_WHEEL,
+        ScrollSource::Trackpad => WM_SYNLY_MOUSE_TRACKPAD_WHEEL,
     }
 }
 
@@ -752,7 +772,19 @@ fn handle_thread_message(state: &WindowsState, message: &Msg) -> bool {
             true
         }
         WM_SYNLY_MOUSE_WHEEL => {
-            handle_mouse_wheel(state, decode_point(message.w_param, message.l_param));
+            handle_mouse_wheel(
+                state,
+                decode_point(message.w_param, message.l_param),
+                ScrollSource::MouseWheel,
+            );
+            true
+        }
+        WM_SYNLY_MOUSE_TRACKPAD_WHEEL => {
+            handle_mouse_wheel(
+                state,
+                decode_point(message.w_param, message.l_param),
+                ScrollSource::Trackpad,
+            );
             true
         }
         WM_SYNLY_PRE_WARP => {
@@ -805,12 +837,12 @@ fn handle_mouse_button(state: &WindowsState, button: u8, down: bool) {
     }
 }
 
-fn handle_mouse_wheel(state: &WindowsState, delta: Point) {
+fn handle_mouse_wheel(state: &WindowsState, delta: Point, source: ScrollSource) {
     if capture_phase(state) == CapturePhase::Relaying {
         state.context.emit_reliable(NativeEvent::Wheel {
             x: delta.x,
             y: delta.y,
-            source: ScrollSource::MouseWheel,
+            source,
         });
     }
 }
@@ -1619,7 +1651,11 @@ fn hid_to_windows_scan(usage: u16) -> Option<(u16, bool)> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{allow_native_fallback, hid_to_windows_scan, vk_to_hid};
+    use super::super::{
+        MOUSEEVENTF_FROMTOUCH, MOUSEEVENTF_MASK, ScrollSource, WM_SYNLY_MOUSE_TRACKPAD_WHEEL,
+        WM_SYNLY_MOUSE_WHEEL, allow_native_fallback, hid_to_windows_scan,
+        scroll_source_from_extra_info, vk_to_hid, wheel_message,
+    };
 
     #[test]
     fn elevated_receiver_failure_does_not_fallback_to_native_input() {
@@ -1636,5 +1672,31 @@ mod tests {
         }
         assert_eq!(vk_to_hid(0x7c), 0x68);
         assert_eq!(vk_to_hid(0x87), 0x73);
+    }
+
+    #[test]
+    fn touch_extra_info_is_classified_as_trackpad_scroll() {
+        assert_eq!(
+            scroll_source_from_extra_info(MOUSEEVENTF_FROMTOUCH),
+            ScrollSource::Trackpad,
+        );
+        assert_eq!(
+            scroll_source_from_extra_info(MOUSEEVENTF_FROMTOUCH | 0x1),
+            ScrollSource::Trackpad,
+        );
+        assert_eq!(scroll_source_from_extra_info(0), ScrollSource::MouseWheel);
+        assert_eq!(
+            scroll_source_from_extra_info(MOUSEEVENTF_MASK),
+            ScrollSource::MouseWheel,
+        );
+    }
+
+    #[test]
+    fn wheel_message_maps_source_to_message_id() {
+        assert_eq!(wheel_message(ScrollSource::MouseWheel), WM_SYNLY_MOUSE_WHEEL);
+        assert_eq!(
+            wheel_message(ScrollSource::Trackpad),
+            WM_SYNLY_MOUSE_TRACKPAD_WHEEL,
+        );
     }
 }
