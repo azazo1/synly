@@ -326,6 +326,7 @@ object SynlyEngine {
                         connectedDevice = event.remote.deviceName,
                         targetLabel = event.remote.deviceName,
                         pinRequest = null,
+                        lastMessage = null,
                         canSend = event.clientToHost,
                         canReceive = event.hostToClient,
                     )
