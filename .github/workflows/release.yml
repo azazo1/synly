@@ -141,6 +141,13 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - name: 缓存 Rust 依赖和 target
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          workspaces: .
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+
       - name: Install Windows Opus dependency
         if: matrix.platform == 'windows'
         shell: pwsh
@@ -235,14 +242,24 @@ jobs:
         with:
           packages: "platforms;android-36 build-tools;36.0.0 ndk;28.2.13676358"
 
+      - name: 配置 Gradle 缓存
+        uses: gradle/actions/setup-gradle@v4
+
       - name: Install Rust Android target
         run: |
           rustup toolchain install stable --profile minimal
           rustup target add aarch64-linux-android
 
+      - name: 缓存 Rust 依赖、Android target 和 cargo 工具
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: android-arm64
+          workspaces: .
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+
       - name: Install cargo-ndk and uniffi-bindgen
         run: |
-          cargo install cargo-ndk --locked
+          cargo install cargo-ndk --locked --version 4.1.2
           cargo install uniffi --version 0.31.2 --features cli --locked
 
       - name: Build core library
