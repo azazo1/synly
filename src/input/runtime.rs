@@ -11,6 +11,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -123,7 +124,11 @@ pub async fn run_input_session(
     master_secret: [u8; 32],
     local_role: LocalInputRole,
     options: InputRuntimeOptions,
+    input_activity: Option<Arc<AtomicBool>>,
 ) -> Result<()> {
+    if let Some(input_activity) = &input_activity {
+        input_activity.store(false, Ordering::Release);
+    }
     let filter_app_events = options.filter_app_events && matches!(local_role, LocalInputRole::Send);
     let mut platform =
         platform::start_with_filter(options.mode, options.hotkey, filter_app_events)?;
@@ -154,6 +159,7 @@ pub async fn run_input_session(
                             local_role,
                             &options,
                             &mut platform,
+                            input_activity.clone(),
                         )
                         .await
                         {
@@ -186,7 +192,14 @@ pub async fn run_input_session(
                 {
                     Ok(Ok(stream)) => {
                         delay = RECONNECT_MIN;
-                        run_established(stream, local_role, &options, &mut platform).await
+                        run_established(
+                            stream,
+                            local_role,
+                            &options,
+                            &mut platform,
+                            input_activity.clone(),
+                        )
+                        .await
                     }
                     Ok(Err(err)) => Err(err),
                     Err(_) => Err(anyhow::anyhow!("输入辅助连接认证超时")),
@@ -224,7 +237,11 @@ async fn run_established(
     local_role: LocalInputRole,
     options: &InputRuntimeOptions,
     platform: &mut platform::PlatformHandle,
+    input_activity: Option<Arc<AtomicBool>>,
 ) -> Result<()> {
+    if let Some(input_activity) = &input_activity {
+        input_activity.store(false, Ordering::Release);
+    }
     let local_layout = platform.backend.layout()?;
     let local_platform = InputPlatform::current();
     let (mut reader, mut writer) = tokio::io::split(stream);
@@ -258,7 +275,7 @@ async fn run_established(
     let _reader_abort = AbortOnDrop(reader_task.abort_handle());
 
     let session = match local_role {
-        LocalInputRole::Send => run_sender(
+        LocalInputRole::Send => run_sender_with_activity(
             &mut incoming,
             &tx,
             platform,
@@ -266,6 +283,7 @@ async fn run_established(
             options.edge,
             remote_platform,
             options,
+            input_activity,
         )
         .await,
         LocalInputRole::Receive => {
@@ -476,6 +494,7 @@ struct SenderControl {
     cooldown_until: Instant,
     local_pressed: PressedState,
     pending_return_request: Option<(u64, f32)>,
+    input_activity: Option<Arc<AtomicBool>>,
 }
 
 impl SenderControl {
@@ -483,7 +502,11 @@ impl SenderControl {
         platform: &platform::PlatformHandle,
         layout: super::DesktopLayout,
         edge: ScreenEdge,
+        input_activity: Option<Arc<AtomicBool>>,
     ) -> Self {
+        if let Some(input_activity) = &input_activity {
+            input_activity.store(false, Ordering::Release);
+        }
         Self {
             generation: 0,
             active: false,
@@ -492,17 +515,22 @@ impl SenderControl {
             cooldown_until: Instant::now(),
             local_pressed: PressedState::default(),
             pending_return_request: None,
+            input_activity,
         }
     }
 
     fn deactivate(&mut self) {
         self.active = false;
+        if let Some(input_activity) = &self.input_activity {
+            input_activity.store(false, Ordering::Release);
+        }
         self.activation_confirmed = false;
         self.cooldown_until = Instant::now() + RETURN_COOLDOWN;
         self.pending_return_request = None;
     }
 }
 
+#[cfg(any(test, feature = "input-screen-mock"))]
 pub(super) async fn run_sender(
     incoming: &mut mpsc::Receiver<Result<InputMessage>>,
     tx: &mpsc::Sender<InputMessage>,
@@ -512,13 +540,38 @@ pub(super) async fn run_sender(
     remote_platform: InputPlatform,
     options: &InputRuntimeOptions,
 ) -> Result<()> {
+    run_sender_with_activity(
+        incoming,
+        tx,
+        platform,
+        local_layout,
+        source_edge,
+        remote_platform,
+        options,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn run_sender_with_activity(
+    incoming: &mut mpsc::Receiver<Result<InputMessage>>,
+    tx: &mpsc::Sender<InputMessage>,
+    platform: &mut platform::PlatformHandle,
+    local_layout: super::DesktopLayout,
+    source_edge: ScreenEdge,
+    remote_platform: InputPlatform,
+    options: &InputRuntimeOptions,
+    input_activity: Option<Arc<AtomicBool>>,
+) -> Result<()> {
     let local_platform = InputPlatform::current();
     let mut key_mapper = KeyMapper::new(
         &options.key_mapping,
         local_platform,
         remote_platform,
     )?;
-    let mut control = SenderControl::new(platform, local_layout.clone(), source_edge);
+    let mut control =
+        SenderControl::new(platform, local_layout.clone(), source_edge, input_activity);
     let mut last_heartbeat = Instant::now();
     let mut motion_tick = time::interval(MOTION_INTERVAL);
     motion_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -794,6 +847,9 @@ pub(super) async fn run_sender(
                         })?;
                         platform.backend.set_capture(true)?;
                         control.active = true;
+                        if let Some(input_activity) = &control.input_activity {
+                            input_activity.store(true, Ordering::Release);
+                        }
                         control.activation_confirmed = false;
                         last_heartbeat = Instant::now();
                         control.recovery.arm(edge_position);

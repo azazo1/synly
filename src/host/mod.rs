@@ -125,7 +125,10 @@ pub(crate) async fn run_host_runtime(
     mut commands: mpsc::UnboundedReceiver<RuntimeCommand>,
 ) -> Result<()> {
     let device = config.device.clone();
-    let notifier = SystemNotifier::new(options.control.tuning());
+    let notifier = SystemNotifier::new(
+        options.control.tuning(),
+        options.control.input_activity(),
+    );
     let shutdown = options.control.shutdown().clone();
     let mut runtime_capabilities = options.control.capabilities();
     let mut runtime_tuning = options.control.tuning();

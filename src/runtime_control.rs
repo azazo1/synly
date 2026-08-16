@@ -2,6 +2,8 @@ use crate::protocol::{CapabilityEpoch, RuntimeCapabilities};
 use crate::clipboard::ClipboardRuntimeOptions;
 use crate::input::InputRuntimeOptions;
 use anyhow::{Context, Result};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -140,6 +142,7 @@ pub struct RuntimeControl {
     shutdown: CancellationToken,
     capabilities: watch::Receiver<RuntimeCapabilities>,
     tuning: watch::Receiver<RuntimeTuning>,
+    input_activity: Arc<AtomicBool>,
     events: mpsc::UnboundedSender<RuntimeEvent>,
     commands: mpsc::UnboundedSender<RuntimeCommand>,
 }
@@ -178,6 +181,7 @@ impl RuntimeControl {
                 shutdown: shutdown.clone(),
                 capabilities,
                 tuning,
+                input_activity: Arc::new(AtomicBool::new(false)),
                 events,
                 commands,
             },
@@ -205,6 +209,10 @@ impl RuntimeControl {
 
     pub fn tuning(&self) -> watch::Receiver<RuntimeTuning> {
         self.tuning.clone()
+    }
+
+    pub fn input_activity(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.input_activity)
     }
 
     pub fn report(&self, event: RuntimeEvent) {

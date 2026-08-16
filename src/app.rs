@@ -47,6 +47,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs::File;
@@ -68,6 +69,8 @@ const PAIRING_MAX_FAILURES: u32 = 5;
 const PAIRING_BACKOFF_BASE_MS: u64 = 1_000;
 const RECONNECT_BASE_DELAY: Duration = Duration::from_secs(2);
 const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(20);
+// 快速直连最多连续重试 3 次, 之后转入发现和正常退避.
+const FAST_DIRECT_RETRIES: u32 = 3;
 const TIMESTAMP_SKEW_TOLERANCE_MS: u64 = 10_000;
 const FUTURE_TIMESTAMP_GUARD_MS: u64 = 10 * 60 * 1_000;
 const CLOCK_SKEW_WARNING_MS: u64 = 60_000;
@@ -330,7 +333,10 @@ pub(crate) async fn run_advertisement_updates(
 pub(crate) async fn run_client(mut config: SynlyConfig, mut options: RuntimeOptions) -> Result<()> {
     let discovery_timeout = Duration::from_secs(options.pairing.discovery_secs);
     let mut reconnect_query = options.pairing.peer_query.clone();
-    let notifier = SystemNotifier::new(options.control.tuning());
+    let notifier = SystemNotifier::new(
+        options.control.tuning(),
+        options.control.input_activity(),
+    );
     let shutdown = options.control.shutdown().clone();
     let mut runtime_capabilities = options.control.capabilities();
     let mut runtime_tuning = options.control.tuning();
@@ -350,6 +356,8 @@ pub(crate) async fn run_client(mut config: SynlyConfig, mut options: RuntimeOpti
         runtime_tuning: &mut runtime_tuning,
         notifier: &notifier,
         discovery_timeout,
+        direct_target: None,
+        fast_retries_left: FAST_DIRECT_RETRIES,
     };
     tokio::select! {
         result = run_auto_reconnect(policy, drive_shutdown, &mut attempt) => result,
@@ -366,6 +374,8 @@ struct PeerReconnectAttempt<'a> {
     runtime_tuning: &'a mut watch::Receiver<RuntimeTuning>,
     notifier: &'a SystemNotifier,
     discovery_timeout: Duration,
+    direct_target: Option<SocketAddr>,
+    fast_retries_left: u32,
 }
 
 impl crate::reconnect::ReconnectAttempt for PeerReconnectAttempt<'_> {
@@ -382,10 +392,69 @@ impl crate::reconnect::ReconnectAttempt for PeerReconnectAttempt<'_> {
             self.runtime_tuning,
             self.notifier,
             self.discovery_timeout,
+            &mut self.direct_target,
+            &mut self.fast_retries_left,
         ))
     }
 }
 
+async fn connect_and_run_session(
+    peer_target: &PeerTarget,
+    config: &mut SynlyConfig,
+    options: &RuntimeOptions,
+    notifier: &SystemNotifier,
+    direct_target: &mut Option<SocketAddr>,
+) -> Result<()> {
+    let session = connect_to_peer(peer_target, config, options).await?;
+    *direct_target = Some(session.remote_socket_addr);
+    let remote_label = format!(
+        "{} ({})",
+        identity_display_name(&session.remote),
+        short_uuid(&session.remote.device_id)
+    );
+    let peer_summary = RuntimePeerSummary {
+        device_id: session.remote.device_id,
+        display_name: identity_display_name(&session.remote),
+    };
+    let peer = notification_peer(&session.remote);
+    if let Err(err) = run_with_session_notifications(
+        notifier,
+        peer,
+        run_sync_session(
+            session,
+            &options.workspace,
+            SyncSessionOptions {
+                clipboard_mode: options.clipboard_mode,
+                audio_mode: options.audio_mode,
+                input_mode: options.input_mode,
+                input_options: options.input.clone(),
+                input_inbox: None,
+                input_session_id: None,
+                input_socket_tx: None,
+                input_routes: None,
+                clipboard_options: &options.clipboard,
+                transfer_limits: options.transfer_limits,
+                control: options.control.clone(),
+                clipboard_hub: None,
+                capability_profile: SessionCapabilityProfile::Full,
+                session_shutdown: None,
+            },
+        ),
+    )
+    .await
+    {
+        tracing::warn!(peer = %remote_label, error = %err, "同步会话中断");
+    } else {
+        tracing::info!(peer = %remote_label, "连接已断开");
+    }
+    options.control.report(RuntimeEvent::Disconnected(peer_summary));
+    options
+        .control
+        .report(RuntimeEvent::Lifecycle(RuntimeLifecycle::Discovering));
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn attempt_peer_connection(
     config: &mut SynlyConfig,
     options: &mut RuntimeOptions,
@@ -394,6 +463,8 @@ async fn attempt_peer_connection(
     runtime_tuning: &mut watch::Receiver<RuntimeTuning>,
     notifier: &SystemNotifier,
     discovery_timeout: Duration,
+    direct_target: &mut Option<SocketAddr>,
+    fast_retries_left: &mut u32,
 ) -> AttemptVerdict {
     refresh_runtime_options(
         config,
@@ -406,6 +477,44 @@ async fn attempt_peer_connection(
         options.audio_mode,
         options.input_mode,
     );
+
+    if let Some(SocketAddr::V4(address)) = *direct_target {
+        let peer_target = PeerTarget::Direct(address);
+        tracing::info!(address = %address, "使用上次地址快速重连");
+        options
+            .control
+            .report(RuntimeEvent::Lifecycle(RuntimeLifecycle::Connecting));
+        match connect_and_run_session(
+            &peer_target,
+            config,
+            options,
+            notifier,
+            direct_target,
+        )
+        .await
+        {
+            Ok(()) => {
+                *fast_retries_left = FAST_DIRECT_RETRIES;
+                return AttemptVerdict::RetryImmediately;
+            }
+            Err(err) if err.downcast_ref::<PairingTerminal>().is_some() => {
+                tracing::warn!(error = %err, "直连配对流程已终止, 不再自动重连");
+                return AttemptVerdict::Terminal(err);
+            }
+            Err(err) => {
+                tracing::warn!(address = %address, error = %err, "快速直连失败");
+                if *fast_retries_left > 0 {
+                    *fast_retries_left -= 1;
+                    return AttemptVerdict::RetryImmediately;
+                }
+                *direct_target = None;
+                tracing::info!("快速直连次数已用完, 转为重新发现");
+            }
+        }
+    } else {
+        *direct_target = None;
+    }
+
     let peer_target = match choose_peer(
         reconnect_query.as_deref(),
         discovery_timeout,
@@ -437,65 +546,29 @@ async fn attempt_peer_connection(
         .control
         .report(RuntimeEvent::Lifecycle(RuntimeLifecycle::Connecting));
 
-    match connect_to_peer(&peer_target, config, options).await {
-        Ok(session) => {
-            let remote_label = format!(
-                "{} ({})",
-                identity_display_name(&session.remote),
-                short_uuid(&session.remote.device_id)
-            );
-            let peer_summary = RuntimePeerSummary {
-                device_id: session.remote.device_id,
-                display_name: identity_display_name(&session.remote),
-            };
-            let peer = notification_peer(&session.remote);
-            if let Err(err) = run_with_session_notifications(
-                notifier,
-                peer,
-                run_sync_session(
-                    session,
-                    &options.workspace,
-                    SyncSessionOptions {
-                        clipboard_mode: options.clipboard_mode,
-                        audio_mode: options.audio_mode,
-                        input_mode: options.input_mode,
-                        input_options: options.input.clone(),
-                        input_inbox: None,
-                        input_session_id: None,
-                        input_socket_tx: None,
-                        input_routes: None,
-                        clipboard_options: &options.clipboard,
-                        transfer_limits: options.transfer_limits,
-                        control: options.control.clone(),
-                        clipboard_hub: None,
-                        capability_profile: SessionCapabilityProfile::Full,
-                        session_shutdown: None,
-                    },
-                ),
-            )
-            .await
-            {
-                tracing::warn!(peer = %remote_label, error = %err, "同步会话中断");
-            } else {
-                tracing::info!(peer = %remote_label, "连接已断开");
-            }
-            options.control.report(RuntimeEvent::Disconnected(peer_summary));
+    match connect_and_run_session(
+        &peer_target,
+        config,
+        options,
+        notifier,
+        direct_target,
+    )
+    .await
+    {
+        Ok(()) => {
+            *fast_retries_left = FAST_DIRECT_RETRIES;
+            AttemptVerdict::RetryImmediately
+        }
+        Err(err) if err.downcast_ref::<PairingTerminal>().is_some() => {
+            tracing::warn!(error = %err, "配对流程已终止, 不再自动重连");
+            AttemptVerdict::Terminal(err)
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "连接失败");
             options
                 .control
                 .report(RuntimeEvent::Lifecycle(RuntimeLifecycle::Discovering));
-            AttemptVerdict::Disconnected
-        }
-        Err(err) => {
-            if err.downcast_ref::<PairingTerminal>().is_some() {
-                tracing::warn!(error = %err, "配对流程已终止, 不再自动重连");
-                AttemptVerdict::Terminal(err)
-            } else {
-                tracing::warn!(error = %err, "连接失败");
-                options
-                    .control
-                    .report(RuntimeEvent::Lifecycle(RuntimeLifecycle::Discovering));
-                AttemptVerdict::Failed
-            }
+            AttemptVerdict::Failed
         }
     }
 }
@@ -532,6 +605,7 @@ pub(crate) fn notification_peer(identity: &DeviceIdentity) -> NotificationPeer {
     NotificationPeer {
         display_name: identity_display_name(identity),
         short_device_id: short_uuid(&identity.device_id),
+        device_id: identity.device_id,
     }
 }
 
@@ -1931,6 +2005,7 @@ struct CapabilityRefreshContext<'a> {
     pub(crate) input_session_id: Option<&'a watch::Sender<Option<Uuid>>>,
     pub(crate) input_socket_tx: Option<&'a mpsc::Sender<InputSocketConnection>>,
     pub(crate) input_routes: Option<&'a Arc<InputRouteRegistry>>,
+    pub(crate) input_activity: &'a Arc<AtomicBool>,
     pub(crate) clipboard_hub: Option<&'a ClipboardHubHandle>,
     pub(crate) tx: &'a mpsc::Sender<Frame>,
 }
@@ -2036,6 +2111,7 @@ async fn refresh_capability_tasks(
         runtime
             .stop_input(context.input_session_id, context.input_routes)
             .await;
+        context.input_activity.store(false, Ordering::Release);
         runtime.input_epoch = Some(epoch);
         runtime.input_role = input_role;
         if let Some(local_role) = input_role
@@ -2066,12 +2142,14 @@ async fn refresh_capability_tasks(
             let mut input_options = context.input_options.clone();
             input_options.mode = local.input_mode;
             let input_master_secret = context.input_master_secret;
+            let activity = Arc::clone(context.input_activity);
             let task = tokio::spawn(async move {
                 if let Err(err) = input::run_input_session(
                     InputSessionContext::host(channel, inbox),
                     input_master_secret,
                     local_role,
                     input_options,
+                    Some(activity),
                 )
                 .await
                 {
@@ -2216,6 +2294,7 @@ pub(crate) async fn run_sync_session(
     let remote_socket_addr = session.remote_socket_addr;
     let audio_master_secret = session.audio_master_secret;
     let input_master_secret = session.input_master_secret;
+    let input_activity = options.control.input_activity();
 
     tracing::info!(
         clipboard = %clipboard_summary_line(
@@ -2296,6 +2375,7 @@ pub(crate) async fn run_sync_session(
             input_session_id: options.input_session_id.as_ref(),
             input_socket_tx: options.input_socket_tx.as_ref(),
             input_routes: options.input_routes.as_ref(),
+            input_activity: &input_activity,
             clipboard_hub: options.clipboard_hub.as_ref(),
             tx: &tx,
         },
@@ -2336,6 +2416,7 @@ pub(crate) async fn run_sync_session(
                 input_session_id: options.input_session_id.as_ref(),
                 input_socket_tx: options.input_socket_tx.as_ref(),
                 input_routes: options.input_routes.as_ref(),
+                input_activity: &input_activity,
                 clipboard_hub: options.clipboard_hub.as_ref(),
                 tx: &tx,
             },
@@ -2413,6 +2494,7 @@ pub(crate) async fn run_sync_session(
                             input_session_id: options.input_session_id.as_ref(),
                             input_socket_tx: options.input_socket_tx.as_ref(),
                             input_routes: options.input_routes.as_ref(),
+                            input_activity: &input_activity,
                             clipboard_hub: options.clipboard_hub.as_ref(),
                             tx: &tx,
                         },
@@ -2472,6 +2554,7 @@ pub(crate) async fn run_sync_session(
                             input_session_id: options.input_session_id.as_ref(),
                             input_socket_tx: options.input_socket_tx.as_ref(),
                             input_routes: options.input_routes.as_ref(),
+                            input_activity: &input_activity,
                             clipboard_hub: options.clipboard_hub.as_ref(),
                             tx: &tx,
                         },
@@ -2522,6 +2605,7 @@ pub(crate) async fn run_sync_session(
                             input_session_id: options.input_session_id.as_ref(),
                             input_socket_tx: options.input_socket_tx.as_ref(),
                             input_routes: options.input_routes.as_ref(),
+                            input_activity: &input_activity,
                             clipboard_hub: options.clipboard_hub.as_ref(),
                             tx: &tx,
                         },
@@ -2548,6 +2632,7 @@ pub(crate) async fn run_sync_session(
                             input_session_id: options.input_session_id.as_ref(),
                             input_socket_tx: options.input_socket_tx.as_ref(),
                             input_routes: options.input_routes.as_ref(),
+                            input_activity: &input_activity,
                             clipboard_hub: options.clipboard_hub.as_ref(),
                             tx: &tx,
                         },
@@ -2575,12 +2660,14 @@ pub(crate) async fn run_sync_session(
                 }
                 let mut task_input_options = input_options.clone();
                 task_input_options.mode = local.input_mode;
+                let activity_for_input = Arc::clone(&input_activity);
                 let task = tokio::spawn(async move {
                     if let Err(err) = input::run_input_session(
                         InputSessionContext::client(offer, remote_socket_addr),
                         input_master_secret,
                         local_role,
                         task_input_options,
+                        Some(activity_for_input),
                     )
                     .await
                     {
@@ -5176,6 +5263,7 @@ mod tests {
         let peer = NotificationPeer {
             display_name: "demo".to_string(),
             short_device_id: "12345678".to_string(),
+            device_id: Uuid::new_v4(),
         };
 
         run_with_session_notifications(&notifier, peer.clone(), async { Ok(()) })
@@ -5206,6 +5294,7 @@ mod tests {
         let peer = NotificationPeer {
             display_name: "demo".to_string(),
             short_device_id: "12345678".to_string(),
+            device_id: Uuid::new_v4(),
         };
         let mut session = Box::pin(run_with_session_notifications(
             &notifier,
