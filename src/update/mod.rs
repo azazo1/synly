@@ -8,7 +8,7 @@ mod state;
 use crate::config::UpdateConfig;
 use anyhow::Result;
 use check::release_page_url;
-use state::{AvailableRelease, InstallOutcome, RestartAction, UpdatePhase, UpdateSnapshot};
+use state::{AvailableRelease, InstallOutcome, RestartAction};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -114,16 +114,17 @@ impl UpdateHandle {
     pub fn skip_current(&self) {
         let mut inner = self.lock();
         if let Some(available) = inner.available.clone() {
-            inner.skipped_version = available.tag;
+            let tag = available.tag;
+            inner.skipped_version = tag.clone();
             inner.persist();
             inner.snapshot.phase = UpdatePhase::UpToDate;
             inner.publish();
-            tracing::info!(tag = %available.tag, "已跳过此版本");
+            tracing::info!(tag = %tag, "已跳过此版本");
         }
     }
 
     pub fn install(&self) -> Option<RestartAction> {
-        let mut inner = self.lock();
+        let inner = self.lock();
         match inner.snapshot.phase {
             UpdatePhase::ReadyToRestart => inner.restart.clone(),
             UpdatePhase::HandedOff => Some(RestartAction::QuitOnly),

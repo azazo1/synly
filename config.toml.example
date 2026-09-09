@@ -1,4 +1,4 @@
-version = 3
+version = 4
 
 # 每台设备的 UUID 和身份密钥由 identity.toml 保存.
 # 首选活跃设备 ID, 由程序写入, host 重启后保持其活跃身份.
@@ -26,6 +26,12 @@ start_hidden = false
 close_to_tray = true
 launch_at_login = false
 resume_last_session = false
+# 仅 macOS 生效. 隐藏主窗口时是否同时隐藏 Dock 图标.
+hide_dock_when_hidden = true
+
+[update]
+auto_check = true
+skipped_version = ""
 
 [runtime]
 connection = "host"

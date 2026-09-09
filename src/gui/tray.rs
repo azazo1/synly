@@ -206,7 +206,7 @@ impl NativeTray {
         let tray_icon = TrayIconBuilder::new()
             .with_icon(make_template_icon()?)
             .with_icon_as_template(true)
-            .with_tooltip(&state.tooltip())
+            .with_tooltip(state.tooltip())
             .with_menu(Box::new(menu))
             .with_menu_on_left_click(false)
             .with_menu_on_right_click(true)

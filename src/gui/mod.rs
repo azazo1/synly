@@ -149,8 +149,7 @@ pub fn run(config: SynlyConfig, force_start: bool) -> Result<GuiExit> {
     let action = restart_action
         .lock()
         .ok()
-        .map(|guard| (*guard).clone())
-        .flatten();
+        .and_then(|guard| (*guard).clone());
     match action {
         Some(UpdateRestartAction::Relaunch { exe }) => Ok(GuiExit::Restart { exe }),
         Some(UpdateRestartAction::QuitOnly) | None => Ok(GuiExit::Quit),

@@ -9,10 +9,11 @@ pub fn apply_archive(archive: &Path) -> Result<InstallOutcome> {
     {
         if let Some(bundle) = super::macos::bundle_root(&exe) {
             super::macos::handoff_replace(archive, &bundle, std::process::id())?;
-            return Ok(InstallOutcome::HandedOff);
+            Ok(InstallOutcome::HandedOff)
+        } else {
+            super::macos::open_dmg(archive)?;
+            Ok(InstallOutcome::DmgOpened)
         }
-        super::macos::open_dmg(archive)?;
-        return Ok(InstallOutcome::DmgOpened);
     }
     #[cfg(not(target_os = "macos"))]
     {

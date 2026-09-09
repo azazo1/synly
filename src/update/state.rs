@@ -94,8 +94,11 @@ pub struct AvailableRelease {
 
 #[derive(Clone, Debug)]
 pub enum InstallOutcome {
+    #[allow(dead_code)]
     ReadyToRestart { exe: PathBuf },
+    #[allow(dead_code)]
     HandedOff,
+    #[allow(dead_code)]
     DmgOpened,
 }
 
