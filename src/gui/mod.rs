@@ -100,10 +100,11 @@ pub fn run(config: SynlyConfig, force_start: bool) -> Result<GuiExit> {
         macos_dock::install_reopen_handler(move || {
             let window = window.clone();
             let _ = slint::invoke_from_event_loop(move || {
-                if let Some(window) = window.upgrade()
-                    && let Err(error) = show_main_window(&window)
-                {
-                    tracing::warn!(error = %error, "无法从 Dock 重新打开主窗口");
+                if let Some(window) = window.upgrade() {
+                    tracing::info!("macOS Dock 或再次打开请求显示主窗口");
+                    if let Err(error) = show_main_window(&window) {
+                        tracing::warn!(error = %error, "无法从 Dock 重新打开主窗口");
+                    }
                 }
             });
         });
@@ -128,19 +129,24 @@ pub fn run(config: SynlyConfig, force_start: bool) -> Result<GuiExit> {
     }
 
     tray.start();
-    if !config.gui_state.first_run_completed || !config.ui.start_hidden {
-        show_main_window(&window).context("failed to show Slint window")?;
-    } else {
-        let window = window.as_weak();
-        let hide_dock_timer = slint::Timer::default();
-        let follow_dock = config.ui.hide_dock_when_hidden;
-        hide_dock_timer.start(slint::TimerMode::SingleShot, Duration::ZERO, move || {
-            if window.upgrade().is_some() {
-                macos_dock::set_follow_window(follow_dock);
-                macos_dock::set_dock_visible(false);
-            }
-        });
-    }
+    let _hide_dock_on_start =
+        if !config.gui_state.first_run_completed || !config.ui.start_hidden {
+            show_main_window(&window).context("failed to show Slint window")?;
+            None
+        } else {
+            macos_dock::note_hidden();
+            let window = window.as_weak();
+            let follow_dock = config.ui.hide_dock_when_hidden;
+            let timer = slint::Timer::default();
+            timer.start(slint::TimerMode::SingleShot, Duration::ZERO, move || {
+                if window.upgrade().is_some() {
+                    tracing::info!("启动时隐藏主窗口, 按设置更新 Dock 可见性");
+                    macos_dock::set_follow_window(follow_dock);
+                    macos_dock::set_dock_visible(false);
+                }
+            });
+            Some(timer)
+        };
 
     slint::run_event_loop_until_quit().context("Slint event loop failed")?;
     save_window_state(&window, &handle.commands());

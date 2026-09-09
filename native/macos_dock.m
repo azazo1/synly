@@ -1,4 +1,5 @@
 #import <AppKit/AppKit.h>
+#import <CoreServices/CoreServices.h>
 #import <Foundation/Foundation.h>
 #include <stdbool.h>
 
@@ -7,41 +8,29 @@ static BOOL g_follow_window = YES;
 static NSTimeInterval g_ignore_activate_until = 0;
 static id g_helper = nil;
 
-@interface SynlyDockHelper : NSObject <NSApplicationDelegate>
-@property(nonatomic, strong) id originalDelegate;
+@interface SynlyDockHelper : NSObject
 @end
 
 @implementation SynlyDockHelper
 
-- (BOOL)respondsToSelector:(SEL)selector {
-  return [super respondsToSelector:selector] ||
-         [self.originalDelegate respondsToSelector:selector];
+- (void)applicationDidBecomeActive:(NSNotification *)notification {
+  (void)notification;
+  [self requestShowIfAllowed];
 }
 
-- (id)forwardingTargetForSelector:(SEL)selector {
-  if ([self.originalDelegate respondsToSelector:selector]) {
-    return self.originalDelegate;
-  }
-  return [super forwardingTargetForSelector:selector];
+- (void)handleReopenEvent:(NSAppleEventDescriptor *)event
+           withReplyEvent:(NSAppleEventDescriptor *)reply {
+  (void)event;
+  (void)reply;
+  [self requestShowIfAllowed];
 }
 
-- (BOOL)applicationShouldHandleReopen:(NSApplication *)sender
-                    hasVisibleWindows:(BOOL)flag {
+- (void)requestShowIfAllowed {
   if ([NSDate date].timeIntervalSinceReferenceDate < g_ignore_activate_until) {
-    return NO;
+    return;
   }
   if (g_show_callback) {
     g_show_callback();
-  }
-  return YES;
-}
-
-- (void)applicationDidBecomeActive:(NSNotification *)notification {
-  if ([self.originalDelegate respondsToSelector:@selector(applicationDidBecomeActive:)]) {
-    [self.originalDelegate applicationDidBecomeActive:notification];
-  }
-  if ([NSDate date].timeIntervalSinceReferenceDate < g_ignore_activate_until) {
-    return;
   }
 }
 
@@ -50,10 +39,20 @@ static id g_helper = nil;
 static void synly_dock_install_helper(void) {
   static dispatch_once_t once;
   dispatch_once(&once, ^{
-    NSApplication *app = [NSApplication sharedApplication];
+    // Do not replace NSApplication.delegate. winit panics in sendEvent if the
+    // current delegate is not WinitApplicationDelegate.
     SynlyDockHelper *helper = [SynlyDockHelper new];
-    helper.originalDelegate = app.delegate;
-    app.delegate = helper;
+    NSApplication *app = [NSApplication sharedApplication];
+    [[NSNotificationCenter defaultCenter]
+        addObserver:helper
+           selector:@selector(applicationDidBecomeActive:)
+               name:NSApplicationDidBecomeActiveNotification
+             object:app];
+    [[NSAppleEventManager sharedAppleEventManager]
+        setEventHandler:helper
+            andSelector:@selector(handleReopenEvent:withReplyEvent:)
+          forEventClass:kCoreEventClass
+             andEventID:kAEReopenApplication];
     g_helper = helper;
   });
 }
@@ -72,11 +71,12 @@ void synly_dock_note_hidden(void) {
 }
 
 void synly_dock_set_visible(bool visible) {
-  synly_dock_install_helper();
   NSApplication *app = [NSApplication sharedApplication];
   if (visible) {
     [app setActivationPolicy:NSApplicationActivationPolicyRegular];
-    [app activateIgnoringOtherApps:YES];
+    if (!app.isActive) {
+      [app activateIgnoringOtherApps:YES];
+    }
   } else {
     synly_dock_note_hidden();
     if (g_follow_window) {

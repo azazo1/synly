@@ -24,6 +24,7 @@ extern "C" fn show_trampoline() {
 /// 非 macOS 平台为空操作.
 #[cfg(target_os = "macos")]
 pub(super) fn set_dock_visible(visible: bool) {
+    tracing::info!(visible, "更新 macOS Dock 图标可见性");
     unsafe { ffi::synly_dock_set_visible(visible) };
 }
 
