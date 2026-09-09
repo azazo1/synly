@@ -46,8 +46,25 @@ fn main() -> Result<()> {
     {
         return run_internal_command(command);
     }
-    let mut config = config::SynlyConfig::load_or_create()?;
-    let _tracing_guard = tracing_utils::init_tracing(config.ui.log_level.as_filter())?;
+    // 先建立日志, 否则配置读取失败时既没有日志也没有可见的错误输出.
+    let _tracing_guard = tracing_utils::init_tracing(tracing_utils::BOOTSTRAP_FILTER)?;
+    match paths::log_file_path() {
+        Ok(log_path) => {
+            tracing::info!(version = BUILD_VERSION, log = %log_path.display(), "Synly 启动")
+        }
+        Err(_) => tracing::info!(version = BUILD_VERSION, "Synly 启动"),
+    }
+    let mut config = match config::SynlyConfig::load_or_create() {
+        Ok(config) => config,
+        Err(error) => {
+            tracing::error!("加载配置失败, 无法启动: {error:#}");
+            return Err(error);
+        }
+    };
+    let configured_filter = config.ui.log_level.as_filter();
+    if let Err(error) = tracing_utils::apply_configured_level(configured_filter) {
+        tracing::warn!("无法应用日志等级 {configured_filter}, 继续使用默认等级: {error:#}");
+    }
     let session_override = cli.session_override();
     if let Some(session) = &session_override {
         session.apply_to(&mut config.runtime, cli.headless);

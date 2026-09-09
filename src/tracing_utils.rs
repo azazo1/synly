@@ -13,6 +13,8 @@ use tracing_subscriber::Registry;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
+/// 配置尚未加载时使用的日志等级, 保证启动早期的失败也能落盘.
+pub const BOOTSTRAP_FILTER: &str = "info";
 const GUI_LOG_CAPACITY: usize = 200;
 const MAX_LOG_FILE_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_LOG_FILES: usize = 14;
@@ -255,6 +257,17 @@ pub fn set_log_level(filter: &str) -> Result<()> {
         .context("tracing filter is not initialized")?
         .reload(filter)
         .context("failed to reload tracing filter")
+}
+
+/// 应用配置里的日志等级, 但 `RUST_LOG` 仍然优先.
+///
+/// 启动早期已经用 [`BOOTSTRAP_FILTER`] 建立过日志, 这里只是把等级切换到用户配置.
+pub fn apply_configured_level(configured: &str) -> Result<()> {
+    if std::env::var_os("RUST_LOG").is_some_and(|value| !value.is_empty()) {
+        tracing::debug!("已设置 RUST_LOG, 忽略配置中的日志等级");
+        return Ok(());
+    }
+    set_log_level(configured)
 }
 
 pub fn recent_logs() -> String {
