@@ -397,13 +397,18 @@ pub fn start(
     persist: Arc<dyn Fn(UpdateConfig) + Send + Sync>,
 ) -> Result<UpdateHandle> {
     install::cleanup_old_binary();
-    let mut snapshot = UpdateSnapshot::idle(current_version.clone(), config.auto_check);
     #[cfg(target_os = "macos")]
-    if let Some(message) = macos::take_apply_result() {
-        snapshot.phase = UpdatePhase::Failed;
-        snapshot.error_text = message;
-        snapshot.apply_message = snapshot.error_text.clone();
-    }
+    let snapshot = {
+        let mut snapshot = UpdateSnapshot::idle(current_version.clone(), config.auto_check);
+        if let Some(message) = macos::take_apply_result() {
+            snapshot.phase = UpdatePhase::Failed;
+            snapshot.error_text = message;
+            snapshot.apply_message = snapshot.error_text.clone();
+        }
+        snapshot
+    };
+    #[cfg(not(target_os = "macos"))]
+    let snapshot = UpdateSnapshot::idle(current_version.clone(), config.auto_check);
     let (snapshot_tx, snapshots) = watch::channel(snapshot.clone());
     let handle = UpdateHandle {
         inner: Arc::new(Mutex::new(Inner {
