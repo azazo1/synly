@@ -24,6 +24,7 @@ const SILENT_CHECK_DELAY_SECS: u64 = 5;
 pub struct UpdateHandle {
     inner: Arc<Mutex<Inner>>,
     snapshots: watch::Receiver<UpdateSnapshot>,
+    runtime: tokio::runtime::Handle,
 }
 
 struct Inner {
@@ -76,8 +77,9 @@ impl UpdateHandle {
             inner.snapshot.apply_message.clear();
         }
         inner.publish();
+        tracing::info!(manual, "开始检查更新");
         let handle = self.clone();
-        inner.check_task = Some(tokio::spawn(async move {
+        inner.check_task = Some(self.runtime.spawn(async move {
             handle.run_check(manual).await;
         }));
     }
@@ -98,7 +100,7 @@ impl UpdateHandle {
         inner.publish();
         tracing::info!("开始下载更新包");
         let handle = self.clone();
-        inner.download_task = Some(tokio::spawn(async move {
+        inner.download_task = Some(self.runtime.spawn(async move {
             handle.run_download().await;
         }));
     }
@@ -355,6 +357,7 @@ pub fn start(
             client,
         })),
         snapshots,
+        runtime: runtime.handle().clone(),
     };
     if config.auto_check {
         let delayed = handle.clone();
