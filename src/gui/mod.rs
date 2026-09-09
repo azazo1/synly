@@ -62,6 +62,7 @@ pub fn run(config: SynlyConfig, force_start: bool) -> Result<GuiExit> {
     let window = AppWindow::new().context("failed to create Slint main window")?;
     window.set_monospace_font_family(system_monospace_font_family().into());
     window.set_about_version(crate::BUILD_VERSION.into());
+    window.set_current_version(crate::BUILD_VERSION.into());
     window.set_macos_dock_setting_visible(cfg!(target_os = "macos"));
     window.window().set_size(restored_window_size(&config.gui_state));
     let _single_instance_guard =
@@ -571,6 +572,7 @@ fn apply_update_snapshot(window: &AppWindow, snapshot: &UpdateSnapshot) {
     let link = snapshot.status_bar_is_link();
     window.set_status_version_is_link(link);
     window.set_about_version(snapshot.status_bar_text().into());
+    window.set_current_version(snapshot.current_version.clone().into());
     window.set_auto_check_update(snapshot.auto_check);
     window.set_update_status_text(update_status_text(snapshot).into());
     window.set_update_notes(snapshot.release_notes.clone().into());
@@ -591,6 +593,16 @@ fn apply_update_snapshot(window: &AppWindow, snapshot: &UpdateSnapshot) {
         UpdatePhase::Failed | UpdatePhase::UpToDate | UpdatePhase::Idle
     ));
     window.set_update_show_release_link(snapshot.release_url.is_some() && !handed_off);
+    window.set_update_show_notes(
+        !snapshot.release_notes.is_empty()
+            && matches!(
+                snapshot.phase,
+                UpdatePhase::Available
+                    | UpdatePhase::Downloading
+                    | UpdatePhase::ReadyToRestart
+                    | UpdatePhase::DmgOpened
+            ),
+    );
     if handed_off {
         window.set_update_window_visible(true);
     }
