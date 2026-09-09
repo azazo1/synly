@@ -101,12 +101,14 @@ pub fn run(config: SynlyConfig, force_start: bool) -> Result<GuiExit> {
         macos_dock::install_reopen_handler(move || {
             let window = window.clone();
             let _ = slint::invoke_from_event_loop(move || {
-                if let Some(window) = window.upgrade() {
-                    tracing::info!("macOS Dock 或再次打开请求显示主窗口");
-                    if let Err(error) = show_main_window(&window) {
-                        tracing::warn!(error = %error, "无法从 Dock 重新打开主窗口");
+                guard_callback("dock_reopen", || {
+                    if let Some(window) = window.upgrade() {
+                        tracing::info!("macOS Dock 或再次打开请求显示主窗口");
+                        if let Err(error) = show_main_window(&window) {
+                            tracing::warn!(error = %error, "无法从 Dock 重新打开主窗口");
+                        }
                     }
-                }
+                })
             });
         });
     }
@@ -140,11 +142,13 @@ pub fn run(config: SynlyConfig, force_start: bool) -> Result<GuiExit> {
             let follow_dock = config.ui.hide_dock_when_hidden;
             let timer = slint::Timer::default();
             timer.start(slint::TimerMode::SingleShot, Duration::ZERO, move || {
-                if window.upgrade().is_some() {
-                    tracing::info!("启动时隐藏主窗口, 按设置更新 Dock 可见性");
-                    macos_dock::set_follow_window(follow_dock);
-                    macos_dock::set_dock_visible(false);
-                }
+                guard_callback("start_hidden_dock", || {
+                    if window.upgrade().is_some() {
+                        tracing::info!("启动时隐藏主窗口, 按设置更新 Dock 可见性");
+                        macos_dock::set_follow_window(follow_dock);
+                        macos_dock::set_dock_visible(false);
+                    }
+                })
             });
             Some(timer)
         };
@@ -188,7 +192,9 @@ fn spawn_ctrl_c_handler(
                 tracing::info!("收到 Ctrl-C, 正在退出 GUI 应用");
                 let _ = commands.send(AppCommand::Shutdown).await;
                 if let Err(error) = slint::invoke_from_event_loop(|| {
-                    let _ = slint::quit_event_loop();
+                    guard_callback("ctrl_c_quit", || {
+                        let _ = slint::quit_event_loop();
+                    })
                 }) {
                     tracing::warn!(error = %error, "无法从 Ctrl-C 处理器退出 Slint 事件循环");
                 }
@@ -207,255 +213,328 @@ pub(super) fn show_main_window(
     Ok(())
 }
 
+/// 拦截 Slint 回调里的 panic.
+///
+/// Slint 在 winit 的 objc 回调 (例如 `mouseUp:`) 内部同步执行回调, 一旦 panic 逃出
+/// FFI 边界就会触发 `panic_cannot_unwind` 并直接 abort 整个进程. 这里统一兜住,
+/// 只记录日志并继续, 让界面保持可用.
+fn guard_callback(name: &'static str, run: impl FnOnce()) {
+    if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+        let message = panic_message(panic.as_ref());
+        tracing::error!(callback = name, panic = %message, "GUI 回调 panic, 已忽略");
+    }
+}
+
+/// 与 [`guard_callback`] 相同, 但回调需要返回值.
+fn guard_callback_with<T>(name: &'static str, fallback: T, run: impl FnOnce() -> T) -> T {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+        Ok(value) => value,
+        Err(panic) => {
+            let message = panic_message(panic.as_ref());
+            tracing::error!(callback = name, panic = %message, "GUI 回调 panic, 已忽略");
+            fallback
+        }
+    }
+}
+
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> String {
+    if let Some(text) = panic.downcast_ref::<&str>() {
+        (*text).to_string()
+    } else if let Some(text) = panic.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "非字符串 panic".to_string()
+    }
+}
+
 fn wire_window_callbacks(
     window: &AppWindow,
     handle: &crate::core::AppSupervisorHandle,
     current_interaction: Arc<Mutex<Option<Uuid>>>,
 ) {
     let commands = handle.commands();
-    window.on_start_hosting(move || send_command(&commands, AppCommand::StartHosting));
+    window.on_start_hosting(move || {
+        guard_callback("start_hosting", || {
+            send_command(&commands, AppCommand::StartHosting)
+        })
+    });
 
     let commands = handle.commands();
     window.on_refresh_discovery(move || {
-        send_command(&commands, AppCommand::RefreshDiscovery)
+        guard_callback("refresh_discovery", || {
+            send_command(&commands, AppCommand::RefreshDiscovery)
+        })
     });
 
     let commands = handle.commands();
     window.on_connect_peer(move |peer| {
-        send_command(&commands, AppCommand::ConnectPeer(peer.to_string()))
+        guard_callback("connect_peer", || {
+            send_command(&commands, AppCommand::ConnectPeer(peer.to_string()))
+        })
     });
 
     let commands = handle.commands();
     let weak = window.as_weak();
     window.on_connect_query(move || {
-        if let Some(window) = weak.upgrade() {
-            send_command(
-                &commands,
-                AppCommand::ConnectPeer(window.get_peer_query().to_string()),
-            );
-        }
+        guard_callback("connect_query", || {
+            if let Some(window) = weak.upgrade() {
+                send_command(
+                    &commands,
+                    AppCommand::ConnectPeer(window.get_peer_query().to_string()),
+                );
+            }
+        })
     });
 
     let commands = handle.commands();
-    window.on_disconnect(move || send_command(&commands, AppCommand::Disconnect));
+    window.on_disconnect(move || {
+        guard_callback("disconnect", || {
+            send_command(&commands, AppCommand::Disconnect)
+        })
+    });
 
     let commands = handle.commands();
     window.on_disconnect_session(move |device_id| {
-        match Uuid::parse_str(device_id.as_str()) {
+        guard_callback("disconnect_session", || match Uuid::parse_str(device_id.as_str()) {
             Ok(device_id) => send_command(&commands, AppCommand::DisconnectPeer(device_id)),
             Err(error) => tracing::warn!(error = %error, "忽略无效的会话设备 ID"),
-        }
+        })
     });
 
     let commands = handle.commands();
     window.on_switch_active_session(move |device_id| {
-        match Uuid::parse_str(device_id.as_str()) {
-            Ok(device_id) => send_command(&commands, AppCommand::SwitchActiveSession(device_id)),
-            Err(error) => tracing::warn!(error = %error, "忽略无效的活跃会话设备 ID"),
-        }
+        guard_callback("switch_active_session", || {
+            match Uuid::parse_str(device_id.as_str()) {
+                Ok(device_id) => send_command(&commands, AppCommand::SwitchActiveSession(device_id)),
+                Err(error) => tracing::warn!(error = %error, "忽略无效的活跃会话设备 ID"),
+            }
+        })
     });
 
     let commands = handle.commands();
     let weak = window.as_weak();
     window.on_quit_application(move || {
-        if let Some(window) = weak.upgrade() {
-            save_window_state(&window, &commands);
-        }
-        send_command(&commands, AppCommand::Shutdown);
-        let _ = slint::quit_event_loop();
+        guard_callback("quit_application", || {
+            if let Some(window) = weak.upgrade() {
+                save_window_state(&window, &commands);
+            }
+            send_command(&commands, AppCommand::Shutdown);
+            let _ = slint::quit_event_loop();
+        })
     });
 
     let commands = handle.commands();
     let snapshots = handle.snapshots();
     let weak = window.as_weak();
     window.on_apply_settings(move || {
-        if let Some(window) = weak.upgrade() {
-            let current_input = snapshots.borrow().desired.input.clone();
-            match settings_from_window(&window, &current_input) {
-                Ok((runtime, settings, session_pin)) => {
-                    window.set_settings_error_text("".into());
-                    let enabling_delete = runtime.sync_delete
-                        && !snapshots.borrow().desired.sync_delete;
-                    if enabling_delete
-                        && rfd::MessageDialog::new()
-                            .set_level(rfd::MessageLevel::Warning)
-                            .set_title("确认启用删除同步")
-                            .set_description(
-                                "启用后, 对侧删除可能会删除本机工作区中的对应文件. 保存后将立即重新扫描.",
-                            )
-                            .set_buttons(rfd::MessageButtons::YesNo)
-                            .show()
-                            != rfd::MessageDialogResult::Yes
-                    {
-                        window.set_sync_delete(false);
-                        return;
+        guard_callback("apply_settings", || {
+            if let Some(window) = weak.upgrade() {
+                let current_input = snapshots.borrow().desired.input.clone();
+                match settings_from_window(&window, &current_input) {
+                    Ok((runtime, settings, session_pin)) => {
+                        window.set_settings_error_text("".into());
+                        let enabling_delete =
+                            runtime.sync_delete && !snapshots.borrow().desired.sync_delete;
+                        if enabling_delete
+                            && rfd::MessageDialog::new()
+                                .set_level(rfd::MessageLevel::Warning)
+                                .set_title("确认启用删除同步")
+                                .set_description(
+                                    "启用后, 对侧删除可能会删除本机工作区中的对应文件. 保存后将立即重新扫描.",
+                                )
+                                .set_buttons(rfd::MessageButtons::YesNo)
+                                .show()
+                                != rfd::MessageDialogResult::Yes
+                        {
+                            window.set_sync_delete(false);
+                            return;
+                        }
+                        macos_dock::set_follow_window(window.get_hide_dock_when_hidden());
+                        send_command(
+                            &commands,
+                            AppCommand::ApplySettings {
+                                runtime,
+                                settings: Box::new(settings),
+                                session_pin,
+                            },
+                        );
                     }
-                    macos_dock::set_follow_window(window.get_hide_dock_when_hidden());
-                    send_command(
-                        &commands,
-                        AppCommand::ApplySettings {
-                            runtime,
-                            settings: Box::new(settings),
-                            session_pin,
-                        },
-                    );
-                }
-                Err(error) => {
-                    let message = format!("{error:#}");
-                    window.set_settings_error_text(message.into());
-                    tracing::error!(error = %error, "GUI 设置校验失败");
+                    Err(error) => {
+                        let message = format!("{error:#}");
+                        window.set_settings_error_text(message.into());
+                        tracing::error!(error = %error, "GUI 设置校验失败");
+                    }
                 }
             }
-        }
+        })
     });
 
     let weak = window.as_weak();
     window.on_choose_path(move || {
-        let Some(window) = weak.upgrade() else { return };
-        let selected = if window.get_file_mode_index() == 1 {
-            rfd::FileDialog::new()
-                .pick_files()
-                .unwrap_or_default()
-        } else {
-            rfd::FileDialog::new()
-                .pick_folder()
-                .into_iter()
-                .collect()
-        };
-        if !selected.is_empty() {
-            window.set_path_text(
-                selected
-                    .iter()
-                    .map(|path| path.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join("\n")
-                    .into(),
-            );
-        }
+        guard_callback("choose_path", || {
+            let Some(window) = weak.upgrade() else { return };
+            let selected = if window.get_file_mode_index() == 1 {
+                rfd::FileDialog::new().pick_files().unwrap_or_default()
+            } else {
+                rfd::FileDialog::new().pick_folder().into_iter().collect()
+            };
+            if !selected.is_empty() {
+                window.set_path_text(
+                    selected
+                        .iter()
+                        .map(|path| path.display().to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                        .into(),
+                );
+            }
+        })
     });
 
     let weak = window.as_weak();
     window.on_clear_log_view(move || {
-        crate::tracing_utils::clear_logs();
-        if let Some(window) = weak.upgrade() {
-            window.set_log_text(String::new().into());
-            window.set_log_action_text("已清空日志显示".into());
-        }
+        guard_callback("clear_log_view", || {
+            crate::tracing_utils::clear_logs();
+            if let Some(window) = weak.upgrade() {
+                window.set_log_text(String::new().into());
+                window.set_log_action_text("已清空日志显示".into());
+            }
+        })
     });
 
     let weak = window.as_weak();
     window.on_scroll_log_to_bottom(move || {
-        if let Some(window) = weak.upgrade() {
-            window.set_log_auto_scroll(true);
-            let visible_height = window.get_log_visible_height();
-            let viewport_height = window.get_log_viewport_height();
-            window.set_log_viewport_y(-(viewport_height - visible_height).max(0.0));
-        }
+        guard_callback("scroll_log_to_bottom", || {
+            if let Some(window) = weak.upgrade() {
+                window.set_log_auto_scroll(true);
+                let visible_height = window.get_log_visible_height();
+                let viewport_height = window.get_log_viewport_height();
+                window.set_log_viewport_y(-(viewport_height - visible_height).max(0.0));
+            }
+        })
     });
 
     let commands = handle.commands();
     window.on_set_clipboard_mode(move |index| {
-        send_command(
-            &commands,
-            AppCommand::SetClipboardMode(clipboard_mode_from_index(index)),
-        )
+        guard_callback("set_clipboard_mode", || {
+            send_command(
+                &commands,
+                AppCommand::SetClipboardMode(clipboard_mode_from_index(index)),
+            )
+        })
     });
 
     let commands = handle.commands();
     window.on_set_audio_mode(move |index| {
-        send_command(
-            &commands,
-            AppCommand::SetAudioMode(audio_mode_from_index(index)),
-        )
+        guard_callback("set_audio_mode", || {
+            send_command(
+                &commands,
+                AppCommand::SetAudioMode(audio_mode_from_index(index)),
+            )
+        })
     });
 
     let commands = handle.commands();
     window.on_set_input_mode(move |index| {
-        send_command(
-            &commands,
-            AppCommand::SetInputMode(input_mode_from_index(index)),
-        )
+        guard_callback("set_input_mode", || {
+            send_command(
+                &commands,
+                AppCommand::SetInputMode(input_mode_from_index(index)),
+            )
+        })
     });
 
     let commands = handle.commands();
     window.on_request_input_elevation(move || {
-        send_command(&commands, AppCommand::RequestInputElevation)
+        guard_callback("request_input_elevation", || {
+            send_command(&commands, AppCommand::RequestInputElevation)
+        })
     });
 
     let commands = handle.commands();
     window.on_uninstall_input_service(move || {
-        send_command(&commands, AppCommand::UninstallInputService)
+        guard_callback("uninstall_input_service", || {
+            send_command(&commands, AppCommand::UninstallInputService)
+        })
     });
 
     let commands = handle.commands();
-    window.on_revoke_trust(move |device_id| match Uuid::parse_str(device_id.as_str()) {
-        Ok(device_id) => send_command(&commands, AppCommand::RevokeTrust(device_id)),
-        Err(error) => tracing::warn!(error = %error, "忽略无效的可信设备 ID"),
+    window.on_revoke_trust(move |device_id| {
+        guard_callback("revoke_trust", || match Uuid::parse_str(device_id.as_str()) {
+            Ok(device_id) => send_command(&commands, AppCommand::RevokeTrust(device_id)),
+            Err(error) => tracing::warn!(error = %error, "忽略无效的可信设备 ID"),
+        })
     });
 
     let commands = handle.commands();
     let weak = window.as_weak();
     let interaction = Arc::clone(&current_interaction);
     window.on_interaction_submit_pin(move || {
-        let Some(window) = weak.upgrade() else { return };
-        if let Some(request_id) = interaction.lock().ok().and_then(|guard| *guard) {
-            send_command(
-                &commands,
-                AppCommand::RespondInteraction {
-                    request_id,
-                    response: InteractionResponse::Pin(window.get_entered_pin().to_string()),
-                },
-            );
-        }
+        guard_callback("interaction_submit_pin", || {
+            let Some(window) = weak.upgrade() else { return };
+            if let Some(request_id) = interaction.lock().ok().and_then(|guard| *guard) {
+                send_command(
+                    &commands,
+                    AppCommand::RespondInteraction {
+                        request_id,
+                        response: InteractionResponse::Pin(window.get_entered_pin().to_string()),
+                    },
+                );
+            }
+        })
     });
 
     let commands = handle.commands();
     let weak = window.as_weak();
     let interaction = Arc::clone(&current_interaction);
     window.on_interaction_accept(move || {
-        let Some(window) = weak.upgrade() else { return };
-        if let Some(request_id) = interaction.lock().ok().and_then(|guard| *guard) {
-            let response = if window.get_interaction_kind() == 3 {
-                InteractionResponse::Confirm(true)
-            } else {
-                InteractionResponse::Decision {
-                    accepted: true,
-                    trust: window.get_interaction_trust(),
-                }
-            };
-            send_command(
-                &commands,
-                AppCommand::RespondInteraction {
-                    request_id,
-                    response,
-                },
-            );
-        }
+        guard_callback("interaction_accept", || {
+            let Some(window) = weak.upgrade() else { return };
+            if let Some(request_id) = interaction.lock().ok().and_then(|guard| *guard) {
+                let response = if window.get_interaction_kind() == 3 {
+                    InteractionResponse::Confirm(true)
+                } else {
+                    InteractionResponse::Decision {
+                        accepted: true,
+                        trust: window.get_interaction_trust(),
+                    }
+                };
+                send_command(
+                    &commands,
+                    AppCommand::RespondInteraction {
+                        request_id,
+                        response,
+                    },
+                );
+            }
+        })
     });
 
     let commands = handle.commands();
     let weak = window.as_weak();
     window.on_interaction_reject(move || {
-        if let Some(window) = weak.upgrade()
-            && let Some(request_id) = current_interaction.lock().ok().and_then(|guard| *guard)
-        {
-            let response = match window.get_interaction_kind() {
-                // host PIN 与客户端输入 PIN 的取消都只中止当前配对.
-                0 | 1 => InteractionResponse::Cancel,
-                3 => InteractionResponse::Confirm(false),
-                _ => InteractionResponse::Decision {
-                    accepted: false,
-                    trust: false,
-                },
-            };
-            send_command(
-                &commands,
-                AppCommand::RespondInteraction {
-                    request_id,
-                    response,
-                },
-            );
-        }
+        guard_callback("interaction_reject", || {
+            if let Some(window) = weak.upgrade()
+                && let Some(request_id) = current_interaction.lock().ok().and_then(|guard| *guard)
+            {
+                let response = match window.get_interaction_kind() {
+                    // host PIN 与客户端输入 PIN 的取消都只中止当前配对.
+                    0 | 1 => InteractionResponse::Cancel,
+                    3 => InteractionResponse::Confirm(false),
+                    _ => InteractionResponse::Decision {
+                        accepted: false,
+                        trust: false,
+                    },
+                };
+                send_command(
+                    &commands,
+                    AppCommand::RespondInteraction {
+                        request_id,
+                        response,
+                    },
+                );
+            }
+        })
     });
 }
 
@@ -468,31 +547,33 @@ fn wire_update_callbacks(
     let update_handle = update.clone();
     let weak = window.as_weak();
     window.on_open_update_window(move || {
-        update_handle.check(true);
-        if let Some(window) = weak.upgrade() {
-            window.set_update_window_visible(true);
-            apply_update_snapshot(&window, &update_handle.snapshot());
-        }
+        guard_callback("open_update_window", || {
+            update_handle.check(true);
+            if let Some(window) = weak.upgrade() {
+                window.set_update_window_visible(true);
+                apply_update_snapshot(&window, &update_handle.snapshot());
+            }
+        })
     });
 
     let update_handle = update.clone();
     window.on_check_update(move || {
-        update_handle.check(true);
+        guard_callback("check_update", || update_handle.check(true))
     });
 
     let update_handle = update.clone();
     window.on_start_update(move || {
-        update_handle.download();
+        guard_callback("start_update", || update_handle.download())
     });
 
     let update_handle = update.clone();
     window.on_cancel_update(move || {
-        update_handle.cancel_download();
+        guard_callback("cancel_update", || update_handle.cancel_download())
     });
 
     let update_handle = update.clone();
     window.on_skip_update(move || {
-        update_handle.skip_current();
+        guard_callback("skip_update", || update_handle.skip_current())
     });
 
     let update_handle = update.clone();
@@ -500,33 +581,37 @@ fn wire_update_callbacks(
     let commands = handle.commands();
     let weak = window.as_weak();
     window.on_restart_for_update(move || {
-        if let Some(action) = update_handle.install() {
-            if let Ok(mut slot) = restart_action.lock() {
-                *slot = Some(action);
+        guard_callback("restart_for_update", || {
+            if let Some(action) = update_handle.install() {
+                if let Ok(mut slot) = restart_action.lock() {
+                    *slot = Some(action);
+                }
+                if let Some(window) = weak.upgrade() {
+                    save_window_state(&window, &commands);
+                }
+                send_command(&commands, AppCommand::Shutdown);
+                let _ = slint::quit_event_loop();
             }
-            if let Some(window) = weak.upgrade() {
-                save_window_state(&window, &commands);
-            }
-            send_command(&commands, AppCommand::Shutdown);
-            let _ = slint::quit_event_loop();
-        }
+        })
     });
 
     let update_handle = update.clone();
     window.on_open_release_page(move || {
-        update_handle.open_release_page();
+        guard_callback("open_release_page", || update_handle.open_release_page())
     });
 
     let weak = window.as_weak();
     window.on_close_update_window(move || {
-        if let Some(window) = weak.upgrade() {
-            window.set_update_window_visible(false);
-        }
+        guard_callback("close_update_window", || {
+            if let Some(window) = weak.upgrade() {
+                window.set_update_window_visible(false);
+            }
+        })
     });
 
     let update_handle = update.clone();
     window.on_auto_check_changed(move |enabled| {
-        update_handle.set_auto_check(enabled);
+        guard_callback("auto_check_changed", || update_handle.set_auto_check(enabled))
     });
 }
 
@@ -551,18 +636,20 @@ fn spawn_update_presenter(
             let restart_action = Arc::clone(&restart_action);
             let commands = commands.clone();
             let _ = slint::invoke_from_event_loop(move || {
-                let Some(window) = window_weak.upgrade() else {
-                    return;
-                };
-                apply_update_snapshot(&window, &snapshot);
-                if handed_off {
-                    if let Ok(mut slot) = restart_action.lock() {
-                        *slot = Some(UpdateRestartAction::QuitOnly);
+                guard_callback("update_handoff", || {
+                    let Some(window) = window_weak.upgrade() else {
+                        return;
+                    };
+                    apply_update_snapshot(&window, &snapshot);
+                    if handed_off {
+                        if let Ok(mut slot) = restart_action.lock() {
+                            *slot = Some(UpdateRestartAction::QuitOnly);
+                        }
+                        save_window_state(&window, &commands);
+                        send_command(&commands, AppCommand::Shutdown);
+                        let _ = slint::quit_event_loop();
                     }
-                    save_window_state(&window, &commands);
-                    send_command(&commands, AppCommand::Shutdown);
-                    let _ = slint::quit_event_loop();
-                }
+                })
             });
         }
     });
@@ -659,21 +746,23 @@ fn wire_close_to_tray(
     let weak = window.as_weak();
     let commands = handle.commands();
     window.window().on_close_requested(move || {
-        let Some(window) = weak.upgrade() else {
-            return CloseRequestResponse::HideWindow;
-        };
-        save_window_state(&window, &commands);
-        if window.get_close_to_tray() {
-            macos_dock::set_follow_window(window.get_hide_dock_when_hidden());
-            macos_dock::note_hidden();
-            let _ = window.hide();
-            macos_dock::set_dock_visible(false);
-            CloseRequestResponse::KeepWindowShown
-        } else {
-            send_command(&commands, AppCommand::Shutdown);
-            let _ = slint::quit_event_loop();
-            CloseRequestResponse::HideWindow
-        }
+        guard_callback_with("close_requested", CloseRequestResponse::HideWindow, || {
+            let Some(window) = weak.upgrade() else {
+                return CloseRequestResponse::HideWindow;
+            };
+            save_window_state(&window, &commands);
+            if window.get_close_to_tray() {
+                macos_dock::set_follow_window(window.get_hide_dock_when_hidden());
+                macos_dock::note_hidden();
+                let _ = window.hide();
+                macos_dock::set_dock_visible(false);
+                CloseRequestResponse::KeepWindowShown
+            } else {
+                send_command(&commands, AppCommand::Shutdown);
+                let _ = slint::quit_event_loop();
+                CloseRequestResponse::HideWindow
+            }
+        })
     });
 }
 
@@ -714,39 +803,43 @@ fn spawn_snapshot_presenter(
             let interaction = Arc::clone(&current_interaction);
             let window_weak = window.clone();
             if slint::invoke_from_event_loop(move || {
-                let Some(window) = window_weak.upgrade() else {
-                    return;
-                };
-                apply_snapshot(&window, &snapshot, Some(&interaction));
-                if new_interaction
-                    && !window.window().is_visible()
-                    && let Some(interaction) = snapshot.interaction.as_ref()
-                {
-                    let (title, body) = interaction_notification_text(&interaction.request);
-                    let window = window.as_weak();
-                    crate::system_notification::notify_interaction(
-                        snapshot.settings.notifications_enabled,
-                        title,
-                        body,
-                        move || {
-                            let window = window.clone();
-                            let _ = slint::invoke_from_event_loop(move || {
-                                if let Some(window) = window.upgrade()
-                                    && let Err(error) = show_main_window(&window)
-                                {
-                                    tracing::warn!(error = %error, "无法从通知打开主窗口");
-                                }
-                            });
-                        },
-                    );
-                }
-                if settings_changed {
-                    apply_settings_to_window(
-                        &window,
-                        &snapshot.desired,
-                        &snapshot.settings,
-                    );
-                }
+                guard_callback("apply_snapshot", || {
+                    let Some(window) = window_weak.upgrade() else {
+                        return;
+                    };
+                    apply_snapshot(&window, &snapshot, Some(&interaction));
+                    if new_interaction
+                        && !window.window().is_visible()
+                        && let Some(interaction) = snapshot.interaction.as_ref()
+                    {
+                        let (title, body) = interaction_notification_text(&interaction.request);
+                        let window = window.as_weak();
+                        crate::system_notification::notify_interaction(
+                            snapshot.settings.notifications_enabled,
+                            title,
+                            body,
+                            move || {
+                                let window = window.clone();
+                                let _ = slint::invoke_from_event_loop(move || {
+                                    guard_callback("notification_show", || {
+                                        if let Some(window) = window.upgrade()
+                                            && let Err(error) = show_main_window(&window)
+                                        {
+                                            tracing::warn!(error = %error, "无法从通知打开主窗口");
+                                        }
+                                    })
+                                });
+                            },
+                        );
+                    }
+                    if settings_changed {
+                        apply_settings_to_window(
+                            &window,
+                            &snapshot.desired,
+                            &snapshot.settings,
+                        );
+                    }
+                })
             })
             .is_err()
             {
@@ -936,32 +1029,34 @@ fn spawn_log_presenter(runtime: &tokio::runtime::Runtime, window: &AppWindow) {
             let window = window.clone();
             let previous_viewport_y = Arc::clone(&previous_viewport_y);
             if slint::invoke_from_event_loop(move || {
-                let Some(window) = window.upgrade() else {
-                    return;
-                };
-                let mut auto_scroll = window.get_log_auto_scroll();
-                let visible_height = window.get_log_visible_height();
-                let viewport_height = window.get_log_viewport_height();
-                let viewport_y = window.get_log_viewport_y();
-                let max_scroll = (viewport_height - visible_height).max(0.0);
-                let at_bottom = visible_height > 0.0
-                    && (max_scroll <= 0.0 || -viewport_y >= max_scroll - 1.0);
-                if let Ok(mut previous) = previous_viewport_y.lock() {
-                    if visible_height > 0.0 {
-                        let user_scrolled_up = match *previous {
-                            Some(previous_y) => viewport_y > previous_y + 1.0,
-                            None => false,
-                        };
-                        auto_scroll =
-                            next_log_auto_scroll(auto_scroll, at_bottom, user_scrolled_up);
+                guard_callback("log_presenter", || {
+                    let Some(window) = window.upgrade() else {
+                        return;
+                    };
+                    let mut auto_scroll = window.get_log_auto_scroll();
+                    let visible_height = window.get_log_visible_height();
+                    let viewport_height = window.get_log_viewport_height();
+                    let viewport_y = window.get_log_viewport_y();
+                    let max_scroll = (viewport_height - visible_height).max(0.0);
+                    let at_bottom = visible_height > 0.0
+                        && (max_scroll <= 0.0 || -viewport_y >= max_scroll - 1.0);
+                    if let Ok(mut previous) = previous_viewport_y.lock() {
+                        if visible_height > 0.0 {
+                            let user_scrolled_up = match *previous {
+                                Some(previous_y) => viewport_y > previous_y + 1.0,
+                                None => false,
+                            };
+                            auto_scroll =
+                                next_log_auto_scroll(auto_scroll, at_bottom, user_scrolled_up);
+                        }
+                        *previous = Some(viewport_y);
                     }
-                    *previous = Some(viewport_y);
-                }
-                window.set_log_auto_scroll(auto_scroll);
-                window.set_log_text(logs.into());
-                if auto_scroll && visible_height > 0.0 {
-                    window.set_log_viewport_y(-max_scroll);
-                }
+                    window.set_log_auto_scroll(auto_scroll);
+                    window.set_log_text(logs.into());
+                    if auto_scroll && visible_height > 0.0 {
+                        window.set_log_viewport_y(-max_scroll);
+                    }
+                })
             })
             .is_err()
             {

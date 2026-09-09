@@ -14,9 +14,12 @@ static SHOW: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
 
 #[cfg(target_os = "macos")]
 extern "C" fn show_trampoline() {
-    if let Some(callback) = SHOW.get() {
-        callback();
-    }
+    // 该回调由 AppKit 在 objc 栈上直接调用, panic 逃出 FFI 边界会 abort 进程.
+    super::guard_callback("dock_show", || {
+        if let Some(callback) = SHOW.get() {
+            callback();
+        }
+    });
 }
 
 /// 控制 macOS Dock 中应用图标的可见性.

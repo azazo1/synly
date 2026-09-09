@@ -1,4 +1,6 @@
-use super::{AppWindow, save_window_state, send_command, show_main_window};
+use super::{
+    AppWindow, guard_callback, save_window_state, send_command, show_main_window,
+};
 use crate::core::{AppCommand, AppSnapshot, AppSupervisorHandle};
 use crate::input::InputMode;
 use crate::settings::{AudioMode, ClipboardMode};
@@ -90,7 +92,7 @@ impl TrayController {
         self.start_timer.start(
             TimerMode::SingleShot,
             Duration::ZERO,
-            move || start_native_tray(inner.clone()),
+            move || guard_callback("tray_start", || start_native_tray(inner.clone())),
         );
     }
 
@@ -275,6 +277,10 @@ fn start_native_tray(inner: Weak<RefCell<ControllerInner>>) {
 }
 
 fn poll_events(inner: &Weak<RefCell<ControllerInner>>) {
+    guard_callback("tray_poll", || poll_events_inner(inner));
+}
+
+fn poll_events_inner(inner: &Weak<RefCell<ControllerInner>>) {
     poll_platform_events();
     if let Some(inner) = inner.upgrade() {
         let auto_check = inner.borrow().update.snapshot().auto_check;
@@ -304,6 +310,11 @@ fn poll_events(inner: &Weak<RefCell<ControllerInner>>) {
 }
 
 fn handle_action(inner: &Weak<RefCell<ControllerInner>>, action: &str) {
+    // 托盘事件同样跑在 winit 的事件循环线程上, panic 逃出去会直接 abort.
+    guard_callback("tray_action", || handle_action_inner(inner, action));
+}
+
+fn handle_action_inner(inner: &Weak<RefCell<ControllerInner>>, action: &str) {
     let Some(inner) = inner.upgrade() else { return };
     match action {
         OPEN_ID => {

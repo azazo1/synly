@@ -114,11 +114,13 @@ fn activation_loop(listener: TcpListener, window: Weak<AppWindow>, stop: Arc<Ato
                     tracing::info!(%address, "收到重复启动激活请求");
                     let window = window.clone();
                     let _ = slint::invoke_from_event_loop(move || {
-                        if let Some(window) = window.upgrade()
-                            && let Err(error) = super::show_main_window(&window)
-                        {
-                            tracing::warn!(error = %error, "无法激活主窗口");
-                        }
+                        super::guard_callback("activate_existing", || {
+                            if let Some(window) = window.upgrade()
+                                && let Err(error) = super::show_main_window(&window)
+                            {
+                                tracing::warn!(error = %error, "无法激活主窗口");
+                            }
+                        });
                     });
                 }
             }
