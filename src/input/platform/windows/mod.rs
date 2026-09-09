@@ -11,8 +11,8 @@ use std::sync::Arc;
 
 pub use agent::{request_elevation, request_elevation_for_auto_recovery, run_agent};
 pub use service::{
-    install, init_tracing, mark_install_attempted, run_service, service_installed, status,
-    uninstall, uninstall_via_uac,
+    install, init_tracing, mark_install_attempted, restart, restart_via_uac, run_service,
+    service_installed, service_running, status, uninstall, uninstall_via_uac,
 };
 
 pub fn init_agent_tracing() -> Result<tracing_appender::non_blocking::WorkerGuard> {

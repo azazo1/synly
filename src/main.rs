@@ -139,6 +139,11 @@ fn run_internal_command(command: &cli::Command) -> Result<()> {
                         println!("Synly 输入服务已卸载");
                         Ok(())
                     }
+                    cli::ServiceAction::Restart => {
+                        input::restart_windows_input_service()?;
+                        println!("Synly 输入服务已重启");
+                        Ok(())
+                    }
                     cli::ServiceAction::Status => {
                         let status = input::windows_input_service_status()?;
                         println!("Synly 输入服务状态: {}", status.label());

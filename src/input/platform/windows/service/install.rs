@@ -169,6 +169,49 @@ pub fn install() -> Result<()> {
     Ok(())
 }
 
+/// 重启输入服务, 让它从注册路径重新加载当前可执行文件.
+///
+/// 自动更新就地替换 exe 后, 正在运行的服务进程仍映射着更新前的映像; 只有重启服务,
+/// SYSTEM 侧才会用新版本代码运行. 服务未安装时退化为安装, 已停止时只做启动.
+pub fn restart() -> Result<()> {
+    let scm = unsafe { OpenSCManagerW(std::ptr::null_mut(), std::ptr::null_mut(), SC_MANAGER_ALL_ACCESS) };
+    if scm.is_null() {
+        return Err(std::io::Error::last_os_error())
+            .context("打开 Windows 服务管理器失败, 重启输入服务需要管理员权限");
+    }
+    let scm = ServiceManagerHandle(scm);
+    let service_name = wide(SERVICE_NAME);
+    let service = unsafe {
+        OpenServiceW(
+            scm.0,
+            service_name.as_ptr(),
+            SERVICE_START | SERVICE_STOP | SERVICE_QUERY_STATUS,
+        )
+    };
+    if service.is_null() {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST as i32) {
+            tracing::info!("Synly 输入服务未安装, 改为安装并启动");
+            return install();
+        }
+        return Err(error).context("打开 Synly 输入服务失败");
+    }
+    let service = ServiceHandle(service);
+    if matches!(query_current_state(service.0)?, ServiceStatus::Running) {
+        stop_service(service.0)?;
+    }
+    let started = unsafe { StartServiceW(service.0, 0, std::ptr::null()) };
+    if started == 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(ERROR_SERVICE_ALREADY_RUNNING as i32) {
+            return Err(error).context("启动 Synly 输入服务失败");
+        }
+    }
+    mark_service_seen_installed();
+    tracing::info!("Synly 输入服务已重启");
+    Ok(())
+}
+
 fn query_current_state(service: SC_HANDLE) -> Result<ServiceStatus> {
     let mut status = SERVICE_STATUS::default();
     if unsafe { QueryServiceStatus(service, &mut status) } == 0 {

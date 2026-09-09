@@ -45,3 +45,5 @@ Windows 输入代理原先在 Tokio named pipe 上进行持续双向读写. 在�
 - 安全桌面状态通知从 `SecureDesktopPaused` 改为 `SecureDesktopChanged { secure, primary }`; SYSTEM 代理进入安全桌面时释放注入状态并保持控制, 非 SYSTEM 回退代理保持旧的暂停加紧急收回行为.
 - 接收端在安全桌面期间抑制外边缘返回并把逻辑光标钳制到主显示器 (主屏矩形由代理在通知中携带), 离开后通过 `cursor_position` 重新锚定; 发送端收到 `InputMessage::SecureDesktop` 后忽略对端返回请求, 避免光标碰到主屏边缘就掉出控制.
 - 服务停止或崩溃时, `KILL_ON_JOB_CLOSE` job 会连带结束 SYSTEM 代理, GUI 侧按连接断开处理并自动回退或重试.
+- 自动更新就地替换 `synly.exe` 后, 正在运行的服务进程仍映射着更新前的映像. 应用在下次申请输入提权前会识别这种情况, 通过一次 UAC 执行 `service restart` 让服务重新加载新版本; 由旧版本完成的更新没有进程内标记, 改用旧映像备份 (`<exe>.old`) 是否删得掉来推断. 服务重启失败或用户取消时继续沿用当前服务, 不影响本次提权.
+- 更新时旧映像可能仍被服务占用, 备份文件在固定名字 `synly.exe.old` 无法让位时改用 `synly.exe.old.<pid>`, 避免下次更新因为无法备份而失败; 启动时统一清理已经释放的备份.

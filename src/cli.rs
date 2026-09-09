@@ -56,6 +56,8 @@ pub enum ServiceAction {
     Install,
     /// 停止并卸载输入服务, 需要管理员权限
     Uninstall,
+    /// 重启输入服务, 让服务重新加载当前可执行文件, 需要管理员权限
+    Restart,
     /// 查询输入服务状态
     Status,
 }

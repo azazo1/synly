@@ -12,6 +12,8 @@ use state::{AvailableRelease, InstallOutcome, RestartAction};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
+#[cfg(windows)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -19,6 +21,13 @@ use tokio_util::sync::CancellationToken;
 pub use state::{RestartAction as UpdateRestartAction, UpdatePhase, UpdateSnapshot};
 
 const SILENT_CHECK_DELAY_SECS: u64 = 5;
+
+/// 本进程是否替换过正在运行的可执行文件.
+///
+/// 替换后当前进程映射的旧映像就是那个 `.old` 文件, 因此不能用它的占用情况判断
+/// 其它进程 (例如 SYSTEM 输入服务) 是否还在运行旧版本.
+#[cfg(windows)]
+static BINARY_REPLACED_IN_PROCESS: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone)]
 pub struct UpdateHandle {
@@ -307,6 +316,8 @@ impl UpdateHandle {
         }
         match install::apply_archive(&final_path) {
             Ok(InstallOutcome::ReadyToRestart { exe }) => {
+                #[cfg(windows)]
+                note_binary_replaced();
                 self.finish_download(generation, |inner| {
                     inner.snapshot.phase = UpdatePhase::ReadyToRestart;
                     inner.snapshot.cancellable = false;
@@ -396,7 +407,7 @@ pub fn start(
     config: UpdateConfig,
     persist: Arc<dyn Fn(UpdateConfig) + Send + Sync>,
 ) -> Result<UpdateHandle> {
-    install::cleanup_old_binary();
+    let _ = install::cleanup_old_binary();
     #[cfg(target_os = "macos")]
     let snapshot = {
         let mut snapshot = UpdateSnapshot::idle(current_version.clone(), config.auto_check);
@@ -439,6 +450,27 @@ pub fn start(
         });
     }
     Ok(handle)
+}
+
+/// 记录本次运行已经就地替换了可执行文件.
+#[cfg(windows)]
+fn note_binary_replaced() {
+    BINARY_REPLACED_IN_PROCESS.store(true, Ordering::Release);
+}
+
+/// 本次运行是否已经就地替换了可执行文件.
+#[cfg(windows)]
+pub fn binary_replaced_in_process() -> bool {
+    BINARY_REPLACED_IN_PROCESS.load(Ordering::Acquire)
+}
+
+/// 上一版可执行文件是否仍被占用.
+///
+/// 更新替换 exe 后旧映像会留在 `<exe>.old`; 只要它还在, 就说明仍有进程运行着更新前的
+/// 版本, Windows 上通常是 SYSTEM 输入服务. 查询顺带做一次清理, 能删掉的备份会被删除.
+#[cfg(windows)]
+pub fn old_binary_still_in_use() -> bool {
+    install::cleanup_old_binary()
 }
 
 /// 每次检查或下载都新建 client, 让系统代理和代理环境变量变化实时生效.

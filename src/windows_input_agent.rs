@@ -1,6 +1,39 @@
 use anyhow::{Context, Result};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// 本次运行是否已经做过输入服务的版本对齐, 避免重复弹 UAC.
+static SERVICE_ALIGNED: AtomicBool = AtomicBool::new(false);
+
+/// 更新就地替换可执行文件后, 正在运行的输入服务仍映射着更新前的映像, 只有重启它才会换成新版本.
+///
+/// 替换过 exe 的进程自己就映射着那个旧映像, 不能用 `.old` 是否被占用判断服务是否过期,
+/// 此时服务只要在运行就必然还是旧版本; 由旧版本完成的更新则没有这个标记, 退回用 `.old`
+/// 是否删得掉来推断. 这里在真正申请输入提权前对齐一次, 失败时继续沿用现有服务, 不影响
+/// 本次提权.
+fn ensure_input_service_current() {
+    if SERVICE_ALIGNED.load(Ordering::Acquire) || !service_is_installed() {
+        return;
+    }
+    let stale = if crate::update::binary_replaced_in_process() {
+        synly::input::windows_input_service_running()
+    } else {
+        crate::update::old_binary_still_in_use()
+    };
+    if !stale || SERVICE_ALIGNED.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    tracing::info!("输入服务仍运行更新前的映像, 请求提权重启");
+    match synly::input::request_windows_input_service_restart_via_uac() {
+        Ok(true) => tracing::info!("输入服务已跟随更新重启"),
+        Ok(false) => tracing::warn!("用户取消了输入服务重启, 继续沿用当前服务"),
+        Err(error) => {
+            tracing::warn!(error = %format!("{error:#}"), "重启输入服务失败, 继续沿用当前服务")
+        }
+    }
+}
 
 pub fn request_elevation() -> Result<()> {
+    ensure_input_service_current();
     synly::input::request_windows_input_elevation()
 }
 

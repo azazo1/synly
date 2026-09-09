@@ -1,7 +1,9 @@
 use super::state::InstallOutcome;
 use anyhow::{Context, Result};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(not(target_os = "macos"))]
+use std::path::PathBuf;
 
 pub fn apply_archive(archive: &Path) -> Result<InstallOutcome> {
     let exe = std::env::current_exe().context("无法确定当前可执行文件")?;
@@ -25,13 +27,33 @@ pub fn apply_archive(archive: &Path) -> Result<InstallOutcome> {
     }
 }
 
-pub fn cleanup_old_binary() {
+/// 清理上次更新遗留的旧可执行文件, 返回它是否仍被占用.
+///
+/// 更新时旧映像被改名为 `<exe>.old`; 只要删不掉它, 就说明还有进程映射着旧映像,
+/// 通常是 SYSTEM 输入服务仍在运行更新前的版本.
+pub fn cleanup_old_binary() -> bool {
+    let mut in_use = false;
     if let Ok(exe) = std::env::current_exe() {
-        let backup = backup_path(&exe);
-        let _ = fs::remove_file(&backup);
+        let prefix = backup_name_prefix(&exe).to_string_lossy().into_owned();
+        let unique_prefix = format!("{prefix}.");
+        if let Some(parent) = exe.parent()
+            && let Ok(entries) = fs::read_dir(parent)
+        {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name != prefix && !name.starts_with(&unique_prefix) {
+                    continue;
+                }
+                if fs::remove_file(entry.path()).is_err() {
+                    tracing::debug!(file = %entry.path().display(), "旧可执行文件仍被占用, 留待下次清理");
+                    in_use = true;
+                }
+            }
+        }
     }
     #[cfg(target_os = "macos")]
     super::macos::cleanup_stale();
+    in_use
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -92,7 +114,16 @@ fn replace_executable(current: &Path, new_binary: &Path) -> Result<()> {
     if backup.exists() {
         let _ = fs::remove_file(&backup);
     }
-    rename_or_copy(current, &backup).context("无法备份当前程序")?;
+    // 旧备份可能仍被上一版进程占用 (例如 SYSTEM 输入服务还映射着旧映像),
+    // 这时换一个唯一名字让位, 避免本次更新因为无法备份而失败.
+    let backup = match rename_or_copy(current, &backup) {
+        Ok(()) => backup,
+        Err(_) => {
+            let fallback = unique_backup_path(current);
+            rename_or_copy(current, &fallback).context("无法备份当前程序")?;
+            fallback
+        }
+    };
     if let Err(error) = rename_or_copy(new_binary, current) {
         let _ = rename_or_copy(&backup, current);
         return Err(error).context("无法安装新程序");
@@ -105,9 +136,21 @@ fn replace_executable(current: &Path, new_binary: &Path) -> Result<()> {
     Ok(())
 }
 
-fn backup_path(exe: &Path) -> PathBuf {
+fn backup_name_prefix(exe: &Path) -> std::ffi::OsString {
     let mut name = exe.file_name().unwrap_or_default().to_os_string();
     name.push(".old");
+    name
+}
+
+#[cfg(not(target_os = "macos"))]
+fn backup_path(exe: &Path) -> PathBuf {
+    exe.with_file_name(backup_name_prefix(exe))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn unique_backup_path(exe: &Path) -> PathBuf {
+    let mut name = backup_name_prefix(exe);
+    name.push(format!(".{}", std::process::id()));
     exe.with_file_name(name)
 }
 

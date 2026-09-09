@@ -87,7 +87,7 @@ just dist
 
 Windows 主 GUI 使用 `asInvoker` manifest 以普通权限运行. 需要管理员输入能力时, GUI 优先请求本机 SYSTEM 输入服务 (`SynlyInputService`) 以 SYSTEM 身份拉起隐藏输入代理, 不弹 UAC. 服务未安装时, 首次授权会通过一次 UAC 自动安装并启动该服务 (延迟自动启动), 之后不再弹窗; 拒绝安装时回退到 `ShellExecuteW("runas")` 启动的 UAC 提权代理, 若主进程已持有提升令牌则直接继承当前令牌. 主进程与代理来自同一个构建产物, 避免 IPC 协议版本错配. 配置 `input.elevate_on_start = true` 后, 主实例会在恢复会话前完成上述提权, 失败时本次启动直接失败.
 
-SYSTEM 输入代理在 `SendInput` 失败时会跟随当前输入桌面 (`OpenInputDesktop` + `SetThreadDesktop`, 参考 Sunshine 的设计), 因此 UAC 弹窗与锁屏期间可以继续注入鼠标键盘, 控制不中断. 安全桌面期间光标会钳制在主显示器并抑制边缘返回, 离开后重新锚定光标; `Ctrl+Alt+Del` 属于 Windows 安全注意序列, 无法通过 `SendInput` 注入. 服务管理命令为 `synly service install`, `synly service uninstall` 和 `synly service status`, GUI 设置页也提供卸载入口. 非 SYSTEM 的 UAC 回退代理进入安全桌面时仍会暂停控制并触发紧急收回.
+SYSTEM 输入代理在 `SendInput` 失败时会跟随当前输入桌面 (`OpenInputDesktop` + `SetThreadDesktop`, 参考 Sunshine 的设计), 因此 UAC 弹窗与锁屏期间可以继续注入鼠标键盘, 控制不中断. 安全桌面期间光标会钳制在主显示器并抑制边缘返回, 离开后重新锚定光标; `Ctrl+Alt+Del` 属于 Windows 安全注意序列, 无法通过 `SendInput` 注入. 服务管理命令为 `synly service install`, `synly service uninstall`, `synly service restart` 和 `synly service status`, GUI 设置页也提供卸载入口. 自动更新就地替换 `synly.exe` 后, 已安装的服务进程仍映射着更新前的映像, 因此应用会在下次申请输入提权时先用一次 UAC 重启该服务, 让它加载新版本; 这次 UAC 被取消时继续沿用当前服务, 输入能力不受影响. 非 SYSTEM 的 UAC 回退代理进入安全桌面时仍会暂停控制并触发紧急收回.
 
 GUI 和提权子进程通过随机命名管道与随机 token 通信. 管道 DACL 只允许当前用户和 SYSTEM, 双方校验 IPC 版本, PID, session ID, 映像路径和安装目录. 服务控制管道只接受同目录 `synly.exe` 且位于当前控制台会话的请求, 拉起参数仅允许 UUID 管道名与 token. Windows release 不要求 Authenticode 签名, 因此请仅从可信来源获取程序, 并避免在其他用户可写目录中运行. 管道断开, 心跳超时或子进程退出时会立即释放输入状态.
 

@@ -77,10 +77,13 @@ pub use platform::windows::init_agent_tracing as init_windows_agent_tracing;
 #[cfg(windows)]
 pub use platform::windows::{
     service_installed as windows_input_service_installed,
+    service_running as windows_input_service_running,
     uninstall_via_uac as request_windows_input_service_uninstall_via_uac,
+    restart_via_uac as request_windows_input_service_restart_via_uac,
     mark_install_attempted as mark_windows_input_service_install_attempted,
     init_tracing as init_windows_service_tracing,
     install as install_windows_input_service,
+    restart as restart_windows_input_service,
     uninstall as uninstall_windows_input_service,
     status as windows_input_service_status,
     run_service as run_windows_input_service,

@@ -71,6 +71,11 @@ pub fn is_installed() -> bool {
     }
 }
 
+/// 服务当前是否处于运行状态, 不修改任何安装状态标记.
+pub fn is_running() -> bool {
+    matches!(status(), Ok(ServiceStatus::Running))
+}
+
 pub(crate) fn is_available() -> bool {
     match status() {
         Ok(ServiceStatus::Running) => {
@@ -129,6 +134,10 @@ pub fn uninstall_via_uac() -> Result<bool> {
         mark_manual_uninstall();
     }
     Ok(uninstalled)
+}
+
+pub fn restart_via_uac() -> Result<bool> {
+    run_elevated("service restart")
 }
 
 fn run_elevated(parameters: &str) -> Result<bool> {
