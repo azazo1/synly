@@ -386,11 +386,8 @@ fn wire_window_callbacks(
             && let Some(request_id) = current_interaction.lock().ok().and_then(|guard| *guard)
         {
             let response = match window.get_interaction_kind() {
-                0 => {
-                    send_command(&commands, AppCommand::Disconnect);
-                    return;
-                }
-                1 => InteractionResponse::Cancel,
+                // host PIN 与客户端输入 PIN 的取消都只中止当前配对.
+                0 | 1 => InteractionResponse::Cancel,
                 3 => InteractionResponse::Confirm(false),
                 _ => InteractionResponse::Decision {
                     accepted: false,

@@ -230,10 +230,10 @@ impl RuntimeControl {
         }));
     }
 
-    pub async fn request_interaction(
+    pub fn watch_interaction(
         &self,
         request: InteractionRequest,
-    ) -> Result<InteractionResponse> {
+    ) -> Result<oneshot::Receiver<InteractionResponse>> {
         let (response_tx, response_rx) = oneshot::channel();
         self.events
             .send(RuntimeEvent::Interaction(InteractionEnvelope {
@@ -241,7 +241,14 @@ impl RuntimeControl {
                 response: Some(response_tx),
             }))
             .map_err(|_| anyhow::anyhow!("GUI interaction channel is closed"))?;
-        response_rx
+        Ok(response_rx)
+    }
+
+    pub async fn request_interaction(
+        &self,
+        request: InteractionRequest,
+    ) -> Result<InteractionResponse> {
+        self.watch_interaction(request)?
             .await
             .context("GUI interaction response channel is closed")
     }

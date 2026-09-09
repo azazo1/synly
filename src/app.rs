@@ -53,7 +53,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{self, Instant};
 use tokio_rustls::{TlsStream, client::TlsStream as ClientTlsStream};
 use tokio_util::sync::CancellationToken;
@@ -1163,9 +1163,9 @@ async fn handle_bootstrap_incoming_connection(
         "配对核对图已生成"
     );
     let gui_pairing_id = Uuid::new_v4();
-    options
-        .control
-        .notify_interaction(InteractionRequest::ShowHostPin {
+    let (mut host_pin, mut cancel_rx) = HostPinPrompt::watch(
+        &options.control,
+        InteractionRequest::ShowHostPin {
             request_id: gui_pairing_id,
             remote_label: remote_label.clone(),
             bootstrap_short: client_display.short.clone(),
@@ -1174,7 +1174,8 @@ async fn handle_bootstrap_incoming_connection(
             session_randomart: session_display.randomart.clone(),
             pin: pin.clone(),
             fixed_pin: options.pairing.pin.is_some(),
-        });
+        },
+    )?;
 
     let (pake_state, server_pake_message) = crypto::start_bootstrap_pake_server(
         &pin,
@@ -1194,14 +1195,19 @@ async fn handle_bootstrap_incoming_connection(
     )
     .await?;
 
-    let pake_frame =
-        match read_frame_with_timeout(&mut socket, PAIRING_TIMEOUT, transfer_limits).await {
-            Ok(frame) => frame,
-            Err(err) => {
-                register_pairing_failure(pairing_throttle, &remote_peer_key).await;
-                return Err(err);
-            }
-        };
+    let pake_frame = match wait_or_cancel_pairing(
+        read_frame_with_timeout(&mut socket, PAIRING_TIMEOUT, transfer_limits),
+        &mut cancel_rx,
+    )
+    .await
+    {
+        Ok(Some(frame)) => frame,
+        Ok(None) => return Ok(None),
+        Err(err) => {
+            register_pairing_failure(pairing_throttle, &remote_peer_key).await;
+            return Err(err);
+        }
+    };
     let (client_pake_message, client_confirm) = match pake_frame {
         Frame::Control(ControlMessage::BootstrapPake {
             request_id: incoming_request_id,
@@ -1284,11 +1290,26 @@ async fn handle_bootstrap_incoming_connection(
         &client_bootstrap_public_key,
     )?;
     let device = config.device.clone();
-    let mut server_stream = time::timeout(TLS_UPGRADE_TIMEOUT, acceptor.accept(socket))
-        .await
-        .map_err(|_| anyhow!("等待客户端切换到临时 mTLS 超时"))??;
-    let frame =
-        read_frame_with_timeout(&mut server_stream, PAIRING_TIMEOUT, transfer_limits).await?;
+    let Some(mut server_stream) = wait_or_cancel_pairing(
+        async {
+            Ok(time::timeout(TLS_UPGRADE_TIMEOUT, acceptor.accept(socket))
+                .await
+                .map_err(|_| anyhow!("等待客户端切换到临时 mTLS 超时"))??)
+        },
+        &mut cancel_rx,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+    let Some(frame) = wait_or_cancel_pairing(
+        read_frame_with_timeout(&mut server_stream, PAIRING_TIMEOUT, transfer_limits),
+        &mut cancel_rx,
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
     let (incoming_request_id, payload, trusted_proof) = match frame {
         Frame::Control(ControlMessage::PairRequest {
             request_id,
@@ -1392,6 +1413,9 @@ async fn handle_bootstrap_incoming_connection(
     }
 
     tracing::info!("已建立基于 PIN 的临时 mTLS, 设备元数据处于加密保护中");
+    if pairing_cancel_received(&mut cancel_rx) {
+        return Ok(None);
+    }
     let (accepted, remember_trusted_device) =
         if should_auto_accept_request(&options.pairing, PairAuthMethod::Pin) {
             (true, options.pairing.trust_device)
@@ -1399,6 +1423,7 @@ async fn handle_bootstrap_incoming_connection(
             tracing::warn!("headless 模式拒绝未信任设备");
             (false, false)
         } else {
+            host_pin.persist();
             let interaction_id = Uuid::new_v4();
             let mut summary = payload.workspace.summary_lines();
             summary.push(format!("剪贴板: {}", payload.workspace.clipboard_mode.label()));
@@ -4331,6 +4356,75 @@ where
     time::timeout(timeout, read_frame(reader, transfer_limits))
         .await
         .map_err(|_| anyhow!("等待对端响应超时"))?
+}
+
+struct HostPinPrompt {
+    control: RuntimeControl,
+    clear_on_drop: bool,
+}
+
+impl HostPinPrompt {
+    fn watch(
+        control: &RuntimeControl,
+        request: InteractionRequest,
+    ) -> Result<(Self, oneshot::Receiver<InteractionResponse>)> {
+        let cancel_rx = control.watch_interaction(request)?;
+        Ok((
+            Self {
+                control: control.clone(),
+                clear_on_drop: true,
+            },
+            cancel_rx,
+        ))
+    }
+
+    fn persist(&mut self) {
+        self.clear_on_drop = false;
+    }
+}
+
+impl Drop for HostPinPrompt {
+    fn drop(&mut self) {
+        if self.clear_on_drop {
+            self.control
+                .notify_interaction(InteractionRequest::Clear {
+                    request_id: Uuid::new_v4(),
+                });
+        }
+    }
+}
+
+async fn wait_or_cancel_pairing<T>(
+    work: impl Future<Output = Result<T>>,
+    cancel_rx: &mut oneshot::Receiver<InteractionResponse>,
+) -> Result<Option<T>> {
+    tokio::select! {
+        result = work => result.map(Some),
+        resp = cancel_rx => {
+            match resp {
+                Ok(InteractionResponse::Cancel) | Err(_) => {
+                    tracing::info!("用户取消了配对");
+                    Ok(None)
+                }
+                Ok(other) => {
+                    tracing::debug!(?other, "配对等待收到非取消响应");
+                    Ok(None)
+                }
+            }
+        }
+    }
+}
+
+fn pairing_cancel_received(
+    cancel_rx: &mut oneshot::Receiver<InteractionResponse>,
+) -> bool {
+    match cancel_rx.try_recv() {
+        Ok(InteractionResponse::Cancel) | Err(oneshot::error::TryRecvError::Closed) => {
+            tracing::info!("用户取消了配对");
+            true
+        }
+        Ok(_) | Err(oneshot::error::TryRecvError::Empty) => false,
+    }
 }
 
 fn is_connection_shutdown_error(err: &anyhow::Error) -> bool {

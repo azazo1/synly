@@ -6,8 +6,8 @@ use crate::config::{RuntimeConfig, SynlyConfig};
 use crate::discovery::{self, DiscoveredPeer};
 use crate::protocol::{PROTOCOL_VERSION, RuntimeCapabilities};
 use crate::runtime_control::{
-    InteractionEnvelope, RuntimeCommand, RuntimeControl, RuntimeControlHandle, RuntimeEvent,
-    RuntimeLifecycle, RuntimeTuning,
+    InteractionEnvelope, InteractionRequest, RuntimeCommand, RuntimeControl, RuntimeControlHandle,
+    RuntimeEvent, RuntimeLifecycle, RuntimeTuning,
 };
 use crate::runtime_options::{RuntimeOptions, runtime_options_from_config};
 use crate::settings::ConnectionPreference;
@@ -341,6 +341,7 @@ impl AppSupervisor {
                     .is_some_and(|pending| pending.request.request_id() == request_id)
                 {
                     self.snapshot.interaction = None;
+                    self.restore_lifecycle_after_interaction();
                     self.publish();
                 }
             }
@@ -653,17 +654,43 @@ impl AppSupervisor {
 
     fn handle_interaction(&mut self, envelope: InteractionEnvelope) {
         let request_id = envelope.request.request_id();
+        if matches!(envelope.request, InteractionRequest::Clear { .. }) {
+            if let Some(pending) = self.snapshot.interaction.as_ref() {
+                self.pending_responses
+                    .remove(&pending.request.request_id());
+            }
+            self.snapshot.interaction = None;
+            self.restore_lifecycle_after_interaction();
+            return;
+        }
+        if let Some(previous) = self.snapshot.interaction.as_ref() {
+            let old_id = previous.request.request_id();
+            if old_id != request_id {
+                self.pending_responses.remove(&old_id);
+            }
+        }
         if let Some(response) = envelope.response {
             self.pending_responses.insert(request_id, response);
         }
-        if matches!(envelope.request, crate::runtime_control::InteractionRequest::Clear { .. }) {
-            self.snapshot.interaction = None;
-        } else {
-            self.snapshot.lifecycle = AppLifecycle::Pairing;
-            self.snapshot.interaction = Some(PendingInteraction {
-                request: envelope.request,
-            });
+        self.snapshot.lifecycle = AppLifecycle::Pairing;
+        self.snapshot.interaction = Some(PendingInteraction {
+            request: envelope.request,
+        });
+    }
+
+    fn restore_lifecycle_after_interaction(&mut self) {
+        if self.snapshot.lifecycle != AppLifecycle::Pairing {
+            return;
         }
+        self.snapshot.lifecycle = if self.snapshot.sessions.is_empty() {
+            match self.snapshot.desired.connection {
+                Some(ConnectionPreference::Host) => AppLifecycle::Hosting,
+                Some(ConnectionPreference::Join) => AppLifecycle::Connecting,
+                None => AppLifecycle::Idle,
+            }
+        } else {
+            AppLifecycle::Connected
+        };
     }
 
     async fn restart_session(&mut self) {
