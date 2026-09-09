@@ -6,7 +6,7 @@ mod macos;
 mod state;
 
 use crate::config::UpdateConfig;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use check::release_page_url;
 use state::{AvailableRelease, InstallOutcome, RestartAction};
 use std::path::PathBuf;
@@ -41,7 +41,6 @@ struct Inner {
     download_generation: u64,
     applying: bool,
     restart: Option<RestartAction>,
-    client: reqwest::Client,
 }
 
 impl UpdateHandle {
@@ -171,15 +170,14 @@ impl UpdateHandle {
     }
 
     async fn run_check(&self, manual: bool) {
-        let (client, current, skipped) = {
+        let (current, skipped) = {
             let inner = self.lock();
-            (
-                inner.client.clone(),
-                inner.current_version.clone(),
-                inner.skipped_version.clone(),
-            )
+            (inner.current_version.clone(), inner.skipped_version.clone())
         };
-        let result = check::fetch_latest(&client, &current).await;
+        let result = match build_client() {
+            Ok(client) => check::fetch_latest(&client, &current).await,
+            Err(error) => Err(error),
+        };
         let mut inner = self.lock();
         match result {
             Ok(Some(available)) => {
@@ -228,7 +226,7 @@ impl UpdateHandle {
     }
 
     async fn run_download(&self, generation: u64) {
-        let (client, available, cancel) = {
+        let (available, cancel) = {
             let inner = self.lock();
             if !inner.is_active_download(generation) {
                 return;
@@ -236,7 +234,14 @@ impl UpdateHandle {
             let Some(available) = inner.available.clone() else {
                 return;
             };
-            (inner.client.clone(), available, inner.cancel_download.clone())
+            (available, inner.cancel_download.clone())
+        };
+        let client = match build_client() {
+            Ok(client) => client,
+            Err(error) => {
+                self.fail(generation, error.to_string());
+                return;
+            }
         };
         let update_dir = match crate::paths::update_dir() {
             Ok(dir) => dir,
@@ -392,10 +397,6 @@ pub fn start(
     persist: Arc<dyn Fn(UpdateConfig) + Send + Sync>,
 ) -> Result<UpdateHandle> {
     install::cleanup_old_binary();
-    let client = reqwest::Client::builder()
-        .user_agent("synly")
-        .build()
-        .expect("reqwest client");
     let mut snapshot = UpdateSnapshot::idle(current_version.clone(), config.auto_check);
     #[cfg(target_os = "macos")]
     if let Some(message) = macos::take_apply_result() {
@@ -419,7 +420,6 @@ pub fn start(
             download_generation: 0,
             applying: false,
             restart: None,
-            client,
         })),
         snapshots,
         runtime: runtime.handle().clone(),
@@ -434,6 +434,16 @@ pub fn start(
         });
     }
     Ok(handle)
+}
+
+/// 每次检查或下载都新建 client, 让系统代理和代理环境变量变化实时生效.
+///
+/// reqwest 只在构建 client 时读取一次代理配置, 长期复用同一个 client 会一直沿用启动时的旧代理.
+fn build_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .user_agent("synly")
+        .build()
+        .context("无法创建更新用的 HTTP 客户端")
 }
 
 fn notify_update_available(version: &str) {
