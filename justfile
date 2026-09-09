@@ -33,8 +33,15 @@ debug:
 
 # 启动隔离数据目录的调试实例, 完整日志写入隔离目录.
 [windows]
+[script('powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File')]
 debug:
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "New-Item -ItemType Directory -Force -Path target/synly-debug | Out-Null; $env:SYNLY_DATA_DIR='target/synly-debug'; $env:SYNLY_LOG_FILE='target/synly-debug/synly.log'; $env:RUST_LOG='synly=trace'; cargo run"
+    $ErrorActionPreference = 'Stop'
+    New-Item -ItemType Directory -Force -Path target/synly-debug | Out-Null
+    $env:SYNLY_DATA_DIR = 'target/synly-debug'
+    $env:SYNLY_LOG_FILE = 'target/synly-debug/synly.log'
+    $env:RUST_LOG = 'synly=trace'
+    cargo run
+    exit $LASTEXITCODE
 
 # 打印当前应嵌入二进制的构建版本.
 [unix]
@@ -47,9 +54,16 @@ build-version:
 
 # 构建当前平台的可分发 release 产物.
 [windows]
+[script('powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File')]
 dist:
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "$env:SYNLY_BUILD_VERSION = (powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-version.ps1).Trim(); cargo build --release; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
+    $ErrorActionPreference = 'Stop'
+    $version = (powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-version.ps1 | Select-Object -Last 1).Trim()
+    if ([string]::IsNullOrWhiteSpace($version)) { throw 'Unable to resolve the build version' }
+    $env:SYNLY_BUILD_VERSION = $version
+    cargo build --release
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows.ps1 -Binary target/release/synly.exe -OutputDir dist
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 [macos]
 dist:
@@ -63,9 +77,15 @@ dist:
 
 # 产出用于自动更新测试的 fake 构建, 版本固定为 v0.0.0.
 [windows]
+[script('powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File')]
 fake-dist:
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "$env:SYNLY_BUILD_VERSION='v0.0.0'; $env:SYNLY_FAKE_DIST='1'; cargo build --release; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
+    $ErrorActionPreference = 'Stop'
+    $env:SYNLY_BUILD_VERSION = 'v0.0.0'
+    $env:SYNLY_FAKE_DIST = '1'
+    cargo build --release
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows.ps1 -Binary target/release/synly.exe -OutputDir dist -Version v0.0.0 -Fake
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 [macos]
 fake-dist:
