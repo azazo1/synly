@@ -77,10 +77,6 @@ fake-dist:
     SYNLY_BUILD_VERSION=v0.0.0 SYNLY_FAKE_DIST=1 cargo build --release
     SYNLY_FAKE_DIST=1 bash scripts/package-linux.sh v0.0.0 "$(rustc -vV | sed -n 's/^host: //p')" dist
 
-# 安装当前工作树中的 Synly.
-install:
-    cargo install --path .
-
 # just gradlew testDebugUnitTest
 # 自动发现 JDK 与 Android SDK 后运行指定 Gradle 任务, 参数原样透传.
 [windows]
