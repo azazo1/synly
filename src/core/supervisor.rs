@@ -61,6 +61,7 @@ pub struct AppSupervisor {
     pending_responses: HashMap<Uuid, oneshot::Sender<crate::runtime_control::InteractionResponse>>,
     runtime_active_session: Option<Uuid>,
     input_permission_monitor: Option<JoinHandle<()>>,
+    discovered_peers: Vec<DiscoveredPeer>,
 }
 
 struct SessionHandle {
@@ -123,6 +124,7 @@ impl AppSupervisor {
                 pending_responses: HashMap::new(),
                 runtime_active_session: None,
                 input_permission_monitor: None,
+                discovered_peers: Vec::new(),
             },
             AppSupervisorHandle {
                 commands,
@@ -446,9 +448,13 @@ impl AppSupervisor {
                 epoch,
                 result: Ok(peers),
             } if epoch == self.discovery_epoch => {
-                self.snapshot.discovered_peers = peers
+                self.discovered_peers = peers
                     .into_iter()
                     .filter(|peer| peer.device_id != self.config.device.device_id.to_string())
+                    .collect();
+                self.snapshot.discovered_peers = self
+                    .discovered_peers
+                    .iter()
                     .map(|peer| peer_view(peer, &self.config))
                     .collect();
                 self.publish();
@@ -691,6 +697,22 @@ impl AppSupervisor {
             return;
         }
         options.control = control;
+        if options.connection == ConnectionPreference::Join {
+            let query = options.pairing.peer_query.clone();
+            if let Some(query) = query.as_deref()
+                && let Some(peer) =
+                    crate::app::known_peer_for_query(&self.discovered_peers, query)
+            {
+                tracing::info!(
+                    peer = %peer.display_name(),
+                    device_id = %peer.device_id,
+                    port = peer.port,
+                    addresses = ?peer.addresses,
+                    "使用当前发现结果作为连接候选, 跳过重新发现"
+                );
+                options.pairing.known_peer = Some(peer);
+            }
+        }
         self.snapshot.lifecycle = match options.connection {
             ConnectionPreference::Host => AppLifecycle::Hosting,
             ConnectionPreference::Join => AppLifecycle::Connecting,
@@ -1002,15 +1024,14 @@ fn map_lifecycle(lifecycle: RuntimeLifecycle) -> AppLifecycle {
     }
 }
 
-fn peer_view(peer: DiscoveredPeer, config: &SynlyConfig) -> DiscoveredPeerView {
+fn peer_view(peer: &DiscoveredPeer, config: &SynlyConfig) -> DiscoveredPeerView {
     let device_id = Uuid::parse_str(&peer.device_id).ok();
-    let display_name = peer.display_name();
     DiscoveredPeerView {
         trusted: device_id
             .as_ref()
             .is_some_and(|device_id| config.trusted_device(device_id).is_some()),
-        device_id: peer.device_id,
-        display_name,
+        device_id: peer.device_id.clone(),
+        display_name: peer.display_name(),
         addresses: peer
             .addresses
             .iter()

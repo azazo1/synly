@@ -340,9 +340,14 @@ pub(crate) async fn run_client(mut config: SynlyConfig, mut options: RuntimeOpti
     let shutdown = options.control.shutdown().clone();
     let mut runtime_capabilities = options.control.capabilities();
     let mut runtime_tuning = options.control.tuning();
+    let initial_lifecycle = if options.pairing.known_peer.is_some() {
+        RuntimeLifecycle::Connecting
+    } else {
+        RuntimeLifecycle::Discovering
+    };
     options
         .control
-        .report(RuntimeEvent::Lifecycle(RuntimeLifecycle::Discovering));
+        .report(RuntimeEvent::Lifecycle(initial_lifecycle));
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
 
@@ -513,6 +518,53 @@ async fn attempt_peer_connection(
         }
     } else {
         *direct_target = None;
+    }
+
+    if let Some(known_peer) = options.pairing.known_peer.take() {
+        match discovered_peer_target(known_peer, &local_workspace_summary) {
+            Ok(peer_target) => {
+                if let PeerTarget::Discovered(peer) = &peer_target {
+                    tracing::info!(
+                        peer = %peer.display_name(),
+                        device_id = %&peer.device_id[..8.min(peer.device_id.len())],
+                        port = peer.port,
+                        addresses = ?peer.addresses,
+                        "使用已发现地址直连, 跳过重新发现"
+                    );
+                }
+                options
+                    .control
+                    .report(RuntimeEvent::Lifecycle(RuntimeLifecycle::Connecting));
+                *reconnect_query = Some(peer_target.reconnect_query());
+                match connect_and_run_session(
+                    &peer_target,
+                    config,
+                    options,
+                    notifier,
+                    direct_target,
+                )
+                .await
+                {
+                    Ok(()) => {
+                        *fast_retries_left = FAST_DIRECT_RETRIES;
+                        return AttemptVerdict::RetryImmediately;
+                    }
+                    Err(err) if err.downcast_ref::<PairingTerminal>().is_some() => {
+                        tracing::warn!(error = %err, "已发现地址配对流程已终止, 不再自动重连");
+                        return AttemptVerdict::Terminal(err);
+                    }
+                    Err(err) => {
+                        tracing::warn!(error = %err, "已发现地址直连失败, 转为重新发现");
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "已发现记录不可用, 转为重新发现");
+            }
+        }
+        options
+            .control
+            .report(RuntimeEvent::Lifecycle(RuntimeLifecycle::Discovering));
     }
 
     let peer_target = match choose_peer(
@@ -740,33 +792,10 @@ async fn connect_to_discovered_peer(peer: &DiscoveredPeer) -> Result<TcpStream> 
     if peer.addresses.is_empty() {
         bail!("peer advertised no IPv4 address");
     }
-    let groups = match discovery::group_peer_addresses(&peer.addresses) {
-        Ok(groups) => groups,
-        Err(err) => {
-            tracing::warn!(error = %err, "无法读取本机网卡子网, 将尝试全部广播地址");
-            discovery::PeerAddressGroups {
-                same_subnet: Vec::new(),
-                fallback: peer.addresses.clone(),
-            }
-        }
-    };
     let mut failures = Vec::new();
     if let Some(socket) = race_peer_addresses(
-        "同子网地址",
-        &groups.same_subnet,
-        peer.port,
-        &mut failures,
-    )
-    .await
-    {
-        return Ok(socket);
-    }
-    if !groups.same_subnet.is_empty() && !groups.fallback.is_empty() {
-        tracing::info!("同子网地址均无法连接, 正在尝试其余地址");
-    }
-    if let Some(socket) = race_peer_addresses(
-        "其余地址",
-        &groups.fallback,
+        "候选地址",
+        &peer.addresses,
         peer.port,
         &mut failures,
     )
@@ -4067,6 +4096,26 @@ async fn choose_peer(
     }
     let peers = discovery::browse(timeout, discovery_config).await?;
     let peer = select_peer_from_query(&peers, query)?;
+    discovered_peer_target(peer, local_workspace)
+}
+
+pub(crate) fn known_peer_for_query(
+    peers: &[DiscoveredPeer],
+    query: &str,
+) -> Option<DiscoveredPeer> {
+    let query = query.trim();
+    if query.is_empty() || parse_direct_peer_addr(query).is_some() {
+        return None;
+    }
+    select_peer_from_query(peers, query)
+        .ok()
+        .filter(|peer| !peer.addresses.is_empty())
+}
+
+fn discovered_peer_target(
+    peer: DiscoveredPeer,
+    local_workspace: &crate::sync::WorkspaceSummary,
+) -> Result<PeerTarget> {
     if peer.protocol_version != PROTOCOL_VERSION {
         bail!(
             "设备协议版本不兼容: 本机 {}, 对侧 {}",
@@ -4748,7 +4797,8 @@ mod tests {
         accept_policy_label, bootstrap_device_name_matches, bootstrap_peer_label,
         build_remote_echo_expectations, choose_peer, delete_policy, handle_file_chunk,
         identity_display_name, input_task_restart_required, is_connection_shutdown_error,
-        parse_direct_peer_addr, peer_matches_query, preferred_peer_query, race_peer_addresses,
+        known_peer_for_query, parse_direct_peer_addr, peer_matches_query, preferred_peer_query,
+        race_peer_addresses,
         resolve_audio_plan, resolve_initial_snapshot_policy, run_with_session_notifications,
         run_advertisement_updates, select_peer_from_query, send_one_file,
         should_auto_accept_request, should_try_direct_trusted,
@@ -5180,6 +5230,46 @@ mod tests {
             addresses: vec![Ipv4Addr::new(192, 168, 1, 21)],
         };
         assert!(select_peer_from_query(&[peer, duplicate], "demo-device").is_err());
+    }
+
+    #[test]
+    fn known_peer_for_query_uses_unique_discovered_match() {
+        let peer = sample_peer();
+        let known = known_peer_for_query(std::slice::from_ref(&peer), &peer.device_id)
+            .expect("unique discovered peer should seed the first connect");
+        assert_eq!(known.device_id, peer.device_id);
+        assert_eq!(known.addresses, peer.addresses);
+        assert_eq!(known.port, peer.port);
+    }
+
+    #[test]
+    fn known_peer_for_query_skips_direct_address_and_empty_candidates() {
+        let peer = sample_peer();
+        assert!(known_peer_for_query(std::slice::from_ref(&peer), "192.168.1.20:8080").is_none());
+
+        let mut empty = sample_peer();
+        empty.addresses.clear();
+        assert!(known_peer_for_query(std::slice::from_ref(&empty), &empty.device_id).is_none());
+    }
+
+    #[test]
+    fn known_peer_for_query_ignores_ambiguous_matches() {
+        let peer = sample_peer();
+        let duplicate = DiscoveredPeer {
+            protocol_version: crate::protocol::PROTOCOL_VERSION,
+            fullname: "dup".to_string(),
+            device_name: "demo-device".to_string(),
+            instance_name: Some("worker-b".to_string()),
+            device_id: "ffffeeee-dddd-cccc-bbbb-aaaaaaaaaaaa".to_string(),
+            file_sync_mode: FileSyncMode::Auto,
+            clipboard_mode: ClipboardMode::Off,
+            audio_mode: AudioMode::Off,
+            input_mode: crate::input::InputMode::Off,
+            source: crate::discovery::DiscoverySource::Mdns,
+            port: 9999,
+            addresses: vec![Ipv4Addr::new(192, 168, 1, 21)],
+        };
+        assert!(known_peer_for_query(&[peer, duplicate], "demo-device").is_none());
     }
 
     #[test]
@@ -5629,6 +5719,7 @@ mod tests {
             trust_device: false,
             trusted_only: false,
             discovery_secs: 3,
+            known_peer: None,
         }
     }
 

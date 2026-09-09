@@ -1,5 +1,6 @@
 use crate::clipboard::ClipboardRuntimeOptions;
 use crate::config::{DiscoveryConfig, RuntimeConfig, SynlyConfig};
+use crate::discovery::DiscoveredPeer;
 use crate::input::{InputMode, InputRuntimeOptions};
 use crate::path_expand::expand_path_string;
 use crate::protocol::{RuntimeCapabilities, TransferLimits};
@@ -41,6 +42,8 @@ pub struct PairingRuntimeOptions {
     pub trust_device: bool,
     pub trusted_only: bool,
     pub discovery_secs: u64,
+    /// GUI 当前发现结果, 仅用于本次 Join 的首次直连, 不写入配置.
+    pub known_peer: Option<DiscoveredPeer>,
 }
 
 pub fn runtime_options_from_config(
@@ -114,6 +117,7 @@ pub fn runtime_options_from_config(
             trust_device: runtime.trust_device,
             trusted_only: runtime.trusted_only,
             discovery_secs: DEFAULT_DISCOVERY_SECS,
+            known_peer: None,
         },
         control: RuntimeControl::detached(capabilities, tuning),
     })
