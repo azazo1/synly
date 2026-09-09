@@ -194,6 +194,29 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # runner 镜像预装的第三方源 (例如 google-chrome) 索引可能过期, 导致
+          # apt-get update 以 Hash Sum mismatch 失败; 依赖都在 Ubuntu 官方源里,
+          # 先剔除第三方源, 但确认官方源仍然存在才删.
+          shopt -s nullglob
+          sources=(/etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources)
+          ubuntu_pattern='ubuntu\.com'
+          kept=()
+          removed=()
+          for source in "${sources[@]}"; do
+            if grep -qiE "$ubuntu_pattern" "$source"; then
+              kept+=("$source")
+            else
+              removed+=("$source")
+            fi
+          done
+          if (( ${#kept[@]} == 0 )); then
+            echo "no Ubuntu apt source detected, leaving ${#removed[@]} source file(s) untouched" >&2
+          else
+            for source in "${removed[@]}"; do
+              echo "removing third-party apt source: $source"
+              sudo rm -f "$source"
+            done
+          fi
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config libgtk-3-dev libopus-dev libxdo-dev
 

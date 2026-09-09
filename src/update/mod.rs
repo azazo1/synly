@@ -464,12 +464,12 @@ pub fn binary_replaced_in_process() -> bool {
     BINARY_REPLACED_IN_PROCESS.load(Ordering::Acquire)
 }
 
-/// 上一版可执行文件是否仍被占用.
+/// 清理上一版可执行文件备份, 返回是否仍有备份无法删除.
 ///
 /// 更新替换 exe 后旧映像会留在 `<exe>.old`; 只要它还在, 就说明仍有进程运行着更新前的
-/// 版本, Windows 上通常是 SYSTEM 输入服务. 查询顺带做一次清理, 能删掉的备份会被删除.
+/// 版本, Windows 上通常是 SYSTEM 输入服务. 每次调用都会顺带清理能删掉的备份.
 #[cfg(windows)]
-pub fn old_binary_still_in_use() -> bool {
+pub fn cleanup_old_binary_backups() -> bool {
     install::cleanup_old_binary()
 }
 

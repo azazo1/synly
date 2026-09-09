@@ -17,18 +17,35 @@ fn ensure_input_service_current() {
     let stale = if crate::update::binary_replaced_in_process() {
         synly::input::windows_input_service_running()
     } else {
-        crate::update::old_binary_still_in_use()
+        crate::update::cleanup_old_binary_backups()
     };
     if !stale || SERVICE_ALIGNED.swap(true, Ordering::AcqRel) {
         return;
     }
     tracing::info!("输入服务仍运行更新前的映像, 请求提权重启");
     match synly::input::request_windows_input_service_restart_via_uac() {
-        Ok(true) => tracing::info!("输入服务已跟随更新重启"),
+        Ok(true) => {
+            tracing::info!("输入服务已跟随更新重启");
+            report_backup_cleanup();
+        }
         Ok(false) => tracing::warn!("用户取消了输入服务重启, 继续沿用当前服务"),
         Err(error) => {
             tracing::warn!(error = %format!("{error:#}"), "重启输入服务失败, 继续沿用当前服务")
         }
+    }
+}
+
+/// 服务重启后再清理一次旧映像备份.
+///
+/// 替换过 exe 的进程自己也映射着那个旧映像, 因此它退出之前备份仍然删不掉, 这属于预期,
+/// 不该报成异常.
+fn report_backup_cleanup() {
+    if !crate::update::cleanup_old_binary_backups() {
+        tracing::info!("输入服务重启后旧映像备份已清理");
+    } else if crate::update::binary_replaced_in_process() {
+        tracing::debug!("旧映像备份仍被本进程映射, 将在本进程退出后清理");
+    } else {
+        tracing::warn!("旧映像备份仍被占用, 将在下次启动时重试清理");
     }
 }
 
