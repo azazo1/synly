@@ -30,7 +30,12 @@ case "$target" in
         exit 1
         ;;
 esac
-dmg_path="$output_dir/synly-$version-macos-$arch.dmg"
+suffix=""
+if [[ "${SYNLY_FAKE_DIST:-}" == "1" || "${SYNLY_FAKE_DIST:-}" == "true" ]]; then
+    suffix="-fake"
+fi
+plist_version="${version#v}"
+dmg_path="$output_dir/synly-$version-macos-$arch$suffix.dmg"
 
 if [[ ! -x "$binary" ]]; then
     printf 'missing executable: %s\n' "$binary" >&2
@@ -75,9 +80,9 @@ printf '%s\n' \
     '  <key>CFBundlePackageType</key>' \
     '  <string>APPL</string>' \
     '  <key>CFBundleShortVersionString</key>' \
-    "  <string>$version</string>" \
+    "  <string>$plist_version</string>" \
     '  <key>CFBundleVersion</key>' \
-    "  <string>$version</string>" \
+    "  <string>$plist_version</string>" \
     '  <key>LSMinimumSystemVersion</key>' \
     '  <string>14.0</string>' \
     '  <key>NSHighResolutionCapable</key>' \

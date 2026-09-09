@@ -25,6 +25,7 @@ pub struct SynlyConfig {
     pub notifications: NotificationConfig,
     pub discovery: DiscoveryConfig,
     pub ui: UiConfig,
+    pub update: UpdateConfig,
     pub gui_state: GuiState,
     pub runtime: RuntimeConfig,
     pub trusted_devices: Vec<TrustedDeviceConfig>,
@@ -77,7 +78,15 @@ pub struct UiConfig {
     pub close_to_tray: bool,
     pub launch_at_login: bool,
     pub resume_last_session: bool,
+    pub hide_dock_when_hidden: bool,
     pub log_level: LogLevel,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateConfig {
+    pub auto_check: bool,
+    pub skipped_version: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -163,6 +172,7 @@ impl Default for UiConfig {
             close_to_tray: true,
             launch_at_login: false,
             resume_last_session: false,
+            hide_dock_when_hidden: true,
             log_level: LogLevel::Info,
         }
     }
@@ -174,6 +184,15 @@ impl Default for GuiState {
             first_run_completed: false,
             window_width: 1080,
             window_height: 720,
+        }
+    }
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            auto_check: true,
+            skipped_version: String::new(),
         }
     }
 }
@@ -332,9 +351,7 @@ pub(super) fn resolve_configured_path(path: &Path, base_dir: &Path) -> Result<Pa
 }
 
 fn clipboard_cache_base_dir() -> Result<PathBuf> {
-    dirs::cache_dir()
-        .map(|dir| dir.join("synly"))
-        .context("unable to determine platform cache directory")
+    crate::paths::cache_dir()
 }
 
 fn unix_time_ms() -> u64 {

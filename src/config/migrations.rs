@@ -1,7 +1,7 @@
 use super::schema::GuiState;
 use anyhow::{Context, Result, bail};
 
-pub(super) const MAIN_CONFIG_VERSION: u32 = 3;
+pub(super) const MAIN_CONFIG_VERSION: u32 = 4;
 pub(super) const GUI_STATE_VERSION: u32 = 1;
 pub(super) const IDENTITY_VERSION: u32 = 1;
 pub(super) const TRUSTED_DEVICES_VERSION: u32 = 1;
@@ -39,6 +39,12 @@ pub(super) fn migrate_main_config(raw: &str) -> Result<MainMigration> {
             2 => {
                 insert_main_v3_filter_app_events(&mut document)?;
                 version = 3;
+                set_version(&mut document, version, "config.toml")?;
+                migrated = true;
+            }
+            3 => {
+                insert_main_v4_update_and_dock(&mut document)?;
+                version = 4;
                 set_version(&mut document, version, "config.toml")?;
                 migrated = true;
             }
@@ -199,6 +205,29 @@ fn insert_main_v3_filter_app_events(document: &mut toml::Value) -> Result<()> {
     Ok(())
 }
 
+fn insert_main_v4_update_and_dock(document: &mut toml::Value) -> Result<()> {
+    let table = document
+        .as_table_mut()
+        .context("config.toml must contain a TOML table")?;
+    if !table.contains_key("ui") {
+        table.insert("ui".to_string(), toml::Value::Table(Default::default()));
+    }
+    let ui = table
+        .get_mut("ui")
+        .and_then(toml::Value::as_table_mut)
+        .context("config.toml ui must be a TOML table")?;
+    if !ui.contains_key("hide_dock_when_hidden") {
+        ui.insert("hide_dock_when_hidden".to_string(), toml::Value::Boolean(true));
+    }
+    if !table.contains_key("update") {
+        let mut update = toml::map::Map::new();
+        update.insert("auto_check".to_string(), toml::Value::Boolean(true));
+        update.insert("skipped_version".to_string(), toml::Value::String(String::new()));
+        table.insert("update".to_string(), toml::Value::Table(update));
+    }
+    Ok(())
+}
+
 fn take_value(
     table: &mut toml::map::Map<String, toml::Value>,
     key: &str,
@@ -226,7 +255,7 @@ mod tests {
             })
         );
         let table = migration.document.as_table().unwrap();
-        assert_eq!(table.get("version").and_then(toml::Value::as_integer), Some(3));
+        assert_eq!(table.get("version").and_then(toml::Value::as_integer), Some(4));
         let ui = table.get("ui").and_then(toml::Value::as_table).unwrap();
         assert!(!ui.contains_key("first_run_completed"));
         assert!(!ui.contains_key("window_width"));
@@ -248,7 +277,7 @@ mod tests {
 
     #[test]
     fn current_main_config_is_not_migrated() {
-        let migration = migrate_main_config("version = 3\n").unwrap();
+        let migration = migrate_main_config("version = 4\n").unwrap();
         assert!(!migration.migrated);
         assert!(migration.legacy_gui_state.is_none());
     }
@@ -259,7 +288,7 @@ mod tests {
             migrate_main_config("version = 1\n[input]\nreverse_mouse_wheel = true\n").unwrap();
         assert!(migration.migrated);
         let table = migration.document.as_table().unwrap();
-        assert_eq!(table.get("version").and_then(toml::Value::as_integer), Some(3));
+        assert_eq!(table.get("version").and_then(toml::Value::as_integer), Some(4));
         let input = table.get("input").and_then(toml::Value::as_table).unwrap();
         assert_eq!(
             input.get("native_scroll_macos_to_windows"),
@@ -285,7 +314,7 @@ mod tests {
             migrate_main_config("version = 2\n[input]\nblock_switch_on_press = true\n").unwrap();
         assert!(migration.migrated);
         let table = migration.document.as_table().unwrap();
-        assert_eq!(table.get("version").and_then(toml::Value::as_integer), Some(3));
+        assert_eq!(table.get("version").and_then(toml::Value::as_integer), Some(4));
         let input = table.get("input").and_then(toml::Value::as_table).unwrap();
         assert_eq!(
             input.get("filter_app_events"),
@@ -298,6 +327,26 @@ mod tests {
     }
 
     #[test]
+    fn main_v3_adds_update_and_dock_fields() {
+        let migration = migrate_main_config("version = 3\n[ui]\nstart_hidden = true\n").unwrap();
+        assert!(migration.migrated);
+        let table = migration.document.as_table().unwrap();
+        assert_eq!(table.get("version").and_then(toml::Value::as_integer), Some(4));
+        let ui = table.get("ui").and_then(toml::Value::as_table).unwrap();
+        assert_eq!(
+            ui.get("hide_dock_when_hidden"),
+            Some(&toml::Value::Boolean(true))
+        );
+        assert_eq!(ui.get("start_hidden"), Some(&toml::Value::Boolean(true)));
+        let update = table.get("update").and_then(toml::Value::as_table).unwrap();
+        assert_eq!(update.get("auto_check"), Some(&toml::Value::Boolean(true)));
+        assert_eq!(
+            update.get("skipped_version"),
+            Some(&toml::Value::String(String::new()))
+        );
+    }
+
+    #[test]
     fn gui_state_requires_a_version() {
         assert!(migrate_gui_state("first_run_completed = false\n").is_err());
     }
@@ -306,6 +355,6 @@ mod tests {
     fn future_versions_are_rejected() {
         assert!(migrate_identity("version = 2\n").is_err());
         assert!(migrate_trusted_devices("version = 2\n").is_err());
-        assert!(migrate_main_config("version = 4\n").is_err());
+        assert!(migrate_main_config("version = 5\n").is_err());
     }
 }

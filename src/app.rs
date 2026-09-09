@@ -5832,6 +5832,7 @@ mod tests {
             notifications: NotificationConfig::default(),
             discovery: DiscoveryConfig::default(),
             ui: crate::config::UiConfig::default(),
+            update: crate::config::UpdateConfig::default(),
             gui_state: crate::config::GuiState::default(),
             runtime: crate::config::RuntimeConfig::default(),
             trusted_devices,

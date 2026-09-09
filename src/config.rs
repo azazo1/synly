@@ -6,6 +6,7 @@ mod store;
 pub use schema::{
     ClipboardConfig, DeviceConfig, DiscoveryConfig, InputConfig, LndDiscoveryConfig,
     GuiState, RuntimeConfig, SynlyConfig, TransferConfig, TrustedDeviceConfig, UiConfig,
+    UpdateConfig,
 };
 #[cfg(test)]
 pub use schema::NotificationConfig;

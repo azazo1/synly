@@ -2,9 +2,9 @@ use super::identity::{generate_keypair, validate_keypair};
 use super::migrations;
 use super::schema::{
     ClipboardConfig, DeviceConfig, DiscoveryConfig, GuiState, InputConfig, NotificationConfig,
-    RuntimeConfig, SynlyConfig, TransferConfig, TrustedDeviceConfig, UiConfig,
+    RuntimeConfig, SynlyConfig, TransferConfig, TrustedDeviceConfig, UiConfig, UpdateConfig,
 };
-use crate::path_expand::home_dir;
+
 use crate::settings::{
     AudioMode, ClipboardMode, ConnectionPreference, FileSyncMode, InitialSyncMode,
 };
@@ -31,6 +31,7 @@ struct MainConfigFile {
     notifications: NotificationConfig,
     discovery: DiscoveryConfig,
     ui: UiConfig,
+    update: UpdateConfig,
     runtime: RuntimeFileConfig,
     input: InputConfig,
     /// 首选活跃设备, 旧配置缺失时按无处理.
@@ -221,6 +222,7 @@ impl MainConfigFile {
             notifications: NotificationConfig::default(),
             discovery: DiscoveryConfig::default(),
             ui: UiConfig::default(),
+            update: UpdateConfig::default(),
             runtime: RuntimeFileConfig::default(),
             input: InputConfig::default(),
             preferred_active: None,
@@ -245,6 +247,7 @@ impl MainConfigFile {
             notifications: self.notifications,
             discovery: self.discovery,
             ui: self.ui,
+            update: self.update,
             gui_state,
             runtime: self.runtime.into_runtime(self.input),
             trusted_devices,
@@ -265,6 +268,7 @@ impl From<&SynlyConfig> for MainConfigFile {
             notifications: config.notifications.clone(),
             discovery: config.discovery.clone(),
             ui: config.ui.clone(),
+            update: config.update.clone(),
             runtime: RuntimeFileConfig::from(&config.runtime),
             input: config.runtime.input.clone(),
             preferred_active: config.preferred_active,
@@ -504,8 +508,7 @@ fn replace_file(source: &Path, destination: &Path) -> Result<()> {
 }
 
 fn config_dir() -> Result<PathBuf> {
-    let home = home_dir().context("unable to determine home directory")?;
-    Ok(Path::new(&home).join(".config").join("synly"))
+    crate::paths::config_dir()
 }
 
 fn detect_device_name(device_id: Uuid) -> String {
@@ -552,7 +555,7 @@ mod tests {
         assert_eq!(reloaded.gui_state, config.gui_state);
         assert!(fs::read_to_string(dir.join(CONFIG_FILE_NAME))
             .unwrap()
-            .contains("version = 3"));
+            .contains("version = 4"));
         assert!(fs::read_to_string(dir.join(GUI_STATE_FILE_NAME))
             .unwrap()
             .contains("version = 1"));
@@ -610,7 +613,7 @@ mod tests {
 
         let main: toml::Value =
             toml::from_str(&fs::read_to_string(dir.join(CONFIG_FILE_NAME)).unwrap()).unwrap();
-        assert_eq!(main["version"].as_integer(), Some(3));
+        assert_eq!(main["version"].as_integer(), Some(4));
         assert!(!main["ui"].as_table().unwrap().contains_key("first_run_completed"));
         assert!(!main["ui"].as_table().unwrap().contains_key("window_width"));
         assert!(!main["ui"].as_table().unwrap().contains_key("window_height"));
@@ -681,7 +684,7 @@ mod tests {
         assert_eq!(loaded.gui_state.window_height, 700);
         let main: toml::Value =
             toml::from_str(&fs::read_to_string(dir.join(CONFIG_FILE_NAME)).unwrap()).unwrap();
-        assert_eq!(main["version"].as_integer(), Some(3));
+        assert_eq!(main["version"].as_integer(), Some(4));
         assert!(!main["ui"].as_table().unwrap().contains_key("window_width"));
         cleanup_dir(&dir);
     }

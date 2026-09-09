@@ -4,7 +4,11 @@ param(
 
     [string]$OutputDir = "dist",
 
-    [string]$Version
+    [string]$Version,
+
+    [string]$Arch,
+
+    [switch]$Fake
 )
 
 Set-StrictMode -Version Latest
@@ -35,6 +39,18 @@ function Resolve-Version {
     return [string]$package.version
 }
 
+function Resolve-Arch {
+    param([string]$RequestedArch)
+
+    if (-not [string]::IsNullOrWhiteSpace($RequestedArch)) {
+        return $RequestedArch
+    }
+    if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") {
+        return "aarch64"
+    }
+    return "x86_64"
+}
+
 $binaryPath = [IO.Path]::GetFullPath($Binary)
 if (-not (Test-Path -LiteralPath $binaryPath -PathType Leaf)) {
     throw "Windows executable does not exist: $binaryPath"
@@ -46,10 +62,18 @@ if ($header.Length -lt 2 -or $header[0] -ne 0x4D -or $header[1] -ne 0x5A) {
 }
 
 $resolvedVersion = Resolve-Version $Version
+$resolvedArch = Resolve-Arch $Arch
+$suffix = ""
+if ($Fake -or $env:SYNLY_FAKE_DIST -eq "1" -or $env:SYNLY_FAKE_DIST -eq "true") {
+    $suffix = "-fake"
+}
 $resolvedOutputDir = [IO.Path]::GetFullPath($OutputDir)
 New-Item -ItemType Directory -Force -Path $resolvedOutputDir | Out-Null
-$archive = Join-Path $resolvedOutputDir "synly-$resolvedVersion-windows-x86_64.zip"
+$archive = Join-Path $resolvedOutputDir "synly-$resolvedVersion-windows-$resolvedArch$suffix.zip"
 Write-Step "Creating $archive"
+if (Test-Path -LiteralPath $archive -PathType Leaf) {
+    Remove-Item -LiteralPath $archive -Force
+}
 Compress-Archive -LiteralPath $binaryPath -DestinationPath $archive -Force
 if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) {
     throw "Windows distribution archive creation failed: $archive"

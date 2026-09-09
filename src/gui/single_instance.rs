@@ -1,12 +1,13 @@
 use anyhow::{Context, Result, bail};
+use sha2::{Digest, Sha256};
 use slint::Weak;
 use std::io::{ErrorKind, Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
-use uuid::Uuid;
 
 use super::AppWindow;
 
@@ -24,21 +25,28 @@ pub struct SingleInstanceGuard {
 }
 
 impl SingleInstance {
-    pub fn acquire(device_id: Uuid) -> Result<Self> {
-        let address = activation_address(device_id);
-        match TcpListener::bind(address) {
-            Ok(listener) => {
-                listener
-                    .set_nonblocking(true)
-                    .context("failed to configure single instance listener")?;
-                Ok(Self::Primary(listener))
+    pub fn acquire(data_dir: &Path) -> Result<Self> {
+        let address = activation_address(data_dir);
+        for attempt in 0..8 {
+            match TcpListener::bind(address) {
+                Ok(listener) => {
+                    listener
+                        .set_nonblocking(true)
+                        .context("failed to configure single instance listener")?;
+                    return Ok(Self::Primary(listener));
+                }
+                Err(error) if error.kind() == ErrorKind::AddrInUse => {
+                    if attempt + 1 < 8 && !probe_existing(address) {
+                        thread::sleep(Duration::from_millis(150));
+                        continue;
+                    }
+                    activate_existing(address)?;
+                    return Ok(Self::ActivatedExisting);
+                }
+                Err(error) => return Err(error).context("failed to create single instance listener"),
             }
-            Err(error) if error.kind() == ErrorKind::AddrInUse => {
-                activate_existing(address)?;
-                Ok(Self::ActivatedExisting)
-            }
-            Err(error) => Err(error).context("failed to create single instance listener"),
         }
+        bail!("single instance lock is busy")
     }
 }
 
@@ -66,11 +74,18 @@ impl Drop for SingleInstanceGuard {
     }
 }
 
-fn activation_address(device_id: Uuid) -> SocketAddrV4 {
-    let bytes = device_id.as_bytes();
-    let seed = u16::from_be_bytes([bytes[0], bytes[1]]);
+fn activation_address(data_dir: &Path) -> SocketAddrV4 {
+    let mut hasher = Sha256::new();
+    hasher.update(b"synly-single-instance-v1");
+    hasher.update(data_dir.to_string_lossy().as_bytes());
+    let hash = hasher.finalize();
+    let seed = u16::from_be_bytes([hash[0], hash[1]]);
     let port = 49_152 + seed % 10_000;
     SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)
+}
+
+fn probe_existing(address: SocketAddrV4) -> bool {
+    TcpStream::connect_timeout(&address.into(), Duration::from_millis(200)).is_ok()
 }
 
 fn activate_existing(address: SocketAddrV4) -> Result<()> {
@@ -78,7 +93,10 @@ fn activate_existing(address: SocketAddrV4) -> Result<()> {
         .context("single instance port is occupied but the existing Synly process did not respond")?;
     stream.set_read_timeout(Some(Duration::from_secs(1)))?;
     stream.set_write_timeout(Some(Duration::from_secs(1)))?;
+    let args = std::env::args().skip(1).collect::<Vec<_>>().join("\0");
     stream.write_all(ACTIVATE_REQUEST)?;
+    stream.write_all(args.as_bytes())?;
+    stream.write_all(b"\n")?;
     stream.flush()?;
     let mut response = [0u8; ACTIVATE_RESPONSE.len()];
     stream.read_exact(&mut response)?;
@@ -118,24 +136,30 @@ fn activation_loop(listener: TcpListener, window: Weak<AppWindow>, stop: Arc<Ato
 fn handle_activation(stream: &mut TcpStream) -> bool {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
-    let mut request = [0u8; ACTIVATE_REQUEST.len()];
-    if stream.read_exact(&mut request).is_err() || request != ACTIVATE_REQUEST {
+    let mut header = [0u8; ACTIVATE_REQUEST.len()];
+    if stream.read_exact(&mut header).is_err() || header != ACTIVATE_REQUEST {
         return false;
     }
+    let mut rest = Vec::new();
+    let _ = stream.read_to_end(&mut rest);
     stream.write_all(ACTIVATE_RESPONSE).is_ok() && stream.flush().is_ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::activation_address;
-    use uuid::Uuid;
+    use std::path::Path;
 
     #[test]
     fn activation_port_is_stable_and_unprivileged() {
-        let device_id = Uuid::parse_str("12345678-1234-5678-1234-567812345678").unwrap();
-        let address = activation_address(device_id);
+        let path = Path::new("/tmp/synly-debug-data");
+        let address = activation_address(path);
         assert_eq!(address.ip(), &std::net::Ipv4Addr::LOCALHOST);
         assert!((49_152..59_152).contains(&address.port()));
-        assert_eq!(address, activation_address(device_id));
+        assert_eq!(address, activation_address(path));
+        assert_ne!(
+            address,
+            activation_address(Path::new("/tmp/synly-other-data"))
+        );
     }
 }

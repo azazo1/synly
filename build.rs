@@ -23,6 +23,7 @@ fn main() {
     println!("cargo:rerun-if-changed=assets/windows/synly.ico");
     slint_build::compile("ui/app.slint").expect("failed to compile Slint UI");
     emit_build_version();
+    emit_fake_dist_cfg();
     for key in [
         "OPUS_DIR",
         "OPUS_LIB_DIR",
@@ -44,18 +45,33 @@ fn main() {
     }
 }
 
-/// 输出构建版本, Rust 侧通过 SYNLY_BUILD_VERSION 环境变量读取.
-///
-/// 版本格式遵循发布约定:
-/// - 构建 commit 恰好是某个版本 tag 时, 直接显示该 tag, 例如 v1.2.3.
-/// - 非 tag commit 时, 在最近版本 tag 后追加 - 和 6 位短 hash, 例如 v1.2.3-a1b2c3.
-/// - 工作区有未提交改动时, 改用 ^ 分隔, 例如 v1.2.3^a1b2c3.
+/// 把 `SYNLY_BUILD_VERSION` 注入编译产物. 未设置时为 `dev-build`, 不读取 `.git`.
+/// 发布路径由 `scripts/build-version.sh` 或 CI 计算后写入该环境变量.
 fn emit_build_version() {
-    println!(
-        "cargo:rustc-env=SYNLY_BUILD_VERSION={}",
-        synly_build_version::build_version_string()
-    );
-    synly_build_version::emit_git_rerun_if_changed();
+    println!("cargo:rerun-if-env-changed=SYNLY_BUILD_VERSION");
+    let version = env::var("SYNLY_BUILD_VERSION")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "dev-build".to_string());
+    println!("cargo:rustc-env=SYNLY_BUILD_VERSION={version}");
+}
+
+fn emit_fake_dist_cfg() {
+    println!("cargo:rerun-if-env-changed=SYNLY_FAKE_DIST");
+    println!("cargo:rustc-check-cfg=cfg(synly_fake_dist)");
+    if env_flag_enabled("SYNLY_FAKE_DIST") {
+        println!("cargo:rustc-cfg=synly_fake_dist");
+    }
+}
+
+fn env_flag_enabled(key: &str) -> bool {
+    match env::var(key) {
+        Ok(value) => {
+            !matches!(value.trim().to_ascii_lowercase().as_str(), "" | "0" | "false" | "no" | "off")
+        }
+        Err(_) => false,
+    }
 }
 
 #[cfg(windows)]

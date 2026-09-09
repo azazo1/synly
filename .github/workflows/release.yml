@@ -30,6 +30,7 @@ jobs:
       source_ref: ${{ steps.release_context.outputs.source_ref }}
       project_version: ${{ steps.project_version.outputs.version }}
       version: ${{ steps.release_version.outputs.version }}
+      build_version: ${{ steps.build_version.outputs.build_version }}
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -103,6 +104,27 @@ jobs:
           fi
           printf 'version=%s\n' "$PROJECT_VERSION" >> "$GITHUB_OUTPUT"
 
+      - name: 解析构建版本
+        id: build_version
+        env:
+          IS_RELEASE: ${{ steps.release_context.outputs.is_release }}
+          PROJECT_VERSION: ${{ steps.project_version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$IS_RELEASE" == true ]]; then
+            printf 'build_version=%s\n' "$PROJECT_VERSION" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          short="$(git rev-parse --short=7 HEAD)"
+          latest="$(git describe --tags --abbrev=0 2>/dev/null || true)"
+          if [[ -n "$latest" ]]; then
+            base="${latest#v}"
+          else
+            base="$PROJECT_VERSION"
+          fi
+          printf 'build_version=%s-%s\n' "$base" "$short" >> "$GITHUB_OUTPUT"
+
   build:
     needs: version
     runs-on: ${{ matrix.runner }}
@@ -114,22 +136,22 @@ jobs:
             arch: x86_64
             target: x86_64-unknown-linux-gnu
             runner: ubuntu-24.04
-            package: false
+          - platform: linux
+            arch: aarch64
+            target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
           - platform: windows
             arch: x86_64
             target: x86_64-pc-windows-msvc
             runner: windows-2025
-            package: true
           - platform: macos
             arch: x86_64
             target: x86_64-apple-darwin
             runner: macos-15-intel
-            package: true
           - platform: macos
             arch: aarch64
             target: aarch64-apple-darwin
             runner: macos-15
-            package: true
     steps:
       - name: Checkout target ref
         uses: actions/checkout@v4
@@ -176,6 +198,8 @@ jobs:
           sudo apt-get install -y build-essential pkg-config libgtk-3-dev libopus-dev libxdo-dev
 
       - name: Build release binary
+        env:
+          SYNLY_BUILD_VERSION: v${{ needs.version.outputs.build_version }}
         shell: bash
         run: cargo build --locked --release --target "${{ matrix.target }}"
 
@@ -188,36 +212,64 @@ jobs:
           test -x "$binary"
           file "$binary" | grep -q 'ELF'
 
-      - name: Package Windows archive
-        if: matrix.platform == 'windows' && (needs.version.outputs.is_release == 'true' || github.event_name == 'workflow_dispatch')
+      - name: Package Linux archive
+        if: matrix.platform == 'linux'
         env:
-          PACKAGE_VERSION: ${{ needs.version.outputs.version || needs.version.outputs.project_version }}
+          PACKAGE_VERSION: ${{ needs.version.outputs.build_version }}
+        shell: bash
+        run: bash scripts/package-linux.sh "$PACKAGE_VERSION" "${{ matrix.target }}" dist
+
+      - name: Package Windows archive
+        if: matrix.platform == 'windows'
+        env:
+          PACKAGE_VERSION: ${{ needs.version.outputs.build_version }}
         shell: pwsh
         run: |
           $binary = "target/${{ matrix.target }}/release/synly.exe"
-          & "$PWD/scripts/package-windows.ps1" -Binary $binary -OutputDir dist -Version $env:PACKAGE_VERSION
+          & "$PWD/scripts/package-windows.ps1" -Binary $binary -OutputDir dist -Version $env:PACKAGE_VERSION -Arch "${{ matrix.arch }}"
 
       - name: Package macOS application
-        if: matrix.platform == 'macos' && (needs.version.outputs.is_release == 'true' || github.event_name == 'workflow_dispatch')
+        if: matrix.platform == 'macos'
         env:
-          PACKAGE_VERSION: ${{ needs.version.outputs.version || needs.version.outputs.project_version }}
+          PACKAGE_VERSION: ${{ needs.version.outputs.build_version }}
         shell: bash
         run: bash scripts/package-macos.sh "$PACKAGE_VERSION" "${{ matrix.target }}" dist
 
-      - name: Upload Windows artifact
-        if: matrix.platform == 'windows' && (needs.version.outputs.is_release == 'true' || github.event_name == 'workflow_dispatch')
+      - name: 校验 dmg 包含 Applications 替身与应用包
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          dmg="$(ls dist/synly-*.dmg)"
+          mount_point="$(mktemp -d)"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount_point" "$dmg"
+          trap 'hdiutil detach "$mount_point" >/dev/null 2>&1 || true' EXIT
+          test -L "$mount_point/Applications"
+          test -d "$mount_point/Synly.app"
+
+      - name: Upload Linux artifact
+        if: matrix.platform == 'linux'
         uses: actions/upload-artifact@v4
         with:
-          name: synly-${{ matrix.platform }}-${{ matrix.arch }}
+          name: synly-${{ needs.version.outputs.build_version }}-${{ matrix.platform }}-${{ matrix.arch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Windows artifact
+        if: matrix.platform == 'windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: synly-${{ needs.version.outputs.build_version }}-${{ matrix.platform }}-${{ matrix.arch }}
           path: dist/*.zip
           if-no-files-found: error
           retention-days: 14
 
       - name: Upload macOS artifact
-        if: matrix.platform == 'macos' && (needs.version.outputs.is_release == 'true' || github.event_name == 'workflow_dispatch')
+        if: matrix.platform == 'macos'
         uses: actions/upload-artifact@v4
         with:
-          name: synly-${{ matrix.platform }}-${{ matrix.arch }}
+          name: synly-${{ needs.version.outputs.build_version }}-${{ matrix.platform }}-${{ matrix.arch }}
           path: dist/*.dmg
           if-no-files-found: error
           retention-days: 14
@@ -265,6 +317,7 @@ jobs:
       - name: Build core library
         env:
           ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/28.2.13676358
+          SYNLY_BUILD_VERSION: v${{ needs.version.outputs.build_version }}
         run: |
           cargo ndk -t arm64-v8a -o android/app/src/main/jniLibs build --locked --release --features uniffi -p synly-core
 
@@ -300,9 +353,9 @@ jobs:
         run: ./gradlew assembleRelease
 
       - name: Prepare debug APK artifact
-        if: github.event_name == 'workflow_dispatch' && needs.version.outputs.is_release != 'true'
+        if: needs.version.outputs.is_release != 'true'
         env:
-          PACKAGE_VERSION: ${{ needs.version.outputs.project_version }}
+          PACKAGE_VERSION: ${{ needs.version.outputs.build_version }}
         shell: bash
         run: |
           set -euo pipefail
@@ -314,7 +367,7 @@ jobs:
       - name: Prepare release APK artifact
         if: needs.version.outputs.is_release == 'true'
         env:
-          PACKAGE_VERSION: ${{ needs.version.outputs.version }}
+          PACKAGE_VERSION: ${{ needs.version.outputs.build_version }}
         shell: bash
         run: |
           set -euo pipefail
@@ -324,10 +377,9 @@ jobs:
           "$ANDROID_HOME/build-tools/36.0.0/apksigner" verify --print-certs "dist/synly-$PACKAGE_VERSION-android-arm64.apk" >/dev/null
 
       - name: Upload APK artifact
-        if: needs.version.outputs.is_release == 'true' || github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
-          name: synly-android
+          name: synly-${{ needs.version.outputs.build_version }}-android-arm64
           path: dist/synly-*.apk
           if-no-files-found: error
           retention-days: 14
@@ -394,7 +446,7 @@ jobs:
         run: |
           set -euo pipefail
           notes="docs/changelog/$VERSION.md"
-          target_sha="$(git rev-parse "refs/tags/$TAG_NAME^{commit}")"
+          target_sha="$(git rev-parse HEAD)"
           api_args=(
             --method POST
             "repos/$GITHUB_REPOSITORY/releases/generate-notes"
@@ -410,7 +462,7 @@ jobs:
           gh api "${api_args[@]}" --jq '.body' > generated-notes.md
           cp "$notes" release-notes.md
           if [[ -s generated-notes.md ]]; then
-            printf '\n\n' >> release-notes.md
+            printf '\n---\n\n' >> release-notes.md
             cat generated-notes.md >> release-notes.md
           fi
 
@@ -427,10 +479,10 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           cd release-artifacts
-          archives=(synly-*.zip synly-*.dmg)
+          archives=(synly-*.zip synly-*.dmg synly-*.tar.gz)
           apks=(synly-*.apk)
-          if (( ${#archives[@]} != 3 )); then
-            printf 'expected 3 archives, found %s\n' "${#archives[@]}" >&2
+          if (( ${#archives[@]} != 5 )); then
+            printf 'expected 5 archives, found %s\n' "${#archives[@]}" >&2
             exit 1
           fi
           if (( ${#apks[@]} != 1 )); then
@@ -451,11 +503,12 @@ jobs:
           assets=(
             release-artifacts/synly-*.zip
             release-artifacts/synly-*.dmg
+            release-artifacts/synly-*.tar.gz
             release-artifacts/synly-*.apk
             release-artifacts/SHA256SUMS
           )
-          if (( ${#assets[@]} != 5 )); then
-            printf 'expected 5 release assets, found %s\n' "${#assets[@]}" >&2
+          if (( ${#assets[@]} != 7 )); then
+            printf 'expected 7 release assets, found %s\n' "${#assets[@]}" >&2
             exit 1
           fi
           prerelease_args=()

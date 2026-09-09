@@ -325,6 +325,7 @@ mod tests {
             notifications: NotificationConfig::default(),
             discovery: DiscoveryConfig::default(),
             ui: UiConfig::default(),
+            update: crate::config::UpdateConfig::default(),
             gui_state: GuiState::default(),
             runtime: RuntimeConfig::default(),
             trusted_devices: Vec::new(),

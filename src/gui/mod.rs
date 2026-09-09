@@ -3,6 +3,7 @@ use crate::config::{
     TransferConfig, UiConfig,
 };
 use crate::core::{AppCommand, AppSettings, AppSnapshot, AppSupervisor};
+use crate::update::{self, UpdateHandle, UpdatePhase, UpdateRestartAction, UpdateSnapshot};
 use crate::input::{CursorMode, InputMode, InputPlatform, ScreenEdge};
 use crate::runtime_control::{InteractionRequest, InteractionResponse};
 use crate::runtime_options::normalize_pin;
@@ -31,11 +32,19 @@ const MIN_WINDOW_HEIGHT: f32 = 560.0;
 const MAX_WINDOW_WIDTH: f32 = 1180.0;
 const MAX_WINDOW_HEIGHT: f32 = 760.0;
 
-pub fn run(config: SynlyConfig, force_start: bool) -> Result<()> {
-    let single_instance = single_instance::SingleInstance::acquire(config.device.device_id)?;
+pub enum GuiExit {
+    Quit,
+    Restart { exe: PathBuf },
+}
+
+pub fn run(config: SynlyConfig, force_start: bool) -> Result<GuiExit> {
+    let data_dir = crate::paths::data_dir()?;
+    std::fs::create_dir_all(&data_dir)
+        .with_context(|| format!("无法创建数据目录 {}", data_dir.display()))?;
+    let single_instance = single_instance::SingleInstance::acquire(&data_dir)?;
     let listener = match single_instance {
         single_instance::SingleInstance::Primary(listener) => listener,
-        single_instance::SingleInstance::ActivatedExisting => return Ok(()),
+        single_instance::SingleInstance::ActivatedExisting => return Ok(GuiExit::Quit),
     };
     #[cfg(windows)]
     if config.runtime.input.elevate_on_start {
@@ -53,16 +62,29 @@ pub fn run(config: SynlyConfig, force_start: bool) -> Result<()> {
     let window = AppWindow::new().context("failed to create Slint main window")?;
     window.set_monospace_font_family(system_monospace_font_family().into());
     window.set_about_version(crate::BUILD_VERSION.into());
+    window.set_macos_dock_setting_visible(cfg!(target_os = "macos"));
     window.window().set_size(restored_window_size(&config.gui_state));
     let _single_instance_guard =
         single_instance::SingleInstanceGuard::start(listener, window.as_weak())?;
-    let tray = tray::TrayController::new(&window, &handle);
+    macos_dock::set_follow_window(config.ui.hide_dock_when_hidden);
+    let persist_commands = handle.commands();
+    let update = update::start(
+        &runtime,
+        crate::BUILD_VERSION.to_string(),
+        config.update.clone(),
+        Arc::new(move |update_config| {
+            send_command(&persist_commands, AppCommand::SaveUpdateConfig(update_config));
+        }),
+    )?;
+    let restart_action = Arc::new(Mutex::new(None::<UpdateRestartAction>));
+    let tray = tray::TrayController::new(&window, &handle, update.clone(), crate::BUILD_VERSION);
     apply_settings_to_window(
         &window,
         &config.runtime,
         &AppSettings::from_config(&config),
     );
     apply_snapshot(&window, &handle.snapshots().borrow(), None);
+    apply_update_snapshot(&window, &update.snapshot());
     #[cfg(target_os = "macos")]
     {
         window.set_input_elevation_hint("鼠标键盘控制需要辅助功能权限".into());
@@ -71,7 +93,21 @@ pub fn run(config: SynlyConfig, force_start: bool) -> Result<()> {
 
     let current_interaction = Arc::new(Mutex::new(None::<Uuid>));
     wire_window_callbacks(&window, &handle, Arc::clone(&current_interaction));
+    wire_update_callbacks(&window, &update, Arc::clone(&restart_action), &handle);
     wire_close_to_tray(&window, &handle);
+    {
+        let window = window.as_weak();
+        macos_dock::install_reopen_handler(move || {
+            let window = window.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(window) = window.upgrade()
+                    && let Err(error) = show_main_window(&window)
+                {
+                    tracing::warn!(error = %error, "无法从 Dock 重新打开主窗口");
+                }
+            });
+        });
+    }
     spawn_snapshot_presenter(
         &runtime,
         &window,
@@ -80,6 +116,7 @@ pub fn run(config: SynlyConfig, force_start: bool) -> Result<()> {
         tray.state_sink(),
     );
     spawn_log_presenter(&runtime, &window);
+    spawn_update_presenter(&runtime, &window, update.subscribe(), tray.state_sink(), Arc::clone(&restart_action), handle.commands());
     spawn_ctrl_c_handler(&runtime, handle.commands());
     #[cfg(target_os = "macos")]
     {
@@ -96,8 +133,10 @@ pub fn run(config: SynlyConfig, force_start: bool) -> Result<()> {
     } else {
         let window = window.as_weak();
         let hide_dock_timer = slint::Timer::default();
+        let follow_dock = config.ui.hide_dock_when_hidden;
         hide_dock_timer.start(slint::TimerMode::SingleShot, Duration::ZERO, move || {
             if window.upgrade().is_some() {
+                macos_dock::set_follow_window(follow_dock);
                 macos_dock::set_dock_visible(false);
             }
         });
@@ -107,7 +146,15 @@ pub fn run(config: SynlyConfig, force_start: bool) -> Result<()> {
     save_window_state(&window, &handle.commands());
     let _ = handle.commands().try_send(AppCommand::Shutdown);
     runtime.shutdown_timeout(std::time::Duration::from_secs(5));
-    Ok(())
+    let action = restart_action
+        .lock()
+        .ok()
+        .map(|guard| (*guard).clone())
+        .flatten();
+    match action {
+        Some(UpdateRestartAction::Relaunch { exe }) => Ok(GuiExit::Restart { exe }),
+        Some(UpdateRestartAction::QuitOnly) | None => Ok(GuiExit::Quit),
+    }
 }
 
 fn system_monospace_font_family() -> &'static str {
@@ -237,6 +284,7 @@ fn wire_window_callbacks(
                         window.set_sync_delete(false);
                         return;
                     }
+                    macos_dock::set_follow_window(window.get_hide_dock_when_hidden());
                     send_command(
                         &commands,
                         AppCommand::ApplySettings {
@@ -405,6 +453,182 @@ fn wire_window_callbacks(
     });
 }
 
+fn wire_update_callbacks(
+    window: &AppWindow,
+    update: &UpdateHandle,
+    restart_action: Arc<Mutex<Option<UpdateRestartAction>>>,
+    handle: &crate::core::AppSupervisorHandle,
+) {
+    let update_handle = update.clone();
+    let weak = window.as_weak();
+    window.on_open_update_window(move || {
+        update_handle.check(true);
+        if let Some(window) = weak.upgrade() {
+            window.set_update_window_visible(true);
+            apply_update_snapshot(&window, &update_handle.snapshot());
+        }
+    });
+
+    let update_handle = update.clone();
+    window.on_check_update(move || {
+        update_handle.check(true);
+    });
+
+    let update_handle = update.clone();
+    window.on_start_update(move || {
+        update_handle.download();
+    });
+
+    let update_handle = update.clone();
+    window.on_cancel_update(move || {
+        update_handle.cancel_download();
+    });
+
+    let update_handle = update.clone();
+    window.on_skip_update(move || {
+        update_handle.skip_current();
+    });
+
+    let update_handle = update.clone();
+    let restart_action = Arc::clone(&restart_action);
+    let commands = handle.commands();
+    let weak = window.as_weak();
+    window.on_restart_for_update(move || {
+        if let Some(action) = update_handle.install() {
+            if let Ok(mut slot) = restart_action.lock() {
+                *slot = Some(action);
+            }
+            if let Some(window) = weak.upgrade() {
+                save_window_state(&window, &commands);
+            }
+            send_command(&commands, AppCommand::Shutdown);
+            let _ = slint::quit_event_loop();
+        }
+    });
+
+    let update_handle = update.clone();
+    window.on_open_release_page(move || {
+        update_handle.open_release_page();
+    });
+
+    let weak = window.as_weak();
+    window.on_close_update_window(move || {
+        if let Some(window) = weak.upgrade() {
+            window.set_update_window_visible(false);
+        }
+    });
+
+    let update_handle = update.clone();
+    window.on_auto_check_changed(move |enabled| {
+        update_handle.set_auto_check(enabled);
+    });
+}
+
+fn spawn_update_presenter(
+    runtime: &tokio::runtime::Runtime,
+    window: &AppWindow,
+    mut snapshots: tokio::sync::watch::Receiver<UpdateSnapshot>,
+    tray_state: tray::TrayStateSink,
+    restart_action: Arc<Mutex<Option<UpdateRestartAction>>>,
+    commands: tokio::sync::mpsc::Sender<AppCommand>,
+) {
+    let window = window.as_weak();
+    runtime.spawn(async move {
+        loop {
+            if snapshots.changed().await.is_err() {
+                break;
+            }
+            let snapshot = snapshots.borrow().clone();
+            tray_state.apply_auto_check(snapshot.auto_check);
+            let handed_off = snapshot.phase == UpdatePhase::HandedOff;
+            let window_weak = window.clone();
+            let restart_action = Arc::clone(&restart_action);
+            let commands = commands.clone();
+            let _ = slint::invoke_from_event_loop(move || {
+                let Some(window) = window_weak.upgrade() else {
+                    return;
+                };
+                apply_update_snapshot(&window, &snapshot);
+                if handed_off {
+                    if let Ok(mut slot) = restart_action.lock() {
+                        *slot = Some(UpdateRestartAction::QuitOnly);
+                    }
+                    save_window_state(&window, &commands);
+                    send_command(&commands, AppCommand::Shutdown);
+                    let _ = slint::quit_event_loop();
+                }
+            });
+        }
+    });
+}
+
+fn apply_update_snapshot(window: &AppWindow, snapshot: &UpdateSnapshot) {
+    let link = snapshot.status_bar_is_link();
+    window.set_status_version_is_link(link);
+    window.set_about_version(snapshot.status_bar_text().into());
+    window.set_auto_check_update(snapshot.auto_check);
+    window.set_update_status_text(update_status_text(snapshot).into());
+    window.set_update_notes(snapshot.release_notes.clone().into());
+    window.set_update_progress(snapshot.progress());
+    window.set_update_progress_text(update_progress_text(snapshot).into());
+    window.set_update_error_text(snapshot.error_text.clone().into());
+    let handed_off = snapshot.phase == UpdatePhase::HandedOff;
+    window.set_update_busy(matches!(
+        snapshot.phase,
+        UpdatePhase::Checking | UpdatePhase::Downloading | UpdatePhase::HandedOff
+    ));
+    window.set_update_show_download(snapshot.phase == UpdatePhase::Available && !handed_off);
+    window.set_update_show_cancel(snapshot.phase == UpdatePhase::Downloading);
+    window.set_update_show_skip(snapshot.phase == UpdatePhase::Available);
+    window.set_update_show_restart(snapshot.phase == UpdatePhase::ReadyToRestart);
+    window.set_update_show_retry(matches!(
+        snapshot.phase,
+        UpdatePhase::Failed | UpdatePhase::UpToDate | UpdatePhase::Idle
+    ));
+    window.set_update_show_release_link(snapshot.release_url.is_some() && !handed_off);
+    if handed_off {
+        window.set_update_window_visible(true);
+    }
+}
+
+fn update_status_text(snapshot: &UpdateSnapshot) -> String {
+    if !snapshot.apply_message.is_empty() {
+        return snapshot.apply_message.clone();
+    }
+    match snapshot.phase {
+        UpdatePhase::Idle => "尚未检查更新".to_string(),
+        UpdatePhase::Checking => "正在检查更新...".to_string(),
+        UpdatePhase::UpToDate => "当前已是最新版本".to_string(),
+        UpdatePhase::Available => snapshot
+            .latest_display
+            .as_ref()
+            .map(|version| format!("发现新版本 {version}"))
+            .unwrap_or_else(|| "发现新版本".to_string()),
+        UpdatePhase::Downloading => "正在下载更新...".to_string(),
+        UpdatePhase::ReadyToRestart => "更新已就绪, 重启后生效".to_string(),
+        UpdatePhase::HandedOff => "正在退出并替换, 请勿手动关闭进程".to_string(),
+        UpdatePhase::DmgOpened => "已打开安装镜像, 请拖拽安装后重启".to_string(),
+        UpdatePhase::Failed => "检查或安装更新失败".to_string(),
+    }
+}
+
+fn update_progress_text(snapshot: &UpdateSnapshot) -> String {
+    if snapshot.phase != UpdatePhase::Downloading {
+        return String::new();
+    }
+    match snapshot.total_bytes {
+        Some(total) => format!(
+            "已下载 {} / {}",
+            synly_core::size::format_human_bytes(snapshot.received_bytes),
+            synly_core::size::format_human_bytes(total)
+        ),
+        None => format!(
+            "已下载 {}",
+            synly_core::size::format_human_bytes(snapshot.received_bytes)
+        ),
+    }
+}
+
 fn wire_close_to_tray(
     window: &AppWindow,
     handle: &crate::core::AppSupervisorHandle,
@@ -417,6 +641,8 @@ fn wire_close_to_tray(
         };
         save_window_state(&window, &commands);
         if window.get_close_to_tray() {
+            macos_dock::set_follow_window(window.get_hide_dock_when_hidden());
+            macos_dock::note_hidden();
             let _ = window.hide();
             macos_dock::set_dock_visible(false);
             CloseRequestResponse::KeepWindowShown
@@ -939,6 +1165,7 @@ fn apply_settings_to_window(
     window.set_notifications_enabled(settings.notifications_enabled);
     window.set_start_hidden(settings.ui.start_hidden);
     window.set_close_to_tray(settings.ui.close_to_tray);
+    window.set_hide_dock_when_hidden(settings.ui.hide_dock_when_hidden);
     window.set_launch_at_login(settings.ui.launch_at_login);
     window.set_resume_last_session(settings.ui.resume_last_session);
     window.set_log_level_index(log_level_index(settings.ui.log_level));
@@ -1055,6 +1282,7 @@ fn settings_from_window(
         start_hidden: window.get_start_hidden(),
         close_to_tray: window.get_close_to_tray(),
         launch_at_login: window.get_launch_at_login(),
+        hide_dock_when_hidden: window.get_hide_dock_when_hidden(),
         resume_last_session: window.get_resume_last_session(),
         log_level: log_level_from_index(window.get_log_level_index()),
     };
