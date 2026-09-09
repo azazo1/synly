@@ -11,10 +11,10 @@ use check::release_page_url;
 use state::{AvailableRelease, InstallOutcome, RestartAction};
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 
 pub use state::{RestartAction as UpdateRestartAction, UpdatePhase, UpdateSnapshot};
 
@@ -37,7 +37,9 @@ struct Inner {
     persist: Arc<dyn Fn(UpdateConfig) + Send + Sync>,
     check_task: Option<JoinHandle<()>>,
     download_task: Option<JoinHandle<()>>,
-    cancel_download: Arc<AtomicBool>,
+    cancel_download: CancellationToken,
+    download_generation: u64,
+    applying: bool,
     restart: Option<RestartAction>,
     client: reqwest::Client,
 }
@@ -92,25 +94,41 @@ impl UpdateHandle {
         if matches!(inner.snapshot.phase, UpdatePhase::Downloading) {
             return;
         }
-        inner.cancel_download.store(false, Ordering::Release);
+        inner.cancel_download = CancellationToken::new();
+        inner.download_generation = inner.download_generation.wrapping_add(1);
+        inner.applying = false;
         inner.snapshot.phase = UpdatePhase::Downloading;
+        inner.snapshot.cancellable = true;
         inner.snapshot.error_text.clear();
         inner.snapshot.received_bytes = 0;
         inner.snapshot.total_bytes = None;
         inner.publish();
         tracing::info!("开始下载更新包");
         let handle = self.clone();
+        let generation = inner.download_generation;
         inner.download_task = Some(self.runtime.spawn(async move {
-            handle.run_download().await;
+            handle.run_download(generation).await;
         }));
     }
 
     pub fn cancel_download(&self) {
-        let inner = self.lock();
-        if inner.snapshot.phase == UpdatePhase::Downloading {
-            tracing::info!("取消更新下载");
-            inner.cancel_download.store(true, Ordering::Release);
+        let mut inner = self.lock();
+        if inner.snapshot.phase != UpdatePhase::Downloading {
+            return;
         }
+        if inner.applying {
+            tracing::debug!("更新已进入安装阶段, 无法取消");
+            return;
+        }
+        tracing::info!("取消更新下载");
+        inner.cancel_download.cancel();
+        if let Some(task) = inner.download_task.take() {
+            task.abort();
+        }
+        inner.snapshot.phase = UpdatePhase::Available;
+        inner.snapshot.cancellable = false;
+        inner.snapshot.error_text.clear();
+        inner.publish();
     }
 
     pub fn skip_current(&self) {
@@ -209,9 +227,12 @@ impl UpdateHandle {
         }
     }
 
-    async fn run_download(&self) {
+    async fn run_download(&self, generation: u64) {
         let (client, available, cancel) = {
             let inner = self.lock();
+            if !inner.is_active_download(generation) {
+                return;
+            }
             let Some(available) = inner.available.clone() else {
                 return;
             };
@@ -220,23 +241,26 @@ impl UpdateHandle {
         let update_dir = match crate::paths::update_dir() {
             Ok(dir) => dir,
             Err(error) => {
-                self.fail(error.to_string());
+                self.fail(generation, error.to_string());
                 return;
             }
         };
         let part_path = update_dir.join(format!("{}.part", available.archive_name));
         let final_path = update_dir.join(&available.archive_name);
-        let sums = match download::download_sha256sums(&client, &available.checksums_url).await {
-            Ok(text) => text,
-            Err(error) => {
-                self.fail(error.to_string());
-                return;
-            }
+        let sums = tokio::select! {
+            _ = cancel.cancelled() => return,
+            result = download::download_sha256sums(&client, &available.checksums_url) => match result {
+                Ok(text) => text,
+                Err(error) => {
+                    self.fail(generation, error.to_string());
+                    return;
+                }
+            },
         };
         let expected = match download::expected_sha256(&sums, &available.archive_name) {
             Ok(value) => value,
             Err(error) => {
-                self.fail(error.to_string());
+                self.fail(generation, error.to_string());
                 return;
             }
         };
@@ -249,67 +273,106 @@ impl UpdateHandle {
             cancel.clone(),
             move |progress| {
                 let mut inner = handle.lock();
+                if !inner.is_active_download(generation) {
+                    return;
+                }
                 inner.snapshot.received_bytes = progress.received;
                 inner.snapshot.total_bytes = progress.total;
                 inner.publish();
             },
         )
         .await;
-        if cancel.load(Ordering::Acquire) {
-            let mut inner = self.lock();
-            inner.snapshot.phase = UpdatePhase::Available;
-            inner.publish();
+        if cancel.is_cancelled() || !self.is_active_download(generation) {
             return;
         }
         if let Err(error) = download {
-            if cancel.load(Ordering::Acquire) {
-                let mut inner = self.lock();
-                inner.snapshot.phase = UpdatePhase::Available;
-                inner.publish();
-                return;
-            }
-            self.fail(error.to_string());
+            self.fail(generation, error.to_string());
             return;
         }
-        if let Err(error) = tokio::fs::rename(&part_path, &final_path).await {
-            self.fail(format!("无法保存更新包: {error}"));
+        let renamed = tokio::select! {
+            _ = cancel.cancelled() => return,
+            result = tokio::fs::rename(&part_path, &final_path) => result,
+        };
+        if let Err(error) = renamed {
+            self.fail(generation, format!("无法保存更新包: {error}"));
+            return;
+        }
+        if !self.mark_applying(generation) {
             return;
         }
         match install::apply_archive(&final_path) {
             Ok(InstallOutcome::ReadyToRestart { exe }) => {
-                let mut inner = self.lock();
-                inner.snapshot.phase = UpdatePhase::ReadyToRestart;
-                inner.restart = Some(RestartAction::Relaunch { exe });
-                inner.publish();
-                tracing::info!("更新已就绪, 等待重启");
+                self.finish_download(generation, |inner| {
+                    inner.snapshot.phase = UpdatePhase::ReadyToRestart;
+                    inner.snapshot.cancellable = false;
+                    inner.restart = Some(RestartAction::Relaunch { exe });
+                    tracing::info!("更新已就绪, 等待重启");
+                });
             }
             Ok(InstallOutcome::HandedOff) => {
-                let mut inner = self.lock();
-                inner.snapshot.phase = UpdatePhase::HandedOff;
-                inner.snapshot.apply_message = "正在退出并替换, 请勿手动关闭进程".to_string();
-                inner.restart = Some(RestartAction::QuitOnly);
-                inner.publish();
-                tracing::info!("已交接 macOS 替换脚本");
+                self.finish_download(generation, |inner| {
+                    inner.snapshot.phase = UpdatePhase::HandedOff;
+                    inner.snapshot.cancellable = false;
+                    inner.snapshot.apply_message = "正在退出并替换, 请勿手动关闭进程".to_string();
+                    inner.restart = Some(RestartAction::QuitOnly);
+                    tracing::info!("已交接 macOS 替换脚本");
+                });
             }
             Ok(InstallOutcome::DmgOpened) => {
-                let mut inner = self.lock();
-                inner.snapshot.phase = UpdatePhase::DmgOpened;
-                inner.snapshot.apply_message = "已打开 dmg, 请拖拽安装后重启应用".to_string();
-                inner.publish();
+                self.finish_download(generation, |inner| {
+                    inner.snapshot.phase = UpdatePhase::DmgOpened;
+                    inner.snapshot.cancellable = false;
+                    inner.snapshot.apply_message = "已打开 dmg, 请拖拽安装后重启应用".to_string();
+                });
             }
-            Err(error) => self.fail(error.to_string()),
+            Err(error) => self.fail(generation, error.to_string()),
         }
     }
 
-    fn fail(&self, message: String) {
+    fn is_active_download(&self, generation: u64) -> bool {
+        self.lock().is_active_download(generation)
+    }
+
+    fn mark_applying(&self, generation: u64) -> bool {
         let mut inner = self.lock();
-        inner.snapshot.phase = UpdatePhase::Failed;
-        inner.snapshot.error_text = message;
+        if !inner.is_active_download(generation) {
+            return false;
+        }
+        inner.applying = true;
+        inner.snapshot.cancellable = false;
         inner.publish();
+        true
+    }
+
+    fn finish_download(&self, generation: u64, update: impl FnOnce(&mut Inner)) {
+        let mut inner = self.lock();
+        if inner.download_generation != generation {
+            return;
+        }
+        if inner.snapshot.phase != UpdatePhase::Downloading {
+            return;
+        }
+        update(&mut inner);
+        inner.applying = false;
+        inner.publish();
+    }
+
+    fn fail(&self, generation: u64, message: String) {
+        self.finish_download(generation, |inner| {
+            inner.snapshot.phase = UpdatePhase::Failed;
+            inner.snapshot.cancellable = false;
+            inner.snapshot.error_text = message;
+        });
     }
 }
 
 impl Inner {
+    fn is_active_download(&self, generation: u64) -> bool {
+        self.download_generation == generation
+            && self.snapshot.phase == UpdatePhase::Downloading
+            && !self.cancel_download.is_cancelled()
+    }
+
     fn publish(&self) {
         self.snapshot_tx.send_replace(self.snapshot.clone());
     }
@@ -352,7 +415,9 @@ pub fn start(
             persist,
             check_task: None,
             download_task: None,
-            cancel_download: Arc::new(AtomicBool::new(false)),
+            cancel_download: CancellationToken::new(),
+            download_generation: 0,
+            applying: false,
             restart: None,
             client,
         })),

@@ -26,6 +26,7 @@ pub struct UpdateSnapshot {
     pub total_bytes: Option<u64>,
     pub auto_check: bool,
     pub apply_message: String,
+    pub cancellable: bool,
 }
 
 impl UpdateSnapshot {
@@ -42,6 +43,7 @@ impl UpdateSnapshot {
             total_bytes: None,
             auto_check,
             apply_message: String::new(),
+            cancellable: false,
         }
     }
 

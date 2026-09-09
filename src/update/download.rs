@@ -3,10 +3,9 @@ use futures_util::StreamExt;
 use reqwest::header::{CONTENT_LENGTH, RANGE};
 use sha2::{Digest, Sha256};
 use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncWriteExt, BufWriter};
+use tokio_util::sync::CancellationToken;
 
 pub struct DownloadProgress {
     pub received: u64,
@@ -70,9 +69,12 @@ pub async fn download_archive(
     url: &str,
     part_path: &Path,
     expected: [u8; 32],
-    cancel: Arc<AtomicBool>,
+    cancel: CancellationToken,
     mut on_progress: impl FnMut(DownloadProgress),
 ) -> Result<()> {
+    if cancel.is_cancelled() {
+        bail!("已取消下载");
+    }
     if let Some(parent) = part_path.parent() {
         fs::create_dir_all(parent).await?;
     }
@@ -85,7 +87,7 @@ pub async fn download_archive(
     if existing > 0 {
         request = request.header(RANGE, format!("bytes={existing}-"));
     }
-    let mut response = request.send().await.context("下载更新包失败")?;
+    let mut response = send_cancellable(request, &cancel, "下载更新包失败").await?;
     let status = response.status();
     if status.as_u16() == 403 || status.as_u16() == 429 {
         bail!("GitHub API 速率限制, 请稍后再试");
@@ -96,12 +98,12 @@ pub async fn download_archive(
             fs::remove_file(part_path).await.ok();
         }
         existing = 0;
-        response = client
-            .get(url)
-            .header("Accept", "application/octet-stream")
-            .send()
-            .await
-            .context("重新下载更新包失败")?;
+        response = send_cancellable(
+            client.get(url).header("Accept", "application/octet-stream"),
+            &cancel,
+            "重新下载更新包失败",
+        )
+        .await?;
         if !response.status().is_success() {
             bail!("下载更新包失败: HTTP {}", response.status());
         }
@@ -125,11 +127,18 @@ pub async fn download_archive(
     let mut writer = BufWriter::new(file);
     let mut received = existing;
     let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        if cancel.load(Ordering::Acquire) {
-            writer.flush().await.ok();
-            bail!("已取消下载");
-        }
+    loop {
+        let chunk = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => {
+                writer.flush().await.ok();
+                bail!("已取消下载");
+            }
+            chunk = stream.next() => chunk,
+        };
+        let Some(chunk) = chunk else {
+            break;
+        };
         let chunk = chunk.context("读取更新包分片失败")?;
         writer.write_all(&chunk).await?;
         received += chunk.len() as u64;
@@ -138,14 +147,32 @@ pub async fn download_archive(
             total,
         });
     }
+    if cancel.is_cancelled() {
+        writer.flush().await.ok();
+        bail!("已取消下载");
+    }
     writer.flush().await?;
     drop(writer);
-    let digest = sha256_file(part_path).await?;
+    let digest = tokio::select! {
+        _ = cancel.cancelled() => bail!("已取消下载"),
+        result = sha256_file(part_path) => result?,
+    };
     if !digest.eq_ignore_ascii_case(&hex_encode(&expected)) {
         fs::remove_file(part_path).await.ok();
         bail!("更新包 SHA256 校验失败");
     }
     Ok(())
+}
+
+async fn send_cancellable(
+    request: reqwest::RequestBuilder,
+    cancel: &CancellationToken,
+    context: &'static str,
+) -> Result<reqwest::Response> {
+    tokio::select! {
+        _ = cancel.cancelled() => bail!("已取消下载"),
+        result = request.send() => result.context(context),
+    }
 }
 
 pub async fn sha256_file(path: &Path) -> Result<String> {
@@ -162,11 +189,89 @@ pub fn hex_encode(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncWriteExt;
+    use tokio_util::sync::CancellationToken;
 
     #[test]
     fn parses_binary_marker_and_crlf() {
         let sums = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef *synly-0.8.0-linux-x86_64.tar.gz\r\n";
         let hash = expected_sha256(sums, "synly-0.8.0-linux-x86_64.tar.gz").unwrap();
         assert_eq!(hex_encode(&hash), "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+    }
+
+    #[tokio::test]
+    async fn cancel_stops_in_flight_download() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10485760\r\n\r\n")
+                .await;
+            let chunk = vec![0u8; 1024];
+            loop {
+                if socket.write_all(&chunk).await.is_err() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!(
+            "synly-update-cancel-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let part_path = dir.join("archive.part");
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let cancel = CancellationToken::new();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let mut started = Some(started_tx);
+        let download = {
+            let client = client.clone();
+            let url = format!("http://{addr}/archive");
+            let part_path = part_path.clone();
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                download_archive(
+                    &client,
+                    &url,
+                    &part_path,
+                    [0u8; 32],
+                    cancel,
+                    move |progress| {
+                        if progress.received > 0
+                            && let Some(tx) = started.take()
+                        {
+                            let _ = tx.send(());
+                        }
+                    },
+                )
+                .await
+            })
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), started_rx)
+            .await
+            .expect("下载应开始写入")
+            .expect("下载进度通道已关闭");
+        cancel.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), download)
+            .await
+            .expect("取消下载应该尽快返回")
+            .expect("下载任务不应 panic");
+        let error = result.expect_err("取消后应返回错误");
+        assert!(
+            error.to_string().contains("已取消下载"),
+            "实际错误: {error}"
+        );
+        assert!(part_path.exists(), "取消后应保留 .part 以便续传");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

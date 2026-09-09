@@ -585,7 +585,7 @@ fn apply_update_snapshot(window: &AppWindow, snapshot: &UpdateSnapshot) {
         UpdatePhase::Checking | UpdatePhase::Downloading | UpdatePhase::HandedOff
     ));
     window.set_update_show_download(snapshot.phase == UpdatePhase::Available && !handed_off);
-    window.set_update_show_cancel(snapshot.phase == UpdatePhase::Downloading);
+    window.set_update_show_cancel(snapshot.phase == UpdatePhase::Downloading && snapshot.cancellable);
     window.set_update_show_skip(snapshot.phase == UpdatePhase::Available);
     window.set_update_show_restart(snapshot.phase == UpdatePhase::ReadyToRestart);
     window.set_update_show_retry(matches!(
@@ -621,7 +621,13 @@ fn update_status_text(snapshot: &UpdateSnapshot) -> String {
             .as_ref()
             .map(|version| format!("发现新版本 {version}"))
             .unwrap_or_else(|| "发现新版本".to_string()),
-        UpdatePhase::Downloading => "正在下载更新...".to_string(),
+        UpdatePhase::Downloading => {
+            if snapshot.cancellable {
+                "正在下载更新...".to_string()
+            } else {
+                "正在安装更新...".to_string()
+            }
+        }
         UpdatePhase::ReadyToRestart => "更新已就绪, 重启后生效".to_string(),
         UpdatePhase::HandedOff => "正在退出并替换, 请勿手动关闭进程".to_string(),
         UpdatePhase::DmgOpened => "已打开安装镜像, 请拖拽安装后重启".to_string(),
