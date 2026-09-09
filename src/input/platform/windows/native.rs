@@ -1651,10 +1651,12 @@ fn hid_to_windows_scan(usage: u16) -> Option<(u16, bool)> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{
-        MOUSEEVENTF_FROMTOUCH, MOUSEEVENTF_MASK, ScrollSource, WM_SYNLY_MOUSE_TRACKPAD_WHEEL,
-        WM_SYNLY_MOUSE_WHEEL, allow_native_fallback, hid_to_windows_scan,
-        scroll_source_from_extra_info, vk_to_hid, wheel_message,
+    use super::super::allow_native_fallback;
+    use super::super::super::ScrollSource;
+    use super::{
+        MOUSEEVENTF_FROMTOUCH, MOUSEEVENTF_MASK, WM_SYNLY_MOUSE_TRACKPAD_WHEEL,
+        WM_SYNLY_MOUSE_WHEEL, hid_to_windows_scan, scroll_source_from_extra_info, vk_to_hid,
+        wheel_message,
     };
 
     #[test]
