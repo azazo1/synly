@@ -2,6 +2,7 @@ use super::{AppWindow, save_window_state, send_command, show_main_window};
 use crate::core::{AppCommand, AppSnapshot, AppSupervisorHandle};
 use crate::input::InputMode;
 use crate::settings::{AudioMode, ClipboardMode};
+use crate::update::UpdateHandle;
 use anyhow::{Context, Result};
 use slint::{ComponentHandle, Timer, TimerMode};
 use std::cell::RefCell;
@@ -16,6 +17,8 @@ const CONNECT_ID: &str = "synly.connect";
 const CLIPBOARD_ID: &str = "synly.clipboard";
 const AUDIO_ID: &str = "synly.audio";
 const INPUT_ID: &str = "synly.input";
+const CHECK_UPDATE_ID: &str = "synly.check-update";
+const AUTO_CHECK_ID: &str = "synly.auto-check";
 const QUIT_ID: &str = "synly.quit";
 
 #[derive(Clone)]
@@ -31,17 +34,20 @@ struct ControllerInner {
     window: slint::Weak<AppWindow>,
     commands: tokio::sync::mpsc::Sender<AppCommand>,
     snapshots: tokio::sync::watch::Receiver<AppSnapshot>,
+    update: UpdateHandle,
     shared_state: Arc<Mutex<TrayState>>,
     tray: Option<NativeTray>,
 }
 
 #[derive(Clone, PartialEq)]
 struct TrayState {
+    app_title: String,
     status_text: String,
     connected: bool,
     clipboard_enabled: bool,
     audio_enabled: bool,
     input_enabled: bool,
+    auto_check: bool,
 }
 
 struct NativeTray {
@@ -51,20 +57,27 @@ struct NativeTray {
     clipboard_item: CheckMenuItem,
     audio_item: CheckMenuItem,
     input_item: CheckMenuItem,
+    auto_check_item: CheckMenuItem,
     state: TrayState,
     _poll_timer: Timer,
 }
 
 impl TrayController {
-    pub fn new(window: &AppWindow, handle: &AppSupervisorHandle) -> Self {
+    pub fn new(
+        window: &AppWindow,
+        handle: &AppSupervisorHandle,
+        update: UpdateHandle,
+        version: &str,
+    ) -> Self {
         let snapshots = handle.snapshots();
-        let state = TrayState::from_snapshot(&snapshots.borrow());
+        let state = TrayState::from_snapshot(&snapshots.borrow(), version, update.snapshot().auto_check);
         let shared_state = Arc::new(Mutex::new(state));
         Self {
             inner: Rc::new(RefCell::new(ControllerInner {
                 window: window.as_weak(),
                 commands: handle.commands(),
                 snapshots,
+                update,
                 shared_state,
                 tray: None,
             })),
@@ -89,26 +102,49 @@ impl TrayController {
 impl TrayStateSink {
     pub fn apply_snapshot(&self, snapshot: &AppSnapshot) {
         if let Ok(mut state) = self.0.lock() {
-            *state = TrayState::from_snapshot(snapshot);
+            state.apply_app_snapshot(snapshot);
+        }
+    }
+
+    pub fn apply_auto_check(&self, auto_check: bool) {
+        if let Ok(mut state) = self.0.lock() {
+            state.auto_check = auto_check;
         }
     }
 }
 
 impl TrayState {
-    fn from_snapshot(snapshot: &AppSnapshot) -> Self {
-        Self {
-            status_text: format!("Synly {}", snapshot.lifecycle.label()),
-            connected: snapshot.applied.is_some(),
-            clipboard_enabled: snapshot.desired.clipboard_mode != ClipboardMode::Off,
-            audio_enabled: snapshot.desired.audio_mode != AudioMode::Off,
-            input_enabled: snapshot.desired.input.mode != InputMode::Off,
-        }
+    fn from_snapshot(snapshot: &AppSnapshot, version: &str, auto_check: bool) -> Self {
+        let mut state = Self {
+            app_title: format!("Synly {version}"),
+            status_text: String::new(),
+            connected: false,
+            clipboard_enabled: false,
+            audio_enabled: false,
+            input_enabled: false,
+            auto_check,
+        };
+        state.apply_app_snapshot(snapshot);
+        state
+    }
+
+    fn apply_app_snapshot(&mut self, snapshot: &AppSnapshot) {
+        self.status_text = format!("Synly {}", snapshot.lifecycle.label());
+        self.connected = snapshot.applied.is_some();
+        self.clipboard_enabled = snapshot.desired.clipboard_mode != ClipboardMode::Off;
+        self.audio_enabled = snapshot.desired.audio_mode != AudioMode::Off;
+        self.input_enabled = snapshot.desired.input.mode != InputMode::Off;
+    }
+
+    fn tooltip(&self) -> String {
+        format!("Synly\n{}", self.status_text)
     }
 }
 
 impl NativeTray {
     fn new(inner: Weak<RefCell<ControllerInner>>, state: &TrayState) -> Result<Self> {
         let menu = Menu::new();
+        let title_item = MenuItem::new(&state.app_title, false, None);
         let open_item = MenuItem::with_id(OPEN_ID, "打开 Synly", true, None);
         let status_item = MenuItem::new(&state.status_text, false, None);
         let separator_one = PredefinedMenuItem::separator();
@@ -140,8 +176,18 @@ impl NativeTray {
             None,
         );
         let separator_two = PredefinedMenuItem::separator();
+        let check_update_item = MenuItem::with_id(CHECK_UPDATE_ID, "检查更新", true, None);
+        let auto_check_item = CheckMenuItem::with_id(
+            AUTO_CHECK_ID,
+            "启动时自动检查更新",
+            true,
+            state.auto_check,
+            None,
+        );
+        let separator_three = PredefinedMenuItem::separator();
         let quit_item = MenuItem::with_id(QUIT_ID, "退出", true, None);
         menu.append_items(&[
+            &title_item,
             &open_item,
             &status_item,
             &separator_one,
@@ -150,6 +196,9 @@ impl NativeTray {
             &audio_item,
             &input_item,
             &separator_two,
+            &check_update_item,
+            &auto_check_item,
+            &separator_three,
             &quit_item,
         ])
         .context("无法创建系统托盘菜单")?;
@@ -157,7 +206,7 @@ impl NativeTray {
         let tray_icon = TrayIconBuilder::new()
             .with_icon(make_template_icon()?)
             .with_icon_as_template(true)
-            .with_tooltip(&state.status_text)
+            .with_tooltip(&state.tooltip())
             .with_menu(Box::new(menu))
             .with_menu_on_left_click(false)
             .with_menu_on_right_click(true)
@@ -178,6 +227,7 @@ impl NativeTray {
             clipboard_item,
             audio_item,
             input_item,
+            auto_check_item,
             state: state.clone(),
             _poll_timer: poll_timer,
         })
@@ -193,7 +243,8 @@ impl NativeTray {
         self.clipboard_item.set_checked(state.clipboard_enabled);
         self.audio_item.set_checked(state.audio_enabled);
         self.input_item.set_checked(state.input_enabled);
-        if let Err(error) = self.tray_icon.set_tooltip(Some(&state.status_text)) {
+        self.auto_check_item.set_checked(state.auto_check);
+        if let Err(error) = self.tray_icon.set_tooltip(Some(&state.tooltip())) {
             tracing::warn!(error = %error, "无法更新系统托盘提示");
         }
         self.state = state.clone();
@@ -226,11 +277,13 @@ fn start_native_tray(inner: Weak<RefCell<ControllerInner>>) {
 fn poll_events(inner: &Weak<RefCell<ControllerInner>>) {
     poll_platform_events();
     if let Some(inner) = inner.upgrade() {
+        let auto_check = inner.borrow().update.snapshot().auto_check;
         let shared_state = inner.borrow().shared_state.clone();
-        if let Ok(state) = shared_state.lock()
-            && let Some(tray) = inner.borrow_mut().tray.as_mut()
-        {
-            tray.apply_state(&state);
+        if let Ok(mut state) = shared_state.lock() {
+            state.auto_check = auto_check;
+            if let Some(tray) = inner.borrow_mut().tray.as_mut() {
+                tray.apply_state(&state);
+            }
         }
     }
     while let Ok(event) = TrayIconEvent::receiver().try_recv() {
@@ -297,6 +350,23 @@ fn handle_action(inner: &Weak<RefCell<ControllerInner>>, action: &str) {
                 InputMode::Off
             };
             send_command(&inner.commands, AppCommand::SetInputMode(mode));
+        }
+        CHECK_UPDATE_ID => {
+            let update = inner.borrow().update.clone();
+            update.check(true);
+            let window = inner.borrow().window.clone();
+            if let Some(window) = window.upgrade() {
+                tracing::info!("从系统托盘检查更新");
+                window.set_update_window_visible(true);
+                if let Err(error) = show_main_window(&window) {
+                    tracing::warn!(error = %error, "无法从系统托盘打开更新窗口");
+                }
+            }
+        }
+        AUTO_CHECK_ID => {
+            let update = inner.borrow().update.clone();
+            let enabled = !update.snapshot().auto_check;
+            update.set_auto_check(enabled);
         }
         QUIT_ID => {
             let inner = inner.borrow();

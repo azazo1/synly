@@ -437,6 +437,10 @@ impl AppSupervisor {
                 self.save_gui_state();
                 self.publish();
             }
+            AppCommand::SaveUpdateConfig(update) => {
+                self.config.update = update;
+                self.save_settings();
+            }
             AppCommand::Shutdown => return true,
         }
         false
@@ -1226,6 +1230,7 @@ mod tests {
             notifications: NotificationConfig::default(),
             discovery: DiscoveryConfig::default(),
             ui: UiConfig::default(),
+            update: crate::config::UpdateConfig::default(),
             gui_state: GuiState::default(),
             runtime: RuntimeConfig::default(),
             trusted_devices: Vec::new(),

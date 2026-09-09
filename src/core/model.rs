@@ -179,6 +179,7 @@ pub enum AppCommand {
         width: u32,
         height: u32,
     },
+    SaveUpdateConfig(crate::config::UpdateConfig),
     RefreshInputPermission,
     Shutdown,
 }

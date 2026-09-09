@@ -1,3 +1,5 @@
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod app;
 mod autostart;
 mod audio;
@@ -10,6 +12,7 @@ mod discovery;
 mod gui;
 mod host;
 mod path_expand;
+mod paths;
 mod protocol;
 mod reconnect;
 mod runtime_control;
@@ -19,6 +22,7 @@ mod session;
 mod system_notification;
 mod tracing_utils;
 mod sync;
+mod update;
 
 #[cfg(windows)]
 mod windows_input_agent;
@@ -27,7 +31,7 @@ use anyhow::Result;
 use clap::Parser;
 use synly::input;
 
-/// 当前构建版本, 由 build.rs 根据最近版本 tag 与工作区状态生成.
+/// 当前构建版本. 日常开发为 `dev-build`, 发布构建由 `scripts/build-version.sh` 或 CI 注入.
 const BUILD_VERSION: &str = env!("SYNLY_BUILD_VERSION");
 
 fn main() -> Result<()> {
@@ -63,7 +67,13 @@ fn main() -> Result<()> {
         let (_, commands) = tokio::sync::mpsc::unbounded_channel();
         return runtime.block_on(app::run(config, options, commands));
     }
-    gui::run(config, session_override.is_some())
+    match gui::run(config, session_override.is_some())? {
+        gui::GuiExit::Quit => Ok(()),
+        gui::GuiExit::Restart { exe } => {
+            drop(_tracing_guard);
+            crate::update::relaunch(exe)
+        }
+    }
 }
 
 fn run_internal_command(command: &cli::Command) -> Result<()> {

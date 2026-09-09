@@ -152,6 +152,23 @@ export component AppWindow inherits Window {
     in property <string> log-text;
     in-out property <string> log-action-text;
     in property <string> about-version: "";
+    in property <bool> status-version-is-link: false;
+    in-out property <bool> update-window-visible: false;
+    in property <string> update-status-text: "";
+    in property <string> update-notes: "";
+    in property <float> update-progress: 0.0;
+    in property <string> update-progress-text: "";
+    in property <string> update-error-text: "";
+    in property <bool> update-show-download: false;
+    in property <bool> update-show-cancel: false;
+    in property <bool> update-show-skip: false;
+    in property <bool> update-show-restart: false;
+    in property <bool> update-show-retry: false;
+    in property <bool> update-show-release-link: false;
+    in property <bool> update-busy: false;
+    in-out property <bool> auto-check-update: true;
+    in-out property <bool> hide-dock-when-hidden: true;
+    in property <bool> macos-dock-setting-visible: false;
     in-out property <bool> log-auto-scroll: true;
     in-out property <length> log-viewport-y <=> log-page.viewport-y;
     in-out property <length> log-viewport-height <=> log-page.viewport-height;
@@ -237,6 +254,15 @@ export component AppWindow inherits Window {
     callback interaction-reject();
     callback interaction-submit-pin();
     callback bring-to-front();
+    callback open-update-window();
+    callback check-update();
+    callback start-update();
+    callback cancel-update();
+    callback skip-update();
+    callback restart-for-update();
+    callback open-release-page();
+    callback close-update-window();
+    callback auto-check-changed(bool);
 
     bring-to-front => { Platform.macos-bring-all-windows-to-front(); }
 
@@ -274,6 +300,24 @@ export component AppWindow inherits Window {
                 NavButton { text: "日志"; active: root.selected-page == 5; clicked => { root.selected-page = 5; } }
                 NavButton { text: "About"; active: root.selected-page == 6; clicked => { root.selected-page = 6; } }
                 Rectangle { vertical-stretch: 1; }
+                if root.status-version-is-link: TouchArea {
+                    height: 28px;
+                    clicked => { root.open-update-window(); }
+                    Text {
+                        text: root.about-version;
+                        color: #75d6a8;
+                        font-size: 11px;
+                        font-weight: 700;
+                        wrap: word-wrap;
+                    }
+                }
+                if !root.status-version-is-link: Text {
+                    text: root.about-version;
+                    color: #9aa19e;
+                    font-size: 11px;
+                    wrap: word-wrap;
+                    height: 28px;
+                }
                 Text {
                     text: root.current-peer;
                     color: #c6cbc8;
@@ -687,6 +731,15 @@ export component AppWindow inherits Window {
                                 CheckBox { text: "启用系统通知"; checked <=> root.notifications-enabled; }
                                 CheckBox { text: "启动后隐藏到托盘"; checked <=> root.start-hidden; }
                                 CheckBox { text: "关闭窗口时隐藏到托盘"; checked <=> root.close-to-tray; }
+                                if root.macos-dock-setting-visible: CheckBox {
+                                    text: "隐藏窗口时同时隐藏 Dock 图标";
+                                    checked <=> root.hide-dock-when-hidden;
+                                }
+                                CheckBox {
+                                    text: "启动时自动检查更新";
+                                    checked <=> root.auto-check-update;
+                                    changed checked => { root.auto-check-changed(self.checked); }
+                                }
                                 CheckBox { text: "登录时启动"; checked <=> root.launch-at-login; }
                                 CheckBox { text: "启动后恢复上次会话"; checked <=> root.resume-last-session; }
                                 HorizontalLayout {
@@ -712,7 +765,12 @@ export component AppWindow inherits Window {
                 spacing: 10px;
                 Text { text: "Synly"; font-size: 24px; font-weight: 700; color: #202523; }
                 Text { text: "安全的局域网同步与跨设备控制"; color: #555b58; }
-                Text { text: root.about-version; color: #7c8380; font-size: 12px; }
+                if root.status-version-is-link: TouchArea {
+                    clicked => { root.open-update-window(); }
+                    Text { text: root.about-version; color: #2e7d5b; font-size: 12px; font-weight: 700; }
+                }
+                if !root.status-version-is-link: Text { text: root.about-version; color: #7c8380; font-size: 12px; }
+                Button { text: "检查更新"; clicked => { root.open-update-window(); } }
                 AboutSlint { height: 104px; }
                 Rectangle { vertical-stretch: 1; }
             }
@@ -756,6 +814,69 @@ export component AppWindow inherits Window {
                     if root.interaction-kind == 0 || root.interaction-kind == 1: Button { text: "取消配对"; clicked => { root.interaction-reject(); } }
                     if root.interaction-kind == 2 || root.interaction-kind == 3: Button { text: "接受"; clicked => { root.interaction-accept(); } }
                     if root.interaction-kind == 2 || root.interaction-kind == 3: Button { text: "拒绝"; clicked => { root.interaction-reject(); } }
+                }
+            }
+        }
+    }
+
+    if root.update-window-visible: Rectangle {
+        background: #00000088;
+        TouchArea {
+            clicked => {
+                if !root.update-busy {
+                    root.close-update-window();
+                }
+            }
+        }
+        Rectangle {
+            width: min(parent.width - 36px, 560px);
+            height: min(parent.height - 44px, 480px);
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            background: #ffffff;
+            border-radius: 6px;
+            TouchArea {}
+            VerticalLayout {
+                padding: 16px;
+                spacing: 8px;
+                Text { text: "检查更新"; font-size: 20px; font-weight: 650; color: #202523; }
+                Text { text: "当前版本: " + root.about-version; color: #555b58; }
+                Text { text: root.update-status-text; wrap: word-wrap; color: #252b28; }
+                CheckBox {
+                    text: "启动时自动检查更新";
+                    checked <=> root.auto-check-update;
+                    changed checked => { root.auto-check-changed(self.checked); }
+                }
+                TextEdit {
+                    text: root.update-notes;
+                    read-only: true;
+                    vertical-stretch: 1;
+                    wrap: word-wrap;
+                    font-size: 12px;
+                }
+                if root.update-show-cancel || root.update-busy: Rectangle {
+                    height: 8px;
+                    border-radius: 4px;
+                    background: #e4e8e6;
+                    Rectangle {
+                        width: parent.width * root.update-progress;
+                        height: 100%;
+                        background: #73b597;
+                        border-radius: 4px;
+                    }
+                }
+                if root.update-progress-text != "": Text { text: root.update-progress-text; color: #68706c; font-size: 11px; }
+                if root.update-error-text != "": Text { text: root.update-error-text; color: #b3261e; wrap: word-wrap; }
+                HorizontalLayout {
+                    spacing: 8px;
+                    if root.update-show-download: Button { text: "立即更新"; clicked => { root.start-update(); } }
+                    if root.update-show-cancel: Button { text: "取消更新"; clicked => { root.cancel-update(); } }
+                    if root.update-show-skip: Button { text: "跳过此版本"; clicked => { root.skip-update(); } }
+                    if root.update-show-release-link: Button { text: "查看 Release 页"; clicked => { root.open-release-page(); } }
+                    if root.update-show-restart: Button { text: "重启应用"; clicked => { root.restart-for-update(); } }
+                    if root.update-show-retry: Button { text: "重新检查"; clicked => { root.check-update(); } }
+                    Rectangle { horizontal-stretch: 1; }
+                    if !root.update-busy: Button { text: "关闭"; clicked => { root.close-update-window(); } }
                 }
             }
         }

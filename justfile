@@ -25,19 +25,57 @@ clippy:
 build:
     cargo build --release
 
+# 启动隔离数据目录的调试实例, 完整日志写入隔离目录.
+[unix]
+debug:
+    mkdir -p target/synly-debug
+    SYNLY_DATA_DIR=target/synly-debug SYNLY_LOG_FILE=target/synly-debug/synly.log RUST_LOG=synly=trace cargo run
+
+# 启动隔离数据目录的调试实例, 完整日志写入隔离目录.
+[windows]
+debug:
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "New-Item -ItemType Directory -Force -Path target/synly-debug | Out-Null; $env:SYNLY_DATA_DIR='target/synly-debug'; $env:SYNLY_LOG_FILE='target/synly-debug/synly.log'; $env:RUST_LOG='synly=trace'; cargo run"
+
+# 打印当前应嵌入二进制的构建版本.
+[unix]
+build-version:
+    bash scripts/build-version.sh
+
+[windows]
+build-version:
+    powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-version.ps1
+
 # 构建当前平台的可分发 release 产物.
 [windows]
-dist: build
+dist:
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "$env:SYNLY_BUILD_VERSION = (powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-version.ps1).Trim(); cargo build --release; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
     powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows.ps1 -Binary target/release/synly.exe -OutputDir dist
 
 [macos]
-dist: build
+dist:
+    SYNLY_BUILD_VERSION="$(bash scripts/build-version.sh)" cargo build --release
     bash scripts/package-macos.sh
 
 [linux]
-dist: build
-    mkdir -p dist
-    cp target/release/synly dist/synly
+dist:
+    SYNLY_BUILD_VERSION="$(bash scripts/build-version.sh)" cargo build --release
+    bash scripts/package-linux.sh
+
+# 产出用于自动更新测试的 fake 构建, 版本固定为 v0.0.0.
+[windows]
+fake-dist:
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "$env:SYNLY_BUILD_VERSION='v0.0.0'; $env:SYNLY_FAKE_DIST='1'; cargo build --release; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }"
+    powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows.ps1 -Binary target/release/synly.exe -OutputDir dist -Version v0.0.0 -Fake
+
+[macos]
+fake-dist:
+    SYNLY_BUILD_VERSION=v0.0.0 SYNLY_FAKE_DIST=1 cargo build --release
+    SYNLY_FAKE_DIST=1 bash scripts/package-macos.sh v0.0.0 "$(rustc -vV | sed -n 's/^host: //p')" dist
+
+[linux]
+fake-dist:
+    SYNLY_BUILD_VERSION=v0.0.0 SYNLY_FAKE_DIST=1 cargo build --release
+    SYNLY_FAKE_DIST=1 bash scripts/package-linux.sh v0.0.0 "$(rustc -vV | sed -n 's/^host: //p')" dist
 
 # 安装当前工作树中的 Synly.
 install:

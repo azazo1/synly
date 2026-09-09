@@ -100,7 +100,7 @@ pub fn init_tracing(listener: Box<dyn FfiLogListener>) -> Result<(), FfiError> {
         })
 }
 
-/// 当前构建版本号, 由 build.rs 根据最近版本 tag 与工作区状态自动生成.
+/// 当前构建版本号. 日常为 `dev-build`, 发布构建由 `scripts/build-version.sh` 或 CI 注入.
 #[uniffi::export]
 pub fn build_version() -> String {
     env!("SYNLY_BUILD_VERSION").to_string()

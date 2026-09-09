@@ -20,11 +20,12 @@ Synly 支持 Windows, macOS 和 Linux. 文件与剪贴板同步可在三大平�
 - 文件扫描间隔和删除策略可在当前会话中更新.
 - 角色, 对侧, 工作区和监听端口变化会自动重建会话.
 - host 支持多设备同时接入: 剪贴板在多会话间广播并防回音防洪流, 文件/音频/输入由单一活跃会话承载, 活跃会话断开后自动提升已信任设备, UI 支持会话列表, 逐个断开与手动切换活跃会话.
-- 单实例运行. 重复启动会激活已有窗口.
-- 支持关闭到托盘, 启动隐藏, 恢复上次会话和登录启动.
+- 单实例运行, 锁与数据目录绑定. 重复启动会激活已有窗口.
+- 支持关闭到托盘, 启动隐藏, 恢复上次会话和登录启动. macOS 可选择隐藏窗口时是否同时隐藏 Dock 图标.
+- 安装版与便携版都支持自动更新, 下载后校验 SHA256.
 - 隐藏窗口收到配对请求时显示不含 PIN 的系统通知, 点击后恢复对应 modal.
 - 窗口尺寸会持久化并在下次启动时恢复.
-- tracing 同时输出到终端, 每日滚动日志文件和 GUI 环形日志缓冲区, 日志级别可实时调整.
+- tracing 同时输出到终端, 按日和大小滚动的日志文件和 GUI 环形日志缓冲区, 日志级别可实时调整.
 
 ## 安全顺序
 
@@ -42,17 +43,25 @@ Rust 版本需要满足 Slint 1.17.1 的要求. 当前开发基线使用 Rust 1.
 just dist
 ```
 
-开发运行:
+隔离调试 (数据目录和日志都在 `target/synly-debug/`):
 
 ```shell
-cargo run --
+just debug
 ```
 
-发布产物位于 `dist/`.
+自动更新测试构建 (版本注入为 `v0.0.0`, 产物名追加 `-fake`):
+
+```shell
+just fake-dist
+```
+
+日常 `cargo run` 显示 `dev-build`. `just dist` 通过 `scripts/build-version.sh` 计算 git 版本并注入二进制.
+
+发布产物位于 `dist/`. 可用 `SYNLY_DATA_DIR` 和 `SYNLY_LOG_FILE` 覆盖数据目录与主日志路径.
 
 ### GitHub 发布
 
-发布工作流在 branch 和 pull request 上执行跨平台编译, 在 tag 或手动指定已有 tag 时生成发布产物. Linux 只做 release 编译, Windows 上传带 exe 图标的 zip, macOS 上传 Intel 和 Apple Silicon 的 app dmg, Android 上传 arm64 APK.
+发布工作流在 branch, pull request, tag 和手动触发上编译, 打包并上传 Actions artifact. 仅 tag 或手动指定已有 tag 时创建 GitHub Release. Linux 上传 x86_64 与 aarch64 的 `tar.gz`, Windows 上传带 exe 图标的 zip, macOS 上传 Intel 和 Apple Silicon 的 app dmg, Android 上传 arm64 APK. 非 release 产物用 `build_version` 命名.
 
 创建版本时先提交 `docs/changelog/VERSION.md`, 再创建 annotated tag:
 
@@ -151,7 +160,7 @@ just android-build release
 synly
 ```
 
-首次启动总是显示主窗口. 关闭窗口默认隐藏到托盘. 托盘菜单可以打开窗口, 连接或断开, 快速切换剪贴板, 音频和输入, 以及退出应用.
+首次启动总是显示主窗口. 关闭窗口默认隐藏到托盘. 托盘菜单可以打开窗口, 连接或断开, 快速切换剪贴板, 音频和输入, 检查更新, 以及退出应用. 左键单击托盘图标会显示并聚焦主窗口.
 
 安全页可以设置仅在当前进程内有效的固定 PIN. 留空时 host 为每次未信任配对生成随机 PIN. 固定 PIN 不写入配置, 状态快照或日志.
 
@@ -198,7 +207,7 @@ Synly 使用固定的四文件配置目录, 每个文件的顶层都有独立的
 └── trusted-devices.toml
 ```
 
-- `config.toml` 保存用户设置和运行参数. 当前格式版本为 `3`. 输入方向, 屏幕边缘, 热键, 启动提权, 按键映射, 滚动反向, 原生滚动, 按住拦截开关, 应用事件过滤, 光标模式(`cursor_mode`, 三选一: `desktop`/`auto`/`game`)都位于 `[input]`.
+- `config.toml` 保存用户设置和运行参数. 当前格式版本为 `4`. 输入方向, 屏幕边缘, 热键, 启动提权, 按键映射, 滚动反向, 原生滚动, 按住拦截开关, 应用事件过滤, 光标模式(`cursor_mode`, 三选一: `desktop`/`auto`/`game`)都位于 `[input]`. `[update]` 保存自动检查开关和跳过的版本. `[ui].hide_dock_when_hidden` 仅 macOS 生效.
 - `gui-state.toml` 保存桌面 GUI 的首次运行标记和窗口尺寸. 当前格式版本为 `1`.
 - `identity.toml` 保存 `device_id`, `private_key`, `public_key`. 当前格式版本为 `1`. 文件缺失时自动生成, 已存在但密钥无效时启动失败.
 - `trusted-devices.toml` 使用 `[[devices]]` 保存可信设备和会话统计. 当前格式版本为 `1`.
