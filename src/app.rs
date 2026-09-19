@@ -2138,10 +2138,10 @@ async fn refresh_capability_tasks(
                 direction,
                 context.remote_socket_addr.ip(),
             ) {
-                Ok((task, port)) => {
+                Ok((task, port, channel_id)) => {
                     context
                         .tx
-                        .send(Frame::Control(ControlMessage::AudioUdpReady { epoch, port }))
+                        .send(Frame::Control(ControlMessage::AudioUdpReady { epoch, port, channel_id }))
                         .await?;
                     runtime.audio_task = Some(task);
                 }
@@ -2731,7 +2731,7 @@ pub(crate) async fn run_sync_session(
                 session_tasks.track(&task);
                 capability_runtime.input_task = Some(task);
             }
-            Frame::Control(ControlMessage::AudioUdpReady { epoch, port }) => {
+            Frame::Control(ControlMessage::AudioUdpReady { epoch, port, channel_id }) => {
                 if !capability_state.current_epoch(epoch) {
                     tracing::debug!(?epoch, current = ?capability_state.epoch(), "忽略过期音频接收端口");
                     continue;
@@ -2743,7 +2743,7 @@ pub(crate) async fn run_sync_session(
                     && capability_runtime.audio_task.is_none()
                 {
                     let remote_audio_addr = SocketAddr::new(remote_socket_addr.ip(), port);
-                    match audio::spawn_sender(audio_master_secret, direction, remote_audio_addr) {
+                    match audio::spawn_sender(audio_master_secret, channel_id, direction, remote_audio_addr) {
                         Ok(task) => {
                             capability_runtime.audio_task = Some(task);
                         }

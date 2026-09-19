@@ -9,10 +9,7 @@ use std::time::Duration;
 
 pub fn open_input(config: &CaptureConfig, stream: &StreamParams) -> Result<Box<dyn AudioInput>> {
     if config.device_name.is_some() {
-        return Err(Error::Backend(
-            "macOS capture now uses system audio tap; selecting a specific device is not implemented yet"
-                .into(),
-        ));
+        return Err(Error::UnsupportedPlatform("macOS 系统音频 tap 尚不支持指定设备"));
     }
     if stream.channels != 2 {
         return Err(Error::UnsupportedPlatform(
@@ -20,6 +17,9 @@ pub fn open_input(config: &CaptureConfig, stream: &StreamParams) -> Result<Box<d
         ));
     }
 
+    if unsafe { ar_macos_capture_supported() } == 0 {
+        return Err(Error::UnsupportedPlatform("macOS 系统音频捕获需要 14.2 或更新版本"));
+    }
     let handle = unsafe {
         ar_macos_capture_create(
             std::ptr::null(),
@@ -34,9 +34,7 @@ pub fn open_input(config: &CaptureConfig, stream: &StreamParams) -> Result<Box<d
 
 pub fn open_output(config: &PlaybackConfig, stream: &StreamParams) -> Result<Box<dyn AudioOutput>> {
     if config.device_name.is_some() {
-        return Err(Error::Backend(
-            "macOS playback does not support selecting a specific device yet".into(),
-        ));
+        return Err(Error::UnsupportedPlatform("macOS 播放尚不支持指定设备"));
     }
 
     let handle = unsafe {
@@ -58,6 +56,10 @@ unsafe impl Send for MacosInput {}
 
 impl Drop for MacosInput {
     fn drop(&mut self) {
+        let mut dropped = 0;
+        let mut high_water = 0;
+        unsafe { ar_macos_capture_stats(self.handle.as_ptr(), &mut dropped, &mut high_water) };
+        tracing::debug!(dropped_samples = dropped, high_water_samples = high_water, "关闭 macOS 捕获缓冲");
         unsafe { ar_macos_capture_destroy(self.handle.as_ptr()) };
     }
 }
@@ -88,6 +90,10 @@ unsafe impl Send for MacosOutput {}
 
 impl Drop for MacosOutput {
     fn drop(&mut self) {
+        let mut dropped = 0;
+        let mut high_water = 0;
+        unsafe { ar_macos_playback_stats(self.handle.as_ptr(), &mut dropped, &mut high_water) };
+        tracing::debug!(dropped_samples = dropped, high_water_samples = high_water, "关闭 macOS 播放缓冲");
         unsafe { ar_macos_playback_destroy(self.handle.as_ptr()) };
     }
 }
@@ -111,18 +117,18 @@ impl AudioOutput for MacosOutput {
 }
 
 fn last_backend_error() -> Error {
+    let mut message = [0 as c_char; 512];
     unsafe {
-        let message = ar_macos_last_error();
-        if message.is_null() {
-            Error::Backend("unknown macOS audio backend error".into())
-        } else {
-            Error::Backend(CStr::from_ptr(message).to_string_lossy().into_owned())
-        }
+        ar_macos_copy_error(message.as_mut_ptr(), message.len() as u32);
+        Error::Backend(CStr::from_ptr(message.as_ptr()).to_string_lossy().into_owned())
     }
 }
 
 unsafe extern "C" {
-    fn ar_macos_last_error() -> *const c_char;
+    fn ar_macos_capture_supported() -> c_int;
+    fn ar_macos_copy_error(out: *mut c_char, capacity: u32);
+    fn ar_macos_capture_stats(handle: *mut c_void, dropped: *mut u64, high_water: *mut u32);
+    fn ar_macos_playback_stats(handle: *mut c_void, dropped: *mut u64, high_water: *mut u32);
 
     fn ar_macos_capture_create(
         device_name: *const c_char,

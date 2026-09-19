@@ -145,6 +145,8 @@ pub enum ControlMessage {
     AudioUdpReady {
         epoch: CapabilityEpoch,
         port: u16,
+        // 每次绑定生成新标识, 防止同一 TLS 会话重启音频时复用密钥和 nonce.
+        channel_id: [u8; 32],
     },
     InputChannelOffer {
         epoch: CapabilityEpoch,
@@ -645,6 +647,26 @@ mod tests {
     use crate::workspace::WorkspaceSummary;
     use serde_json::json;
     use tokio::io::duplex;
+
+    #[test]
+    fn audio_offer_roundtrip_requires_the_full_channel_identifier() {
+        let epoch = super::CapabilityEpoch { host_generation: 8, client_generation: 3 };
+        let offer = ControlMessage::AudioUdpReady { epoch, port: 48000, channel_id: [0xa7; 32] };
+        let bytes = encode_payload(&offer).unwrap();
+        let decoded: ControlMessage = decode_payload(&bytes, "音频控制帧解码失败").unwrap();
+        match decoded {
+            ControlMessage::AudioUdpReady { epoch: actual, port, channel_id } => {
+                assert_eq!(actual, epoch);
+                assert_eq!(port, 48000);
+                assert_eq!(channel_id, [0xa7; 32]);
+            }
+            _ => panic!("音频通道控制帧类型不符"),
+        }
+        // 不为缺失随机标识的旧控制帧填充默认值.
+        let mut missing_id = serde_json::to_value(offer).unwrap();
+        missing_id["audio_udp_ready"].as_object_mut().unwrap().remove("channel_id");
+        assert!(serde_json::from_value::<ControlMessage>(missing_id).is_err());
+    }
 
     #[test]
     fn clipboard_payload_roundtrip_preserves_binary_content() {

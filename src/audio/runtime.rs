@@ -1,21 +1,23 @@
-use crate::audio::capture::{CaptureStatus, open_input};
-use crate::audio::codec::{OpusDecoder, OpusEncoder};
-use crate::audio::config::{CaptureConfig, CodecConfig, DEFAULT_INITIAL_DROP_MS, PlaybackConfig};
-use crate::audio::playback::open_output;
-use crate::audio::receiver::{AudioDepacketizer, QueuedAudioFrame};
-use crate::audio::sender::AudioPacketizer;
-use anyhow::{Context, Result, anyhow};
-use ring::aead::{Aad, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKey};
-use ring::hkdf;
-use std::net::{IpAddr, SocketAddr, UdpSocket};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
-use tokio::task::JoinHandle;
+mod capture;
+mod crypto;
+mod queue;
+mod receive;
+mod render;
+mod send;
+mod workers;
+#[cfg(test)]
+mod tests;
+#[cfg(test)]
+mod channel_tests;
 
-const AUDIO_SOCKET_TIMEOUT: Duration = Duration::from_millis(200);
-const AUDIO_AAD: &[u8] = b"synly-audio-udp-v1";
-const AUDIO_COUNTER_LEN: usize = 8;
+use anyhow::{Context, Result};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::time::Duration;
+use tokio::net::UdpSocket;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+
+const AUDIO_IO_TIMEOUT: Duration = Duration::from_millis(200);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AudioChannelDirection {
@@ -33,24 +35,22 @@ impl AudioChannelDirection {
 }
 
 pub struct AudioTaskHandle {
-    stop_flag: Arc<AtomicBool>,
+    stop: CancellationToken,
     task: Option<JoinHandle<Result<()>>>,
 }
 
 impl AudioTaskHandle {
     pub async fn stop(mut self) -> Result<()> {
-        self.stop_flag.store(true, Ordering::Relaxed);
-        let task = self.task.take().context("audio task handle is missing")?;
-        match task.await {
-            Ok(result) => result,
-            Err(err) => Err(err.into()),
-        }
+        self.stop.cancel();
+        self.task.take().context("音频任务句柄丢失")?
+            .await.context("音频监督任务异常退出")?
     }
 }
 
 impl Drop for AudioTaskHandle {
     fn drop(&mut self) {
-        self.stop_flag.store(true, Ordering::Relaxed);
+        // 外层监督任务继续回收全部工作线程, 不直接 abort 阻塞音频操作.
+        self.stop.cancel();
     }
 }
 
@@ -58,334 +58,48 @@ pub fn bind_and_spawn_receiver(
     master_secret: [u8; 32],
     direction: AudioChannelDirection,
     expected_peer_ip: IpAddr,
-) -> Result<(AudioTaskHandle, u16)> {
-    let socket = UdpSocket::bind(("0.0.0.0", 0)).context("failed to bind audio UDP receiver")?;
-    socket
-        .set_read_timeout(Some(AUDIO_SOCKET_TIMEOUT))
-        .context("failed to configure audio UDP receiver timeout")?;
-    let local_port = socket
-        .local_addr()
-        .context("failed to read local audio UDP receiver address")?
-        .port();
-    let stop_flag = Arc::new(AtomicBool::new(false));
-    let task_stop_flag = Arc::clone(&stop_flag);
-    let task = tokio::task::spawn_blocking(move || {
-        run_receiver_loop(
-            socket,
-            task_stop_flag,
-            master_secret,
-            direction,
-            expected_peer_ip,
-        )
-    });
-    Ok((
-        AudioTaskHandle {
-            stop_flag,
-            task: Some(task),
-        },
-        local_port,
-    ))
+) -> Result<(AudioTaskHandle, u16, [u8; 32])> {
+    let (socket, channel_secret, channel_id) = prepare_receiver(master_secret, expected_peer_ip)?;
+    let local_port = socket.local_addr()?.port();
+    let stop = CancellationToken::new();
+    let task_stop = stop.clone();
+    let task = tokio::spawn(receive::run(socket, task_stop, channel_secret, direction, expected_peer_ip));
+    Ok((AudioTaskHandle { stop, task: Some(task) }, local_port, channel_id))
 }
 
 pub fn spawn_sender(
     master_secret: [u8; 32],
+    channel_id: [u8; 32],
     direction: AudioChannelDirection,
     remote_addr: SocketAddr,
 ) -> Result<AudioTaskHandle> {
-    let socket = UdpSocket::bind(("0.0.0.0", 0)).context("failed to bind audio UDP sender")?;
-    socket
-        .connect(remote_addr)
-        .with_context(|| format!("failed to connect audio UDP sender to {remote_addr}"))?;
-    socket
-        .set_write_timeout(Some(AUDIO_SOCKET_TIMEOUT))
-        .context("failed to configure audio UDP sender timeout")?;
-    let stop_flag = Arc::new(AtomicBool::new(false));
-    let task_stop_flag = Arc::clone(&stop_flag);
-    let task = tokio::task::spawn_blocking(move || {
-        run_sender_loop(
-            socket,
-            task_stop_flag,
-            master_secret,
-            direction,
-            remote_addr,
-        )
+    let channel_secret = crypto::derive_channel_secret(master_secret, channel_id)?;
+    let socket = bind_socket(remote_addr.ip())?;
+    let stop = CancellationToken::new();
+    let task_stop = stop.clone();
+    let task = tokio::spawn(async move {
+        socket.connect(remote_addr).await.context("连接音频 UDP 接收端失败")?;
+        send::run(socket, task_stop, channel_secret, direction).await
     });
-    Ok(AudioTaskHandle {
-        stop_flag,
-        task: Some(task),
-    })
+    Ok(AudioTaskHandle { stop, task: Some(task) })
 }
 
-fn run_sender_loop(
-    socket: UdpSocket,
-    stop_flag: Arc<AtomicBool>,
-    master_secret: [u8; 32],
-    direction: AudioChannelDirection,
-    remote_addr: SocketAddr,
-) -> Result<()> {
-    let codec = CodecConfig::default();
-    let stream = codec.stream_params().map_err(anyhow::Error::from)?;
-    let mut input = open_input(&CaptureConfig::default(), &stream).map_err(anyhow::Error::from)?;
-    let mut encoder =
-        OpusEncoder::new(stream.opus_config(), stream.bitrate).map_err(anyhow::Error::from)?;
-    let mut packetizer =
-        AudioPacketizer::new(stream.packet_duration_ms, rand::random::<u32>(), true);
-    let mut pcm_buffer = vec![0.0; stream.samples_per_frame()];
-    let mut encoded_buffer = vec![0u8; 1400];
-    let mut encryptor = AudioEncryptor::new(master_secret, direction)?;
-    let local_addr = socket
-        .local_addr()
-        .context("failed to read local audio UDP sender address")?;
-
-    tracing::info!(%local_addr, %remote_addr, "音频 UDP 发送端已连接");
-
-    while !stop_flag.load(Ordering::Relaxed) {
-        match input
-            .read_frame(&mut pcm_buffer, AUDIO_SOCKET_TIMEOUT)
-            .map_err(anyhow::Error::from)?
-        {
-            CaptureStatus::Timeout => continue,
-            CaptureStatus::Ok => {
-                let encoded = encoder
-                    .encode_float(&pcm_buffer, &mut encoded_buffer)
-                    .map_err(anyhow::Error::from)?;
-                let datagrams = packetizer
-                    .push_encoded_frame(&encoded_buffer[..encoded])
-                    .map_err(anyhow::Error::from)?;
-                for datagram in datagrams {
-                    if stop_flag.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let encrypted = encryptor.encrypt(&datagram.bytes)?;
-                    socket.send(&encrypted).with_context(|| {
-                        format!("failed to send encrypted audio UDP packet to {remote_addr}")
-                    })?;
-                }
-            }
-        }
-    }
-
-    tracing::info!("音频 UDP 发送已停止");
-    Ok(())
+fn prepare_receiver(master_secret: [u8; 32], peer: IpAddr) -> Result<(UdpSocket, [u8; 32], [u8; 32])> {
+    let mut channel_id = [0; 32];
+    ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut channel_id)
+        .map_err(|_| anyhow::anyhow!("生成音频通道随机标识失败"))?;
+    let channel_secret = crypto::derive_channel_secret(master_secret, channel_id)?;
+    Ok((bind_socket(peer)?, channel_secret, channel_id))
 }
 
-fn run_receiver_loop(
-    socket: UdpSocket,
-    stop_flag: Arc<AtomicBool>,
-    master_secret: [u8; 32],
-    direction: AudioChannelDirection,
-    expected_peer_ip: IpAddr,
-) -> Result<()> {
-    let codec = CodecConfig::default();
-    let stream = codec.stream_params().map_err(anyhow::Error::from)?;
-    let mut output =
-        open_output(&PlaybackConfig::default(), &stream).map_err(anyhow::Error::from)?;
-    let mut decoder = OpusDecoder::new(stream.opus_config()).map_err(anyhow::Error::from)?;
-    let mut depacketizer =
-        AudioDepacketizer::new(stream.packet_duration_ms, DEFAULT_INITIAL_DROP_MS);
-    let mut decode_buffer = vec![0.0; stream.samples_per_frame()];
-    let mut read_buffer = vec![0u8; 2048];
-    let decryptor = AudioDecryptor::new(master_secret, direction)?;
-    let local_addr = socket
-        .local_addr()
-        .context("failed to read local audio UDP receiver address")?;
-    let mut bound_peer = None;
-
-    tracing::info!(%local_addr, %expected_peer_ip, "音频 UDP 接收端已监听");
-
-    while !stop_flag.load(Ordering::Relaxed) {
-        let (packet_len, remote_addr) = match socket.recv_from(&mut read_buffer) {
-            Ok(result) => result,
-            Err(err)
-                if err.kind() == std::io::ErrorKind::WouldBlock
-                    || err.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                continue;
-            }
-            Err(err) => return Err(err).context("failed to receive audio UDP packet"),
-        };
-
-        if remote_addr.ip() != expected_peer_ip {
-            continue;
-        }
-        if let Some(bound_peer) = bound_peer
-            && bound_peer != remote_addr
-        {
-            continue;
-        }
-
-        let packet = match decryptor.decrypt(&read_buffer[..packet_len]) {
-            Ok(packet) => packet,
-            Err(_) => continue,
-        };
-
-        if bound_peer.is_none() {
-            bound_peer = Some(remote_addr);
-            tracing::info!(%remote_addr, %local_addr, "音频 UDP 接收端已连接");
-        }
-
-        let ready = depacketizer
-            .push_datagram(&packet)
-            .map_err(anyhow::Error::from)?;
-        for frame in ready {
-            let decoded = match frame {
-                QueuedAudioFrame::Encoded(packet) => decoder
-                    .decode_float(Some(&packet), &mut decode_buffer)
-                    .map_err(anyhow::Error::from)?,
-                QueuedAudioFrame::Missing => decoder
-                    .decode_float(None, &mut decode_buffer)
-                    .map_err(anyhow::Error::from)?,
-            };
-            output
-                .submit_frame(&decode_buffer[..decoded], AUDIO_SOCKET_TIMEOUT)
-                .map_err(anyhow::Error::from)?;
-        }
-    }
-
-    tracing::info!("音频 UDP 接收已停止");
-    Ok(())
-}
-
-struct AudioEncryptor {
-    key: LessSafeKey,
-    nonce_prefix: [u8; 4],
-    counter: u64,
-}
-
-impl AudioEncryptor {
-    fn new(master_secret: [u8; 32], direction: AudioChannelDirection) -> Result<Self> {
-        let (key, nonce_prefix) = derive_directional_key(master_secret, direction)?;
-        Ok(Self {
-            key,
-            nonce_prefix,
-            counter: 0,
-        })
-    }
-
-    fn encrypt(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
-        let counter = self.counter;
-        self.counter = self.counter.wrapping_add(1);
-        let mut in_out = plaintext.to_vec();
-        self.key
-            .seal_in_place_append_tag(self.nonce(counter), Aad::from(AUDIO_AAD), &mut in_out)
-            .map_err(|_| anyhow!("failed to encrypt audio UDP packet"))?;
-        let mut packet = Vec::with_capacity(AUDIO_COUNTER_LEN + in_out.len());
-        packet.extend_from_slice(&counter.to_be_bytes());
-        packet.extend_from_slice(&in_out);
-        Ok(packet)
-    }
-
-    fn nonce(&self, counter: u64) -> Nonce {
-        build_nonce(self.nonce_prefix, counter)
-    }
-}
-
-struct AudioDecryptor {
-    key: LessSafeKey,
-    nonce_prefix: [u8; 4],
-}
-
-impl AudioDecryptor {
-    fn new(master_secret: [u8; 32], direction: AudioChannelDirection) -> Result<Self> {
-        let (key, nonce_prefix) = derive_directional_key(master_secret, direction)?;
-        Ok(Self { key, nonce_prefix })
-    }
-
-    fn decrypt(&self, ciphertext: &[u8]) -> Result<Vec<u8>> {
-        if ciphertext.len() <= AUDIO_COUNTER_LEN {
-            return Err(anyhow!("encrypted audio UDP packet is too short"));
-        }
-        let (counter_bytes, body) = ciphertext.split_at(AUDIO_COUNTER_LEN);
-        let counter = u64::from_be_bytes(
-            counter_bytes
-                .try_into()
-                .map_err(|_| anyhow!("invalid audio UDP packet counter"))?,
-        );
-        let mut in_out = body.to_vec();
-        let plaintext = self
-            .key
-            .open_in_place(
-                build_nonce(self.nonce_prefix, counter),
-                Aad::from(AUDIO_AAD),
-                &mut in_out,
-            )
-            .map_err(|_| anyhow!("failed to decrypt audio UDP packet"))?;
-        Ok(plaintext.to_vec())
-    }
-}
-
-fn derive_directional_key(
-    master_secret: [u8; 32],
-    direction: AudioChannelDirection,
-) -> Result<(LessSafeKey, [u8; 4])> {
-    let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, b"synly-audio-udp-key");
-    let prk = salt.extract(&master_secret);
-    let key_bytes = hkdf_expand::<32>(&prk, &[b"key", direction.as_label()])?;
-    let nonce_prefix = hkdf_expand::<4>(&prk, &[b"nonce", direction.as_label()])?;
-    let key = LessSafeKey::new(
-        UnboundKey::new(&CHACHA20_POLY1305, &key_bytes)
-            .map_err(|_| anyhow!("failed to initialize audio AEAD key"))?,
-    );
-    Ok((key, nonce_prefix))
-}
-
-fn build_nonce(prefix: [u8; 4], counter: u64) -> Nonce {
-    let mut nonce = [0u8; 12];
-    nonce[..4].copy_from_slice(&prefix);
-    nonce[4..].copy_from_slice(&counter.to_be_bytes());
-    Nonce::assume_unique_for_key(nonce)
-}
-
-fn hkdf_expand<const N: usize>(prk: &hkdf::Prk, info: &[&[u8]]) -> Result<[u8; N]> {
-    let mut output = [0u8; N];
-    prk.expand(info, HkdfLen(N))
-        .map_err(|_| anyhow!("failed to expand audio HKDF output"))?
-        .fill(&mut output)
-        .map_err(|_| anyhow!("failed to fill audio HKDF output"))?;
-    Ok(output)
-}
-
-#[derive(Clone, Copy)]
-struct HkdfLen(usize);
-
-impl hkdf::KeyType for HkdfLen {
-    fn len(&self) -> usize {
-        self.0
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{AudioChannelDirection, AudioDecryptor, AudioEncryptor, AudioTaskHandle};
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
-    #[test]
-    fn audio_crypto_roundtrip_preserves_payload() {
-        let secret = [7u8; 32];
-        let mut sender = AudioEncryptor::new(secret, AudioChannelDirection::HostToClient).unwrap();
-        let receiver = AudioDecryptor::new(secret, AudioChannelDirection::HostToClient).unwrap();
-        let payload = b"rtp-packet".to_vec();
-
-        let packet = sender.encrypt(&payload).unwrap();
-        let decoded = receiver.decrypt(&packet).unwrap();
-
-        assert_eq!(decoded, payload);
-    }
-
-    #[tokio::test]
-    async fn dropping_audio_task_requests_stop() {
-        let stop_flag = Arc::new(AtomicBool::new(false));
-        let task = tokio::spawn(std::future::pending::<anyhow::Result<()>>());
-        let abort_handle = task.abort_handle();
-        let handle = AudioTaskHandle {
-            stop_flag: Arc::clone(&stop_flag),
-            task: Some(task),
-        };
-
-        drop(handle);
-
-        assert!(stop_flag.load(Ordering::Relaxed));
-        abort_handle.abort();
-    }
+fn bind_socket(peer: IpAddr) -> Result<UdpSocket> {
+    let address = match peer {
+        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+    };
+    // 同步入口仅绑定端口, 所有网络收发都交给 Tokio 非阻塞驱动.
+    let socket = std::net::UdpSocket::bind(SocketAddr::new(address, 0))
+        .context("绑定音频 UDP 端口失败")?;
+    socket.set_nonblocking(true).context("设置音频 UDP 非阻塞模式失败")?;
+    UdpSocket::from_std(socket).context("注册音频 UDP 异步驱动失败")
 }

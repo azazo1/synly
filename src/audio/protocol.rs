@@ -63,6 +63,9 @@ pub fn parse_datagram(packet: &[u8]) -> Result<ParsedPacket> {
 
     let rtp = parse_rtp_header(packet)?;
     let body = &packet[RTP_HEADER_LEN..];
+    if body.is_empty() {
+        return Err(Error::Protocol("empty RTP audio payload".into()));
+    }
 
     match rtp.packet_type {
         RTP_PAYLOAD_TYPE_AUDIO => Ok(ParsedPacket::Audio {
@@ -70,7 +73,7 @@ pub fn parse_datagram(packet: &[u8]) -> Result<ParsedPacket> {
             payload: body.to_vec(),
         }),
         RTP_PAYLOAD_TYPE_FEC => {
-            if body.len() < AUDIO_FEC_HEADER_LEN {
+            if body.len() <= AUDIO_FEC_HEADER_LEN {
                 return Err(Error::Protocol(
                     "datagram shorter than audio FEC header".into(),
                 ));
@@ -98,8 +101,14 @@ fn parse_rtp_header(packet: &[u8]) -> Result<RtpHeader> {
         return Err(Error::Protocol("missing RTP header".into()));
     }
 
+    // Sunshine 音频只发送固定 RTPv2 头, 不包含 CSRC, 扩展头或尾部填充.
+    // 拒绝其他形态, 避免把额外头字段当成 Opus 数据参与 FEC.
+    if packet[0] != 0x80 || packet[1] & 0x80 != 0 {
+        return Err(Error::Protocol("unsupported RTP audio header flags".into()));
+    }
+
     Ok(RtpHeader {
-        packet_type: packet[1] & 0x7f,
+        packet_type: packet[1],
         sequence_number: u16::from_be_bytes([packet[2], packet[3]]),
         timestamp: u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]),
         ssrc: u32::from_be_bytes([packet[8], packet[9], packet[10], packet[11]]),

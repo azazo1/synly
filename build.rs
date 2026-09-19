@@ -425,6 +425,8 @@ fn is_opus_lib_name(lib_name: &str) -> bool {
 }
 
 fn build_macos_native() {
+    println!("cargo:rerun-if-changed=native/macos_audio_conversion.h");
+    println!("cargo:rerun-if-changed=native/macos_capture_ring.h");
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR is missing"));
     let sources = [
         PathBuf::from("native/macos_audio.m"),

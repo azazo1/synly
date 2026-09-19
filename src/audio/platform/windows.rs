@@ -11,10 +11,20 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+mod budget;
+mod diagnostics;
+mod scheduling;
+mod stream;
+#[cfg(test)]
+mod tests;
+#[cfg(test)]
+mod queue_tests;
+
+use budget::{MAX_PLAYBACK_WAIT, QueueBudget};
+use diagnostics::CaptureDiagnostics;
+use scheduling::MmcssTask;
+
 const SUPPORTED_CHANNELS: u16 = 2;
-const CAPTURE_RING_SECONDS: usize = 2;
-const PLAYBACK_RING_SECONDS: usize = 1;
-const SHARED_BUFFER_DURATION_HNS: i64 = 1_000_000;
 
 const CLSCTX_ALL: u32 = 23;
 const COINIT_MULTITHREADED: u32 = 0;
@@ -31,6 +41,7 @@ const AUDCLNT_STREAMFLAGS_EVENTCALLBACK: u32 = 0x0004_0000;
 const AUDCLNT_STREAMFLAGS_NOPERSIST: u32 = 0x0008_0000;
 const AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY: u32 = 0x0800_0000;
 const AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM: u32 = 0x8000_0000;
+const AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY: u32 = 0x1;
 const AUDCLNT_BUFFERFLAGS_SILENT: u32 = 0x2;
 const AUDCLNT_E_DEVICE_INVALIDATED: i32 = 0x8889_0004u32 as i32;
 const AUDCLNT_E_ENDPOINT_CREATE_FAILED: i32 = 0x8889_000Fu32 as i32;
@@ -73,16 +84,16 @@ const IID_IAUDIO_CAPTURE_CLIENT: Guid = Guid::new(
 );
 
 pub fn open_input(config: &CaptureConfig, stream: &StreamParams) -> Result<Box<dyn AudioInput>> {
-    validate_stream(
-        "Windows WASAPI loopback capture",
-        config.device_name.as_deref(),
-        stream,
-    )?;
+    validate_stream(config.device_name.as_deref(), stream)?;
 
+    let budget = QueueBudget::from_stream(stream)?;
     let ring = Arc::new(SharedSampleRing::new(
-        stream.sample_rate as usize * stream.channels as usize * CAPTURE_RING_SECONDS,
+        budget.capture_samples,
+        budget.channels,
+        budget.frame_samples,
+        budget.capture_samples,
         "windows capture backend has been closed",
-    ));
+    )?);
     let stop_event = OwnedHandle::create_manual_reset(false)?;
     let thread = spawn_capture_thread(
         stop_event.raw(),
@@ -98,16 +109,16 @@ pub fn open_input(config: &CaptureConfig, stream: &StreamParams) -> Result<Box<d
 }
 
 pub fn open_output(config: &PlaybackConfig, stream: &StreamParams) -> Result<Box<dyn AudioOutput>> {
-    validate_stream(
-        "Windows WASAPI playback",
-        config.device_name.as_deref(),
-        stream,
-    )?;
+    validate_stream(config.device_name.as_deref(), stream)?;
 
+    let budget = QueueBudget::from_stream(stream)?;
     let ring = Arc::new(SharedSampleRing::new(
-        stream.sample_rate as usize * stream.channels as usize * PLAYBACK_RING_SECONDS,
+        budget.playback_samples,
+        budget.channels,
+        budget.frame_samples,
+        budget.playback_watermark,
         "windows playback backend has been closed",
-    ));
+    )?);
     let stop_event = OwnedHandle::create_manual_reset(false)?;
     let thread = spawn_playback_thread(
         stop_event.raw(),
@@ -122,11 +133,9 @@ pub fn open_output(config: &PlaybackConfig, stream: &StreamParams) -> Result<Box
     }))
 }
 
-fn validate_stream(kind: &str, device_name: Option<&str>, stream: &StreamParams) -> Result<()> {
+fn validate_stream(device_name: Option<&str>, stream: &StreamParams) -> Result<()> {
     if device_name.is_some() {
-        return Err(Error::Backend(format!(
-            "{kind} does not support selecting a specific device yet"
-        )));
+        return Err(Error::UnsupportedPlatform("Windows 音频尚不支持指定设备"));
     }
 
     if stream.channels != SUPPORTED_CHANNELS as u8 {
@@ -156,6 +165,9 @@ impl Drop for WindowsInput {
 
 impl AudioInput for WindowsInput {
     fn read_frame(&mut self, frame: &mut [f32], timeout: Duration) -> Result<CaptureStatus> {
+        if frame.len() != self.ring.frame_samples {
+            return Err(Error::Backend("Windows 捕获缓冲必须为完整协商帧".into()));
+        }
         if self.ring.read_exact(frame, timeout)? {
             Ok(CaptureStatus::Ok)
         } else {
@@ -282,18 +294,46 @@ fn capture_thread_main(
     spec: WasapiSpec,
     ready_tx: mpsc::Sender<std::result::Result<(), String>>,
 ) {
+    let _mmcss = MmcssTask::register();
+    let mut diagnostics = CaptureDiagnostics::default();
     let mut ready_sent = false;
     loop {
         match CaptureThreadContext::start(spec) {
             Ok(context) => {
+                if let Err(err) = ring.configure_capture_packet(context.buffer_frames, spec.sample_rate) {
+                    let message = err.to_string();
+                    if !ready_sent {
+                        let _ = ready_tx.send(Err(message.clone()));
+                    }
+                    ring.close(Some(message));
+                    return;
+                }
+                if ready_sent {
+                    if let Err(err) = ring.finish_recovery() {
+                        ring.close(Some(err.to_string()));
+                        return;
+                    }
+                    tracing::info!("Windows 音频捕获设备已重建, 旧音频已丢弃");
+                }
                 if !ready_sent {
                     let _ = ready_tx.send(Ok(()));
                     ready_sent = true;
                 }
 
-                match context.run(stop_event, &ring) {
+                match context.run(stop_event, &ring, &mut diagnostics) {
                     Ok(ThreadRunState::Stop) => return,
-                    Ok(ThreadRunState::Restart) => continue,
+                    Ok(ThreadRunState::Restart) => {
+                        match ring.begin_recovery() {
+                            Ok(discarded_samples) => {
+                                tracing::info!(discarded_samples, "Windows 音频设备需要重建, 清空队列并暂停接收音频");
+                            }
+                            Err(err) => {
+                                ring.close(Some(err.to_string()));
+                                return;
+                            }
+                        }
+                        continue;
+                    }
                     Err(err) => {
                         if !ready_sent {
                             let message = err.to_string();
@@ -333,58 +373,39 @@ fn playback_thread_main(
     spec: WasapiSpec,
     ready_tx: mpsc::Sender<std::result::Result<(), String>>,
 ) {
-    let mut ready_sent = false;
-    loop {
-        match PlaybackThreadContext::start(spec) {
-            Ok(context) => {
-                if !ready_sent {
-                    let _ = ready_tx.send(Ok(()));
-                    ready_sent = true;
-                }
-
-                match context.run(stop_event, &ring) {
-                    Ok(ThreadRunState::Stop) => return,
-                    Ok(ThreadRunState::Restart) => continue,
-                    Err(err) => {
-                        if !ready_sent {
-                            let message = err.to_string();
-                            let _ = ready_tx.send(Err(message.clone()));
-                            ring.close(Some(message));
-                            return;
-                        }
-                        ring.close(Some(err.to_string()));
-                        return;
-                    }
-                }
-            }
-            Err(err) => {
-                if !ready_sent {
-                    let message = err.to_string();
-                    let _ = ready_tx.send(Err(message.clone()));
-                    ring.close(Some(message));
-                    return;
-                }
-
-                match wait_for_stop_or_timeout(stop_event, DEVICE_RETRY_BACKOFF_MS) {
-                    Ok(true) => return,
-                    Ok(false) => continue,
-                    Err(wait_err) => {
-                        ring.close(Some(wait_err.to_string()));
-                        return;
-                    }
-                }
-            }
+    let _mmcss = MmcssTask::register();
+    match PlaybackThreadContext::start(spec) {
+        Ok(context) => {
+            let _ = ready_tx.send(Ok(()));
+            finish_playback_stream(context.run(stop_event, &ring), &ring);
+        }
+        Err(error) => {
+            let message = error.to_string();
+            let _ = ready_tx.send(Err(message.clone()));
+            ring.close(Some(message));
         }
     }
 }
 
+fn finish_playback_stream(result: Result<ThreadRunState>, ring: &SharedSampleRing) {
+    // 播放设备的整个生命周期由 runtime/render 负责, 不能在这里偷偷重建,
+    // 否则上层会保留旧 Opus 解码状态, 也不会执行恢复丢帧窗口.
+    match result {
+        Ok(ThreadRunState::Stop) => ring.close(None),
+        Ok(ThreadRunState::Restart) => ring.close(Some("Windows 播放设备请求重建".into())),
+        Err(error) => ring.close(Some(error.to_string())),
+    }
+}
+
 struct CaptureThreadContext {
-    _com: ComApartment,
     audio_client: ComPtr<IAudioClient>,
     capture_client: ComPtr<IAudioCaptureClient>,
     capture_event: OwnedHandle,
     endpoint_id: String,
     channels: usize,
+    buffer_frames: u32,
+    // Rust 按字段声明顺序析构, COM apartment 必须晚于所有接口释放.
+    _com: ComApartment,
 }
 
 impl CaptureThreadContext {
@@ -392,35 +413,20 @@ impl CaptureThreadContext {
         let com = ComApartment::new()?;
         let activated = activate_default_audio_client()?;
         let audio_client = activated.audio_client;
-        let capture_event = OwnedHandle::create_manual_reset(false)?;
-        let format = spec.wave_format();
+        let capture_event = OwnedHandle::create_auto_reset(false)?;
         let stream_flags = AUDCLNT_STREAMFLAGS_LOOPBACK
             | AUDCLNT_STREAMFLAGS_EVENTCALLBACK
             | AUDCLNT_STREAMFLAGS_NOPERSIST
             | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
             | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
 
-        unsafe {
-            check_hresult(
-                ((*(*audio_client.as_ptr()).lp_vtbl).initialize)(
-                    audio_client.as_ptr(),
-                    AUDCLNT_SHAREMODE_SHARED,
-                    stream_flags,
-                    SHARED_BUFFER_DURATION_HNS,
-                    0,
-                    &format,
-                    ptr::null(),
-                ),
-                "IAudioClient::Initialize(loopback)",
-            )?;
-            check_hresult(
-                ((*(*audio_client.as_ptr()).lp_vtbl).set_event_handle)(
-                    audio_client.as_ptr(),
-                    capture_event.raw(),
-                ),
-                "IAudioClient::SetEventHandle(loopback)",
-            )?;
-        }
+        let buffer_frames = stream::initialize_shared_client(
+            audio_client.as_ptr(),
+            stream_flags,
+            capture_event.raw(),
+            spec,
+            "capture",
+        )?;
 
         let capture_client = get_service::<IAudioCaptureClient>(
             audio_client.as_ptr(),
@@ -436,41 +442,51 @@ impl CaptureThreadContext {
         }
 
         Ok(Self {
-            _com: com,
             audio_client,
             capture_client,
             capture_event,
             endpoint_id: activated.endpoint_id,
             channels: spec.channels as usize,
+            buffer_frames,
+            _com: com,
         })
     }
 
-    fn run(self, stop_event: Handle, ring: &SharedSampleRing) -> Result<ThreadRunState> {
-        let result = capture_loop(
+    fn run(
+        self,
+        stop_event: Handle,
+        ring: &SharedSampleRing,
+        diagnostics: &mut CaptureDiagnostics,
+    ) -> Result<ThreadRunState> {
+        capture_loop(
             self.capture_client.as_ptr(),
             self.capture_event.raw(),
             stop_event,
             ring,
             &self.endpoint_id,
             self.channels,
-        );
+            diagnostics,
+        )
+    }
+}
 
+impl Drop for CaptureThreadContext {
+    fn drop(&mut self) {
         unsafe {
             let _ = ((*(*self.audio_client.as_ptr()).lp_vtbl).stop)(self.audio_client.as_ptr());
         }
-
-        result
     }
 }
 
 struct PlaybackThreadContext {
-    _com: ComApartment,
     audio_client: ComPtr<IAudioClient>,
     render_client: ComPtr<IAudioRenderClient>,
     render_event: OwnedHandle,
     endpoint_id: String,
     channels: usize,
     buffer_frames: u32,
+    // Rust 按字段声明顺序析构, COM apartment 必须晚于所有接口释放.
+    _com: ComApartment,
 }
 
 impl PlaybackThreadContext {
@@ -478,45 +494,19 @@ impl PlaybackThreadContext {
         let com = ComApartment::new()?;
         let activated = activate_default_audio_client()?;
         let audio_client = activated.audio_client;
-        let render_event = OwnedHandle::create_manual_reset(false)?;
-        let format = spec.wave_format();
+        let render_event = OwnedHandle::create_auto_reset(false)?;
         let stream_flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK
             | AUDCLNT_STREAMFLAGS_NOPERSIST
             | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
             | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
 
-        unsafe {
-            check_hresult(
-                ((*(*audio_client.as_ptr()).lp_vtbl).initialize)(
-                    audio_client.as_ptr(),
-                    AUDCLNT_SHAREMODE_SHARED,
-                    stream_flags,
-                    SHARED_BUFFER_DURATION_HNS,
-                    0,
-                    &format,
-                    ptr::null(),
-                ),
-                "IAudioClient::Initialize(render)",
-            )?;
-            check_hresult(
-                ((*(*audio_client.as_ptr()).lp_vtbl).set_event_handle)(
-                    audio_client.as_ptr(),
-                    render_event.raw(),
-                ),
-                "IAudioClient::SetEventHandle(render)",
-            )?;
-        }
-
-        let mut buffer_frames = 0u32;
-        unsafe {
-            check_hresult(
-                ((*(*audio_client.as_ptr()).lp_vtbl).get_buffer_size)(
-                    audio_client.as_ptr(),
-                    &mut buffer_frames,
-                ),
-                "IAudioClient::GetBufferSize",
-            )?;
-        }
+        let buffer_frames = stream::initialize_shared_client(
+            audio_client.as_ptr(),
+            stream_flags,
+            render_event.raw(),
+            spec,
+            "render",
+        )?;
 
         let render_client = get_service::<IAudioRenderClient>(
             audio_client.as_ptr(),
@@ -538,18 +528,18 @@ impl PlaybackThreadContext {
         }
 
         Ok(Self {
-            _com: com,
             audio_client,
             render_client,
             render_event,
             endpoint_id: activated.endpoint_id,
             channels: spec.channels as usize,
             buffer_frames,
+            _com: com,
         })
     }
 
     fn run(self, stop_event: Handle, ring: &SharedSampleRing) -> Result<ThreadRunState> {
-        let result = playback_loop(
+        playback_loop(
             self.audio_client.as_ptr(),
             self.render_client.as_ptr(),
             self.render_event.raw(),
@@ -558,13 +548,15 @@ impl PlaybackThreadContext {
             &self.endpoint_id,
             self.channels,
             self.buffer_frames,
-        );
+        )
+    }
+}
 
+impl Drop for PlaybackThreadContext {
+    fn drop(&mut self) {
         unsafe {
             let _ = ((*(*self.audio_client.as_ptr()).lp_vtbl).stop)(self.audio_client.as_ptr());
         }
-
-        result
     }
 }
 
@@ -575,6 +567,7 @@ fn capture_loop(
     ring: &SharedSampleRing,
     endpoint_id: &str,
     channels: usize,
+    diagnostics: &mut CaptureDiagnostics,
 ) -> Result<ThreadRunState> {
     let handles = [stop_event, capture_event];
     let mut last_endpoint_check =
@@ -645,6 +638,16 @@ fn capture_loop(
                 return Ok(ThreadRunState::Restart);
             }
             check_hresult(hr, "IAudioCaptureClient::ReleaseBuffer")?;
+            if let Some(report) = diagnostics.observe(
+                flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY != 0,
+                Instant::now(),
+            ) {
+                tracing::warn!(
+                    total = report.total,
+                    since_last_report = report.since_last_report,
+                    "WASAPI 捕获音频不连续"
+                );
+            }
         }
     }
 }
@@ -754,28 +757,99 @@ struct SharedSampleRing {
     readable: Condvar,
     writable: Condvar,
     closed_message: &'static str,
+    channels: usize,
+    frame_samples: usize,
+    playback_watermark: usize,
 }
 
 impl SharedSampleRing {
-    fn new(capacity: usize, closed_message: &'static str) -> Self {
-        Self {
+    fn new(
+        capacity: usize,
+        channels: usize,
+        frame_samples: usize,
+        playback_watermark: usize,
+        closed_message: &'static str,
+    ) -> Result<Self> {
+        if channels == 0 || frame_samples == 0 || capacity < frame_samples
+            || !capacity.is_multiple_of(channels) || !frame_samples.is_multiple_of(channels)
+            || !playback_watermark.is_multiple_of(channels) || playback_watermark > capacity
+        {
+            return Err(Error::Backend("Windows 音频队列边界无效".into()));
+        }
+        let mut buffer = Vec::new();
+        buffer.try_reserve_exact(capacity)
+            .map_err(|err| Error::Backend(format!("分配 Windows 音频队列失败: {err}")))?;
+        buffer.resize(capacity, 0.0);
+        Ok(Self {
             state: Mutex::new(RingState {
-                buffer: vec![0.0; capacity.max(1)],
+                buffer,
                 read_pos: 0,
                 write_pos: 0,
                 len: 0,
                 closed: false,
+                recovering: false,
+                generation: 0,
+                dropped_samples: 0,
+                high_water_samples: 0,
+                #[cfg(test)]
+                writer_wait_hook: None,
                 error: None,
             }),
             readable: Condvar::new(),
             writable: Condvar::new(),
             closed_message,
+            channels,
+            frame_samples,
+            playback_watermark,
+        })
+    }
+
+    // 仅在捕获生产循环启动前调用, 初始化与设备恢复都需要重新读取实际单包上界.
+    fn configure_capture_packet(&self, buffer_frames: u32, sample_rate: u32) -> Result<()> {
+        if buffer_frames == 0 || sample_rate == 0 {
+            return Err(Error::Backend("Windows 捕获设备包或采样率无效".into()));
         }
+        let packet_samples = usize::try_from(buffer_frames).ok()
+            .and_then(|frames| frames.checked_mul(self.channels))
+            .ok_or_else(|| Error::Backend("Windows 捕获设备包样本数溢出".into()))?;
+        let floor_frames = usize::try_from(sample_rate).ok()
+            .and_then(|rate| rate.checked_mul(30))
+            .ok_or_else(|| Error::Backend("Windows 捕获时间预算溢出".into()))?;
+        let floor_samples = floor_frames.div_ceil(1000).checked_mul(self.channels)
+            .ok_or_else(|| Error::Backend("Windows 捕获时间预算样本数溢出".into()))?;
+        let capacity = self.frame_samples.checked_add(packet_samples)
+            .ok_or_else(|| Error::Backend("Windows 捕获拼帧容量溢出".into()))?
+            .max(floor_samples);
+        let mut state = self.lock_state()?;
+        if state.closed {
+            return Err(self.closed_error(&state));
+        }
+        // 分配成功后才替换旧状态, 不改变恢复标志或流代次.
+        let mut buffer = Vec::new();
+        buffer.try_reserve_exact(capacity)
+            .map_err(|err| Error::Backend(format!("分配 Windows 捕获拼帧队列失败: {err}")))?;
+        buffer.resize(capacity, 0.0);
+        let discarded = state.len;
+        state.record_drop(discarded);
+        state.buffer = buffer;
+        state.read_pos = 0;
+        state.write_pos = 0;
+        state.len = 0;
+        self.readable.notify_all();
+        self.writable.notify_all();
+        tracing::debug!(capacity, packet_samples, "已按设备最大单包调整 Windows 捕获队列");
+        Ok(())
     }
 
     fn read_exact(&self, out: &mut [f32], timeout: Duration) -> Result<bool> {
         let deadline = Instant::now() + timeout;
         let mut state = self.lock_state()?;
+        if state.closed {
+            return Err(self.closed_error(&state));
+        }
+        if !out.len().is_multiple_of(self.channels) || out.len() > state.buffer.len() {
+            return Err(Error::Backend("Windows 捕获读取未按声道帧对齐或超出容量".into()));
+        }
         while state.len < out.len() && !state.closed {
             let now = Instant::now();
             if now >= deadline {
@@ -785,6 +859,9 @@ impl SharedSampleRing {
             let remaining = deadline.saturating_duration_since(now);
             let (next_state, timed_out) = self.wait_for_readable(state, remaining)?;
             state = next_state;
+            if state.closed {
+                return Err(self.closed_error(&state));
+            }
             if timed_out && state.len < out.len() {
                 return Ok(false);
             }
@@ -800,28 +877,39 @@ impl SharedSampleRing {
     }
 
     fn write_blocking(&self, samples: &[f32], timeout: Duration) -> Result<()> {
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now() + timeout.min(MAX_PLAYBACK_WAIT);
         let mut state = self.lock_state()?;
-        while state.available() < samples.len() && !state.closed {
+        let generation = state.generation;
+        loop {
+            if state.closed {
+                return Err(self.closed_error(&state));
+            }
+            if samples.len() != self.frame_samples {
+                return Err(Error::Backend("Windows 播放提交必须为完整协商帧".into()));
+            }
+            // 恢复期间的提交以及跨越恢复边界的旧提交均丢弃, 不加入新设备队列.
+            if !state.accepts_write(generation) {
+                state.record_drop(samples.len());
+                return Ok(());
+            }
+            // 水位仅计算软件队列, WASAPI 设备缓冲由独立诊断报告.
+            if state.len <= self.playback_watermark && state.available() >= samples.len() {
+                break;
+            }
             let now = Instant::now();
             if now >= deadline {
+                state.record_drop(samples.len());
                 return Err(Error::Backend(
                     "Windows playback ring buffer timed out".into(),
                 ));
             }
-
             let remaining = deadline.saturating_duration_since(now);
-            let (next_state, timed_out) = self.wait_for_writable(state, remaining)?;
-            state = next_state;
-            if timed_out && state.available() < samples.len() {
-                return Err(Error::Backend(
-                    "Windows playback ring buffer timed out".into(),
-                ));
+            #[cfg(test)]
+            if let Some(hook) = state.writer_wait_hook.take() {
+                let _ = hook.send(remaining);
             }
-        }
-
-        if state.closed {
-            return Err(self.closed_error(&state));
+            let (next_state, _) = self.wait_for_writable(state, remaining)?;
+            state = next_state;
         }
 
         write_ring(&mut state, samples);
@@ -829,7 +917,42 @@ impl SharedSampleRing {
         Ok(())
     }
 
+    fn begin_recovery(&self) -> Result<usize> {
+        let mut state = self.lock_state()?;
+        if state.closed {
+            return Err(self.closed_error(&state));
+        }
+        let discarded = state.len;
+        state.generation = state.generation.wrapping_add(1);
+        state.recovering = true;
+        discard_oldest(&mut state, discarded);
+        self.readable.notify_all();
+        self.writable.notify_all();
+        Ok(discarded)
+    }
+
+    fn finish_recovery(&self) -> Result<()> {
+        let mut state = self.lock_state()?;
+        if state.closed {
+            return Err(self.closed_error(&state));
+        }
+        let discarded = state.len;
+        discard_oldest(&mut state, discarded);
+        state.recovering = false;
+        self.readable.notify_all();
+        self.writable.notify_all();
+        Ok(())
+    }
+
     fn write_overwrite(&self, samples: &[f32]) {
+        self.write_capture(Some(samples), samples.len());
+    }
+
+    fn write_silence_overwrite(&self, sample_count: usize) {
+        self.write_capture(None, sample_count);
+    }
+
+    fn write_capture(&self, samples: Option<&[f32]>, sample_count: usize) {
         let mut state = match self.lock_state() {
             Ok(state) => state,
             Err(_) => return,
@@ -837,25 +960,29 @@ impl SharedSampleRing {
         if state.closed {
             return;
         }
-
-        let samples = if samples.len() >= state.buffer.len() {
-            &samples[samples.len() - state.buffer.len()..]
-        } else {
-            samples
-        };
-
-        let needed = samples.len().saturating_sub(state.available());
-        if needed > 0 {
-            discard_oldest(&mut state, needed);
+        if state.recovering || !sample_count.is_multiple_of(self.channels) {
+            state.record_drop(sample_count);
+            return;
         }
-
-        write_ring(&mut state, samples);
+        let retained = sample_count.min(state.buffer.len());
+        let input_skipped = sample_count - retained;
+        state.record_drop(input_skipped);
+        let needed = retained.saturating_sub(state.available());
+        discard_oldest(&mut state, needed);
+        // 容量与输入都按完整声道帧对齐, 保留最新音频不会交换左右声道.
+        match samples {
+            Some(samples) => write_ring(&mut state, &samples[input_skipped..]),
+            None => {
+                for _ in 0..retained {
+                    let position = state.write_pos;
+                    state.buffer[position] = 0.0;
+                    state.write_pos = (position + 1) % state.buffer.len();
+                }
+                state.len += retained;
+                state.high_water_samples = state.high_water_samples.max(state.len);
+            }
+        }
         self.readable.notify_all();
-    }
-
-    fn write_silence_overwrite(&self, sample_count: usize) {
-        let silence = vec![0.0; sample_count];
-        self.write_overwrite(&silence);
     }
 
     fn read_partial_zero_fill(&self, out: &mut [f32]) -> usize {
@@ -867,7 +994,8 @@ impl SharedSampleRing {
             }
         };
 
-        let count = state.len.min(out.len());
+        let aligned_len = out.len() - out.len() % self.channels;
+        let count = state.len.min(aligned_len);
         if count > 0 {
             read_ring_prefix(&mut state, out, count);
         }
@@ -882,6 +1010,14 @@ impl SharedSampleRing {
         if let Ok(mut state) = self.lock_state() {
             if let Some(error) = error {
                 state.error.get_or_insert(error);
+            }
+            if !state.closed {
+                tracing::debug!(
+                    backend = self.closed_message,
+                    dropped_samples = state.dropped_samples,
+                    high_water_samples = state.high_water_samples,
+                    "Windows 音频软件队列已关闭"
+                );
             }
             state.closed = true;
             self.readable.notify_all();
@@ -933,10 +1069,26 @@ struct RingState {
     write_pos: usize,
     len: usize,
     closed: bool,
+    recovering: bool,
+    generation: u64,
+    dropped_samples: u64,
+    high_water_samples: usize,
+    #[cfg(test)]
+    writer_wait_hook: Option<mpsc::Sender<Duration>>,
     error: Option<String>,
 }
 
 impl RingState {
+    fn record_drop(&mut self, samples: usize) {
+        self.dropped_samples = self.dropped_samples.saturating_add(
+            u64::try_from(samples).unwrap_or(u64::MAX),
+        );
+    }
+
+    fn accepts_write(&self, generation: u64) -> bool {
+        !self.recovering && self.generation == generation
+    }
+
     fn available(&self) -> usize {
         self.buffer.len() - self.len
     }
@@ -948,6 +1100,7 @@ fn write_ring(state: &mut RingState, samples: &[f32]) {
         state.write_pos = (state.write_pos + 1) % state.buffer.len();
     }
     state.len += samples.len();
+    state.high_water_samples = state.high_water_samples.max(state.len);
 }
 
 fn read_ring(state: &mut RingState, out: &mut [f32]) {
@@ -963,6 +1116,7 @@ fn read_ring_prefix(state: &mut RingState, out: &mut [f32], count: usize) {
 }
 
 fn discard_oldest(state: &mut RingState, count: usize) {
+    state.record_drop(count.min(state.len));
     if count >= state.len {
         state.read_pos = state.write_pos;
         state.len = 0;
@@ -1207,7 +1361,22 @@ struct OwnedHandle(Handle);
 
 impl OwnedHandle {
     fn create_manual_reset(initial_state: bool) -> Result<Self> {
-        let handle = unsafe { CreateEventW(ptr::null_mut(), 1, initial_state as i32, ptr::null()) };
+        Self::create(true, initial_state)
+    }
+
+    fn create_auto_reset(initial_state: bool) -> Result<Self> {
+        Self::create(false, initial_state)
+    }
+
+    fn create(manual_reset: bool, initial_state: bool) -> Result<Self> {
+        let handle = unsafe {
+            CreateEventW(
+                ptr::null_mut(),
+                manual_reset as i32,
+                initial_state as i32,
+                ptr::null(),
+            )
+        };
         if handle.is_null() {
             Err(last_os_error("CreateEventW"))
         } else {

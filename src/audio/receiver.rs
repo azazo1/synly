@@ -1,8 +1,15 @@
+// 接收状态机移植自 moonlight-common-c/src/RtpAudioQueue.c.
+// 上游版本与对应函数见 docs/audio-port.md.
+#[cfg(test)]
+mod tests;
+#[cfg(test)]
+mod upstream_tests;
+
 use crate::audio::error::{Error, Result};
 use crate::audio::fec;
 use crate::audio::protocol::{
     self, AudioFecHeader, OOS_WAIT_TIME_MS, ParsedPacket, RTP_PAYLOAD_TYPE_AUDIO, RTPA_DATA_SHARDS,
-    RTPA_FEC_SHARDS, RtpHeader, parse_datagram,
+    RTPA_FEC_SHARDS, parse_datagram,
 };
 use std::array;
 use std::collections::VecDeque;
@@ -19,7 +26,7 @@ pub struct RtpAudioStats {
     pub packet_count_oos: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum QueuedAudioFrame {
     Encoded(Vec<u8>),
     Missing,
@@ -73,6 +80,7 @@ pub struct RtpAudioQueue {
     last_oos_sequence_number: u16,
     received_oos_data: bool,
     synchronizing: bool,
+    initialized: bool,
     stats: RtpAudioStats,
     packet_duration_ms: u32,
 }
@@ -86,6 +94,7 @@ impl RtpAudioQueue {
             last_oos_sequence_number: 0,
             received_oos_data: false,
             synchronizing: true,
+            initialized: false,
             stats: RtpAudioStats::default(),
             packet_duration_ms,
         }
@@ -93,13 +102,38 @@ impl RtpAudioQueue {
 
     pub fn add_packet(&mut self, packet: ParsedPacket) -> Result<()> {
         match &packet {
-            ParsedPacket::Audio { .. } => self.stats.packet_count_audio += 1,
+            ParsedPacket::Audio { rtp, .. } => {
+                self.stats.packet_count_audio += 1;
+                // 与 getFecBlockForRtpPacket 一致, 必须在丢弃旧块之前记录迟到包.
+                if !self.synchronizing
+                    && protocol::is_before16(
+                        rtp.sequence_number,
+                        self.oldest_rtp_base_sequence_number,
+                    )
+                {
+                    self.last_oos_sequence_number = rtp.sequence_number;
+                    self.stats.packet_count_oos += 1;
+                    if !self.received_oos_data {
+                        tracing::debug!(sequence = rtp.sequence_number, "音频检测到迟到包, 延长恢复等待");
+                        self.received_oos_data = true;
+                    }
+                } else if self.received_oos_data
+                    && protocol::is_before16(
+                        self.oldest_rtp_base_sequence_number,
+                        self.last_oos_sequence_number,
+                    )
+                {
+                    self.received_oos_data = false;
+                }
+            }
             ParsedPacket::Fec { .. } => self.stats.packet_count_fec += 1,
         }
 
         let (fec_header, block_size) = self.block_identity(&packet)?;
 
-        if self.synchronizing && self.oldest_rtp_base_sequence_number == 0 {
+        // 单独保存初始化状态, 避免起始块为 65532 时下一块回绕至 0 导致重复同步.
+        if !self.initialized {
+            self.initialized = true;
             self.next_rtp_sequence_number = fec_header
                 .base_sequence_number
                 .wrapping_add(RTPA_DATA_SHARDS as u16);
@@ -120,6 +154,10 @@ impl RtpAudioQueue {
             .get_mut(index)
             .ok_or_else(|| Error::Protocol("failed to locate queued FEC block".into()))?;
 
+        if block.fully_reassembled {
+            return Ok(());
+        }
+
         match packet {
             ParsedPacket::Audio { rtp, payload } => {
                 let shard_index = rtp
@@ -132,27 +170,10 @@ impl RtpAudioQueue {
                         "audio shard index exceeded FEC data span".into(),
                     ));
                 }
-                if block.data_shards[shard_index].is_none() {
-                    block.data_shards[shard_index] = Some(payload);
+                if block.data_shards[shard_index].is_some() {
+                    return Ok(());
                 }
-
-                if !self.synchronizing
-                    && protocol::is_before16(
-                        rtp.sequence_number,
-                        self.oldest_rtp_base_sequence_number,
-                    )
-                {
-                    self.last_oos_sequence_number = rtp.sequence_number;
-                    self.stats.packet_count_oos += 1;
-                    self.received_oos_data = true;
-                } else if self.received_oos_data
-                    && protocol::is_before16(
-                        self.oldest_rtp_base_sequence_number,
-                        self.last_oos_sequence_number,
-                    )
-                {
-                    self.received_oos_data = false;
-                }
+                block.data_shards[shard_index] = Some(payload);
             }
             ParsedPacket::Fec { fec, payload, .. } => {
                 let shard_index = fec.fec_shard_index as usize;
@@ -162,9 +183,10 @@ impl RtpAudioQueue {
                         "audio FEC shard index exceeded parity span".into(),
                     ));
                 }
-                if block.fec_shards[shard_index].is_none() {
-                    block.fec_shards[shard_index] = Some(payload);
+                if block.fec_shards[shard_index].is_some() {
+                    return Ok(());
                 }
+                block.fec_shards[shard_index] = Some(payload);
             }
         }
 
@@ -176,6 +198,10 @@ impl RtpAudioQueue {
     }
 
     pub fn dequeue_ready(&mut self) -> Option<QueuedAudioFrame> {
+        // 每次出队都推进恢复状态, 避免前一块释放后剩余块只能靠新 UDP 包唤醒.
+        if !self.has_packet_ready() {
+            self.handle_missing_packets();
+        }
         if let Some(block) = self.blocks.front_mut() {
             let expected_seq = block
                 .fec_header
@@ -213,6 +239,10 @@ impl RtpAudioQueue {
     fn block_identity(&mut self, packet: &ParsedPacket) -> Result<(AudioFecHeader, usize)> {
         match packet {
             ParsedPacket::Audio { rtp, payload } => {
+                if payload.is_empty() {
+                    self.stats.packet_count_invalid += 1;
+                    return Err(Error::Protocol("empty audio payload".into()));
+                }
                 let base_sequence =
                     (rtp.sequence_number / RTPA_DATA_SHARDS as u16) * RTPA_DATA_SHARDS as u16;
                 let offset = rtp.sequence_number.wrapping_sub(base_sequence) as u32;
@@ -229,11 +259,13 @@ impl RtpAudioQueue {
                 ))
             }
             ParsedPacket::Fec { fec, payload, .. } => {
-                if fec.base_sequence_number % RTPA_DATA_SHARDS as u16 != 0 {
+                if fec.base_sequence_number % RTPA_DATA_SHARDS as u16 != 0
+                    || fec.fec_shard_index as usize >= RTPA_FEC_SHARDS
+                    || fec.payload_type != RTP_PAYLOAD_TYPE_AUDIO
+                    || payload.is_empty()
+                {
                     self.stats.packet_count_fec_invalid += 1;
-                    return Err(Error::Protocol(
-                        "audio FEC block is not aligned to 4-packet boundary".into(),
-                    ));
+                    return Err(Error::Protocol("invalid audio FEC block header or payload".into()));
                 }
                 Ok((*fec, payload.len()))
             }
@@ -248,6 +280,13 @@ impl RtpAudioQueue {
                     return Err(Error::Protocol(
                         "audio block size mismatch within a FEC block".into(),
                     ));
+                }
+                if block.fec_header.payload_type != fec_header.payload_type
+                    || block.fec_header.base_timestamp != fec_header.base_timestamp
+                    || block.fec_header.ssrc != fec_header.ssrc
+                {
+                    self.stats.packet_count_fec_invalid += 1;
+                    return Err(Error::Protocol("inconsistent audio FEC block identity".into()));
                 }
                 return Ok(index);
             }
@@ -318,7 +357,11 @@ impl RtpAudioQueue {
         ) {
             self.next_rtp_sequence_number = head.fec_header.base_sequence_number;
             self.oldest_rtp_base_sequence_number = head.fec_header.base_sequence_number;
-            return;
+            // 跨过全丢块后, 若新队头也缺首包, 继续评估其已到期的恢复窗口.
+            // 有首包时立即交付, 不能将整块提前标记为丢失.
+            if head.data_shards[head.next_data_index].is_some() {
+                return;
+            }
         }
 
         if block_count == 1 {
@@ -332,6 +375,12 @@ impl RtpAudioQueue {
                 )
         {
             self.stats.packet_count_fec_failed += 1;
+            tracing::debug!(
+                base_sequence = head.fec_header.base_sequence_number,
+                data_shards = head.data_received(),
+                fec_shards = head.fec_received(),
+                "音频 FEC 无法恢复, 使用 Opus 丢包补偿"
+            );
             head.allow_discontinuity = true;
         }
     }
@@ -350,6 +399,7 @@ impl RtpAudioQueue {
 pub struct AudioDepacketizer {
     queue: RtpAudioQueue,
     packets_to_drop: u32,
+    received_packet: bool,
 }
 
 impl AudioDepacketizer {
@@ -357,32 +407,39 @@ impl AudioDepacketizer {
         Self {
             queue: RtpAudioQueue::new(packet_duration_ms),
             packets_to_drop: initial_drop_ms.checked_div(packet_duration_ms).unwrap_or(0),
+            received_packet: false,
         }
     }
 
     pub fn push_datagram(&mut self, datagram: &[u8]) -> Result<Vec<QueuedAudioFrame>> {
         let parsed = parse_datagram(datagram)?;
-        if self.packets_to_drop > 0
-            && matches!(
-                parsed,
-                ParsedPacket::Audio {
-                    rtp: RtpHeader {
-                        packet_type: RTP_PAYLOAD_TYPE_AUDIO,
-                        ..
-                    },
-                    ..
-                }
-            )
-        {
-            self.packets_to_drop -= 1;
+        self.received_packet = true;
+        if self.packets_to_drop > 0 {
+            // AudioReceiveThreadProc 丢弃整个启动窗口, 只有数据包消耗计数.
+            // FEC 同时丢弃, 否则会重建本应舍弃的过期音频.
+            if matches!(parsed, ParsedPacket::Audio { .. }) {
+                self.packets_to_drop -= 1;
+            }
             return Ok(Vec::new());
         }
 
         self.queue.add_packet(parsed)?;
+        Ok(self.drain_ready())
+    }
+
+    pub fn receive_timeout(&mut self) -> Vec<QueuedAudioFrame> {
+        // 已收到有效包后 socket 超时表示启动积压已排空, 与 Moonlight 一致.
+        if self.received_packet {
+            self.packets_to_drop = 0;
+        }
+        self.drain_ready()
+    }
+
+    fn drain_ready(&mut self) -> Vec<QueuedAudioFrame> {
         let mut ready = Vec::new();
         while let Some(frame) = self.queue.dequeue_ready() {
             ready.push(frame);
         }
-        Ok(ready)
+        ready
     }
 }

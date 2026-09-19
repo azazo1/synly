@@ -17,6 +17,38 @@ headless *args:
 test:
     cargo test
 
+# 运行音频编解码, 队列及 UDP 流水线测试.
+audio-test:
+    cargo test --offline --bin synly audio::
+    cargo test --offline -p synly-core protocol::tests::audio_offer
+
+# just audio-fec-vectors /path/to/nanors
+# 编译上游独立 FEC 生成器并验证全部单片和双片丢失组合.
+[unix]
+audio-fec-vectors upstream:
+    mkdir -p target/audio-tests
+    bash native/tests/build-audio-fec-vectors.sh '{{upstream}}' target/audio-tests/audio-fec-vectors
+    target/audio-tests/audio-fec-vectors
+
+# just audio-queue-vectors /path/to/moonlight-common-c /path/to/nanors
+# 编译原始 Moonlight 队列, 重现并逐字节比较固定接收轨迹.
+[unix]
+audio-queue-vectors moonlight nanors:
+    mkdir -p target/audio-tests
+    bash native/tests/build-audio-queue-vectors.sh '{{moonlight}}' '{{nanors}}' target/audio-tests/audio-queue-vectors
+    target/audio-tests/audio-queue-vectors > target/audio-tests/audio-queue-vectors.tsv
+    cmp native/tests/audio-queue-vectors.tsv target/audio-tests/audio-queue-vectors.tsv
+    cargo test --offline --bin synly audio::receiver::upstream_tests
+
+# 使用内存检查器验证 macOS 原生故障路径和真实重采样, 不打开音频设备.
+[macos]
+audio-native-test:
+    mkdir -p target/audio-tests
+    clang -fobjc-arc -fsanitize=address,undefined -g native/tests/macos-audio-tests.m -framework Foundation -framework AudioToolbox -framework CoreAudio -o target/audio-tests/macos-audio-tests
+    target/audio-tests/macos-audio-tests
+    clang -fsanitize=address,undefined -g native/tests/macos-conversion-tests.c -framework AudioToolbox -framework CoreAudio -o target/audio-tests/macos-conversion-tests
+    target/audio-tests/macos-conversion-tests
+
 # 运行全部 target 和 feature 的 clippy.
 clippy:
     cargo clippy --all-targets --all-features

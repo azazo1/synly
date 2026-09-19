@@ -8,14 +8,20 @@ pub const DEFAULT_INITIAL_DROP_MS: u32 = 500;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AudioLayout {
     Stereo,
-    #[expect(
-        dead_code,
-        reason = "surround layouts are supported by the codec layer but not yet exposed by the CLI"
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "环绕声布局由 codec 支持, 尚未通过 CLI 暴露"
+        )
     )]
     Surround51,
-    #[expect(
-        dead_code,
-        reason = "surround layouts are supported by the codec layer but not yet exposed by the CLI"
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "环绕声布局由 codec 支持, 尚未通过 CLI 暴露"
+        )
     )]
     Surround71,
 }
@@ -33,20 +39,22 @@ pub struct StreamParams {
 
 impl StreamParams {
     pub fn frame_size(&self) -> usize {
-        (self.packet_duration_ms as usize * self.sample_rate as usize) / 1000
+        let samples = u64::from(self.packet_duration_ms) * u64::from(self.sample_rate) / 1000;
+        usize::try_from(samples).unwrap_or(usize::MAX)
     }
 
     pub fn samples_per_frame(&self) -> usize {
-        self.frame_size() * self.channels as usize
+        self.frame_size().saturating_mul(self.channels as usize)
     }
 
     pub fn opus_config(&self) -> OpusMultistreamConfig {
         OpusMultistreamConfig {
-            sample_rate: self.sample_rate as i32,
-            channel_count: self.channels as i32,
-            streams: self.streams as i32,
-            coupled_streams: self.coupled_streams as i32,
-            samples_per_frame: self.frame_size() as i32,
+            // 无法表示的配置交由 codec 验证拒绝, 避免截断后意外变成合法帧.
+            sample_rate: i32::try_from(self.sample_rate).unwrap_or(0),
+            channel_count: i32::from(self.channels),
+            streams: i32::from(self.streams),
+            coupled_streams: i32::from(self.coupled_streams),
+            samples_per_frame: i32::try_from(self.frame_size()).unwrap_or(0),
             mapping: self.mapping,
         }
     }
@@ -71,9 +79,9 @@ impl Default for CodecConfig {
 
 impl CodecConfig {
     pub fn stream_params(&self) -> Result<StreamParams> {
-        if self.packet_duration_ms == 0 {
+        if !matches!(self.packet_duration_ms, 5 | 10 | 20 | 40 | 60) {
             return Err(Error::InvalidConfig(
-                "packet duration must be greater than zero",
+                "Opus 整数毫秒帧时长必须为 5, 10, 20, 40 或 60 ms",
             ));
         }
 

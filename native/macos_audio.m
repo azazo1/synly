@@ -5,6 +5,7 @@
 #import <CoreAudio/CoreAudio.h>
 #import <Foundation/Foundation.h>
 #include <errno.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -13,21 +14,32 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include "macos_audio_conversion.h"
+#include "macos_capture_ring.h"
 
-static pthread_mutex_t g_error_mutex = PTHREAD_MUTEX_INITIALIZER;
-static char g_last_error[512] = "macOS audio backend error";
+// FFI 错误只在调用线程读取. 回调错误经各自 ring 传递到读写线程,
+// 避免多个捕获/播放实例并发覆盖共享字符缓冲区.
+static _Thread_local char g_last_error[512] = "macOS audio backend error";
 
 static void ar_set_error(const char *fmt, ...) {
   va_list args;
   va_start(args, fmt);
-  pthread_mutex_lock(&g_error_mutex);
   vsnprintf(g_last_error, sizeof(g_last_error), fmt, args);
-  pthread_mutex_unlock(&g_error_mutex);
   va_end(args);
 }
 
-const char *ar_macos_last_error(void) {
-  return g_last_error;
+int ar_macos_capture_supported(void) {
+  // AudioHardwareCreateProcessTap 自 macOS 14.2 起提供, 不是 14.0.
+  @autoreleasepool {
+    NSOperatingSystemVersion minimum = {14, 2, 0};
+    return [[NSProcessInfo processInfo] isOperatingSystemAtLeastVersion:minimum];
+  }
+}
+
+void ar_macos_copy_error(char *out, uint32_t capacity) {
+  if (out != NULL && capacity > 0) {
+    snprintf(out, capacity, "%s", g_last_error);
+  }
 }
 
 typedef struct {
@@ -36,25 +48,39 @@ typedef struct {
   uint32_t read_pos;
   uint32_t write_pos;
   uint32_t len;
+  uint32_t channels;
+  uint32_t frame_samples;
+  uint32_t write_watermark;
+  uint32_t high_water_samples;
+  uint64_t dropped_samples;
   bool closed;
+  bool initialized;
+  OSStatus failure;
+  const char *failure_operation;
   pthread_mutex_t mutex;
   pthread_cond_t cond_read;
   pthread_cond_t cond_write;
 } ARFloatRing;
 
-typedef struct {
-  float *input_data;
-  UInt32 input_frames;
-  UInt32 frames_provided;
-  UInt32 device_channels;
-} ARConverterInput;
-
 static void ar_deadline_from_now(struct timespec *ts, uint32_t timeout_ms) {
-  clock_gettime(CLOCK_REALTIME, ts);
+  clock_gettime(CLOCK_MONOTONIC, ts);
   ts->tv_sec += timeout_ms / 1000;
   long nanos = ts->tv_nsec + (long) (timeout_ms % 1000) * 1000000L;
   ts->tv_sec += nanos / 1000000000L;
   ts->tv_nsec = nanos % 1000000000L;
+}
+
+// macOS 条件变量相对等待配合单调截止时间, 系统时钟变化不延长背压预算.
+static int ar_ring_wait(pthread_cond_t *condition, pthread_mutex_t *mutex, const struct timespec *deadline) {
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  struct timespec remaining = {deadline->tv_sec - now.tv_sec, deadline->tv_nsec - now.tv_nsec};
+  if (remaining.tv_nsec < 0) {
+    remaining.tv_sec--;
+    remaining.tv_nsec += 1000000000L;
+  }
+  if (remaining.tv_sec < 0) return ETIMEDOUT;
+  return pthread_cond_timedwait_relative_np(condition, mutex, &remaining);
 }
 
 static bool ar_ring_init(ARFloatRing *ring, uint32_t capacity) {
@@ -64,14 +90,104 @@ static bool ar_ring_init(ARFloatRing *ring, uint32_t capacity) {
     ar_set_error("failed to allocate ring buffer");
     return false;
   }
+  int status = pthread_mutex_init(&ring->mutex, NULL);
+  if (status != 0) {
+    ar_set_error("初始化音频环形缓冲区 mutex 失败: %d", status);
+    goto fail_data;
+  }
+  status = pthread_cond_init(&ring->cond_read, NULL);
+  if (status != 0) {
+    ar_set_error("初始化音频环形缓冲区读取条件变量失败: %d", status);
+    goto fail_mutex;
+  }
+  status = pthread_cond_init(&ring->cond_write, NULL);
+  if (status != 0) {
+    ar_set_error("初始化音频环形缓冲区写入条件变量失败: %d", status);
+    goto fail_cond_read;
+  }
+
   ring->capacity = capacity;
-  pthread_mutex_init(&ring->mutex, NULL);
-  pthread_cond_init(&ring->cond_read, NULL);
-  pthread_cond_init(&ring->cond_write, NULL);
+  ring->channels = 1;
+  ring->write_watermark = capacity;
+  ring->initialized = true;
+  return true;
+
+fail_cond_read:
+  pthread_cond_destroy(&ring->cond_read);
+fail_mutex:
+  pthread_mutex_destroy(&ring->mutex);
+fail_data:
+  free(ring->data);
+  ring->data = NULL;
+  return false;
+}
+
+// Sunshine 捕获预算 30 ms; Moonlight 播放队列水位 50 ms.
+// 水位在提交前检查, 容量另加一整帧, 允许合法的 60 ms 帧.
+static bool ar_ring_init_audio(ARFloatRing *ring, uint32_t rate, uint32_t channels,
+                               uint32_t frame_size, bool playback) {
+  if (rate < 8000 || rate > 48000 || channels == 0 || channels > 8 ||
+      frame_size == 0 || (uint64_t) frame_size * 1000 > (uint64_t) rate * 60) {
+    ar_set_error("无效的原生音频缓冲参数");
+    return false;
+  }
+  uint64_t budget_frames = ((uint64_t) rate * (playback ? 50 : 30) + 999) / 1000;
+  uint64_t capacity_frames = playback ? budget_frames + frame_size
+      : (budget_frames > frame_size ? budget_frames : frame_size);
+  uint64_t capacity = capacity_frames * channels;
+  if (capacity > UINT32_MAX / sizeof(float)) {
+    ar_set_error("原生音频缓冲大小溢出");
+    return false;
+  }
+  if (!ar_ring_init(ring, (uint32_t) capacity)) return false;
+  ring->channels = channels;
+  ring->frame_samples = frame_size * channels;
+  ring->write_watermark = playback ? (uint32_t) budget_frames * channels : ring->capacity;
   return true;
 }
 
+// 仅在 IOProc 启动前调用. 一帧尚未凑满时仍需接纳完整设备回调,
+// 因而实际捕获容量下限为读取帧加一次回调的最大输出.
+static bool ar_ring_reserve_capture_chunk(ARFloatRing *ring, uint32_t chunk_frames) {
+  uint64_t required = (uint64_t) ring->frame_samples + (uint64_t) chunk_frames * ring->channels;
+  if (required <= ring->capacity) return true;
+  if (required > UINT32_MAX / sizeof(float)) {
+    ar_set_error("捕获回调缓冲大小溢出");
+    return false;
+  }
+  float *data = calloc((size_t) required, sizeof(float));
+  if (data == NULL) {
+    ar_set_error("无法分配捕获拼帧缓冲");
+    return false;
+  }
+  free(ring->data);
+  ring->data = data;
+  ring->capacity = (uint32_t) required;
+  ring->write_watermark = ring->capacity;
+  ring->read_pos = ring->write_pos = ring->len = 0;
+  return true;
+}
+
+static void ar_ring_record_drop(ARFloatRing *ring, uint32_t count) {
+  ring->dropped_samples = UINT64_MAX - ring->dropped_samples < count
+      ? UINT64_MAX : ring->dropped_samples + count;
+}
+
+static void ar_ring_record_high_water(ARFloatRing *ring) {
+  if (ring->len > ring->high_water_samples) ring->high_water_samples = ring->len;
+}
+
+static void ar_ring_copy_stats(ARFloatRing *ring, uint64_t *dropped, uint32_t *high_water) {
+  pthread_mutex_lock(&ring->mutex);
+  *dropped = ring->dropped_samples;
+  *high_water = ring->high_water_samples;
+  pthread_mutex_unlock(&ring->mutex);
+}
+
 static void ar_ring_close(ARFloatRing *ring) {
+  if (!ring->initialized) {
+    return;
+  }
   pthread_mutex_lock(&ring->mutex);
   ring->closed = true;
   pthread_cond_broadcast(&ring->cond_read);
@@ -79,14 +195,44 @@ static void ar_ring_close(ARFloatRing *ring) {
   pthread_mutex_unlock(&ring->mutex);
 }
 
-static void ar_ring_free(ARFloatRing *ring) {
-  if (ring->data != NULL) {
-    free(ring->data);
-    ring->data = NULL;
+// 回调只保存原始错误和静态操作名, 字符串格式化留给阻塞读写线程.
+// 首个故障保持不变, 直到整个设备实例销毁.
+static void ar_ring_fail(ARFloatRing *ring, OSStatus status, const char *operation) {
+  pthread_mutex_lock(&ring->mutex);
+  if (ring->failure == noErr) {
+    ring->failure = status;
+    ring->failure_operation = operation;
   }
-  pthread_mutex_destroy(&ring->mutex);
-  pthread_cond_destroy(&ring->cond_read);
+  ring->closed = true;
+  pthread_cond_broadcast(&ring->cond_read);
+  pthread_cond_broadcast(&ring->cond_write);
+  pthread_mutex_unlock(&ring->mutex);
+}
+
+static bool ar_ring_is_closed(ARFloatRing *ring) {
+  pthread_mutex_lock(&ring->mutex);
+  bool closed = ring->closed;
+  pthread_mutex_unlock(&ring->mutex);
+  return closed;
+}
+
+static void ar_ring_report_failure_locked(ARFloatRing *ring) {
+  if (ring->failure != noErr) {
+    ar_set_error("%s 失败, OSStatus=%d", ring->failure_operation, (int) ring->failure);
+  } else {
+    ar_set_error("音频设备已关闭");
+  }
+}
+
+static void ar_ring_free(ARFloatRing *ring) {
+  if (!ring->initialized) {
+    return;
+  }
   pthread_cond_destroy(&ring->cond_write);
+  pthread_cond_destroy(&ring->cond_read);
+  pthread_mutex_destroy(&ring->mutex);
+  free(ring->data);
+  memset(ring, 0, sizeof(*ring));
 }
 
 static void ar_ring_drop_oldest_locked(ARFloatRing *ring, uint32_t count) {
@@ -102,14 +248,26 @@ static void ar_ring_drop_oldest_locked(ARFloatRing *ring, uint32_t count) {
 
 static void ar_ring_write_overwrite(ARFloatRing *ring, const float *samples, uint32_t count) {
   pthread_mutex_lock(&ring->mutex);
+  if (ring->closed) {
+    pthread_mutex_unlock(&ring->mutex);
+    return;
+  }
 
+  // 上游回调必须提供完整的 interleaved sample-frame, 不能错位截断声道.
+  if (count % ring->channels != 0) {
+    pthread_mutex_unlock(&ring->mutex);
+    ar_ring_fail(ring, kAudio_ParamError, "捕获 PCM 声道对齐");
+    return;
+  }
   if (count > ring->capacity) {
+    ar_ring_record_drop(ring, count - ring->capacity);
     samples += count - ring->capacity;
     count = ring->capacity;
   }
 
   uint32_t free_slots = ring->capacity - ring->len;
   if (count > free_slots) {
+    ar_ring_record_drop(ring, count - free_slots);
     ar_ring_drop_oldest_locked(ring, count - free_slots);
   }
 
@@ -118,24 +276,31 @@ static void ar_ring_write_overwrite(ARFloatRing *ring, const float *samples, uin
     ring->write_pos = (ring->write_pos + 1) % ring->capacity;
   }
   ring->len += count;
+  ar_ring_record_high_water(ring);
 
   pthread_cond_signal(&ring->cond_read);
   pthread_mutex_unlock(&ring->mutex);
 }
 
 static int ar_ring_read(ARFloatRing *ring, float *out, uint32_t count, uint32_t timeout_ms) {
+  if (count == 0 || count > ring->capacity || count % ring->channels != 0 ||
+      (ring->frame_samples != 0 && count != ring->frame_samples)) {
+    ar_set_error("音频读取长度超出缓冲区范围");
+    return -1;
+  }
   pthread_mutex_lock(&ring->mutex);
   struct timespec deadline;
   ar_deadline_from_now(&deadline, timeout_ms);
 
   while (!ring->closed && ring->len < count) {
-    if (pthread_cond_timedwait(&ring->cond_read, &ring->mutex, &deadline) == ETIMEDOUT) {
+    if (ar_ring_wait(&ring->cond_read, &ring->mutex, &deadline) == ETIMEDOUT) {
       pthread_mutex_unlock(&ring->mutex);
       return 1;
     }
   }
 
   if (ring->closed) {
+    ar_ring_report_failure_locked(ring);
     pthread_mutex_unlock(&ring->mutex);
     return -1;
   }
@@ -169,21 +334,33 @@ static uint32_t ar_ring_read_partial_zero_fill(ARFloatRing *ring, float *out, ui
 }
 
 static int ar_ring_write_wait(ARFloatRing *ring, const float *samples, uint32_t count, uint32_t timeout_ms) {
+  if (count == 0 || count > ring->capacity || count % ring->channels != 0 ||
+      (ring->frame_samples != 0 && count != ring->frame_samples)) {
+    ar_set_error("音频写入长度超出缓冲区范围");
+    return -1;
+  }
   pthread_mutex_lock(&ring->mutex);
   struct timespec deadline;
-  ar_deadline_from_now(&deadline, timeout_ms);
+  ar_deadline_from_now(&deadline, timeout_ms < 100 ? timeout_ms : 100);
 
-  while (!ring->closed && ring->capacity - ring->len < count) {
-    if (pthread_cond_timedwait(&ring->cond_write, &ring->mutex, &deadline) == ETIMEDOUT) {
+  while (!ring->closed && (ring->len > ring->write_watermark || ring->capacity - ring->len < count)) {
+    int status = ar_ring_wait(&ring->cond_write, &ring->mutex, &deadline);
+    if (status != 0 && status != ETIMEDOUT) {
       pthread_mutex_unlock(&ring->mutex);
-      ar_set_error("audio output ring buffer timed out");
+      ar_set_error("等待音频播放缓冲失败: %d", status);
+      return -1;
+    }
+    if (status == ETIMEDOUT && !ring->closed &&
+        (ring->len > ring->write_watermark || ring->capacity - ring->len < count)) {
+      pthread_mutex_unlock(&ring->mutex);
+      ar_set_error("音频播放队列超过水位且等待超时");
       return -1;
     }
   }
 
   if (ring->closed) {
+    ar_ring_report_failure_locked(ring);
     pthread_mutex_unlock(&ring->mutex);
-    ar_set_error("audio output backend has been closed");
     return -1;
   }
 
@@ -192,61 +369,34 @@ static int ar_ring_write_wait(ARFloatRing *ring, const float *samples, uint32_t 
     ring->write_pos = (ring->write_pos + 1) % ring->capacity;
   }
   ring->len += count;
+  ar_ring_record_high_water(ring);
 
   pthread_cond_signal(&ring->cond_read);
   pthread_mutex_unlock(&ring->mutex);
   return 0;
 }
 
-static UInt32 ar_min_u32(UInt32 lhs, UInt32 rhs) {
-  return lhs < rhs ? lhs : rhs;
-}
-
-static OSStatus ar_converter_input_proc(
-    AudioConverterRef inAudioConverter,
-    UInt32 *ioNumberDataPackets,
-    AudioBufferList *ioData,
-    AudioStreamPacketDescription **outDataPacketDescription,
-    void *inUserData) {
-  (void) inAudioConverter;
-  (void) outDataPacketDescription;
-
-  ARConverterInput *input = (ARConverterInput *) inUserData;
-  if (input->frames_provided >= input->input_frames) {
-    *ioNumberDataPackets = 0;
-    return noErr;
-  }
-
-  UInt32 frames = ar_min_u32(*ioNumberDataPackets, input->input_frames - input->frames_provided);
-  ioData->mNumberBuffers = 1;
-  ioData->mBuffers[0].mNumberChannels = input->device_channels;
-  ioData->mBuffers[0].mDataByteSize = frames * input->device_channels * sizeof(float);
-  ioData->mBuffers[0].mData = input->input_data + (input->frames_provided * input->device_channels);
-  input->frames_provided += frames;
-  *ioNumberDataPackets = frames;
-  return noErr;
-}
+typedef struct {
+  ARPcmConverter converter;
+  ARCaptureRing ring;
+} ARCaptureState;
 
 @interface ARSystemAudioCapture : NSObject {
 @public
   AudioObjectID tapObjectID;
   AudioObjectID aggregateDeviceID;
   AudioDeviceIOProcID ioProcID;
-  AudioConverterRef audioConverter;
-  float *conversionBuffer;
-  UInt32 conversionBufferSize;
-  UInt32 clientSampleRate;
-  UInt32 clientChannels;
-  UInt32 clientFrameSize;
-  Float64 deviceSampleRate;
-  UInt32 deviceChannels;
-  ARFloatRing ring;
+  ARCaptureState state;
 }
 - (instancetype)initWithSampleRate:(uint32_t)sampleRate
                           channels:(uint32_t)channels
                          frameSize:(uint32_t)frameSize;
 - (int)readSamples:(float *)out sampleCount:(uint32_t)count timeoutMs:(uint32_t)timeoutMs;
 @end
+
+static void ar_capture_pcm(void *context, const float *samples, UInt32 count) {
+  ar_capture_ring_write(context, samples, count);
+}
 
 static OSStatus ar_system_audio_io_proc(
     AudioObjectID inDevice,
@@ -262,59 +412,12 @@ static OSStatus ar_system_audio_io_proc(
   (void) outOutputData;
   (void) inOutputTime;
 
-  ARSystemAudioCapture *capture = (__bridge ARSystemAudioCapture *) inClientData;
-  bool wrote = false;
-
-  if (inInputData != NULL && inInputData->mNumberBuffers > 0) {
-    AudioBuffer input = inInputData->mBuffers[0];
-    if (input.mData != NULL && input.mDataByteSize > 0 && capture->deviceChannels > 0) {
-      if (capture->audioConverter != NULL) {
-        UInt32 inputFrames = input.mDataByteSize / (capture->deviceChannels * sizeof(float));
-        ARConverterInput converterInput;
-        converterInput.input_data = (float *) input.mData;
-        converterInput.input_frames = inputFrames;
-        converterInput.frames_provided = 0;
-        converterInput.device_channels = capture->deviceChannels;
-
-        AudioBufferList output;
-        memset(&output, 0, sizeof(output));
-        output.mNumberBuffers = 1;
-        output.mBuffers[0].mNumberChannels = capture->clientChannels;
-        output.mBuffers[0].mDataByteSize = capture->conversionBufferSize;
-        output.mBuffers[0].mData = capture->conversionBuffer;
-
-        UInt32 outputFrames = capture->conversionBufferSize / (capture->clientChannels * sizeof(float));
-        OSStatus status = AudioConverterFillComplexBuffer(
-            capture->audioConverter,
-            ar_converter_input_proc,
-            &converterInput,
-            &outputFrames,
-            &output,
-            NULL);
-
-        if (status == noErr && outputFrames > 0) {
-          ar_ring_write_overwrite(&capture->ring, capture->conversionBuffer, outputFrames * capture->clientChannels);
-          wrote = true;
-        }
-      } else {
-        ar_ring_write_overwrite(&capture->ring, (const float *) input.mData, input.mDataByteSize / sizeof(float));
-        wrote = true;
-      }
-    }
+  ARCaptureState *capture = inClientData;
+  if (atomic_load_explicit(&capture->ring.closed, memory_order_acquire)) {
+    return noErr;
   }
-
-  if (!wrote) {
-    UInt32 silenceSamples = capture->clientFrameSize * capture->clientChannels;
-    UInt32 availableSamples = capture->conversionBufferSize / sizeof(float);
-    if (silenceSamples > availableSamples) {
-      silenceSamples = availableSamples;
-    }
-    if (silenceSamples > 0) {
-      memset(capture->conversionBuffer, 0, silenceSamples * sizeof(float));
-      ar_ring_write_overwrite(&capture->ring, capture->conversionBuffer, silenceSamples);
-    }
-  }
-
+  OSStatus status = ar_pcm_push(&capture->converter, inInputData, ar_capture_pcm, &capture->ring);
+  if (status != noErr) ar_capture_ring_fail(&capture->ring, status);
   return noErr;
 }
 
@@ -334,28 +437,15 @@ static OSStatus ar_system_audio_io_proc(
     return nil;
   }
 
-  NSOperatingSystemVersion minimum = {14, 0, 0};
-  if (![[NSProcessInfo processInfo] isOperatingSystemAtLeastVersion:minimum]) {
-    ar_set_error("macOS system audio capture requires macOS 14.0 or newer");
-    return nil;
-  }
-
-  uint32_t ringCapacity = sampleRate * channels * 2;
-  if (!ar_ring_init(&ring, ringCapacity)) {
+  if (!ar_macos_capture_supported()) {
+    ar_set_error("macOS 系统音频捕获需要 14.2 或更新版本");
     return nil;
   }
 
   tapObjectID = kAudioObjectUnknown;
   aggregateDeviceID = kAudioObjectUnknown;
   ioProcID = NULL;
-  audioConverter = NULL;
-  conversionBuffer = NULL;
-  conversionBufferSize = 0;
-  clientSampleRate = sampleRate;
-  clientChannels = channels;
-  clientFrameSize = frameSize;
-  deviceSampleRate = sampleRate;
-  deviceChannels = channels;
+  memset(&state, 0, sizeof(state));
 
   CATapDescription *tapDescription = [[CATapDescription alloc] initStereoGlobalTapButExcludeProcesses:@[]];
   if (tapDescription == nil) {
@@ -416,72 +506,55 @@ static OSStatus ar_system_audio_io_proc(
   UInt32 frameSizeSize = sizeof(requestedFrameSize);
   AudioObjectSetPropertyData(aggregateDeviceID, &bufferSizeAddr, 0, NULL, frameSizeSize, &requestedFrameSize);
 
-  UInt32 queryRateSize = sizeof(deviceSampleRate);
-  status = AudioObjectGetPropertyData(aggregateDeviceID, &sampleRateAddr, 0, NULL, &queryRateSize, &deviceSampleRate);
-  if (status != noErr || deviceSampleRate <= 0.0) {
-    deviceSampleRate = sampleRate;
-  }
-
-  AudioObjectPropertyAddress streamConfigAddr = {
-    .mSelector = kAudioDevicePropertyStreamConfiguration,
-    .mScope = kAudioDevicePropertyScopeInput,
+  // 从实际输入 stream 查询虚拟格式, 不能用 nominal rate 和声道数猜 ASBD.
+  AudioObjectPropertyAddress streamsAddr = {
+    .mSelector = kAudioDevicePropertyStreams, .mScope = kAudioDevicePropertyScopeInput,
     .mElement = kAudioObjectPropertyElementMain,
   };
-  UInt32 streamConfigSize = 0;
-  status = AudioObjectGetPropertyDataSize(aggregateDeviceID, &streamConfigAddr, 0, NULL, &streamConfigSize);
-  if (status == noErr && streamConfigSize > 0) {
-    AudioBufferList *streamConfig = (AudioBufferList *) malloc(streamConfigSize);
-    if (streamConfig != NULL) {
-      status = AudioObjectGetPropertyData(aggregateDeviceID, &streamConfigAddr, 0, NULL, &streamConfigSize, streamConfig);
-      if (status == noErr && streamConfig->mNumberBuffers > 0) {
-        deviceChannels = streamConfig->mBuffers[0].mNumberChannels;
-      }
-      free(streamConfig);
-    }
+  UInt32 streamsSize = 0;
+  status = AudioObjectGetPropertyDataSize(aggregateDeviceID, &streamsAddr, 0, NULL, &streamsSize);
+  if (status != noErr || streamsSize != sizeof(AudioStreamID)) {
+    ar_set_error("捕获输入必须为单个音频 stream, OSStatus=%d", (int) status);
+    return nil;
   }
-  if (deviceChannels == 0) {
-    deviceChannels = channels;
+  AudioStreamID streamID = kAudioObjectUnknown;
+  status = AudioObjectGetPropertyData(aggregateDeviceID, &streamsAddr, 0, NULL, &streamsSize, &streamID);
+  if (status != noErr) {
+    ar_set_error("查询捕获输入 stream 失败, OSStatus=%d", (int) status);
+    return nil;
   }
-
-  uint32_t roundedDeviceRate = (uint32_t) (deviceSampleRate + 0.5);
-  if (roundedDeviceRate != sampleRate || deviceChannels != channels) {
-    AudioStreamBasicDescription sourceFormat;
-    memset(&sourceFormat, 0, sizeof(sourceFormat));
-    sourceFormat.mSampleRate = deviceSampleRate;
-    sourceFormat.mFormatID = kAudioFormatLinearPCM;
-    sourceFormat.mFormatFlags = kLinearPCMFormatFlagIsFloat | kLinearPCMFormatFlagIsPacked;
-    sourceFormat.mBitsPerChannel = 32;
-    sourceFormat.mChannelsPerFrame = deviceChannels;
-    sourceFormat.mFramesPerPacket = 1;
-    sourceFormat.mBytesPerFrame = deviceChannels * sizeof(float);
-    sourceFormat.mBytesPerPacket = sourceFormat.mBytesPerFrame;
-
-    AudioStreamBasicDescription targetFormat;
-    memset(&targetFormat, 0, sizeof(targetFormat));
-    targetFormat.mSampleRate = sampleRate;
-    targetFormat.mFormatID = kAudioFormatLinearPCM;
-    targetFormat.mFormatFlags = kLinearPCMFormatFlagIsFloat | kLinearPCMFormatFlagIsPacked;
-    targetFormat.mBitsPerChannel = 32;
-    targetFormat.mChannelsPerFrame = channels;
-    targetFormat.mFramesPerPacket = 1;
-    targetFormat.mBytesPerFrame = channels * sizeof(float);
-    targetFormat.mBytesPerPacket = targetFormat.mBytesPerFrame;
-
-    status = AudioConverterNew(&sourceFormat, &targetFormat, &audioConverter);
-    if (status != noErr) {
-      ar_set_error("AudioConverterNew failed with status %d", (int) status);
-      return nil;
-    }
-  }
-
-  conversionBufferSize = frameSize * channels * sizeof(float) * 8;
-  conversionBuffer = (float *) calloc(conversionBufferSize, 1);
-  if (conversionBuffer == NULL) {
-    ar_set_error("failed to allocate system audio conversion buffer");
+  AudioObjectPropertyAddress formatAddr = {
+    .mSelector = kAudioStreamPropertyVirtualFormat, .mScope = kAudioObjectPropertyScopeGlobal,
+    .mElement = kAudioObjectPropertyElementMain,
+  };
+  AudioStreamBasicDescription sourceFormat = {0};
+  UInt32 formatSize = sizeof(sourceFormat);
+  status = AudioObjectGetPropertyData(streamID, &formatAddr, 0, NULL, &formatSize, &sourceFormat);
+  if (status != noErr || formatSize != sizeof(sourceFormat) || !ar_pcm_format_supported(&sourceFormat)) {
+    ar_set_error("捕获输入格式不是支持的 native packed Float32 PCM, OSStatus=%d", (int) status);
     return nil;
   }
 
-  status = AudioDeviceCreateIOProcID(aggregateDeviceID, ar_system_audio_io_proc, (__bridge void *) self, &ioProcID);
+  UInt32 deviceBufferFrames = 0;
+  UInt32 deviceBufferSize = sizeof(deviceBufferFrames);
+  status = AudioObjectGetPropertyData(aggregateDeviceID, &bufferSizeAddr, 0, NULL,
+                                      &deviceBufferSize, &deviceBufferFrames);
+  if (status != noErr || deviceBufferSize != sizeof(deviceBufferFrames) || deviceBufferFrames == 0) {
+    ar_set_error("无法查询实际捕获缓冲, OSStatus=%d", (int) status);
+    return nil;
+  }
+  status = ar_pcm_init(&state.converter, &sourceFormat, sampleRate, channels, deviceBufferFrames);
+  if (status != noErr) {
+    ar_set_error("初始化捕获 PCM 转换失败, OSStatus=%d", (int) status);
+    return nil;
+  }
+  int ringStatus = ar_capture_ring_init(&state.ring, sampleRate, channels, frameSize, state.converter.callback_output_frames);
+  if (ringStatus != 0) {
+    ar_set_error("初始化捕获 SPSC 缓冲失败, status=%d", ringStatus);
+    return nil;
+  }
+
+  status = AudioDeviceCreateIOProcID(aggregateDeviceID, ar_system_audio_io_proc, &state, &ioProcID);
   if (status != noErr) {
     ar_set_error("AudioDeviceCreateIOProcID failed with status %d", (int) status);
     return nil;
@@ -497,7 +570,7 @@ static OSStatus ar_system_audio_io_proc(
 }
 
 - (void)dealloc {
-  ar_ring_close(&ring);
+  ar_capture_ring_close(&state.ring);
 
   if (ioProcID != NULL && aggregateDeviceID != kAudioObjectUnknown) {
     AudioDeviceStop(aggregateDeviceID, ioProcID);
@@ -512,20 +585,16 @@ static OSStatus ar_system_audio_io_proc(
     AudioHardwareDestroyProcessTap(tapObjectID);
     tapObjectID = kAudioObjectUnknown;
   }
-  if (audioConverter != NULL) {
-    AudioConverterDispose(audioConverter);
-    audioConverter = NULL;
-  }
-  if (conversionBuffer != NULL) {
-    free(conversionBuffer);
-    conversionBuffer = NULL;
-  }
-
-  ar_ring_free(&ring);
+  ar_pcm_destroy(&state.converter);
+  ar_capture_ring_free(&state.ring);
 }
 
 - (int)readSamples:(float *)out sampleCount:(uint32_t)count timeoutMs:(uint32_t)timeoutMs {
-  return ar_ring_read(&ring, out, count, timeoutMs);
+  int result = ar_capture_ring_read(&state.ring, out, count, timeoutMs);
+  if (result < 0) {
+    ar_set_error("捕获 SPSC 读取失败或已关闭, status=%d", atomic_load(&state.ring.failure));
+  }
+  return result;
 }
 
 @end
@@ -540,10 +609,16 @@ typedef struct {
 
 static void ar_output_callback(void *inUserData, AudioQueueRef inAQ, AudioQueueBufferRef inBuffer) {
   ARPlaybackEngine *engine = (ARPlaybackEngine *) inUserData;
+  if (ar_ring_is_closed(&engine->ring)) {
+    return;
+  }
   uint32_t sample_count = engine->buffer_samples;
   ar_ring_read_partial_zero_fill(&engine->ring, (float *) inBuffer->mAudioData, sample_count);
   inBuffer->mAudioDataByteSize = sample_count * sizeof(float);
-  AudioQueueEnqueueBuffer(inAQ, inBuffer, 0, NULL);
+  OSStatus status = AudioQueueEnqueueBuffer(inAQ, inBuffer, 0, NULL);
+  if (status != noErr) {
+    ar_ring_fail(&engine->ring, status, "AudioQueueEnqueueBuffer");
+  }
 }
 
 void *ar_macos_capture_create(const char *device_name, uint32_t sample_rate, uint32_t channels, uint32_t frame_size) {
@@ -560,6 +635,12 @@ void *ar_macos_capture_create(const char *device_name, uint32_t sample_rate, uin
     }
     return (__bridge_retained void *) capture;
   }
+}
+
+void ar_macos_capture_stats(void *handle, uint64_t *dropped, uint32_t *high_water) {
+  ARSystemAudioCapture *capture = (__bridge ARSystemAudioCapture *) handle;
+  *dropped = atomic_load_explicit(&capture->state.ring.dropped_samples, memory_order_relaxed);
+  *high_water = atomic_load_explicit(&capture->state.ring.high_water_samples, memory_order_relaxed);
 }
 
 void ar_macos_capture_destroy(void *handle) {
@@ -584,8 +665,7 @@ void *ar_macos_playback_create(uint32_t sample_rate, uint32_t channels, uint32_t
     return NULL;
   }
 
-  uint32_t ringCapacity = sample_rate * channels;
-  if (!ar_ring_init(&engine->ring, ringCapacity)) {
+  if (!ar_ring_init_audio(&engine->ring, sample_rate, channels, frame_size, true)) {
     free(engine);
     return NULL;
   }
@@ -620,7 +700,14 @@ void *ar_macos_playback_create(uint32_t sample_rate, uint32_t channels, uint32_t
     }
     memset(engine->buffers[i]->mAudioData, 0, bufferBytes);
     engine->buffers[i]->mAudioDataByteSize = bufferBytes;
-    AudioQueueEnqueueBuffer(engine->queue, engine->buffers[i], 0, NULL);
+    status = AudioQueueEnqueueBuffer(engine->queue, engine->buffers[i], 0, NULL);
+    if (status != noErr) {
+      ar_set_error("AudioQueueEnqueueBuffer 初始化失败, OSStatus=%d", (int) status);
+      AudioQueueDispose(engine->queue, true);
+      ar_ring_free(&engine->ring);
+      free(engine);
+      return NULL;
+    }
   }
 
   status = AudioQueueStart(engine->queue, NULL);
@@ -633,6 +720,11 @@ void *ar_macos_playback_create(uint32_t sample_rate, uint32_t channels, uint32_t
   }
 
   return engine;
+}
+
+void ar_macos_playback_stats(void *handle, uint64_t *dropped, uint32_t *high_water) {
+  ARPlaybackEngine *engine = handle;
+  ar_ring_copy_stats(&engine->ring, dropped, high_water);
 }
 
 void ar_macos_playback_destroy(void *handle) {

@@ -39,3 +39,18 @@ pub fn open_output(config: &PlaybackConfig, stream: &StreamParams) -> Result<Box
         unsupported::open_output(config, stream)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio::{config::CodecConfig, error::Error};
+
+    #[test]
+    fn unsupported_device_selection_is_not_a_retryable_device_outage() {
+        let stream = CodecConfig::default().stream_params().unwrap();
+        let capture = CaptureConfig { device_name: Some("测试指定设备".into()) };
+        let playback = PlaybackConfig { device_name: Some("测试指定设备".into()) };
+        assert!(matches!(open_input(&capture, &stream), Err(Error::UnsupportedPlatform(_))));
+        assert!(matches!(open_output(&playback, &stream), Err(Error::UnsupportedPlatform(_))));
+    }
+}
