@@ -12,3 +12,4 @@ AGENTS.*.md
 /android/.kotlin/
 local.just
 /secrets/
+.references/
