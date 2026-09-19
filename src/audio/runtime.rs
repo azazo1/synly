@@ -3,6 +3,7 @@ mod crypto;
 mod queue;
 mod receive;
 mod render;
+mod sdl_policy;
 mod send;
 mod workers;
 #[cfg(test)]

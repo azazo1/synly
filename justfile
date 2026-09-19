@@ -22,6 +22,16 @@ audio-test:
     cargo test --offline --bin synly audio::
     cargo test --offline -p synly-core protocol::tests::audio_offer
 
+# 验证音频许可全文, 失败拒绝行为与归档随附, 不运行应用.
+[unix]
+audio-notices-test:
+    bash scripts/tests/audio-notices.sh
+
+# 验证音频许可全文, 失败拒绝行为与 Windows ZIP 随附, 不运行应用.
+[windows]
+audio-notices-test:
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/tests/audio-notices.ps1
+
 # just audio-fec-vectors /path/to/nanors
 # 编译上游独立 FEC 生成器并验证全部单片和双片丢失组合.
 [unix]
@@ -40,6 +50,14 @@ audio-queue-vectors moonlight nanors:
     cmp native/tests/audio-queue-vectors.tsv target/audio-tests/audio-queue-vectors.tsv
     cargo test --offline --bin synly audio::receiver::upstream_tests
 
+# just audio-renderer-test /path/to/moonlight-qt
+# 编译未经修改的上游 SDL renderer, 使用内存设备验证水位和失败路径.
+[unix]
+audio-renderer-test moonlight:
+    mkdir -p target/audio-tests
+    bash native/tests/build-audio-renderer-tests.sh '{{moonlight}}' target/audio-tests/audio-renderer-tests
+    target/audio-tests/audio-renderer-tests
+
 # 使用内存检查器验证 macOS 原生故障路径和真实重采样, 不打开音频设备.
 [macos]
 audio-native-test:
@@ -48,6 +66,27 @@ audio-native-test:
     target/audio-tests/macos-audio-tests
     clang -fsanitize=address,undefined -g native/tests/macos-conversion-tests.c -framework AudioToolbox -framework CoreAudio -o target/audio-tests/macos-conversion-tests
     target/audio-tests/macos-conversion-tests
+    clang -std=c11 -fsanitize=address,undefined -fno-sanitize-recover=all -g native/tests/macos-capture-ring-tests.c -o target/audio-tests/macos-capture-ring-tests
+    target/audio-tests/macos-capture-ring-tests
+    clang -std=c11 -fsanitize=address,undefined -fno-sanitize-recover=all -g native/tests/macos-playback-ring-tests.c -o target/audio-tests/macos-playback-ring-tests
+    target/audio-tests/macos-playback-ring-tests
+    clang -fobjc-arc -fsanitize=address,undefined -fno-sanitize-recover=all -g native/tests/macos-audio-lifecycle-tests.m -framework Foundation -framework AudioToolbox -framework CoreAudio -o target/audio-tests/macos-audio-lifecycle-tests
+    target/audio-tests/macos-audio-lifecycle-tests
+    clang -std=c11 -fsanitize=address,undefined -fno-sanitize-recover=all -g native/tests/macos-capture-health-tests.c -o target/audio-tests/macos-capture-health-tests
+    target/audio-tests/macos-capture-health-tests
+
+# 使用 ThreadSanitizer 验证双向 SPSC 和创建/销毁串行边界, 不打开音频设备.
+[macos]
+audio-ring-race-test:
+    mkdir -p target/audio-tests
+    clang -std=c11 -fsanitize=thread -g native/tests/macos-capture-ring-tests.c -o target/audio-tests/macos-capture-ring-race-tests
+    target/audio-tests/macos-capture-ring-race-tests
+    clang -std=c11 -fsanitize=thread -g native/tests/macos-playback-ring-tests.c -o target/audio-tests/macos-playback-ring-race-tests
+    target/audio-tests/macos-playback-ring-race-tests
+    clang -fobjc-arc -fsanitize=thread -g native/tests/macos-audio-lifecycle-tests.m -framework Foundation -framework AudioToolbox -framework CoreAudio -o target/audio-tests/macos-audio-lifecycle-race-tests
+    target/audio-tests/macos-audio-lifecycle-race-tests
+    clang -std=c11 -fsanitize=thread -g native/tests/macos-capture-health-tests.c -o target/audio-tests/macos-capture-health-race-tests
+    target/audio-tests/macos-capture-health-race-tests
 
 # 运行全部 target 和 feature 的 clippy.
 clippy:

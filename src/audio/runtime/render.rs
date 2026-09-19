@@ -5,11 +5,11 @@ use crate::audio::config::StreamParams;
 use crate::audio::error::{Error, Result};
 use crate::audio::playback::AudioOutput;
 use crate::audio::receiver::QueuedAudioFrame;
+use super::sdl_policy;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
-const MAX_PENDING_AUDIO_MS: usize = 30;
 const DEVICE_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 pub(super) fn run(
@@ -97,7 +97,7 @@ pub(super) fn decode_frames(
             Err(error) => return Err(error),
         };
         // 保留 Moonlight SDL 的网络积压规则, 先解码推进状态再丢弃过期 PCM.
-        if packets.len() * stream.packet_duration_ms as usize > MAX_PENDING_AUDIO_MS {
+        if sdl_policy::should_drop_network_backlog(packets.len(), stream.packet_duration_ms) {
             skipped += 1;
             continue;
         }

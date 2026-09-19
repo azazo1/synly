@@ -47,7 +47,18 @@ fi
 
 printf '[package] creating %s\n' "$archive"
 mkdir -p "$output_dir"
+notices_stage="$(mktemp -d "$output_dir/audio-notices.XXXXXX")"
+cleanup_notices() {
+    # 仅删除本脚本生成的固定文件, 不递归删除用户指定目录.
+    for name in README.md sunshine-GPL-3.0.txt moonlight-common-GPL-3.0.txt moonlight-qt-GPL-3.0.txt; do
+        rm -f "$notices_stage/audio-licenses/$name"
+    done
+    if [[ -d "$notices_stage/audio-licenses" ]]; then rmdir "$notices_stage/audio-licenses"; fi
+    rmdir "$notices_stage"
+}
+trap cleanup_notices EXIT
+bash "$(dirname "${BASH_SOURCE[0]}")/package-audio-notices.sh" "$notices_stage/audio-licenses"
 rm -f "$archive"
-tar -C "$(dirname "$binary")" -czf "$archive" "$(basename "$binary")"
+tar -czf "$archive" -C "$(dirname "$binary")" "$(basename "$binary")" -C "$(cd "$notices_stage" && pwd)" audio-licenses
 test -f "$archive"
 printf '[package] completed %s\n' "$archive"

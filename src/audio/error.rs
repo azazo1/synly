@@ -9,6 +9,9 @@ pub enum Error {
     Protocol(String),
     Codec(String),
     Backend(String),
+    // 公共运行时统一识别不可重试的原生状态, 当前只有 macOS 清理隔离会产生此错误.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    BackendFatal(String),
     UnsupportedPlatform(&'static str),
 }
 
@@ -20,6 +23,7 @@ impl Display for Error {
             Self::Protocol(msg) => write!(f, "protocol error: {msg}"),
             Self::Codec(msg) => write!(f, "codec error: {msg}"),
             Self::Backend(msg) => write!(f, "backend error: {msg}"),
+            Self::BackendFatal(msg) => write!(f, "fatal backend error: {msg}"),
             Self::UnsupportedPlatform(msg) => write!(f, "unsupported platform: {msg}"),
         }
     }

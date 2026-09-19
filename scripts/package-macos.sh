@@ -58,6 +58,7 @@ mkdir -p "$app_bundle/Contents/MacOS" "$app_bundle/Contents/Resources"
 cp "$binary" "$app_bundle/Contents/MacOS/synly"
 chmod 755 "$app_bundle/Contents/MacOS/synly"
 cp "$icon" "$app_bundle/Contents/Resources/synly.icns"
+bash "$(dirname "${BASH_SOURCE[0]}")/package-audio-notices.sh" "$app_bundle/Contents/Resources/audio-licenses"
 
 printf '%s\n' \
     '<?xml version="1.0" encoding="UTF-8"?>' \
@@ -107,6 +108,8 @@ hdiutil create \
 test -f "$app_bundle/Contents/MacOS/synly"
 test -f "$app_bundle/Contents/Info.plist"
 test -f "$app_bundle/Contents/Resources/synly.icns"
+test -s "$app_bundle/Contents/Resources/audio-licenses/README.md"
+test -s "$dmg_root/Synly.app/Contents/Resources/audio-licenses/sunshine-GPL-3.0.txt"
 test -L "$dmg_root/Applications"
 test -f "$dmg_path"
 printf '[package] completed %s\n' "$dmg_path"

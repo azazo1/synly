@@ -60,7 +60,10 @@ impl Drop for MacosInput {
         let mut high_water = 0;
         unsafe { ar_macos_capture_stats(self.handle.as_ptr(), &mut dropped, &mut high_water) };
         tracing::debug!(dropped_samples = dropped, high_water_samples = high_water, "关闭 macOS 捕获缓冲");
-        unsafe { ar_macos_capture_destroy(self.handle.as_ptr()) };
+        let status = unsafe { ar_macos_capture_destroy(self.handle.as_ptr()) };
+        if status != 0 {
+            tracing::error!(status, "Core Audio 捕获清理失败, 已保留回调资源并禁用重新创建, 需要重启应用");
+        }
     }
 }
 
@@ -94,7 +97,10 @@ impl Drop for MacosOutput {
         let mut high_water = 0;
         unsafe { ar_macos_playback_stats(self.handle.as_ptr(), &mut dropped, &mut high_water) };
         tracing::debug!(dropped_samples = dropped, high_water_samples = high_water, "关闭 macOS 播放缓冲");
-        unsafe { ar_macos_playback_destroy(self.handle.as_ptr()) };
+        let status = unsafe { ar_macos_playback_destroy(self.handle.as_ptr()) };
+        if status != 0 {
+            tracing::error!(status, "AudioQueue 销毁失败, 已保留回调资源并禁用重新创建, 需要重启应用");
+        }
     }
 }
 
@@ -120,11 +126,17 @@ fn last_backend_error() -> Error {
     let mut message = [0 as c_char; 512];
     unsafe {
         ar_macos_copy_error(message.as_mut_ptr(), message.len() as u32);
-        Error::Backend(CStr::from_ptr(message.as_ptr()).to_string_lossy().into_owned())
+        let message = CStr::from_ptr(message.as_ptr()).to_string_lossy().into_owned();
+        if ar_macos_audio_cleanup_failure() != 0 {
+            Error::BackendFatal(message)
+        } else {
+            Error::Backend(message)
+        }
     }
 }
 
 unsafe extern "C" {
+    fn ar_macos_audio_cleanup_failure() -> c_int;
     fn ar_macos_capture_supported() -> c_int;
     fn ar_macos_copy_error(out: *mut c_char, capacity: u32);
     fn ar_macos_capture_stats(handle: *mut c_void, dropped: *mut u64, high_water: *mut u32);
@@ -137,7 +149,7 @@ unsafe extern "C" {
         frame_size: u32,
     ) -> *mut c_void;
 
-    fn ar_macos_capture_destroy(handle: *mut c_void);
+    fn ar_macos_capture_destroy(handle: *mut c_void) -> c_int;
 
     fn ar_macos_capture_read(
         handle: *mut c_void,
@@ -148,7 +160,7 @@ unsafe extern "C" {
 
     fn ar_macos_playback_create(sample_rate: u32, channels: u32, frame_size: u32) -> *mut c_void;
 
-    fn ar_macos_playback_destroy(handle: *mut c_void);
+    fn ar_macos_playback_destroy(handle: *mut c_void) -> c_int;
 
     fn ar_macos_playback_submit(
         handle: *mut c_void,

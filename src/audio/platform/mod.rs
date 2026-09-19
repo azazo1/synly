@@ -45,6 +45,19 @@ mod tests {
     use super::*;
     use crate::audio::{config::CodecConfig, error::Error};
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn malformed_endpoint_selection_fails_before_device_startup() {
+        let stream = CodecConfig::default().stream_params().unwrap();
+        for id in ["", "设备\0后缀"] {
+            let capture = CaptureConfig { device_name: Some(id.into()) };
+            let playback = PlaybackConfig { device_name: Some(id.into()) };
+            assert!(matches!(open_input(&capture, &stream), Err(Error::InvalidConfig(_))));
+            assert!(matches!(open_output(&playback, &stream), Err(Error::InvalidConfig(_))));
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn unsupported_device_selection_is_not_a_retryable_device_outage() {
         let stream = CodecConfig::default().stream_params().unwrap();

@@ -21,6 +21,19 @@ impl AudioInput for ScriptInput {
     }
 }
 
+#[test]
+fn fatal_backend_state_stops_without_retrying_or_requiring_a_timer() {
+    let stream = CodecConfig::default().stream_params().unwrap();
+    let samples = Arc::new(FrameQueue::new("capture-fatal", 30));
+    let mut attempts = 0;
+    let result = run_with_retry_delay(|| {
+        attempts += 1;
+        Err(Error::BackendFatal("回调上下文已隔离".into()))
+    }, samples, CancellationToken::new(), &stream, Duration::from_secs(5));
+    assert!(matches!(result, Err(Error::BackendFatal(_))));
+    assert_eq!(attempts, 1);
+}
+
 #[tokio::test]
 async fn initial_absence_and_read_failure_recover_without_emitting_partial_frames() {
     let stream = CodecConfig::default().stream_params().unwrap();

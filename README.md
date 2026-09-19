@@ -257,6 +257,10 @@ cargo clippy --all-targets --all-features
 
 协议热协商测试覆盖 generation 并发更新, stale epoch, ack 和 capability 开关状态. Windows 原生构建应运行 `cargo clippy --all-targets --all-features`, `cargo test` 和 `cargo build --bins`. 输入代理仍需要在普通应用, 管理员应用, 服务安装与卸载, UAC 拒绝, 代理崩溃, 签名发布包, UAC 弹窗与锁屏输入控制场景中进行真机验证.
 
+## 音频代码来源
+
+桌面音频包含 Sunshine 和 Moonlight 的移植与改写, 来源和随附许可全文见 [音频许可说明](licenses/audio/README.md). 当前移植范围, 有意差异和未完成验证见 [音频移植映射](docs/audio-port.md). 许可文本随附不等于已满足完整对应源码及全部依赖的分发要求.
+
 ## 协议兼容
 
 当前协议版本为 `21`. 本版本不提供旧协议兼容层. 发现结果会携带协议版本, GUI 在连接前禁用不兼容设备.

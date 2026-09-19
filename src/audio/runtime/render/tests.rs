@@ -250,11 +250,26 @@ async fn udp_reception_survives_blocked_device_recreation() {
 }
 
 #[test]
+fn fatal_backend_state_stops_before_waiting_for_network_or_reopening() {
+    let stream = CodecConfig::default().stream_params().unwrap();
+    let packets = Arc::new(FrameQueue::new("render-fatal", 30));
+    let mut attempts = 0;
+    let result = run_with_retry_delay(|| {
+        attempts += 1;
+        assert_eq!(attempts, 1);
+        Err(Error::BackendFatal("回调上下文已隔离".into()))
+    }, packets, CancellationToken::new(), &stream, Duration::from_millis(1));
+    assert!(matches!(result, Err(Error::BackendFatal(_))));
+    assert_eq!(attempts, 1);
+}
+
+#[test]
 fn only_backend_and_io_errors_are_recoverable() {
     assert!(recoverable(&Error::Backend("设备离线".into())));
     assert!(recoverable(&Error::Io(std::io::Error::other("设备错误"))));
     for error in [Error::InvalidConfig("无效参数"), Error::Codec("解码错误".into()),
-                  Error::Protocol("协议错误".into()), Error::UnsupportedPlatform("不支持的平台")] {
+                  Error::Protocol("协议错误".into()), Error::UnsupportedPlatform("不支持的平台"),
+                  Error::BackendFatal("原生回调无法安全销毁".into())] {
         assert!(!recoverable(&error));
     }
 }

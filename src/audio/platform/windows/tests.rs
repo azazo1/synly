@@ -1,9 +1,11 @@
 use super::*;
 use std::cell::Cell;
+use std::mem::size_of;
 
 thread_local! {
     static MOCK_STAGE: Cell<u32> = const { Cell::new(0) };
     static MOCK_PERIOD_FAILS: Cell<bool> = const { Cell::new(false) };
+    static MOCK_CHANNELS: Cell<u16> = const { Cell::new(2) };
 }
 
 unsafe extern "system" fn mock_initialize(
@@ -18,7 +20,16 @@ unsafe extern "system" fn mock_initialize(
     assert_eq!(mode, AUDCLNT_SHAREMODE_SHARED);
     assert_ne!(flags & AUDCLNT_STREAMFLAGS_EVENTCALLBACK, 0);
     assert_eq!((duration, periodicity), (0, 0));
-    assert_eq!(unsafe { (*format).n_samples_per_sec }, 48_000);
+    let header = unsafe { format.read_unaligned() };
+    let rate = header.n_samples_per_sec;
+    let channels = header.n_channels;
+    let tag = header.w_format_tag;
+    let size = header.cb_size;
+    assert_eq!(rate, 48_000);
+    assert_eq!(channels, MOCK_CHANNELS.with(Cell::get));
+    assert_eq!((tag, size), (0xfffe, 22));
+    let mask = unsafe { ptr::addr_of!((*format.cast::<format::WaveFormatExtensible>()).channel_mask).read_unaligned() };
+    assert_eq!(mask, match channels { 2 => 0x3, 6 => 0x60f, 8 => 0x63f, _ => unreachable!() });
     MOCK_STAGE.with(|stage| { assert_eq!(stage.get(), 0); stage.set(1); });
     0
 }
@@ -54,7 +65,21 @@ unsafe extern "system" fn unused_ref(_: *mut IAudioClient) -> u32 { 1 }
 unsafe extern "system" fn unused_status(_: *mut IAudioClient) -> i32 { -1 }
 unsafe extern "system" fn unused_padding(_: *mut IAudioClient, _: *mut u32) -> i32 { -1 }
 unsafe extern "system" fn unused_format(_: *mut IAudioClient, _: u32, _: *const WaveFormatEx, _: *mut *mut WaveFormatEx) -> i32 { -1 }
-unsafe extern "system" fn unused_mix(_: *mut IAudioClient, _: *mut *mut WaveFormatEx) -> i32 { -1 }
+#[link(name = "ole32")]
+unsafe extern "system" {
+    fn CoTaskMemAlloc(size: usize) -> *mut c_void;
+}
+unsafe extern "system" fn mock_mix(_: *mut IAudioClient, output: *mut *mut WaveFormatEx) -> i32 {
+    let channels = MOCK_CHANNELS.with(Cell::get);
+    let mut mix = WasapiSpec { sample_rate: 44_100, channels }.wave_format().unwrap();
+    if channels == 6 { mix.channel_mask = 0x60f; }
+    let raw = unsafe { CoTaskMemAlloc(size_of::<format::WaveFormatExtensible>()) }.cast::<format::WaveFormatExtensible>();
+    assert!(!raw.is_null());
+    unsafe { raw.write_unaligned(mix); *output = raw.cast(); }
+    0
+}
+unsafe extern "system" fn failed_mix(_: *mut IAudioClient, _: *mut *mut WaveFormatEx) -> i32 { AUDCLNT_E_DEVICE_INVALIDATED }
+unsafe extern "system" fn null_mix(_: *mut IAudioClient, _: *mut *mut WaveFormatEx) -> i32 { 0 }
 
 fn mock_vtbl() -> IAudioClientVtbl {
     IAudioClientVtbl {
@@ -66,7 +91,7 @@ fn mock_vtbl() -> IAudioClientVtbl {
         get_stream_latency: mock_latency,
         get_current_padding: unused_padding,
         is_format_supported: unused_format,
-        get_mix_format: unused_mix,
+        get_mix_format: mock_mix,
         get_device_period: mock_period,
         start: unused_status,
         stop: unused_status,
@@ -112,6 +137,38 @@ fn failed_period_query_propagates_without_starting_stream() {
     assert!(result.is_err());
     MOCK_STAGE.with(|stage| assert_eq!(stage.get(), 4));
     MOCK_PERIOD_FAILS.with(|fails| fails.set(false));
+}
+
+#[test]
+fn all_layouts_reach_capture_and_playback_initialize_with_native_51_mask() {
+    let vtbl = mock_vtbl();
+    let mut client = IAudioClient { lp_vtbl: &vtbl };
+    for channels in [2, 6, 8] {
+        MOCK_CHANNELS.with(|value| value.set(channels));
+        for extra_flags in [0, AUDCLNT_STREAMFLAGS_LOOPBACK] {
+            MOCK_STAGE.with(|value| value.set(0));
+            let frames = stream::initialize_shared_client(&mut client,
+                AUDCLNT_STREAMFLAGS_EVENTCALLBACK | extra_flags, Handle(ptr::null_mut()),
+                WasapiSpec { sample_rate: 48_000, channels }, "test").unwrap();
+            assert_eq!(frames, 480);
+            MOCK_STAGE.with(|value| assert_eq!(value.get(), 5));
+        }
+    }
+    MOCK_CHANNELS.with(|value| value.set(2));
+}
+
+#[test]
+fn failed_or_null_mix_format_never_initializes_stream() {
+    for get_mix_format in [failed_mix as unsafe extern "system" fn(_, _) -> _, null_mix] {
+        let mut vtbl = mock_vtbl();
+        vtbl.get_mix_format = get_mix_format;
+        let mut client = IAudioClient { lp_vtbl: &vtbl };
+        MOCK_STAGE.with(|value| value.set(0));
+        let result = stream::initialize_shared_client(&mut client, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+            Handle(ptr::null_mut()), WasapiSpec { sample_rate: 48_000, channels: 2 }, "test");
+        assert!(matches!(result, Err(Error::Backend(_))));
+        MOCK_STAGE.with(|value| assert_eq!(value.get(), 0));
+    }
 }
 
 fn ring() -> SharedSampleRing {

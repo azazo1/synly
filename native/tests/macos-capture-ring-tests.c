@@ -60,9 +60,9 @@ static kern_return_t checked_wait(semaphore_t semaphore, mach_timespec_t duratio
 #undef semaphore_timedwait
 
 static void test_init_and_overflow(void) {
-  ARCaptureRing ring = {0};
-  ar_capture_ring_close(&ring);
-  ar_capture_ring_free(&ring);
+  ARAudioRing ring = {0};
+  ar_audio_ring_close(&ring);
+  ar_audio_ring_free(&ring);
   assert(ar_capture_ring_init(&ring, 0, 2, 240, 512) != 0);
   assert(ar_capture_ring_init(&ring, 48000, 0, 240, 512) != 0);
   assert(ar_capture_ring_init(&ring, 48000, 2, 240, UINT32_MAX) != 0);
@@ -72,7 +72,7 @@ static void test_init_and_overflow(void) {
   fail_semaphore = 1;
   assert(ar_capture_ring_init(&ring, 48000, 2, 240, 512) != 0);
   fail_semaphore = 0;
-  ar_capture_ring_free(&ring);
+  ar_audio_ring_free(&ring);
   assert(allocations == 0 && semaphores == 0);
   assert(ar_capture_ring_init(&ring, 8000, 2, 1, 1) == 0);
   assert(ring.capacity_frames == 240);
@@ -83,6 +83,9 @@ static void test_init_and_overflow(void) {
   assert(!ar_capture_ring_write(&ring, extra, 2));
   assert(atomic_load(&ring.dropped_samples) == 2);
   assert(atomic_load(&ring.high_water_samples) == 480);
+  atomic_store(&ring.dropped_samples, UINT64_MAX - 1);
+  assert(!ar_capture_ring_write(&ring, extra, 2));
+  assert(atomic_load(&ring.dropped_samples) == UINT64_MAX);
   for (unsigned i = 0; i < 240; i++) {
     float out[2];
     assert(ar_capture_ring_read(&ring, out, 2, 0) == 0);
@@ -100,16 +103,16 @@ static void test_init_and_overflow(void) {
     assert(ar_capture_ring_read(&ring, out, 2, 0) == 0);
     assert(out[0] == (float)(i * 2) && out[1] == (float)(i * 2 + 1));
   }
-  ar_capture_ring_fail(&ring, -1234);
-  ar_capture_ring_fail(&ring, -2345);
+  ar_audio_ring_fail(&ring, -1234);
+  ar_audio_ring_fail(&ring, -2345);
   assert(atomic_load(&ring.failure) == -1234);
   assert(ar_capture_ring_read(&ring, out, 2, 0) == -1);
-  ar_capture_ring_free(&ring);
-  ar_capture_ring_free(&ring);
+  ar_audio_ring_free(&ring);
+  ar_audio_ring_free(&ring);
 }
 
 static void test_long_frame_and_notifications(void) {
-  ARCaptureRing ring;
+  ARAudioRing ring;
   assert(ar_capture_ring_init(&ring, 48000, 2, 2880, 512) == 0);
   assert(ring.capacity_frames == 3392);
   float chunk[1024], out[5760];
@@ -120,9 +123,9 @@ static void test_long_frame_and_notifications(void) {
   }
   assert(ar_capture_ring_read(&ring, out, 5760, 0) == 0);
   for (unsigned i = 0; i < 5760; i++) assert(out[i] == (float)i);
-  assert(ar_capture_distance(&ring, atomic_load(&ring.write_cursor), atomic_load(&ring.read_cursor)) == 192);
+  assert(ar_audio_ring_distance(&ring, atomic_load(&ring.write_cursor), atomic_load(&ring.read_cursor)) == 192);
   assert(atomic_load(&ring.dropped_samples) == 0);
-  ar_capture_ring_free(&ring);
+  ar_audio_ring_free(&ring);
 
   assert(ar_capture_ring_init(&ring, 8000, 2, 1, 1) == 0);
   atomic_store(&signals, 0);
@@ -132,19 +135,19 @@ static void test_long_frame_and_notifications(void) {
     assert(ar_capture_ring_read(&ring, frame, 2, 0) == 0);
   }
   assert(atomic_load(&signals) == 1);
-  uint64_t start = ar_capture_monotonic_ns();
+  uint64_t start = ar_audio_monotonic_ns();
   assert(ar_capture_ring_read(&ring, frame, 2, 20) == 1);
-  assert(ar_capture_monotonic_ns() - start >= 20000000);
+  assert(ar_audio_monotonic_ns() - start >= 20000000);
   assert(!atomic_load(&ring.notified));
   assert(ar_capture_ring_write(&ring, frame, 2));
   assert(atomic_load(&signals) == 2);
-  ar_capture_ring_close(&ring);
+  ar_audio_ring_close(&ring);
   assert(ar_capture_ring_read(&ring, frame, 2, 0) == -1);
   assert(!ar_capture_ring_write(&ring, frame, 2));
-  ar_capture_ring_free(&ring);
+  ar_audio_ring_free(&ring);
 }
 
-typedef struct { ARCaptureRing *ring; int result; } Reader;
+typedef struct { ARAudioRing *ring; int result; } Reader;
 static void *waiter(void *context) {
   Reader *reader = context;
   float out[2];
@@ -154,7 +157,7 @@ static void *waiter(void *context) {
 }
 static void test_wakeup(void) {
   for (int mode = 0; mode < 3; mode++) {
-    ARCaptureRing ring;
+    ARAudioRing ring;
     assert(ar_capture_ring_init(&ring, 8000, 2, 1, 1) == 0);
     atomic_store(&waiting, false);
     Reader reader = {&ring, 99};
@@ -164,16 +167,16 @@ static void test_wakeup(void) {
     if (mode == 0) {
       float frame[] = {1, 2};
       assert(ar_capture_ring_write(&ring, frame, 2));
-    } else if (mode == 1) ar_capture_ring_close(&ring);
-    else ar_capture_ring_fail(&ring, -3456);
+    } else if (mode == 1) ar_audio_ring_close(&ring);
+    else ar_audio_ring_fail(&ring, -3456);
     assert(pthread_join(thread, NULL) == 0);
     assert(reader.result == (mode == 0 ? 0 : -1));
-    ar_capture_ring_free(&ring);
+    ar_audio_ring_free(&ring);
   }
 }
 
 typedef struct {
-  ARCaptureRing ring;
+  ARAudioRing ring;
   _Atomic bool done;
   uint32_t accepted;
   uint32_t consumed;
@@ -212,7 +215,42 @@ static void test_concurrent_samples(void) {
   assert(stress.consumed == stress.accepted);
   assert((uint64_t)stress.accepted * 2 + atomic_load(&stress.ring.dropped_samples) == 20000 * 34);
   assert(atomic_load(&stress.ring.high_water_samples) <= stress.ring.capacity_frames * 2);
-  ar_capture_ring_free(&stress.ring);
+  ar_audio_ring_free(&stress.ring);
+}
+
+typedef struct {
+  ARAudioRing ring;
+  _Atomic unsigned acknowledged;
+} Handoff;
+static void *handoff_producer(void *context) {
+  Handoff *handoff = context;
+  uint64_t deadline = ar_audio_monotonic_ns() + 10000000000ULL;
+  for (unsigned index = 1; index <= 2000; index++) {
+    while (atomic_load(&handoff->acknowledged) != index - 1) {
+      assert(ar_audio_monotonic_ns() < deadline);
+      sched_yield();
+    }
+    float frame[2] = {(float)index, -(float)index};
+    assert(ar_capture_ring_write(&handoff->ring, frame, 2));
+    if (index % 3 == 0) sched_yield();
+  }
+  return NULL;
+}
+static void test_repeated_handoff(void) {
+  Handoff handoff = {0};
+  assert(ar_capture_ring_init(&handoff.ring, 8000, 2, 1, 1) == 0);
+  pthread_t thread;
+  assert(pthread_create(&thread, NULL, handoff_producer, &handoff) == 0);
+  for (unsigned index = 1; index <= 2000; index++) {
+    float frame[2];
+    assert(ar_capture_ring_read(&handoff.ring, frame, 2, 1000) == 0);
+    assert(frame[0] == (float)index && frame[1] == -(float)index);
+    atomic_store(&handoff.acknowledged, index);
+    if (index % 5 == 0) sched_yield();
+  }
+  assert(pthread_join(thread, NULL) == 0);
+  assert(atomic_load(&handoff.ring.dropped_samples) == 0);
+  ar_audio_ring_free(&handoff.ring);
 }
 
 int main(void) {
@@ -222,8 +260,9 @@ int main(void) {
   test_long_frame_and_notifications();
   puts("[3/4] 数据, 关闭和故障唤醒");
   test_wakeup();
-  puts("[4/4] 34 万帧并发有序传输");
+  puts("[4/4] 34 万帧并发传输和 2000 次交接唤醒");
   test_concurrent_samples();
+  test_repeated_handoff();
   assert(allocations == 0 && semaphores == 0);
   puts("macOS 捕获 SPSC 测试通过");
   return 0;

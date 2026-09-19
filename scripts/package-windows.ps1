@@ -1,4 +1,4 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$Binary = "target/release/synly.exe",
 
@@ -71,12 +71,25 @@ $resolvedOutputDir = [IO.Path]::GetFullPath($OutputDir)
 New-Item -ItemType Directory -Force -Path $resolvedOutputDir | Out-Null
 $archive = Join-Path $resolvedOutputDir "synly-$resolvedVersion-windows-$resolvedArch$suffix.zip"
 Write-Step "Creating $archive"
-if (Test-Path -LiteralPath $archive -PathType Leaf) {
-    Remove-Item -LiteralPath $archive -Force
-}
-Compress-Archive -LiteralPath $binaryPath -DestinationPath $archive -Force
-if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) {
-    throw "Windows distribution archive creation failed: $archive"
+$noticesStage = Join-Path $resolvedOutputDir ("audio-notices-" + [Guid]::NewGuid().ToString("N"))
+$noticesDir = Join-Path $noticesStage "audio-licenses"
+try {
+    & (Join-Path $PSScriptRoot "package-audio-notices.ps1") -Destination $noticesDir
+    if (Test-Path -LiteralPath $archive -PathType Leaf) {
+        Remove-Item -LiteralPath $archive -Force
+    }
+    Compress-Archive -LiteralPath @($binaryPath, $noticesDir) -DestinationPath $archive -Force
+    if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) {
+        throw "Windows distribution archive creation failed: $archive"
+    }
+} finally {
+    # 只清理本次生成的固定文件, 不递归删除输出目录.
+    foreach ($name in @("README.md", "sunshine-GPL-3.0.txt", "moonlight-common-GPL-3.0.txt", "moonlight-qt-GPL-3.0.txt")) {
+        $file = Join-Path $noticesDir $name
+        if (Test-Path -LiteralPath $file -PathType Leaf) { Remove-Item -LiteralPath $file -Force }
+    }
+    if (Test-Path -LiteralPath $noticesDir -PathType Container) { [IO.Directory]::Delete($noticesDir) }
+    if (Test-Path -LiteralPath $noticesStage -PathType Container) { [IO.Directory]::Delete($noticesStage) }
 }
 
 Write-Step "Completed $archive"

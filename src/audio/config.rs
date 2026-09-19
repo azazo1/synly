@@ -85,6 +85,9 @@ impl CodecConfig {
             ));
         }
 
+        // Sunshine audio.cpp:51-100 与 platform/common.h:279-320 的默认编码表.
+        // PCM 顺序为 FL,FR,FC,LFE,BL,BR,SL,SR. 不套用 RTSP 描述兼容旋转,
+        // 也不使用 Moonlight 为旧 GFE 无 surround-params 提供的硬编码 fallback.
         let params = match (self.layout, self.high_quality) {
             (AudioLayout::Stereo, false) => StreamParams {
                 sample_rate: SAMPLE_RATE,
@@ -109,7 +112,7 @@ impl CodecConfig {
                 channels: 6,
                 streams: 4,
                 coupled_streams: 2,
-                mapping: [0, 4, 1, 5, 2, 3, 0, 0],
+                mapping: [0, 1, 2, 3, 4, 5, 0, 0],
                 bitrate: 256_000,
                 packet_duration_ms: self.packet_duration_ms,
             },
@@ -118,7 +121,7 @@ impl CodecConfig {
                 channels: 6,
                 streams: 6,
                 coupled_streams: 0,
-                mapping: [0, 4, 1, 5, 2, 3, 0, 0],
+                mapping: [0, 1, 2, 3, 4, 5, 0, 0],
                 bitrate: 1_536_000,
                 packet_duration_ms: self.packet_duration_ms,
             },
@@ -127,7 +130,7 @@ impl CodecConfig {
                 channels: 8,
                 streams: 5,
                 coupled_streams: 3,
-                mapping: [0, 6, 1, 7, 2, 3, 4, 5],
+                mapping: [0, 1, 2, 3, 4, 5, 6, 7],
                 bitrate: 450_000,
                 packet_duration_ms: self.packet_duration_ms,
             },
@@ -136,7 +139,7 @@ impl CodecConfig {
                 channels: 8,
                 streams: 8,
                 coupled_streams: 0,
-                mapping: [0, 6, 1, 7, 2, 3, 4, 5],
+                mapping: [0, 1, 2, 3, 4, 5, 6, 7],
                 bitrate: 2_048_000,
                 packet_duration_ms: self.packet_duration_ms,
             },

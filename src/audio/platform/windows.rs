@@ -3,7 +3,6 @@ use crate::audio::config::{CaptureConfig, PlaybackConfig, StreamParams};
 use crate::audio::error::{Error, Result};
 use crate::audio::playback::AudioOutput;
 use std::ffi::c_void;
-use std::mem::size_of;
 use std::ptr;
 use std::slice;
 use std::sync::mpsc;
@@ -13,6 +12,8 @@ use std::time::{Duration, Instant};
 
 mod budget;
 mod diagnostics;
+mod endpoint;
+mod format;
 mod scheduling;
 mod stream;
 #[cfg(test)]
@@ -22,9 +23,8 @@ mod queue_tests;
 
 use budget::{MAX_PLAYBACK_WAIT, QueueBudget};
 use diagnostics::CaptureDiagnostics;
+use endpoint::EndpointSelection;
 use scheduling::MmcssTask;
-
-const SUPPORTED_CHANNELS: u16 = 2;
 
 const CLSCTX_ALL: u32 = 23;
 const COINIT_MULTITHREADED: u32 = 0;
@@ -50,7 +50,6 @@ const AUDCLNT_E_RESOURCES_INVALIDATED: i32 = 0x8889_0026u32 as i32;
 
 const E_RENDER: u32 = 0;
 const E_CONSOLE: u32 = 0;
-const WAVE_FORMAT_IEEE_FLOAT: u16 = 0x0003;
 
 const CLSID_MMDEVICE_ENUMERATOR: Guid = Guid::new(
     0xBCDE_0395,
@@ -84,7 +83,8 @@ const IID_IAUDIO_CAPTURE_CLIENT: Guid = Guid::new(
 );
 
 pub fn open_input(config: &CaptureConfig, stream: &StreamParams) -> Result<Box<dyn AudioInput>> {
-    validate_stream(config.device_name.as_deref(), stream)?;
+    let endpoint = EndpointSelection::parse(config.device_name.as_deref())?;
+    validate_stream(stream)?;
 
     let budget = QueueBudget::from_stream(stream)?;
     let ring = Arc::new(SharedSampleRing::new(
@@ -99,6 +99,7 @@ pub fn open_input(config: &CaptureConfig, stream: &StreamParams) -> Result<Box<d
         stop_event.raw(),
         Arc::clone(&ring),
         WasapiSpec::from_stream(stream),
+        endpoint,
     )?;
 
     Ok(Box::new(WindowsInput {
@@ -109,7 +110,8 @@ pub fn open_input(config: &CaptureConfig, stream: &StreamParams) -> Result<Box<d
 }
 
 pub fn open_output(config: &PlaybackConfig, stream: &StreamParams) -> Result<Box<dyn AudioOutput>> {
-    validate_stream(config.device_name.as_deref(), stream)?;
+    let endpoint = EndpointSelection::parse(config.device_name.as_deref())?;
+    validate_stream(stream)?;
 
     let budget = QueueBudget::from_stream(stream)?;
     let ring = Arc::new(SharedSampleRing::new(
@@ -124,6 +126,7 @@ pub fn open_output(config: &PlaybackConfig, stream: &StreamParams) -> Result<Box
         stop_event.raw(),
         Arc::clone(&ring),
         WasapiSpec::from_stream(stream),
+        endpoint,
     )?;
 
     Ok(Box::new(WindowsOutput {
@@ -133,17 +136,8 @@ pub fn open_output(config: &PlaybackConfig, stream: &StreamParams) -> Result<Box
     }))
 }
 
-fn validate_stream(device_name: Option<&str>, stream: &StreamParams) -> Result<()> {
-    if device_name.is_some() {
-        return Err(Error::UnsupportedPlatform("Windows 音频尚不支持指定设备"));
-    }
-
-    if stream.channels != SUPPORTED_CHANNELS as u8 {
-        return Err(Error::UnsupportedPlatform(
-            "Windows audio backend currently supports stereo only",
-        ));
-    }
-
+fn validate_stream(stream: &StreamParams) -> Result<()> {
+    WasapiSpec::from_stream(stream).wave_format()?;
     Ok(())
 }
 
@@ -211,19 +205,6 @@ impl WasapiSpec {
             channels: stream.channels as u16,
         }
     }
-
-    fn wave_format(&self) -> WaveFormatEx {
-        let block_align = self.channels * size_of::<f32>() as u16;
-        WaveFormatEx {
-            w_format_tag: WAVE_FORMAT_IEEE_FLOAT,
-            n_channels: self.channels,
-            n_samples_per_sec: self.sample_rate,
-            n_avg_bytes_per_sec: self.sample_rate * block_align as u32,
-            n_block_align: block_align,
-            w_bits_per_sample: 32,
-            cb_size: 0,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -236,12 +217,13 @@ fn spawn_capture_thread(
     stop_event: Handle,
     ring: Arc<SharedSampleRing>,
     spec: WasapiSpec,
+    endpoint: EndpointSelection,
 ) -> Result<JoinHandle<()>> {
     let (ready_tx, ready_rx) = mpsc::channel();
     let thread = thread::Builder::new()
         .name("audio-relay-win-capture".into())
         .spawn(move || {
-            capture_thread_main(stop_event, ring, spec, ready_tx);
+            capture_thread_main(stop_event, ring, spec, endpoint, ready_tx);
         })
         .map_err(|err| Error::Backend(format!("failed to spawn Windows capture thread: {err}")))?;
 
@@ -264,12 +246,13 @@ fn spawn_playback_thread(
     stop_event: Handle,
     ring: Arc<SharedSampleRing>,
     spec: WasapiSpec,
+    endpoint: EndpointSelection,
 ) -> Result<JoinHandle<()>> {
     let (ready_tx, ready_rx) = mpsc::channel();
     let thread = thread::Builder::new()
         .name("audio-relay-win-playback".into())
         .spawn(move || {
-            playback_thread_main(stop_event, ring, spec, ready_tx);
+            playback_thread_main(stop_event, ring, spec, endpoint, ready_tx);
         })
         .map_err(|err| Error::Backend(format!("failed to spawn Windows playback thread: {err}")))?;
 
@@ -292,13 +275,14 @@ fn capture_thread_main(
     stop_event: Handle,
     ring: Arc<SharedSampleRing>,
     spec: WasapiSpec,
+    endpoint: EndpointSelection,
     ready_tx: mpsc::Sender<std::result::Result<(), String>>,
 ) {
     let _mmcss = MmcssTask::register();
     let mut diagnostics = CaptureDiagnostics::default();
     let mut ready_sent = false;
     loop {
-        match CaptureThreadContext::start(spec) {
+        match CaptureThreadContext::start(spec, &endpoint) {
             Ok(context) => {
                 if let Err(err) = ring.configure_capture_packet(context.buffer_frames, spec.sample_rate) {
                     let message = err.to_string();
@@ -371,10 +355,11 @@ fn playback_thread_main(
     stop_event: Handle,
     ring: Arc<SharedSampleRing>,
     spec: WasapiSpec,
+    endpoint: EndpointSelection,
     ready_tx: mpsc::Sender<std::result::Result<(), String>>,
 ) {
     let _mmcss = MmcssTask::register();
-    match PlaybackThreadContext::start(spec) {
+    match PlaybackThreadContext::start(spec, &endpoint) {
         Ok(context) => {
             let _ = ready_tx.send(Ok(()));
             finish_playback_stream(context.run(stop_event, &ring), &ring);
@@ -401,7 +386,7 @@ struct CaptureThreadContext {
     audio_client: ComPtr<IAudioClient>,
     capture_client: ComPtr<IAudioCaptureClient>,
     capture_event: OwnedHandle,
-    endpoint_id: String,
+    endpoint_id: Option<String>,
     channels: usize,
     buffer_frames: u32,
     // Rust 按字段声明顺序析构, COM apartment 必须晚于所有接口释放.
@@ -409,9 +394,9 @@ struct CaptureThreadContext {
 }
 
 impl CaptureThreadContext {
-    fn start(spec: WasapiSpec) -> Result<Self> {
+    fn start(spec: WasapiSpec, endpoint: &EndpointSelection) -> Result<Self> {
         let com = ComApartment::new()?;
-        let activated = activate_default_audio_client()?;
+        let activated = activate_audio_client(endpoint)?;
         let audio_client = activated.audio_client;
         let capture_event = OwnedHandle::create_auto_reset(false)?;
         let stream_flags = AUDCLNT_STREAMFLAGS_LOOPBACK
@@ -463,7 +448,7 @@ impl CaptureThreadContext {
             self.capture_event.raw(),
             stop_event,
             ring,
-            &self.endpoint_id,
+            self.endpoint_id.as_deref(),
             self.channels,
             diagnostics,
         )
@@ -482,7 +467,7 @@ struct PlaybackThreadContext {
     audio_client: ComPtr<IAudioClient>,
     render_client: ComPtr<IAudioRenderClient>,
     render_event: OwnedHandle,
-    endpoint_id: String,
+    endpoint_id: Option<String>,
     channels: usize,
     buffer_frames: u32,
     // Rust 按字段声明顺序析构, COM apartment 必须晚于所有接口释放.
@@ -490,9 +475,9 @@ struct PlaybackThreadContext {
 }
 
 impl PlaybackThreadContext {
-    fn start(spec: WasapiSpec) -> Result<Self> {
+    fn start(spec: WasapiSpec, endpoint: &EndpointSelection) -> Result<Self> {
         let com = ComApartment::new()?;
-        let activated = activate_default_audio_client()?;
+        let activated = activate_audio_client(endpoint)?;
         let audio_client = activated.audio_client;
         let render_event = OwnedHandle::create_auto_reset(false)?;
         let stream_flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK
@@ -545,7 +530,7 @@ impl PlaybackThreadContext {
             self.render_event.raw(),
             stop_event,
             ring,
-            &self.endpoint_id,
+            self.endpoint_id.as_deref(),
             self.channels,
             self.buffer_frames,
         )
@@ -565,7 +550,7 @@ fn capture_loop(
     capture_event: Handle,
     stop_event: Handle,
     ring: &SharedSampleRing,
-    endpoint_id: &str,
+    endpoint_id: Option<&str>,
     channels: usize,
     diagnostics: &mut CaptureDiagnostics,
 ) -> Result<ThreadRunState> {
@@ -573,7 +558,7 @@ fn capture_loop(
     let mut last_endpoint_check =
         Instant::now() - Duration::from_millis(u64::from(DEVICE_REBIND_POLL_MS));
     loop {
-        if should_rebind_default_render_endpoint(endpoint_id, &mut last_endpoint_check)? {
+        if endpoint::should_rebind(endpoint_id, &mut last_endpoint_check, Instant::now(), current_default_render_endpoint_id) {
             return Ok(ThreadRunState::Restart);
         }
 
@@ -692,7 +677,7 @@ fn playback_loop(
     render_event: Handle,
     stop_event: Handle,
     ring: &SharedSampleRing,
-    endpoint_id: &str,
+    endpoint_id: Option<&str>,
     channels: usize,
     buffer_frames: u32,
 ) -> Result<ThreadRunState> {
@@ -700,7 +685,7 @@ fn playback_loop(
     let mut last_endpoint_check =
         Instant::now() - Duration::from_millis(u64::from(DEVICE_REBIND_POLL_MS));
     loop {
-        if should_rebind_default_render_endpoint(endpoint_id, &mut last_endpoint_check)? {
+        if endpoint::should_rebind(endpoint_id, &mut last_endpoint_check, Instant::now(), current_default_render_endpoint_id) {
             return Ok(ThreadRunState::Restart);
         }
 
@@ -1129,13 +1114,13 @@ fn discard_oldest(state: &mut RingState, count: usize) {
 
 struct ActivatedAudioClient {
     audio_client: ComPtr<IAudioClient>,
-    endpoint_id: String,
+    endpoint_id: Option<String>,
 }
 
-fn activate_default_audio_client() -> Result<ActivatedAudioClient> {
-    let endpoint = get_default_render_endpoint()?;
-    let endpoint_id = get_device_id(endpoint.device.as_ptr())?;
-    let device = endpoint.device;
+fn activate_audio_client(selection: &EndpointSelection) -> Result<ActivatedAudioClient> {
+    let device = get_render_endpoint(selection)?;
+    let endpoint_id = get_device_id(device.as_ptr())?;
+    tracing::info!(follows_default = selection.follows_default(), "已选择 Windows 音频 endpoint");
 
     let mut audio_client = ptr::null_mut();
     unsafe {
@@ -1153,15 +1138,11 @@ fn activate_default_audio_client() -> Result<ActivatedAudioClient> {
 
     Ok(ActivatedAudioClient {
         audio_client: ComPtr::from_raw(audio_client.cast())?,
-        endpoint_id,
+        endpoint_id: selection.follows_default().then_some(endpoint_id),
     })
 }
 
-struct DefaultRenderEndpoint {
-    device: ComPtr<IMMDevice>,
-}
-
-fn get_default_render_endpoint() -> Result<DefaultRenderEndpoint> {
+fn get_render_endpoint(selection: &EndpointSelection) -> Result<ComPtr<IMMDevice>> {
     let mut enumerator = ptr::null_mut();
     unsafe {
         check_hresult(
@@ -1177,25 +1158,12 @@ fn get_default_render_endpoint() -> Result<DefaultRenderEndpoint> {
     }
     let enumerator = ComPtr::<IMMDeviceEnumerator>::from_raw(enumerator.cast())?;
 
-    let mut device = ptr::null_mut();
-    unsafe {
-        check_hresult(
-            ((*(*enumerator.as_ptr()).lp_vtbl).get_default_audio_endpoint)(
-                enumerator.as_ptr(),
-                E_RENDER,
-                E_CONSOLE,
-                &mut device,
-            ),
-            "IMMDeviceEnumerator::GetDefaultAudioEndpoint",
-        )?;
-    }
-    let device = ComPtr::<IMMDevice>::from_raw(device)?;
-    Ok(DefaultRenderEndpoint { device })
+    endpoint::select(&enumerator, selection)
 }
 
 fn current_default_render_endpoint_id() -> Result<String> {
-    let endpoint = get_default_render_endpoint()?;
-    get_device_id(endpoint.device.as_ptr())
+    let device = get_render_endpoint(&EndpointSelection::Default)?;
+    get_device_id(device.as_ptr())
 }
 
 fn get_device_id(device: *mut IMMDevice) -> Result<String> {
@@ -1222,26 +1190,6 @@ fn get_device_id(device: *mut IMMDevice) -> Result<String> {
 
     unsafe { CoTaskMemFree(wide_ptr.cast()) };
     Ok(id)
-}
-
-fn has_default_render_endpoint_changed(bound_endpoint_id: &str) -> Result<bool> {
-    match current_default_render_endpoint_id() {
-        Ok(current) => Ok(current != bound_endpoint_id),
-        Err(_) => Ok(true),
-    }
-}
-
-fn should_rebind_default_render_endpoint(
-    bound_endpoint_id: &str,
-    last_check: &mut Instant,
-) -> Result<bool> {
-    let now = Instant::now();
-    if now.duration_since(*last_check) < Duration::from_millis(u64::from(DEVICE_REBIND_POLL_MS)) {
-        return Ok(false);
-    }
-
-    *last_check = now;
-    has_default_render_endpoint_changed(bound_endpoint_id)
 }
 
 fn should_restart_audio_client(hr: i32) -> bool {
@@ -1450,7 +1398,8 @@ impl Guid {
     }
 }
 
-#[repr(C)]
+#[repr(C, packed(1))]
+#[derive(Clone, Copy)]
 struct WaveFormatEx {
     w_format_tag: u16,
     n_channels: u16,

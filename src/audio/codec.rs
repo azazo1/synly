@@ -9,6 +9,8 @@ const OPUS_SET_VBR_REQUEST: c_int = 4006;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod upstream_tests;
 
 #[derive(Clone, Copy, Debug)]
 pub struct OpusMultistreamConfig {
