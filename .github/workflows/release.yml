@@ -200,7 +200,7 @@ jobs:
         if: matrix.platform == 'windows'
         shell: pwsh
         run: |
-          vcpkg install opus:x64-windows-static sdl2:x64-windows
+          vcpkg install opus:x64-windows-static-md sdl2:x64-windows
           $sdlBin = Join-Path $env:VCPKG_ROOT "installed/x64-windows/bin"
           if (-not (Test-Path -LiteralPath (Join-Path $sdlBin "SDL2.dll") -PathType Leaf)) {
             throw "vcpkg did not install SDL2.dll under $sdlBin"
@@ -328,6 +328,29 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+
+          # Inno 的安装器是 GUI 子系统程序, PowerShell 既不会等它结束, 也不会设置
+          # $LASTEXITCODE, 所以统一用 Start-Process 取退出码; 它的 loader 还可能先返回,
+          # 真正的安装在子进程里继续, 因此落地结果一律靠轮询确认.
+          function Invoke-Installer([string]$Exe, [string[]]$Arguments, [string]$What) {
+            $process = Start-Process -FilePath $Exe -ArgumentList $Arguments -PassThru
+            if (-not $process.WaitForExit(300000)) {
+              throw "$What 超时未退出: $Exe"
+            }
+            if ($process.ExitCode -ne 0) {
+              throw "$What 退出码: $($process.ExitCode)"
+            }
+          }
+
+          function Wait-ForPath([string]$Path, [string]$What) {
+            $deadline = (Get-Date).AddSeconds(180)
+            while ((Get-Date) -lt $deadline) {
+              if (Test-Path -LiteralPath $Path) { return }
+              Start-Sleep -Milliseconds 500
+            }
+            throw "等待$What 超时: $Path"
+          }
+
           $installer = "dist/synly-$env:PACKAGE_VERSION-windows-${{ matrix.arch }}-setup.exe"
           if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
             throw "缺少 Windows 安装器: $installer"
@@ -339,8 +362,8 @@ jobs:
 
           $target = Join-Path $env:RUNNER_TEMP "installer-check"
           $log = Join-Path $env:RUNNER_TEMP "installer-check.log"
-          & $installer '/SP-' '/VERYSILENT' '/SUPPRESSMSGBOXES' '/NORESTART' '/NOICONS' "/DIR=$target" "/LOG=$log"
-          if ($LASTEXITCODE -ne 0) { throw "安装器退出码: $LASTEXITCODE, 日志: $log" }
+          Invoke-Installer $installer @('/SP-', '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/NOICONS', "/DIR=$target", "/LOG=$log") '安装器'
+          Wait-ForPath (Join-Path $target 'synly.exe') '安装后的主程序'
 
           foreach ($name in @("synly.exe", "SDL2.dll")) {
             $installed = Join-Path $target $name
@@ -356,8 +379,9 @@ jobs:
           # 安装器的 postinstall 会拉起应用, 卸载前先结束它.
           Get-Process -Name synly -ErrorAction SilentlyContinue | Stop-Process -Force
           Start-Sleep -Seconds 1
-          & (Join-Path $target "unins000.exe") '/VERYSILENT' '/SUPPRESSMSGBOXES' '/NORESTART'
-          if ($LASTEXITCODE -ne 0) { throw "卸载器退出码: $LASTEXITCODE" }
+          $uninstaller = Join-Path $target "unins000.exe"
+          Wait-ForPath $uninstaller '卸载器'
+          Invoke-Installer $uninstaller @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART') '卸载器'
 
       - name: Package macOS application
         if: matrix.platform == 'macos'
