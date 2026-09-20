@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 #[derive(Clone, Debug, PartialEq)]
 pub enum UpdatePhase {
     Idle,
@@ -8,6 +6,8 @@ pub enum UpdatePhase {
     Available,
     Downloading,
     ReadyToRestart,
+    /// 用户已点击重启并更新, 正在把安装包交接给平台安装器.
+    Applying,
     HandedOff,
     DmgOpened,
     Failed,
@@ -52,6 +52,7 @@ impl UpdateSnapshot {
             UpdatePhase::Available
             | UpdatePhase::Downloading
             | UpdatePhase::ReadyToRestart
+            | UpdatePhase::Applying
             | UpdatePhase::HandedOff
             | UpdatePhase::DmgOpened => {
                 if let Some(version) = &self.latest_display {
@@ -60,6 +61,7 @@ impl UpdateSnapshot {
                     "新版本可用".to_string()
                 }
             }
+            _ if !self.apply_message.is_empty() => self.apply_message.clone(),
             _ => self.current_version.clone(),
         }
     }
@@ -70,6 +72,7 @@ impl UpdateSnapshot {
             UpdatePhase::Available
                 | UpdatePhase::Downloading
                 | UpdatePhase::ReadyToRestart
+                | UpdatePhase::Applying
                 | UpdatePhase::HandedOff
                 | UpdatePhase::DmgOpened
         )
@@ -94,18 +97,12 @@ pub struct AvailableRelease {
     pub checksums_url: String,
 }
 
+/// 安装器交接结果.
 #[derive(Clone, Debug)]
 pub enum InstallOutcome {
-    #[allow(dead_code)]
-    ReadyToRestart { exe: PathBuf },
-    #[allow(dead_code)]
+    /// 已把落地工作交给脱离进程的安装器, 本进程应当尽快退出.
     HandedOff,
-    #[allow(dead_code)]
+    /// 无法交接 (便携运行), 已打开 dmg 引导用户手动安装, 只有 macOS 会走到这一步.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     DmgOpened,
-}
-
-#[derive(Clone, Debug)]
-pub enum RestartAction {
-    Relaunch { exe: PathBuf },
-    QuitOnly,
 }

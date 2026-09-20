@@ -84,13 +84,7 @@ fn main() -> Result<()> {
         let (_, commands) = tokio::sync::mpsc::unbounded_channel();
         return runtime.block_on(app::run(config, options, commands));
     }
-    match gui::run(config, session_override.is_some())? {
-        gui::GuiExit::Quit => Ok(()),
-        gui::GuiExit::Restart { exe } => {
-            drop(_tracing_guard);
-            crate::update::relaunch(exe)
-        }
-    }
+    gui::run(config, session_override.is_some())
 }
 
 fn run_internal_command(command: &cli::Command) -> Result<()> {

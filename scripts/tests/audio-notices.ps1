@@ -1,4 +1,4 @@
-﻿Set-StrictMode -Version Latest
+Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $work = Join-Path $root (".tmp/audio-notices-test-" + [Guid]::NewGuid().ToString("N"))
@@ -50,17 +50,25 @@ foreach ($name in $files) {
     if (Test-Path -LiteralPath $empty) { throw "空输入时不应生成目标" }
     Copy-Item -LiteralPath (Join-Path $notices $name) -Destination $source -Force
 }
-Write-Host "[3/3] 执行 Windows 打包并解包校验, 不运行占位二进制"
+Write-Host "[3/3] 执行 Windows 安装器打包并静默安装校验, 不运行占位二进制"
 Copy-Item -LiteralPath (Join-Path $root "scripts/package-windows.ps1") -Destination $fixtureScripts
+Copy-Item -LiteralPath (Join-Path $root "scripts/installer-windows.iss") -Destination $fixtureScripts
+$fixtureAssets = Join-Path $repo "assets/windows"
+New-Item -ItemType Directory -Path $fixtureAssets -Force | Out-Null
+Copy-Item -LiteralPath (Join-Path $root "assets/windows/synly.ico") -Destination $fixtureAssets
 $binary = Join-Path $repo "synly.exe"
 # 仅满足现有打包脚本的 MZ 标志检查, 不编译或运行任何应用.
 [IO.File]::WriteAllBytes($binary, [byte[]]@(0x4D, 0x5A))
 $output = Join-Path $work "dist with spaces"
 & (Join-Path $fixtureScripts "package-windows.ps1") -Binary $binary -OutputDir $output -Version "test-only" -Arch "x86_64"
-$archive = Join-Path $output "synly-test-only-windows-x86_64.zip"
-$unpacked = Join-Path $work "unpacked"
-Expand-Archive -LiteralPath $archive -DestinationPath $unpacked
-Assert-SameFile $binary (Join-Path $unpacked "synly.exe")
-foreach ($name in $files) { Assert-SameFile (Join-Path $notices $name) (Join-Path $unpacked "audio-licenses/$name") }
-if (@(Get-ChildItem -LiteralPath $output -Directory).Count -ne 0) { throw "许可暂存目录未清理" }
+$installer = Join-Path $output "synly-test-only-windows-x86_64-setup.exe"
+if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) { throw "安装器未生成: $installer" }
+$target = Join-Path $work "installed"
+& $installer '/SP-' '/VERYSILENT' '/SUPPRESSMSGBOXES' '/NORESTART' '/NOICONS' "/DIR=$target"
+if (-not (Test-Path -LiteralPath (Join-Path $target "synly.exe") -PathType Leaf)) { throw "安装目录缺少主程序" }
+Assert-SameFile $binary (Join-Path $target "synly.exe")
+foreach ($name in $files) { Assert-SameFile (Join-Path $notices $name) (Join-Path $target "audio-licenses/$name") }
+& (Join-Path $target "unins000.exe") '/VERYSILENT' '/SUPPRESSMSGBOXES' '/NORESTART'
+if (Test-Path -LiteralPath (Join-Path $target "synly.exe")) { throw "卸载后主程序仍在" }
+if (@(Get-ChildItem -LiteralPath $output -Directory).Count -ne 0) { throw "载荷暂存目录未清理" }
 Write-Host "音频许可随附测试通过, 测试产物保留于 $work"

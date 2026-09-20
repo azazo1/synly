@@ -4,17 +4,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// 本次运行是否已经做过输入服务的版本对齐, 避免重复弹 UAC.
 static SERVICE_ALIGNED: AtomicBool = AtomicBool::new(false);
 
-/// 更新就地替换可执行文件后, 正在运行的输入服务仍映射着更新前的映像, 只有重启它才会换成新版本.
+/// 安装器替换可执行文件后, 正在运行的输入服务仍映射着更新前的映像, 只有重启它才会换成新版本.
 ///
-/// 替换过 exe 的进程自己就映射着那个旧映像, 不能用 `.old` 是否被占用判断服务是否过期,
-/// 此时服务只要在运行就必然还是旧版本; 由旧版本完成的更新则没有这个标记, 退回用 `.old`
-/// 是否删得掉来推断. 这里在真正申请输入提权前对齐一次, 失败时继续沿用现有服务, 不影响
-/// 本次提权.
+/// 安装器只换磁盘上的文件, SYSTEM 服务要等重启才会加载新版本, 所以落地更新后的首次启动
+/// 只要服务在运行就必然是旧版本; 其它启动没有这个标记, 退回用让位文件是否删得掉来推断.
+/// 这里在真正申请输入提权前对齐一次, 失败时继续沿用现有服务, 不影响本次提权.
 fn ensure_input_service_current() {
     if SERVICE_ALIGNED.load(Ordering::Acquire) || !service_is_installed() {
         return;
     }
-    let stale = if crate::update::binary_replaced_in_process() {
+    let stale = if crate::update::update_landed_before_start() {
         synly::input::windows_input_service_running()
     } else {
         crate::update::cleanup_old_binary_backups()
@@ -35,17 +34,12 @@ fn ensure_input_service_current() {
     }
 }
 
-/// 服务重启后再清理一次旧映像备份.
-///
-/// 替换过 exe 的进程自己也映射着那个旧映像, 因此它退出之前备份仍然删不掉, 这属于预期,
-/// 不该报成异常.
+/// 服务重启后再清理一次让位文件.
 fn report_backup_cleanup() {
     if !crate::update::cleanup_old_binary_backups() {
-        tracing::info!("输入服务重启后旧映像备份已清理");
-    } else if crate::update::binary_replaced_in_process() {
-        tracing::debug!("旧映像备份仍被本进程映射, 将在本进程退出后清理");
+        tracing::info!("输入服务重启后旧程序文件备份已清理");
     } else {
-        tracing::warn!("旧映像备份仍被占用, 将在下次启动时重试清理");
+        tracing::debug!("旧程序文件备份仍被占用, 将在下次启动时重试清理");
     }
 }
 

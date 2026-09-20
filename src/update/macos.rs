@@ -54,18 +54,6 @@ pub fn open_dmg(dmg: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn take_apply_result() -> Option<String> {
-    let path = crate::paths::update_dir().ok()?.join("apply-update-result.txt");
-    let text = fs::read_to_string(&path).ok()?;
-    let _ = fs::remove_file(&path);
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
-}
-
 pub fn cleanup_stale() {
     let Ok(update_dir) = crate::paths::update_dir() else {
         return;

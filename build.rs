@@ -23,6 +23,7 @@ fn main() {
     println!("cargo:rerun-if-changed=assets/windows/synly.ico");
     slint_build::compile("ui/app.slint").expect("failed to compile Slint UI");
     emit_build_version();
+    emit_distribution_form();
     emit_fake_dist_cfg();
     for key in [
         "OPUS_DIR",
@@ -139,6 +140,24 @@ fn find_vcpkg_sdl2_lib_dir(target: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// 把 `SYNLY_DISTRIBUTION_FORM` 注入编译产物, 默认按便携形态处理.
+///
+/// 只有 `just dist` / `just fake-dist` 与 CI 发布构建注入 `installer`, 日常构建与直接运行
+/// 的二进制都不是安装版, 更新落地方式与资产匹配因此不同.
+fn emit_distribution_form() {
+    println!("cargo:rerun-if-env-changed=SYNLY_DISTRIBUTION_FORM");
+    let form = env::var("SYNLY_DISTRIBUTION_FORM")
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "portable".to_string());
+    match form.as_str() {
+        "installer" | "portable" => {}
+        other => panic!("unsupported SYNLY_DISTRIBUTION_FORM: {other}"),
+    }
+    println!("cargo:rustc-env=SYNLY_DISTRIBUTION_FORM={form}");
 }
 
 fn emit_fake_dist_cfg() {

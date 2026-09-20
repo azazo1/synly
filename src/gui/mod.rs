@@ -3,7 +3,7 @@ use crate::config::{
     TransferConfig, UiConfig,
 };
 use crate::core::{AppCommand, AppSettings, AppSnapshot, AppSupervisor};
-use crate::update::{self, UpdateHandle, UpdatePhase, UpdateRestartAction, UpdateSnapshot};
+use crate::update::{self, UpdateHandle, UpdatePhase, UpdateSnapshot};
 use crate::input::{CursorMode, InputMode, InputPlatform, ScreenEdge};
 use crate::runtime_control::{InteractionRequest, InteractionResponse};
 use crate::runtime_options::normalize_pin;
@@ -32,19 +32,14 @@ const MIN_WINDOW_HEIGHT: f32 = 560.0;
 const MAX_WINDOW_WIDTH: f32 = 1180.0;
 const MAX_WINDOW_HEIGHT: f32 = 760.0;
 
-pub enum GuiExit {
-    Quit,
-    Restart { exe: PathBuf },
-}
-
-pub fn run(config: SynlyConfig, force_start: bool) -> Result<GuiExit> {
+pub fn run(config: SynlyConfig, force_start: bool) -> Result<()> {
     let data_dir = crate::paths::data_dir()?;
     std::fs::create_dir_all(&data_dir)
         .with_context(|| format!("无法创建数据目录 {}", data_dir.display()))?;
     let single_instance = single_instance::SingleInstance::acquire(&data_dir)?;
     let listener = match single_instance {
         single_instance::SingleInstance::Primary(listener) => listener,
-        single_instance::SingleInstance::ActivatedExisting => return Ok(GuiExit::Quit),
+        single_instance::SingleInstance::ActivatedExisting => return Ok(()),
     };
     #[cfg(windows)]
     if config.runtime.input.elevate_on_start {
@@ -77,7 +72,6 @@ pub fn run(config: SynlyConfig, force_start: bool) -> Result<GuiExit> {
             send_command(&persist_commands, AppCommand::SaveUpdateConfig(update_config));
         }),
     )?;
-    let restart_action = Arc::new(Mutex::new(None::<UpdateRestartAction>));
     let tray = tray::TrayController::new(&window, &handle, update.clone(), crate::BUILD_VERSION);
     apply_settings_to_window(
         &window,
@@ -94,7 +88,7 @@ pub fn run(config: SynlyConfig, force_start: bool) -> Result<GuiExit> {
 
     let current_interaction = Arc::new(Mutex::new(None::<Uuid>));
     wire_window_callbacks(&window, &handle, Arc::clone(&current_interaction));
-    wire_update_callbacks(&window, &update, Arc::clone(&restart_action), &handle);
+    wire_update_callbacks(&window, &update, &handle);
     wire_close_to_tray(&window, &handle);
     {
         let window = window.as_weak();
@@ -120,7 +114,7 @@ pub fn run(config: SynlyConfig, force_start: bool) -> Result<GuiExit> {
         tray.state_sink(),
     );
     spawn_log_presenter(&runtime, &window);
-    spawn_update_presenter(&runtime, &window, update.subscribe(), tray.state_sink(), Arc::clone(&restart_action), handle.commands());
+    spawn_update_presenter(&runtime, &window, update.subscribe(), tray.state_sink(), handle.commands());
     spawn_ctrl_c_handler(&runtime, handle.commands());
     #[cfg(target_os = "macos")]
     {
@@ -157,14 +151,7 @@ pub fn run(config: SynlyConfig, force_start: bool) -> Result<GuiExit> {
     save_window_state(&window, &handle.commands());
     let _ = handle.commands().try_send(AppCommand::Shutdown);
     runtime.shutdown_timeout(std::time::Duration::from_secs(5));
-    let action = restart_action
-        .lock()
-        .ok()
-        .and_then(|guard| (*guard).clone());
-    match action {
-        Some(UpdateRestartAction::Relaunch { exe }) => Ok(GuiExit::Restart { exe }),
-        Some(UpdateRestartAction::QuitOnly) | None => Ok(GuiExit::Quit),
-    }
+    Ok(())
 }
 
 fn system_monospace_font_family() -> &'static str {
@@ -548,7 +535,6 @@ fn wire_window_callbacks(
 fn wire_update_callbacks(
     window: &AppWindow,
     update: &UpdateHandle,
-    restart_action: Arc<Mutex<Option<UpdateRestartAction>>>,
     handle: &crate::core::AppSupervisorHandle,
 ) {
     let update_handle = update.clone();
@@ -584,21 +570,15 @@ fn wire_update_callbacks(
     });
 
     let update_handle = update.clone();
-    let restart_action = Arc::clone(&restart_action);
     let commands = handle.commands();
     let weak = window.as_weak();
     window.on_restart_for_update(move || {
         guard_callback("restart_for_update", || {
-            if let Some(action) = update_handle.install() {
-                if let Ok(mut slot) = restart_action.lock() {
-                    *slot = Some(action);
-                }
-                if let Some(window) = weak.upgrade() {
-                    save_window_state(&window, &commands);
-                }
-                send_command(&commands, AppCommand::Shutdown);
-                let _ = slint::quit_event_loop();
+            if let Some(window) = weak.upgrade() {
+                save_window_state(&window, &commands);
             }
+            // 交接成功后由更新状态监听统一走退出路径.
+            update_handle.install();
         })
     });
 
@@ -627,7 +607,6 @@ fn spawn_update_presenter(
     window: &AppWindow,
     mut snapshots: tokio::sync::watch::Receiver<UpdateSnapshot>,
     tray_state: tray::TrayStateSink,
-    restart_action: Arc<Mutex<Option<UpdateRestartAction>>>,
     commands: tokio::sync::mpsc::Sender<AppCommand>,
 ) {
     let window = window.as_weak();
@@ -640,7 +619,6 @@ fn spawn_update_presenter(
             tray_state.apply_auto_check(snapshot.auto_check);
             let handed_off = snapshot.phase == UpdatePhase::HandedOff;
             let window_weak = window.clone();
-            let restart_action = Arc::clone(&restart_action);
             let commands = commands.clone();
             let _ = slint::invoke_from_event_loop(move || {
                 guard_callback("update_handoff", || {
@@ -649,9 +627,7 @@ fn spawn_update_presenter(
                     };
                     apply_update_snapshot(&window, &snapshot);
                     if handed_off {
-                        if let Ok(mut slot) = restart_action.lock() {
-                            *slot = Some(UpdateRestartAction::QuitOnly);
-                        }
+                        QUITTING_FOR_UPDATE.store(true, std::sync::atomic::Ordering::Release);
                         save_window_state(&window, &commands);
                         send_command(&commands, AppCommand::Shutdown);
                         let _ = slint::quit_event_loop();
@@ -676,7 +652,10 @@ fn apply_update_snapshot(window: &AppWindow, snapshot: &UpdateSnapshot) {
     let handed_off = snapshot.phase == UpdatePhase::HandedOff;
     window.set_update_busy(matches!(
         snapshot.phase,
-        UpdatePhase::Checking | UpdatePhase::Downloading | UpdatePhase::HandedOff
+        UpdatePhase::Checking
+            | UpdatePhase::Downloading
+            | UpdatePhase::Applying
+            | UpdatePhase::HandedOff
     ));
     window.set_update_show_download(snapshot.phase == UpdatePhase::Available && !handed_off);
     window.set_update_show_cancel(snapshot.phase == UpdatePhase::Downloading && snapshot.cancellable);
@@ -722,8 +701,11 @@ fn update_status_text(snapshot: &UpdateSnapshot) -> String {
                 "正在安装更新...".to_string()
             }
         }
-        UpdatePhase::ReadyToRestart => "更新已就绪, 重启后生效".to_string(),
-        UpdatePhase::HandedOff => "正在退出并替换, 请勿手动关闭进程".to_string(),
+        UpdatePhase::ReadyToRestart => {
+            "更新已就绪, 点击后会运行安装程序并退出当前进程".to_string()
+        }
+        UpdatePhase::Applying => "正在运行安装程序...".to_string(),
+        UpdatePhase::HandedOff => "正在退出并运行安装程序, 请勿手动关闭进程".to_string(),
         UpdatePhase::DmgOpened => "已打开安装镜像, 请拖拽安装后重启".to_string(),
         UpdatePhase::Failed => "检查或安装更新失败".to_string(),
     }
@@ -746,6 +728,13 @@ fn update_progress_text(snapshot: &UpdateSnapshot) -> String {
     }
 }
 
+/// 是否已经把落地工作交给安装器, 正在退出.
+///
+/// 这个阶段里窗口关闭必须按真退出处理: 安装器会通过 Restart Manager 请求关闭占用程序
+/// 文件的进程, 若把它当成隐藏到托盘, 替换就无法完成.
+static QUITTING_FOR_UPDATE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 fn wire_close_to_tray(
     window: &AppWindow,
     handle: &crate::core::AppSupervisorHandle,
@@ -758,7 +747,9 @@ fn wire_close_to_tray(
                 return CloseRequestResponse::HideWindow;
             };
             save_window_state(&window, &commands);
-            if window.get_close_to_tray() {
+            if !QUITTING_FOR_UPDATE.load(std::sync::atomic::Ordering::Acquire)
+                && window.get_close_to_tray()
+            {
                 macos_dock::set_follow_window(window.get_hide_dock_when_hidden());
                 macos_dock::note_hidden();
                 let _ = window.hide();

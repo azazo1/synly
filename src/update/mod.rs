@@ -1,15 +1,19 @@
 mod check;
 mod download;
+mod form;
 mod install;
 #[cfg(target_os = "macos")]
 mod macos;
+mod pending;
 mod state;
 
 use crate::config::UpdateConfig;
 use anyhow::{Context, Result};
 use check::release_page_url;
-use state::{AvailableRelease, InstallOutcome, RestartAction};
-use std::path::PathBuf;
+use pending::ApplyOutcome;
+use state::{AvailableRelease, InstallOutcome, UpdatePhase as Phase};
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 #[cfg(windows)]
@@ -18,16 +22,20 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-pub use state::{RestartAction as UpdateRestartAction, UpdatePhase, UpdateSnapshot};
+pub use form::DistributionForm;
+pub use state::{UpdatePhase, UpdateSnapshot};
 
 const SILENT_CHECK_DELAY_SECS: u64 = 5;
 
-/// 本进程是否替换过正在运行的可执行文件.
+/// 上次下载留下的校验和文件, 用于确认本地安装包仍然可信.
+const CHECKSUMS_FILE: &str = "SHA256SUMS";
+
+/// 本次启动是不是安装器落地更新后的首次启动.
 ///
-/// 替换后当前进程映射的旧映像就是那个 `.old` 文件, 因此不能用它的占用情况判断
-/// 其它进程 (例如 SYSTEM 输入服务) 是否还在运行旧版本.
+/// 这种启动下, 正在运行的 Windows 输入服务必然还映射着更新前的映像: 安装器只换了磁盘上
+/// 的文件, SYSTEM 服务要等重启才会加载新版本. 其它情况退回用让位文件是否删得掉来推断.
 #[cfg(windows)]
-static BINARY_REPLACED_IN_PROCESS: AtomicBool = AtomicBool::new(false);
+static UPDATE_LANDED_BEFORE_START: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone)]
 pub struct UpdateHandle {
@@ -49,7 +57,8 @@ struct Inner {
     cancel_download: CancellationToken,
     download_generation: u64,
     applying: bool,
-    restart: Option<RestartAction>,
+    /// 下载完成、等待用户点击重启并更新的安装包.
+    ready_package: Option<PathBuf>,
 }
 
 impl UpdateHandle {
@@ -151,13 +160,33 @@ impl UpdateHandle {
         }
     }
 
-    pub fn install(&self) -> Option<RestartAction> {
-        let inner = self.lock();
-        match inner.snapshot.phase {
-            UpdatePhase::ReadyToRestart => inner.restart.clone(),
-            UpdatePhase::HandedOff => Some(RestartAction::QuitOnly),
-            _ => None,
+    /// 用户点击 "重启并更新" 后把安装包交接给平台安装器.
+    ///
+    /// 下载完成本身只进入 `ReadyToRestart`, 不会自动交接, 也不会自动退出.
+    pub fn install(&self) {
+        let mut inner = self.lock();
+        if inner.snapshot.phase != Phase::ReadyToRestart {
+            return;
         }
+        let Some(package) = inner.ready_package.clone() else {
+            tracing::warn!("更新包已不在本地, 无法交接安装程序");
+            return;
+        };
+        let version = inner
+            .snapshot
+            .latest_tag
+            .clone()
+            .unwrap_or_else(|| inner.current_version.clone());
+        inner.snapshot.phase = Phase::Applying;
+        inner.snapshot.cancellable = false;
+        inner.snapshot.apply_message.clear();
+        inner.snapshot.error_text.clear();
+        inner.publish();
+        tracing::info!(package = %package.display(), "开始交接安装程序");
+        let handle = self.clone();
+        inner.download_task = Some(self.runtime.spawn(async move {
+            handle.run_apply(package, version).await;
+        }));
     }
 
     pub fn open_release_page(&self) {
@@ -311,37 +340,50 @@ impl UpdateHandle {
             self.fail(generation, format!("无法保存更新包: {error}"));
             return;
         }
-        if !self.mark_applying(generation) {
+        if let Err(error) = persist_checksums(&update_dir, &sums) {
+            tracing::warn!(error = %error, "无法保存 SHA256SUMS, 下次启动时需要重新下载更新包");
+        }
+        self.finish_download(generation, |inner| {
+            inner.ready_package = Some(final_path.clone());
+            inner.snapshot.phase = Phase::ReadyToRestart;
+            inner.snapshot.cancellable = false;
+            inner.snapshot.apply_message = "新版本已下载, 点击重启并更新后由安装程序完成替换".to_string();
+            tracing::info!(package = %final_path.display(), "更新包已就绪, 等待用户重启安装");
+        });
+    }
+
+    /// 把安装包交接给平台安装器, 成功后本进程随即退出.
+    async fn run_apply(&self, package: PathBuf, version: String) {
+        let result = tokio::task::spawn_blocking(move || install::apply_installer(&package, &version))
+            .await
+            .unwrap_or_else(|error| Err(anyhow::anyhow!("安装任务异常终止: {error}")));
+        let mut inner = self.lock();
+        if inner.snapshot.phase != Phase::Applying {
             return;
         }
-        match install::apply_archive(&final_path) {
-            Ok(InstallOutcome::ReadyToRestart { exe }) => {
-                #[cfg(windows)]
-                note_binary_replaced();
-                self.finish_download(generation, |inner| {
-                    inner.snapshot.phase = UpdatePhase::ReadyToRestart;
-                    inner.snapshot.cancellable = false;
-                    inner.restart = Some(RestartAction::Relaunch { exe });
-                    tracing::info!("更新已就绪, 等待重启");
-                });
-            }
+        match result {
             Ok(InstallOutcome::HandedOff) => {
-                self.finish_download(generation, |inner| {
-                    inner.snapshot.phase = UpdatePhase::HandedOff;
-                    inner.snapshot.cancellable = false;
-                    inner.snapshot.apply_message = "正在退出并替换, 请勿手动关闭进程".to_string();
-                    inner.restart = Some(RestartAction::QuitOnly);
-                    tracing::info!("已交接 macOS 替换脚本");
-                });
+                inner.snapshot.phase = Phase::HandedOff;
+                inner.snapshot.cancellable = false;
+                inner.snapshot.apply_message = "正在退出并运行安装程序, 请勿手动关闭进程".to_string();
+                inner.publish();
+                tracing::info!("已交接安装程序, 准备退出");
             }
             Ok(InstallOutcome::DmgOpened) => {
-                self.finish_download(generation, |inner| {
-                    inner.snapshot.phase = UpdatePhase::DmgOpened;
-                    inner.snapshot.cancellable = false;
-                    inner.snapshot.apply_message = "已打开 dmg, 请拖拽安装后重启应用".to_string();
-                });
+                inner.snapshot.phase = Phase::DmgOpened;
+                inner.snapshot.cancellable = false;
+                inner.snapshot.apply_message = "已打开安装镜像, 请拖拽安装后重启".to_string();
+                inner.publish();
+                tracing::info!("已打开 dmg, 等待用户手动安装");
             }
-            Err(error) => self.fail(generation, error.to_string()),
+            Err(error) => {
+                inner.snapshot.phase = Phase::Failed;
+                inner.snapshot.cancellable = false;
+                inner.snapshot.error_text = error.to_string();
+                inner.snapshot.apply_message.clear();
+                inner.publish();
+                tracing::warn!(error = %format!("{error:#}"), "交接安装程序失败");
+            }
         }
     }
 
@@ -349,15 +391,52 @@ impl UpdateHandle {
         self.lock().is_active_download(generation)
     }
 
-    fn mark_applying(&self, generation: u64) -> bool {
-        let mut inner = self.lock();
-        if !inner.is_active_download(generation) {
-            return false;
+    /// 启动时复用上次已下载并校验通过的安装包, 避免让用户重新下载.
+    async fn restore_local_package(&self, update_dir: &Path) {
+        let Some((package, version)) = locate_local_package(update_dir) else {
+            return;
+        };
+        let current = {
+            let inner = self.lock();
+            if inner.ready_package.is_some() {
+                return;
+            }
+            inner.current_version.clone()
+        };
+        if !check::is_newer(&current, &version) {
+            return;
         }
-        inner.applying = true;
-        inner.snapshot.cancellable = false;
+        let Some(name) = package.file_name().map(|value| value.to_string_lossy().into_owned())
+        else {
+            return;
+        };
+        let Some(expected) = fs::read_to_string(update_dir.join(CHECKSUMS_FILE))
+            .ok()
+            .and_then(|text| download::expected_sha256(&text, &name).ok())
+        else {
+            return;
+        };
+        let Ok(actual) = download::sha256_file(&package).await else {
+            return;
+        };
+        if !actual.eq_ignore_ascii_case(&download::hex_encode(&expected)) {
+            tracing::warn!(package = %package.display(), "本地更新包校验失败, 需要重新下载");
+            return;
+        }
+        let mut inner = self.lock();
+        if inner.ready_package.is_some()
+            || !matches!(inner.snapshot.phase, Phase::Idle | Phase::UpToDate)
+        {
+            return;
+        }
+        inner.ready_package = Some(package.clone());
+        inner.snapshot.phase = Phase::ReadyToRestart;
+        inner.snapshot.latest_tag = Some(version.clone());
+        inner.snapshot.latest_display = Some(version.clone());
+        inner.snapshot.apply_message =
+            "新版本已下载, 点击重启并更新后由安装程序完成替换".to_string();
         inner.publish();
-        true
+        tracing::info!(version, package = %package.display(), "复用上次下载好的更新包");
     }
 
     fn finish_download(&self, generation: u64, update: impl FnOnce(&mut Inner)) {
@@ -407,19 +486,12 @@ pub fn start(
     config: UpdateConfig,
     persist: Arc<dyn Fn(UpdateConfig) + Send + Sync>,
 ) -> Result<UpdateHandle> {
-    let _ = install::cleanup_old_binary();
-    #[cfg(target_os = "macos")]
-    let snapshot = {
-        let mut snapshot = UpdateSnapshot::idle(current_version.clone(), config.auto_check);
-        if let Some(message) = macos::take_apply_result() {
-            snapshot.phase = UpdatePhase::Failed;
-            snapshot.error_text = message;
-            snapshot.apply_message = snapshot.error_text.clone();
-        }
-        snapshot
-    };
-    #[cfg(not(target_os = "macos"))]
-    let snapshot = UpdateSnapshot::idle(current_version.clone(), config.auto_check);
+    let _ = install::cleanup_stale_artifacts();
+    let mut snapshot = UpdateSnapshot::idle(current_version.clone(), config.auto_check);
+    let update_dir = crate::paths::update_dir().ok();
+    if let Some(dir) = &update_dir {
+        apply_pending_outcome(dir, &current_version, &mut snapshot);
+    }
     let (snapshot_tx, snapshots) = watch::channel(snapshot.clone());
     let handle = UpdateHandle {
         inner: Arc::new(Mutex::new(Inner {
@@ -435,11 +507,17 @@ pub fn start(
             cancel_download: CancellationToken::new(),
             download_generation: 0,
             applying: false,
-            restart: None,
+            ready_package: None,
         })),
         snapshots,
         runtime: runtime.handle().clone(),
     };
+    if let Some(dir) = update_dir {
+        let restored = handle.clone();
+        runtime.spawn(async move {
+            restored.restore_local_package(&dir).await;
+        });
+    }
     if config.auto_check {
         let delayed = handle.clone();
         runtime.spawn(async move {
@@ -452,25 +530,47 @@ pub fn start(
     Ok(handle)
 }
 
-/// 记录本次运行已经就地替换了可执行文件.
-#[cfg(windows)]
-fn note_binary_replaced() {
-    BINARY_REPLACED_IN_PROCESS.store(true, Ordering::Release);
+/// 回显上次交接的落地结果.
+fn apply_pending_outcome(update_dir: &Path, current_version: &str, snapshot: &mut UpdateSnapshot) {
+    match pending::take_outcome(update_dir, current_version) {
+        Some(ApplyOutcome::Applied { version }) => {
+            #[cfg(windows)]
+            note_update_landed();
+            snapshot.apply_message = format!("已更新到 {version}");
+            tracing::info!(version, "上次交接的安装程序已完成替换");
+        }
+        Some(ApplyOutcome::Failed { message }) => {
+            tracing::warn!(message, "上次交接的安装程序没有完成替换");
+            snapshot.phase = Phase::Failed;
+            snapshot.error_text = message.clone();
+            snapshot.apply_message = message;
+        }
+        None => {}
+    }
 }
 
-/// 本次运行是否已经就地替换了可执行文件.
+/// 记录本次启动是安装器落地更新后的首次启动.
 #[cfg(windows)]
-pub fn binary_replaced_in_process() -> bool {
-    BINARY_REPLACED_IN_PROCESS.load(Ordering::Acquire)
+fn note_update_landed() {
+    UPDATE_LANDED_BEFORE_START.store(true, Ordering::Release);
 }
 
-/// 清理上一版可执行文件备份, 返回是否仍有备份无法删除.
+/// 本次启动是否紧接着一次已落地的更新.
 ///
-/// 更新替换 exe 后旧映像会留在 `<exe>.old`; 只要它还在, 就说明仍有进程运行着更新前的
-/// 版本, Windows 上通常是 SYSTEM 输入服务. 每次调用都会顺带清理能删掉的备份.
+/// 这种情况下正在运行的 Windows 输入服务必然还映射着更新前的映像, 需要重启它.
+#[cfg(windows)]
+pub fn update_landed_before_start() -> bool {
+    UPDATE_LANDED_BEFORE_START.load(Ordering::Acquire)
+}
+
+/// 清理安装器让位时留下的旧文件, 返回是否仍有文件无法删除.
+///
+/// 安装器覆盖程序文件前会把被占用的旧文件改成 `<name>.old`; 只要它还在, 就说明仍有进程
+/// 运行着更新前的版本, Windows 上通常是 SYSTEM 输入服务. 每次调用都会顺带清理能删掉的
+/// 残留.
 #[cfg(windows)]
 pub fn cleanup_old_binary_backups() -> bool {
-    install::cleanup_old_binary()
+    install::cleanup_stale_artifacts()
 }
 
 /// 每次检查或下载都新建 client, 让系统代理和代理环境变量变化实时生效.
@@ -514,8 +614,57 @@ fn open_url(url: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn relaunch(exe: PathBuf) -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    std::process::Command::new(exe).args(args).spawn()?;
-    Ok(())
+/// 把本次下载使用的 SHA256SUMS 留在更新目录, 供下次启动校验本地安装包.
+fn persist_checksums(update_dir: &Path, sums: &str) -> Result<()> {
+    fs::write(update_dir.join(CHECKSUMS_FILE), sums).context("无法保存 SHA256SUMS")
+}
+
+/// 在更新目录里寻找上次下载好的安装包.
+fn locate_local_package(update_dir: &Path) -> Option<(PathBuf, String)> {
+    let entries = fs::read_dir(update_dir).ok()?;
+    let mut found: Option<(PathBuf, String)> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(version) = parse_local_package_name(
+            &name,
+            check::current_platform(),
+            check::current_arch(),
+            form::effective_form(),
+        ) else {
+            continue;
+        };
+        let version = format!("v{version}");
+        let newer = found
+            .as_ref()
+            .map(|(_, existing)| check::is_newer(existing, &version))
+            .unwrap_or(true);
+        if newer {
+            found = Some((path, version));
+        }
+    }
+    found
+}
+
+/// 从安装包文件名解析版本, 只接受当前平台与形态对应的命名.
+fn parse_local_package_name(
+    name: &str,
+    platform: &str,
+    arch: &str,
+    form: DistributionForm,
+) -> Option<String> {
+    let suffix = match (platform, form) {
+        ("windows", DistributionForm::Installer) => "-setup.exe",
+        ("windows", DistributionForm::Portable) => "-portable.zip",
+        ("linux", DistributionForm::Installer) => "-setup.tar.gz",
+        ("linux", DistributionForm::Portable) => "-portable.tar.gz",
+        _ => ".dmg",
+    };
+    let head = name.strip_suffix(suffix)?;
+    let rest = head.strip_prefix("synly-")?;
+    let version = rest.strip_suffix(&format!("-{platform}-{arch}"))?;
+    (!version.is_empty()).then(|| version.to_string())
 }

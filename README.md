@@ -22,7 +22,7 @@ Synly 支持 Windows, macOS 和 Linux. 文件与剪贴板同步可在三大平�
 - host 支持多设备同时接入: 剪贴板在多会话间广播并防回音防洪流, 文件/音频/输入由单一活跃会话承载, 活跃会话断开后自动提升已信任设备, UI 支持会话列表, 逐个断开与手动切换活跃会话.
 - 单实例运行, 锁与数据目录绑定. 重复启动会激活已有窗口.
 - 支持关闭到托盘, 启动隐藏, 恢复上次会话和登录启动. macOS 可选择隐藏窗口时是否同时隐藏 Dock 图标.
-- 安装版与便携版都支持自动更新, 下载后校验 SHA256.
+- 安装版支持自动更新, 下载后校验 SHA256, 由平台安装器整目录替换程序文件.
 - 隐藏窗口收到配对请求时显示不含 PIN 的系统通知, 点击后恢复对应 modal.
 - 窗口尺寸会持久化并在下次启动时恢复.
 - tracing 同时输出到终端, 按日和大小滚动的日志文件和 GUI 环形日志缓冲区, 日志级别可实时调整.
@@ -61,7 +61,7 @@ just fake-dist
 
 ### GitHub 发布
 
-发布工作流在 branch, pull request, tag 和手动触发上编译, 打包并上传 Actions artifact. 仅 tag 或手动指定已有 tag 时创建 GitHub Release. Linux 上传 x86_64 与 aarch64 的 `tar.gz`, Windows 上传带 exe 图标的 zip, macOS 上传 Intel 和 Apple Silicon 的 app dmg, Android 上传 arm64 APK. 非 release 产物用 `build_version` 命名.
+发布工作流在 branch, pull request, tag 和手动触发上编译, 打包并上传 Actions artifact. 仅 tag 或手动指定已有 tag 时创建 GitHub Release. Linux 上传 x86_64 与 aarch64 的 `-setup.tar.gz` 安装包, Windows 上传 `-setup.exe` 安装器, macOS 上传 Intel 和 Apple Silicon 的 app dmg, Android 上传 arm64 APK. 非 release 产物用 `build_version` 命名.
 
 创建版本时先提交 `docs/changelog/VERSION.md`, 再创建 annotated tag:
 
@@ -76,7 +76,7 @@ git push origin main --follow-tags
 
 ### Windows
 
-推荐使用 MSVC 工具链和 Windows 10/11 SDK. 音频依赖 Opus. 发布构建还需要动态 SDL2.
+推荐使用 MSVC 工具链和 Windows 10/11 SDK. 音频依赖 Opus. 发布构建还需要动态 SDL2 和 Inno Setup 6.3 以上 (即 `ISCC.exe`, 放在 PATH 或默认安装位置, 也可以用 `SYNLY_ISCC` 指定).
 
 ```powershell
 rustup default stable-x86_64-pc-windows-msvc
@@ -85,9 +85,11 @@ $env:VCPKG_ROOT="C:\path\to\vcpkg"
 just dist
 ```
 
+Windows 的发布形态是 Inno Setup 安装包: `just dist` 产出 `synly-<version>-windows-<arch>-setup.exe`, 默认按当前用户安装到 `%LOCALAPPDATA%\Programs\Synly`, 全程不需要管理员权限, 卸载项, 开始菜单与桌面快捷方式都由安装器维护. 安装目录只放程序文件, 配置和日志仍在数据目录 (`%USERPROFILE%\.config\synly`), 升级与卸载都不触碰它.
+
 Windows 主 GUI 使用 `asInvoker` manifest 以普通权限运行. 需要管理员输入能力时, GUI 优先请求本机 SYSTEM 输入服务 (`SynlyInputService`) 以 SYSTEM 身份拉起隐藏输入代理, 不弹 UAC. 服务未安装时, 首次授权会通过一次 UAC 自动安装并启动该服务 (延迟自动启动), 之后不再弹窗; 拒绝安装时回退到 `ShellExecuteW("runas")` 启动的 UAC 提权代理, 若主进程已持有提升令牌则直接继承当前令牌. 主进程与代理来自同一个构建产物, 避免 IPC 协议版本错配. 配置 `input.elevate_on_start = true` 后, 主实例会在恢复会话前完成上述提权, 失败时本次启动直接失败.
 
-SYSTEM 输入代理在 `SendInput` 失败时会跟随当前输入桌面 (`OpenInputDesktop` + `SetThreadDesktop`, 参考 Sunshine 的设计), 因此 UAC 弹窗与锁屏期间可以继续注入鼠标键盘, 控制不中断. 安全桌面期间光标会钳制在主显示器并抑制边缘返回, 离开后重新锚定光标; `Ctrl+Alt+Del` 属于 Windows 安全注意序列, 无法通过 `SendInput` 注入. 服务管理命令为 `synly service install`, `synly service uninstall`, `synly service restart` 和 `synly service status`, GUI 设置页也提供卸载入口. 自动更新就地替换 `synly.exe` 后, 已安装的服务进程仍映射着更新前的映像, 因此应用会在下次申请输入提权时先用一次 UAC 重启该服务, 让它加载新版本; 这次 UAC 被取消时继续沿用当前服务, 输入能力不受影响. 非 SYSTEM 的 UAC 回退代理进入安全桌面时仍会暂停控制并触发紧急收回.
+SYSTEM 输入代理在 `SendInput` 失败时会跟随当前输入桌面 (`OpenInputDesktop` + `SetThreadDesktop`, 参考 Sunshine 的设计), 因此 UAC 弹窗与锁屏期间可以继续注入鼠标键盘, 控制不中断. 安全桌面期间光标会钳制在主显示器并抑制边缘返回, 离开后重新锚定光标; `Ctrl+Alt+Del` 属于 Windows 安全注意序列, 无法通过 `SendInput` 注入. 服务管理命令为 `synly service install`, `synly service uninstall`, `synly service restart` 和 `synly service status`, GUI 设置页也提供卸载入口. 自动更新交给安装器落地, 覆盖程序文件前会把仍被占用的旧映像改名让位, 因此输入服务这类无法在升级期间停掉的进程不会挡住安装; 它仍映射着更新前的映像, 应用会在更新后的首次输入提权前用一次 UAC 重启该服务, 让它加载新版本, 这次 UAC 被取消时继续沿用当前服务, 输入能力不受影响. 非 SYSTEM 的 UAC 回退代理进入安全桌面时仍会暂停控制并触发紧急收回.
 
 GUI 和提权子进程通过随机命名管道与随机 token 通信. 管道 DACL 只允许当前用户和 SYSTEM, 双方校验 IPC 版本, PID, session ID, 映像路径和安装目录. 服务控制管道只接受同目录 `synly.exe` 且位于当前控制台会话的请求, 拉起参数仅允许 UUID 管道名与 token. Windows release 不要求 Authenticode 签名, 因此请仅从可信来源获取程序, 并避免在其他用户可写目录中运行. 管道断开, 心跳超时或子进程退出时会立即释放输入状态.
 
@@ -124,6 +126,15 @@ cargo build --release
 ```
 
 Linux 发布包随附 SDL2, 可以播放对端音频, 系统采集和输入运行时目前仍不可用. 文件与剪贴板同步不受影响.
+
+Linux 的发布形态是 `-setup.tar.gz` 安装包, 里面的 `install.sh` 把程序装到 `~/.local/opt/synly`, 并在 `~/.local/bin` 与 `~/.local/share/applications` 建立入口, 全程不需要 root:
+
+```shell
+tar -xzf synly-<version>-linux-<arch>-setup.tar.gz
+./install.sh --silent
+```
+
+`./install.sh --uninstall` 卸载程序文件, 保留数据目录.
 
 ### Android
 

@@ -1,3 +1,4 @@
+use super::form::DistributionForm;
 use super::state::AvailableRelease;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -40,18 +41,24 @@ pub fn current_arch() -> &'static str {
     }
 }
 
-pub fn archive_extension() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "dmg"
-    } else if cfg!(windows) {
-        "zip"
-    } else {
-        "tar.gz"
+/// 当前平台与分发形态对应的 release 资产名.
+///
+/// 安装版与便携版的变体段不同, 不做跨变体降级匹配: 匹配不到就报错, 让用户去 Release 页
+/// 手动下载.
+pub fn asset_name_for(
+    tag: &str,
+    platform: &str,
+    arch: &str,
+    form: DistributionForm,
+) -> String {
+    let base = format!("{APP_NAME}-{}-{platform}-{arch}", strip_v_prefix(tag));
+    match (platform, form) {
+        ("windows", DistributionForm::Installer) => format!("{base}-setup.exe"),
+        ("windows", DistributionForm::Portable) => format!("{base}-portable.zip"),
+        ("linux", DistributionForm::Installer) => format!("{base}-setup.tar.gz"),
+        ("linux", DistributionForm::Portable) => format!("{base}-portable.tar.gz"),
+        _ => format!("{base}.dmg"),
     }
-}
-
-pub fn archive_name_for(tag: &str, platform: &str, arch: &str, ext: &str) -> String {
-    format!("{APP_NAME}-{}-{platform}-{arch}.{ext}", strip_v_prefix(tag))
 }
 
 pub fn normalize_semver(display: &str) -> Option<semver::Version> {
@@ -108,17 +115,22 @@ pub async fn fetch_latest(
     if !is_newer(current_version, &release.tag_name) {
         return Ok(None);
     }
-    let archive_name = archive_name_for(
+    let archive_name = asset_name_for(
         &release.tag_name,
         current_platform(),
         current_arch(),
-        archive_extension(),
+        super::form::effective_form(),
     );
     let archive = release
         .assets
         .iter()
         .find(|asset| asset.name == archive_name)
-        .with_context(|| format!("当前平台没有匹配的更新包: {archive_name}"))?;
+        .with_context(|| {
+            format!(
+                "当前 release 没有匹配的更新包: {archive_name}. 请到 {} 手动下载安装包",
+                release.html_url
+            )
+        })?;
     let checksums = release
         .assets
         .iter()
@@ -157,10 +169,26 @@ mod tests {
     }
 
     #[test]
-    fn archive_name_strips_v_prefix() {
+    fn asset_name_follows_platform_and_form() {
         assert_eq!(
-            archive_name_for("v0.8.0", "macos", "aarch64", "dmg"),
+            asset_name_for("v0.8.0", "macos", "aarch64", DistributionForm::Installer),
             "synly-0.8.0-macos-aarch64.dmg"
+        );
+        assert_eq!(
+            asset_name_for("v0.11.0", "windows", "x86_64", DistributionForm::Installer),
+            "synly-0.11.0-windows-x86_64-setup.exe"
+        );
+        assert_eq!(
+            asset_name_for("v0.11.0", "windows", "x86_64", DistributionForm::Portable),
+            "synly-0.11.0-windows-x86_64-portable.zip"
+        );
+        assert_eq!(
+            asset_name_for("v0.11.0", "linux", "aarch64", DistributionForm::Installer),
+            "synly-0.11.0-linux-aarch64-setup.tar.gz"
+        );
+        assert_eq!(
+            asset_name_for("v0.11.0", "linux", "aarch64", DistributionForm::Portable),
+            "synly-0.11.0-linux-aarch64-portable.tar.gz"
         );
     }
 }

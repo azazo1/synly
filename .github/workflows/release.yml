@@ -194,6 +194,20 @@ jobs:
         shell: bash
         run: brew install pkg-config opus sdl2 sdl3
 
+      - name: Install Inno Setup
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $iscc = Get-Command iscc.exe -ErrorAction SilentlyContinue
+          if ($null -ne $iscc) {
+            Write-Host "runner 已预装 Inno Setup: $($iscc.Source)"
+            exit 0
+          }
+          choco install innosetup --no-progress -y
+          if (-not (Get-Command iscc.exe -ErrorAction SilentlyContinue)) {
+            throw "Inno Setup 安装后仍找不到 iscc.exe"
+          }
+
       - name: Install Linux Opus and SDL2 dependencies
         if: matrix.platform == 'linux'
         shell: bash
@@ -229,6 +243,7 @@ jobs:
         env:
           SYNLY_BUILD_VERSION: v${{ needs.version.outputs.build_version }}
           SYNLY_BUNDLE_SDL: ${{ matrix.platform == 'linux' && '1' || '0' }}
+          SYNLY_DISTRIBUTION_FORM: installer
         shell: bash
         run: cargo build --locked --release --target "${{ matrix.target }}" --features sdl2-audio
 
@@ -241,14 +256,43 @@ jobs:
           test -x "$binary"
           file "$binary" | grep -q 'ELF'
 
-      - name: Package Linux archive
+      - name: Package Linux installer
         if: matrix.platform == 'linux'
         env:
           PACKAGE_VERSION: ${{ needs.version.outputs.build_version }}
         shell: bash
         run: bash scripts/package-linux.sh "$PACKAGE_VERSION" "${{ matrix.target }}" dist
 
-      - name: Package Windows archive
+      - name: 校验 Linux 安装包结构与静默安装
+        if: matrix.platform == 'linux'
+        env:
+          PACKAGE_VERSION: ${{ needs.version.outputs.build_version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          setup="dist/synly-$PACKAGE_VERSION-linux-${{ matrix.arch }}-setup.tar.gz"
+          tar -tzf "$setup" | grep -qx 'install.sh'
+          tar -tzf "$setup" | grep -q '^payload/'
+          tar -tzf "$setup" | grep -q '^payload/synly$'
+
+          staging="$(mktemp -d)"
+          prefix="$(mktemp -d)"
+          tar -xzf "$setup" -C "$staging"
+          "$staging/install.sh" --silent --prefix "$prefix" --no-restart --log "$staging/install.log"
+
+          test -x "$prefix/opt/synly/synly"
+          test -s "$prefix/share/applications/synly.desktop"
+          grep -Fq "$prefix/opt/synly/synly" "$prefix/share/applications/synly.desktop"
+          test -f "$prefix/share/icons/hicolor/256x256/apps/synly.png"
+
+          # 再装一次走升级路径, 确认整目录交换可重复执行.
+          "$staging/install.sh" --silent --prefix "$prefix" --no-restart --log "$staging/install.log"
+          test -x "$prefix/opt/synly/synly"
+          "$staging/install.sh" --uninstall --prefix "$prefix"
+          test ! -e "$prefix/opt/synly"
+          rm -rf "$staging" "$prefix"
+
+      - name: Package Windows installer
         if: matrix.platform == 'windows'
         env:
           PACKAGE_VERSION: ${{ needs.version.outputs.build_version }}
@@ -256,6 +300,44 @@ jobs:
         run: |
           $binary = "target/${{ matrix.target }}/release/synly.exe"
           & "$PWD/scripts/package-windows.ps1" -Binary $binary -OutputDir dist -Version $env:PACKAGE_VERSION -Arch "${{ matrix.arch }}"
+
+      - name: 校验 Windows 安装器能静默装出完整载荷
+        if: matrix.platform == 'windows'
+        env:
+          PACKAGE_VERSION: ${{ needs.version.outputs.build_version }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = "dist/synly-$env:PACKAGE_VERSION-windows-${{ matrix.arch }}-setup.exe"
+          if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
+            throw "缺少 Windows 安装器: $installer"
+          }
+          $header = [System.IO.File]::ReadAllBytes($installer)
+          if ($header.Length -lt 2 -or $header[0] -ne 0x4d -or $header[1] -ne 0x5a) {
+            throw "PE 文件头无效: $installer"
+          }
+
+          $target = Join-Path $env:RUNNER_TEMP "installer-check"
+          $log = Join-Path $env:RUNNER_TEMP "installer-check.log"
+          & $installer '/SP-' '/VERYSILENT' '/SUPPRESSMSGBOXES' '/NORESTART' '/NOICONS' "/DIR=$target" "/LOG=$log"
+          if ($LASTEXITCODE -ne 0) { throw "安装器退出码: $LASTEXITCODE, 日志: $log" }
+
+          foreach ($name in @("synly.exe", "SDL2.dll")) {
+            $installed = Join-Path $target $name
+            if (-not (Test-Path -LiteralPath $installed -PathType Leaf)) {
+              throw "安装目录缺少: $installed"
+            }
+          }
+          $notices = Join-Path $target "audio-licenses/moonlight-common-GPL-3.0.txt"
+          if (-not (Test-Path -LiteralPath $notices -PathType Leaf)) {
+            throw "安装目录缺少音频许可: $notices"
+          }
+
+          # 安装器的 postinstall 会拉起应用, 卸载前先结束它.
+          Get-Process -Name synly -ErrorAction SilentlyContinue | Stop-Process -Force
+          Start-Sleep -Seconds 1
+          & (Join-Path $target "unins000.exe") '/VERYSILENT' '/SUPPRESSMSGBOXES' '/NORESTART'
+          if ($LASTEXITCODE -ne 0) { throw "卸载器退出码: $LASTEXITCODE" }
 
       - name: Package macOS application
         if: matrix.platform == 'macos'
@@ -280,8 +362,8 @@ jobs:
         if: matrix.platform == 'linux'
         uses: actions/upload-artifact@v7
         with:
-          name: synly-${{ needs.version.outputs.build_version }}-${{ matrix.platform }}-${{ matrix.arch }}
-          path: dist/*.tar.gz
+          name: synly-${{ needs.version.outputs.build_version }}-${{ matrix.platform }}-${{ matrix.arch }}-setup
+          path: dist/*-setup.tar.gz
           if-no-files-found: error
           retention-days: 14
 
@@ -289,8 +371,8 @@ jobs:
         if: matrix.platform == 'windows'
         uses: actions/upload-artifact@v7
         with:
-          name: synly-${{ needs.version.outputs.build_version }}-${{ matrix.platform }}-${{ matrix.arch }}
-          path: dist/*.zip
+          name: synly-${{ needs.version.outputs.build_version }}-${{ matrix.platform }}-${{ matrix.arch }}-setup
+          path: dist/*-setup.exe
           if-no-files-found: error
           retention-days: 14
 
@@ -508,7 +590,7 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           cd release-artifacts
-          archives=(synly-*.zip synly-*.dmg synly-*.tar.gz)
+          archives=(synly-*.exe synly-*.dmg synly-*.tar.gz)
           apks=(synly-*.apk)
           if (( ${#archives[@]} != 5 )); then
             printf 'expected 5 archives, found %s\n' "${#archives[@]}" >&2
@@ -530,7 +612,7 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
           assets=(
-            release-artifacts/synly-*.zip
+            release-artifacts/synly-*.exe
             release-artifacts/synly-*.dmg
             release-artifacts/synly-*.tar.gz
             release-artifacts/synly-*.apk

@@ -171,7 +171,7 @@ pub fn install() -> Result<()> {
 
 /// 重启输入服务, 让它从注册路径重新加载当前可执行文件.
 ///
-/// 自动更新就地替换 exe 后, 正在运行的服务进程仍映射着更新前的映像; 只有重启服务,
+/// 自动更新由安装器落地后, 正在运行的服务进程仍映射着更新前的映像; 只有重启服务,
 /// SYSTEM 侧才会用新版本代码运行. 服务未安装时退化为安装, 已停止时只做启动.
 pub fn restart() -> Result<()> {
     let scm = unsafe { OpenSCManagerW(std::ptr::null_mut(), std::ptr::null_mut(), SC_MANAGER_ALL_ACCESS) };

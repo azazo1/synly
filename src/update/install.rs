@@ -1,81 +1,192 @@
+//! 安装落地: 把下载好的安装包交接给脱离进程的平台安装器.
+//!
+//! 安装版一律由安装器整目录落地, 应用自己只做交接: 新版新增的 dll 与资源由安装器补齐,
+//! 新版移除的文件由安装器清理. 交接前写下 `apply-update.pending`, 落地结果由下次启动
+//! 回显, 见 `super::pending`.
+
+use super::form::{self, DistributionForm};
+use super::pending::{self, Handoff};
 use super::state::InstallOutcome;
 use anyhow::{Context, Result};
+#[cfg(not(target_os = "macos"))]
+use anyhow::bail;
 use std::fs;
 use std::path::Path;
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(windows, target_os = "macos")))]
 use std::path::PathBuf;
+#[cfg(not(target_os = "macos"))]
+use std::process::{Command, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-pub fn apply_archive(archive: &Path) -> Result<InstallOutcome> {
-    let exe = std::env::current_exe().context("无法确定当前可执行文件")?;
+/// 把安装包交接给平台安装器.
+pub fn apply_installer(archive: &Path, version: &str) -> Result<InstallOutcome> {
+    let update_dir = crate::paths::update_dir()?;
+    fs::create_dir_all(&update_dir)
+        .with_context(|| format!("无法创建更新目录 {}", update_dir.display()))?;
+    let log_path = pending::log_path(&update_dir);
+    match form::effective_form() {
+        DistributionForm::Installer => {}
+        DistributionForm::Portable => return handoff_portable(archive),
+    }
+    write_pending(archive, version, &update_dir, &log_path)?;
+    #[cfg(windows)]
+    {
+        handoff_windows(archive, &log_path, &update_dir)?;
+    }
     #[cfg(target_os = "macos")]
     {
-        if let Some(bundle) = super::macos::bundle_root(&exe) {
-            super::macos::handoff_replace(archive, &bundle, std::process::id())?;
-            Ok(InstallOutcome::HandedOff)
-        } else {
-            super::macos::open_dmg(archive)?;
-            Ok(InstallOutcome::DmgOpened)
-        }
+        let exe = std::env::current_exe().context("无法确定当前可执行文件")?;
+        let bundle = super::macos::bundle_root(&exe).context("当前程序不在 app bundle 内")?;
+        super::macos::handoff_replace(archive, &bundle, std::process::id())?;
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        handoff_linux(archive, version, &update_dir, &log_path)?;
+    }
+    Ok(InstallOutcome::HandedOff)
+}
+
+/// 交接前写下本次落地记录, 供下次启动判断结果.
+fn write_pending(
+    archive: &Path,
+    version: &str,
+    update_dir: &Path,
+    log_path: &Path,
+) -> Result<()> {
+    let package = archive
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let time_unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or_default();
+    let handoff = Handoff {
+        version: version.to_string(),
+        form: form::effective_form().as_str().to_string(),
+        package,
+        time_unix,
+        log_path: log_path.to_path_buf(),
+    };
+    handoff.write(update_dir)?;
+    tracing::info!(
+        version,
+        form = handoff.form,
+        package = handoff.package,
+        log = %log_path.display(),
+        "已写下更新交接标记"
+    );
+    Ok(())
+}
+
+/// 非安装位置运行的副本只能手动更新.
+#[allow(unused_variables)]
+fn handoff_portable(archive: &Path) -> Result<InstallOutcome> {
+    #[cfg(target_os = "macos")]
+    {
+        // 直接运行二进制时没有可替换的 bundle, 退回引导用户手动拖拽安装.
+        super::macos::open_dmg(archive)?;
+        Ok(InstallOutcome::DmgOpened)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let unpacked = unpack(archive)?;
-        let new_binary = find_binary(&unpacked)?;
-        replace_executable(&exe, &new_binary)?;
-        let _ = fs::remove_dir_all(unpacked);
-        Ok(InstallOutcome::ReadyToRestart { exe })
+        tracing::warn!("当前程序不在安装位置, 无法就地升级");
+        bail!(
+            "当前程序不在安装位置, 自动更新无法替换程序文件. 请从 Release 页下载安装包重新安装."
+        );
     }
 }
 
-/// 清理上次更新遗留的旧可执行文件, 返回它是否仍被占用.
-///
-/// 更新时旧映像被改名为 `<exe>.old`; 只要删不掉它, 就说明还有进程映射着旧映像,
-/// 通常是 SYSTEM 输入服务仍在运行更新前的版本.
-pub fn cleanup_old_binary() -> bool {
-    let mut in_use = false;
-    if let Ok(exe) = std::env::current_exe() {
-        let prefix = backup_name_prefix(&exe).to_string_lossy().into_owned();
-        let unique_prefix = format!("{prefix}.");
-        if let Some(parent) = exe.parent()
-            && let Ok(entries) = fs::read_dir(parent)
-        {
-            for entry in entries.flatten() {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                if name != prefix && !name.starts_with(&unique_prefix) {
-                    continue;
-                }
-                if fs::remove_file(entry.path()).is_err() {
-                    tracing::debug!(file = %entry.path().display(), "旧可执行文件仍被占用, 留待下次清理");
-                    in_use = true;
-                }
-            }
-        }
-    }
-    #[cfg(target_os = "macos")]
-    super::macos::cleanup_stale();
-    in_use
+#[cfg(windows)]
+fn handoff_windows(archive: &Path, log_path: &Path, update_dir: &Path) -> Result<()> {
+    use std::os::windows::process::CommandExt;
+
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    // /SP- 不能省: /VERYSILENT 不会去掉安装器开头的确认提示.
+    // 不加 /FORCECLOSEAPPLICATIONS, /RESTARTAPPLICATIONS 与 /DIR, 重新拉起应用由安装器
+    // 的 postinstall 项负责.
+    let log_arg = format!("/LOG={}", log_path.display());
+    let mut command = Command::new(archive);
+    command
+        .arg("/SP-")
+        .arg("/VERYSILENT")
+        .arg("/SUPPRESSMSGBOXES")
+        .arg("/NORESTART")
+        .arg("/CLOSEAPPLICATIONS")
+        .arg(log_arg)
+        .current_dir(update_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
+    let child = command
+        .spawn()
+        .with_context(|| format!("无法启动安装程序 {}", archive.display()))?;
+    tracing::info!(pid = child.id(), installer = %archive.display(), "已启动 Windows 安装程序");
+    Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
-fn unpack(archive: &Path) -> Result<PathBuf> {
-    let parent = archive.parent().unwrap_or(Path::new("."));
-    let unpack_dir = parent.join("extract");
-    if unpack_dir.exists() {
-        fs::remove_dir_all(&unpack_dir)?;
+#[cfg(not(any(windows, target_os = "macos")))]
+fn handoff_linux(
+    archive: &Path,
+    version: &str,
+    update_dir: &Path,
+    log_path: &Path,
+) -> Result<()> {
+    let staging = update_dir.join(format!("staging-{}", version.trim_start_matches('v')));
+    if staging.exists() {
+        fs::remove_dir_all(&staging)
+            .with_context(|| format!("无法清理旧的暂存目录 {}", staging.display()))?;
     }
-    fs::create_dir_all(&unpack_dir)?;
-    let name = archive.file_name().and_then(|value| value.to_str()).unwrap_or("");
-    if name.ends_with(".tar.gz") {
-        unpack_tar_gz(archive, &unpack_dir)?;
-    } else if name.ends_with(".zip") {
-        unpack_zip(archive, &unpack_dir)?;
-    } else {
-        anyhow::bail!("不支持的更新包格式: {name}");
+    fs::create_dir_all(&staging)
+        .with_context(|| format!("无法创建暂存目录 {}", staging.display()))?;
+    unpack_tar_gz(archive, &staging)?;
+    let script = staging.join("install.sh");
+    if !script.is_file() {
+        bail!("更新包缺少 install.sh: {}", archive.display());
     }
-    Ok(unpack_dir)
+    if !staging.join("payload").is_dir() {
+        bail!("更新包缺少 payload 目录: {}", archive.display());
+    }
+    let home = crate::path_expand::home_dir().context("无法确定用户主目录")?;
+    let prefix = Path::new(&home).join(".local");
+    let log_file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_path)
+        .with_context(|| format!("无法打开更新日志 {}", log_path.display()))?;
+    let error_file = log_file.try_clone().context("无法复制更新日志句柄")?;
+    let mut command = Command::new("bash");
+    command
+        .arg(&script)
+        .arg("--silent")
+        .arg("--wait-pid")
+        .arg(std::process::id().to_string())
+        .arg("--prefix")
+        .arg(&prefix)
+        .arg("--log")
+        .arg(log_path)
+        .arg("--result-file")
+        .arg(pending::result_path(update_dir))
+        .current_dir(update_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(error_file));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let child = command
+        .spawn()
+        .with_context(|| format!("无法启动安装脚本 {}", script.display()))?;
+    tracing::info!(pid = child.id(), script = %script.display(), "已启动 Linux 安装脚本");
+    Ok(())
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn unpack_tar_gz(archive: &Path, dest: &Path) -> Result<()> {
     let file = fs::File::open(archive)?;
     let decoder = flate2::read::GzDecoder::new(file);
@@ -84,84 +195,50 @@ fn unpack_tar_gz(archive: &Path, dest: &Path) -> Result<()> {
         .with_context(|| format!("解压 {} 失败", archive.display()))
 }
 
-#[cfg(not(target_os = "macos"))]
-fn unpack_zip(archive: &Path, dest: &Path) -> Result<()> {
-    let file = fs::File::open(archive)?;
-    let mut zip = zip::ZipArchive::new(file)
-        .with_context(|| format!("打开 {} 失败", archive.display()))?;
-    zip.extract(dest)
-        .with_context(|| format!("解压 {} 失败", archive.display()))
-}
-
-#[cfg(not(target_os = "macos"))]
-fn find_binary(root: &Path) -> Result<PathBuf> {
-    let expected = if cfg!(windows) { "synly.exe" } else { "synly" };
-    if root.join(expected).is_file() {
-        return Ok(root.join(expected));
-    }
-    for entry in walkdir::WalkDir::new(root) {
-        let entry = entry?;
-        if entry.file_type().is_file() && entry.file_name() == expected {
-            return Ok(entry.path().to_path_buf());
-        }
-    }
-    anyhow::bail!("更新包中没有 {expected}");
-}
-
-#[cfg(not(target_os = "macos"))]
-fn replace_executable(current: &Path, new_binary: &Path) -> Result<()> {
-    let backup = backup_path(current);
-    if backup.exists() {
-        let _ = fs::remove_file(&backup);
-    }
-    // 旧备份可能仍被上一版进程占用 (例如 SYSTEM 输入服务还映射着旧映像),
-    // 这时换一个唯一名字让位, 避免本次更新因为无法备份而失败.
-    let backup = match rename_or_copy(current, &backup) {
-        Ok(()) => backup,
-        Err(_) => {
-            let fallback = unique_backup_path(current);
-            rename_or_copy(current, &fallback).context("无法备份当前程序")?;
-            fallback
-        }
-    };
-    if let Err(error) = rename_or_copy(new_binary, current) {
-        let _ = rename_or_copy(&backup, current);
-        return Err(error).context("无法安装新程序");
-    }
-    #[cfg(unix)]
+/// 清理上次更新遗留的让位文件, 返回是否仍有文件被占用.
+///
+/// 安装器覆盖程序文件前会把被占用的旧文件改成 `<name>.old` 让位; 只要删不掉这些让位
+/// 文件, 就说明仍有进程映射着更新前的映像, Windows 上通常是 SYSTEM 输入服务. 每次调用
+/// 都会顺带清理能删掉的残留.
+pub fn cleanup_stale_artifacts() -> bool {
+    let mut in_use = false;
+    if let Some(root) = form::installer_root()
+        && let Ok(entries) = fs::read_dir(&root)
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(current, fs::Permissions::from_mode(0o755))?;
-    }
-    Ok(())
-}
-
-fn backup_name_prefix(exe: &Path) -> std::ffi::OsString {
-    let mut name = exe.file_name().unwrap_or_default().to_os_string();
-    name.push(".old");
-    name
-}
-
-#[cfg(not(target_os = "macos"))]
-fn backup_path(exe: &Path) -> PathBuf {
-    exe.with_file_name(backup_name_prefix(exe))
-}
-
-#[cfg(not(target_os = "macos"))]
-fn unique_backup_path(exe: &Path) -> PathBuf {
-    let mut name = backup_name_prefix(exe);
-    name.push(format!(".{}", std::process::id()));
-    exe.with_file_name(name)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn rename_or_copy(from: &Path, to: &Path) -> Result<()> {
-    match fs::rename(from, to) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            fs::copy(from, to)?;
-            fs::remove_file(from)?;
-            Ok(())
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !is_displaced_name(&name) {
+                continue;
+            }
+            if fs::remove_file(&path).is_err() {
+                tracing::debug!(file = %path.display(), "旧程序文件仍被占用, 留待下次清理");
+                in_use = true;
+            }
         }
+    }
+    #[cfg(target_os = "macos")]
+    super::macos::cleanup_stale();
+    in_use
+}
+
+/// 判断文件名是否是安装器让位时留下的备份.
+fn is_displaced_name(name: &str) -> bool {
+    match name.rsplit_once(".old") {
+        Some((_, suffix)) => suffix.is_empty() || suffix.starts_with('.'),
+        None => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_displaced_backup_names() {
+        assert!(is_displaced_name("synly.exe.old"));
+        assert!(is_displaced_name("SDL2.dll.old.1234"));
+        assert!(!is_displaced_name("synly.exe"));
+        assert!(!is_displaced_name("old"));
     }
 }

@@ -172,19 +172,20 @@ dist:
     $version = (powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-version.ps1 | Select-Object -Last 1).Trim()
     if ([string]::IsNullOrWhiteSpace($version)) { throw 'Unable to resolve the build version' }
     $env:SYNLY_BUILD_VERSION = $version
+    $env:SYNLY_DISTRIBUTION_FORM = 'installer'
     cargo build --release --features sdl2-audio
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows.ps1 -Binary target/release/synly.exe -OutputDir dist
+    powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows.ps1 -Binary target/release/synly.exe -OutputDir dist -Version $version
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 [macos]
 dist:
-    SYNLY_BUILD_VERSION="$(bash scripts/build-version.sh)" cargo build --release --features sdl2-audio
+    SYNLY_BUILD_VERSION="$(bash scripts/build-version.sh)" SYNLY_DISTRIBUTION_FORM=installer cargo build --release --features sdl2-audio
     bash scripts/package-macos.sh
 
 [linux]
 dist:
-    SYNLY_BUILD_VERSION="$(bash scripts/build-version.sh)" SYNLY_BUNDLE_SDL=1 cargo build --release --features sdl2-audio
+    SYNLY_BUILD_VERSION="$(bash scripts/build-version.sh)" SYNLY_DISTRIBUTION_FORM=installer SYNLY_BUNDLE_SDL=1 cargo build --release --features sdl2-audio
     bash scripts/package-linux.sh
 
 # 产出用于自动更新测试的 fake 构建, 版本固定为 v0.0.0.
@@ -194,6 +195,7 @@ fake-dist:
     $ErrorActionPreference = 'Stop'
     $env:SYNLY_BUILD_VERSION = 'v0.0.0'
     $env:SYNLY_FAKE_DIST = '1'
+    $env:SYNLY_DISTRIBUTION_FORM = 'installer'
     cargo build --release --features sdl2-audio
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows.ps1 -Binary target/release/synly.exe -OutputDir dist -Version v0.0.0 -Fake
@@ -201,12 +203,12 @@ fake-dist:
 
 [macos]
 fake-dist:
-    SYNLY_BUILD_VERSION=v0.0.0 SYNLY_FAKE_DIST=1 cargo build --release --features sdl2-audio
+    SYNLY_BUILD_VERSION=v0.0.0 SYNLY_FAKE_DIST=1 SYNLY_DISTRIBUTION_FORM=installer cargo build --release --features sdl2-audio
     SYNLY_FAKE_DIST=1 bash scripts/package-macos.sh v0.0.0 "$(rustc -vV | sed -n 's/^host: //p')" dist
 
 [linux]
 fake-dist:
-    SYNLY_BUILD_VERSION=v0.0.0 SYNLY_FAKE_DIST=1 SYNLY_BUNDLE_SDL=1 cargo build --release --features sdl2-audio
+    SYNLY_BUILD_VERSION=v0.0.0 SYNLY_FAKE_DIST=1 SYNLY_DISTRIBUTION_FORM=installer SYNLY_BUNDLE_SDL=1 cargo build --release --features sdl2-audio
     SYNLY_FAKE_DIST=1 bash scripts/package-linux.sh v0.0.0 "$(rustc -vV | sed -n 's/^host: //p')" dist
 
 # just gradlew testDebugUnitTest

@@ -43,21 +43,23 @@ for name in "${files[@]}"; do
     cp "$root/licenses/audio/$name" "$work/repo/licenses/audio/$name"
 done
 
-printf '[3/3] 执行 Linux 归档脚本并解包校验, 不执行占位二进制\n'
-cp "$root/scripts/package-linux.sh" "$work/repo/scripts/"
-mkdir -p "$work/repo/target/release"
+printf '[3/3] 执行 Linux 安装包脚本并解包校验, 不执行占位二进制\n'
+cp "$root/scripts/package-linux.sh" "$root/scripts/installer-linux.sh" "$work/repo/scripts/"
+mkdir -p "$work/repo/target/release" "$work/repo/assets/linux"
 # 只用于 file 格式识别的 ELF 头, 不编译或运行 Linux 程序.
 printf '\177ELF\002\001\001\000\000\000\000\000\000\000\000\000\002\000\076\000' > "$work/repo/target/release/synly"
 chmod 755 "$work/repo/target/release/synly"
+cp "$root/assets/linux/synly-256.png" "$root/assets/linux/synly-512.png" "$work/repo/assets/linux/"
 (
     cd "$work/repo"
     bash scripts/package-linux.sh test-only x86_64-unknown-linux-gnu 'dist with spaces'
 )
-archive="$work/repo/dist with spaces/synly-test-only-linux-x86_64.tar.gz"
+archive="$work/repo/dist with spaces/synly-test-only-linux-x86_64-setup.tar.gz"
 mkdir "$work/unpacked"
 tar -xzf "$archive" -C "$work/unpacked"
-cmp "$work/repo/target/release/synly" "$work/unpacked/synly"
-for name in "${files[@]}"; do cmp "$root/licenses/audio/$name" "$work/unpacked/audio-licenses/$name"; done
+[[ -x "$work/unpacked/install.sh" ]]
+cmp "$work/repo/target/release/synly" "$work/unpacked/payload/synly"
+for name in "${files[@]}"; do cmp "$root/licenses/audio/$name" "$work/unpacked/payload/audio-licenses/$name"; done
 # 暂存目录应全部回收, 只留下最终归档.
 shopt -s nullglob
 leftovers=("$work/repo/dist with spaces"/audio-notices.* "$work/repo/dist with spaces"/linux-stage.*)

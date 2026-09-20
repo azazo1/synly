@@ -951,7 +951,7 @@ export component AppWindow inherits Window {
                     if root.update-show-download: Button { text: "立即更新"; clicked => { root.start-update(); } }
                     if root.update-show-cancel: Button { text: "取消更新"; clicked => { root.cancel-update(); } }
                     if root.update-show-skip: Button { text: "跳过此版本"; clicked => { root.skip-update(); } }
-                    if root.update-show-restart: Button { text: "重启应用"; clicked => { root.restart-for-update(); } }
+                    if root.update-show-restart: Button { text: "重启并更新"; clicked => { root.restart-for-update(); } }
                     if root.update-show-retry: Button { text: "重新检查"; clicked => { root.check-update(); } }
                     Rectangle { horizontal-stretch: 1; }
                     if !root.update-busy: Button { text: "关闭"; clicked => { root.close-update-window(); } }
