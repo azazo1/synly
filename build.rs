@@ -400,19 +400,31 @@ fn candidate_vcpkg_triplets(
 ) -> Vec<String> {
     let default_dynamic = default_vcpkg_triplet(target, false);
     let default_static = default_vcpkg_triplet(target, true);
+    let static_md = static_md_vcpkg_triplet(target);
     let mut triplets = Vec::new();
 
     match preference {
         OpusLinkPreference::PreferStatic => {
-            triplets.push(default_static);
-            triplets.push(default_dynamic);
+            // 静态库配动态 CRT 的 triplet 与 Rust MSVC 默认的 /MD 一致, 优先于静态 CRT 的
+            // triplet, 否则链接器会同时看到 LIBCMT 和 MSVCRT 并报 LNK4098.
+            if crt_static {
+                triplets.push(default_static.clone());
+                triplets.push(static_md.clone());
+            } else {
+                triplets.push(static_md.clone());
+                triplets.push(default_static.clone());
+            }
+            triplets.push(default_dynamic.clone());
+            triplets.push("x64-windows-static-md".to_string());
             triplets.push("x64-windows-static".to_string());
             triplets.push("x64-windows".to_string());
         }
         OpusLinkPreference::PreferDynamic => {
-            triplets.push(default_dynamic);
-            triplets.push(default_static);
+            triplets.push(default_dynamic.clone());
+            triplets.push(static_md.clone());
+            triplets.push(default_static.clone());
             triplets.push("x64-windows".to_string());
+            triplets.push("x64-windows-static-md".to_string());
             triplets.push("x64-windows-static".to_string());
         }
     }
@@ -423,6 +435,11 @@ fn candidate_vcpkg_triplets(
 
     triplets.dedup();
     triplets
+}
+
+/// 静态库配动态 CRT 的 vcpkg triplet, 与 Rust MSVC 默认的 /MD 匹配.
+fn static_md_vcpkg_triplet(target: &str) -> String {
+    format!("{}-windows-static-md", vcpkg_arch(target))
 }
 
 fn candidate_windows_lib_names(default_lib_name: &str, prefer_static_names: bool) -> Vec<String> {
@@ -448,7 +465,17 @@ fn candidate_windows_lib_names(default_lib_name: &str, prefer_static_names: bool
 }
 
 fn default_vcpkg_triplet(target: &str, crt_static: bool) -> String {
-    let arch = if target.starts_with("x86_64") {
+    let arch = vcpkg_arch(target);
+
+    if crt_static {
+        format!("{arch}-windows-static")
+    } else {
+        format!("{arch}-windows")
+    }
+}
+
+fn vcpkg_arch(target: &str) -> &'static str {
+    if target.starts_with("x86_64") {
         "x64"
     } else if target.starts_with("aarch64") {
         "arm64"
@@ -456,12 +483,6 @@ fn default_vcpkg_triplet(target: &str, crt_static: bool) -> String {
         "x86"
     } else {
         "x64"
-    };
-
-    if crt_static {
-        format!("{arch}-windows-static")
-    } else {
-        format!("{arch}-windows")
     }
 }
 

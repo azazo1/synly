@@ -80,7 +80,7 @@ git push origin main --follow-tags
 
 ```powershell
 rustup default stable-x86_64-pc-windows-msvc
-vcpkg install opus:x64-windows-static sdl2:x64-windows
+vcpkg install opus:x64-windows-static-md sdl2:x64-windows
 $env:VCPKG_ROOT="C:\path\to\vcpkg"
 just dist
 ```
