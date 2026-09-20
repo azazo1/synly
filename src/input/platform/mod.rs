@@ -140,6 +140,7 @@ pub struct MotionAccumulator {
 }
 
 impl MotionAccumulator {
+    #[cfg(any(target_os = "macos", windows, test))]
     pub fn add(&self, dx: i32, dy: i32) {
         self.dx.fetch_add(dx, Ordering::Relaxed);
         self.dy.fetch_add(dy, Ordering::Relaxed);
@@ -154,6 +155,7 @@ impl MotionAccumulator {
         }
     }
 
+    #[cfg(any(target_os = "macos", windows, test))]
     pub fn add_at(&self, dx: i32, dy: i32, position: Point) {
         self.position.store(pack_point(position), Ordering::Relaxed);
         self.position_valid.store(true, Ordering::Release);
@@ -206,6 +208,7 @@ pub struct MotionSample {
     pub position_updated: bool,
 }
 
+#[cfg(any(target_os = "macos", windows, test))]
 fn pack_point(point: Point) -> u64 {
     (u64::from(point.x as u32) << 32) | u64::from(point.y as u32)
 }
@@ -226,6 +229,7 @@ pub struct PlatformHandle {
 }
 
 #[derive(Clone)]
+#[cfg_attr(not(any(target_os = "macos", windows)), allow(dead_code))]
 pub struct CaptureContext {
     pub mode: InputMode,
     pub hotkey: Hotkey,
@@ -238,6 +242,7 @@ pub struct CaptureContext {
 }
 
 impl CaptureContext {
+    #[cfg(any(target_os = "macos", windows))]
     pub fn emit_reliable(&self, event: NativeEvent) {
         if matches!(&event, NativeEvent::Failed(_)) {
             self.failed.store(true, Ordering::Release);
@@ -296,13 +301,12 @@ impl Drop for PlatformHandle {
     }
 }
 
+#[cfg(any(target_os = "macos", windows))]
 pub fn ensure_permissions(mode: InputMode) -> Result<()> {
     #[cfg(target_os = "macos")]
     return macos::ensure_permissions(mode);
     #[cfg(windows)]
     return windows::ensure_permissions(mode);
-    #[cfg(not(any(target_os = "macos", windows)))]
-    return unsupported::ensure_permissions(mode);
 }
 
 #[cfg(test)]

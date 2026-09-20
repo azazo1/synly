@@ -140,6 +140,7 @@ impl CodecConfig {
 
 #[derive(Clone, Debug, Default)]
 pub struct CaptureConfig {
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     pub device_name: Option<String>,
 }
 

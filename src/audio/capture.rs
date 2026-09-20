@@ -4,6 +4,7 @@ use crate::audio::platform;
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
 pub enum CaptureStatus {
     Ok,
     Timeout,
