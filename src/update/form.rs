@@ -81,39 +81,45 @@ pub fn installer_root() -> Option<PathBuf> {
 }
 
 fn installed_location() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let root = exe.parent()?.to_path_buf();
-    let expected = expected_install_root()?;
-    if !same_path(&root, &expected) {
-        return None;
-    }
+    installed_location_from(&std::env::current_exe().ok()?)
+}
+
+/// 按当前可执行文件路径判断安装位置, 供测试注入路径.
+fn installed_location_from(exe: &Path) -> Option<PathBuf> {
     #[cfg(target_os = "macos")]
     {
-        // macOS 的安装实体是 app bundle 本身, 由更新模块的 bundle 探测负责.
-        super::macos::bundle_root(&exe).map(|_| root)
+        // macOS 没有 Windows/Linux 那种固定安装目录. skill 要求只要跑在
+        // `<bundle>/Contents/MacOS/` 里就算安装版, 用 bundle 探测, 不能拿
+        // expected_install_root() 的 None 把已安装的 .app 误判成便携版.
+        super::macos::bundle_root(exe)
     }
-    #[cfg(windows)]
+    #[cfg(not(target_os = "macos"))]
     {
-        uninstall_entry_exists().then_some(root)
-    }
-    #[cfg(not(any(target_os = "macos", windows)))]
-    {
-        root.join(INSTALL_MANIFEST).is_file().then_some(root)
+        let root = exe.parent()?.to_path_buf();
+        let expected = expected_install_root()?;
+        if !same_path(&root, &expected) {
+            return None;
+        }
+        #[cfg(windows)]
+        {
+            uninstall_entry_exists().then_some(root)
+        }
+        #[cfg(not(windows))]
+        {
+            root.join(INSTALL_MANIFEST).is_file().then_some(root)
+        }
     }
 }
 
-/// 平台约定下的安装目录.
+/// 平台约定下的安装目录. macOS 没有这一层, 见 `installed_location_from`.
+#[cfg(not(target_os = "macos"))]
 fn expected_install_root() -> Option<PathBuf> {
     #[cfg(windows)]
     {
         let local = dirs::data_local_dir()?;
         Some(local.join("Programs").join(APP_DISPLAY_NAME))
     }
-    #[cfg(target_os = "macos")]
-    {
-        None
-    }
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(not(windows))]
     {
         let home = crate::path_expand::home_dir()?;
         Some(Path::new(&home).join(".local/opt").join(APP_EXECUTABLE))
@@ -146,7 +152,7 @@ fn same_path(left: &Path, right: &Path) -> bool {
         .eq_ignore_ascii_case(right.to_string_lossy().trim_end_matches(['\\', '/']))
 }
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 fn same_path(left: &Path, right: &Path) -> bool {
     left == right
 }
@@ -170,5 +176,21 @@ mod tests {
     fn uninstall_key_is_a_user_hive_subkey() {
         assert!(WINDOWS_UNINSTALL_KEY.starts_with(r"Software\Microsoft\Windows\CurrentVersion"));
         assert!(WINDOWS_UNINSTALL_KEY.ends_with("_is1"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_bundle_binary_is_an_installed_location() {
+        let exe = Path::new("/Applications/Synly.app/Contents/MacOS/synly");
+        assert_eq!(
+            installed_location_from(exe).as_deref(),
+            Some(Path::new("/Applications/Synly.app"))
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_plain_binary_is_not_an_installed_location() {
+        assert_eq!(installed_location_from(Path::new("/tmp/synly")), None);
     }
 }

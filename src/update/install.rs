@@ -4,7 +4,9 @@
 //! 新版移除的文件由安装器清理. 交接前写下 `apply-update.pending`, 落地结果由下次启动
 //! 回显, 见 `super::pending`.
 
-use super::form::{self, DistributionForm};
+use super::form;
+#[cfg(not(target_os = "macos"))]
+use super::form::DistributionForm;
 use super::pending::{self, Handoff};
 use super::state::InstallOutcome;
 use anyhow::{Context, Result};
@@ -24,26 +26,39 @@ pub fn apply_installer(archive: &Path, version: &str) -> Result<InstallOutcome> 
     fs::create_dir_all(&update_dir)
         .with_context(|| format!("无法创建更新目录 {}", update_dir.display()))?;
     let log_path = pending::log_path(&update_dir);
-    match form::effective_form() {
-        DistributionForm::Installer => {}
-        DistributionForm::Portable => return handoff_portable(archive),
-    }
-    write_pending(archive, version, &update_dir, &log_path)?;
-    #[cfg(windows)]
-    {
-        handoff_windows(archive, &log_path, &update_dir)?;
-    }
     #[cfg(target_os = "macos")]
     {
+        // macOS 的安装实体是 .app bundle, 不能拿 Windows/Linux 那种固定安装目录来判断.
+        // 只要跑在 bundle 里就交接替换脚本; 点 "重启并更新" 之后本进程必须退出,
+        // 脚本等 PID 消失再覆盖, 否则 LaunchServices 会拒绝替换正在运行的 .app.
+        // 直接跑裸二进制时没有可替换的 bundle, 才打开 dmg 让用户手动拖拽.
         let exe = std::env::current_exe().context("无法确定当前可执行文件")?;
-        let bundle = super::macos::bundle_root(&exe).context("当前程序不在 app bundle 内")?;
-        super::macos::handoff_replace(archive, &bundle, std::process::id())?;
+        if let Some(bundle) = super::macos::bundle_root(&exe) {
+            write_pending(archive, version, &update_dir, &log_path)?;
+            super::macos::handoff_replace(archive, &bundle, std::process::id())?;
+            return Ok(InstallOutcome::HandedOff);
+        }
+        tracing::warn!("当前程序不在 app bundle 内, 无法就地替换, 改为打开 dmg");
+        handoff_portable(archive)
     }
-    #[cfg(not(any(windows, target_os = "macos")))]
+
+    #[cfg(not(target_os = "macos"))]
     {
-        handoff_linux(archive, version, &update_dir, &log_path)?;
+        match form::effective_form() {
+            DistributionForm::Installer => {}
+            DistributionForm::Portable => return handoff_portable(archive),
+        }
+        write_pending(archive, version, &update_dir, &log_path)?;
+        #[cfg(windows)]
+        {
+            handoff_windows(archive, &log_path, &update_dir)?;
+        }
+        #[cfg(not(windows))]
+        {
+            handoff_linux(archive, version, &update_dir, &log_path)?;
+        }
+        Ok(InstallOutcome::HandedOff)
     }
-    Ok(InstallOutcome::HandedOff)
 }
 
 /// 交接前写下本次落地记录, 供下次启动判断结果.

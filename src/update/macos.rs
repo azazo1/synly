@@ -24,10 +24,11 @@ pub fn bundle_root(exe: &Path) -> Option<PathBuf> {
 pub fn handoff_replace(dmg: &Path, bundle: &Path, pid: u32) -> Result<()> {
     let update_dir = crate::paths::update_dir()?;
     fs::create_dir_all(&update_dir)?;
+    let paths = replace_paths(bundle).context("无法从应用包推导同级暂存和备份路径")?;
     let script_path = update_dir.join("apply-update.sh");
     let log_path = update_dir.join("apply-update.log");
     let result_path = update_dir.join("apply-update-result.txt");
-    let script = render_script(pid, bundle, dmg, &result_path, &log_path);
+    let script = render_script(pid, bundle, dmg, &paths, &result_path, &log_path);
     fs::write(&script_path, script)
         .with_context(|| format!("无法写入 {}", script_path.display()))?;
     fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755))?;
@@ -37,9 +38,15 @@ pub fn handoff_replace(dmg: &Path, bundle: &Path, pid: u32) -> Result<()> {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .process_group(0);
-    command
+    let child = command
         .spawn()
         .with_context(|| format!("无法启动替换脚本 {}", script_path.display()))?;
+    tracing::info!(
+        pid = child.id(),
+        bundle = %bundle.display(),
+        script = %script_path.display(),
+        "已启动 macOS 替换脚本, 本进程即将退出"
+    );
     Ok(())
 }
 
@@ -71,13 +78,40 @@ pub fn cleanup_stale() {
     }
     if let Ok(exe) = std::env::current_exe()
         && let Some(bundle) = bundle_root(&exe)
+        && let Some(paths) = replace_paths(&bundle)
     {
-        let backup = bundle.with_extension("app.old");
-        let _ = fs::remove_dir_all(backup);
+        let _ = fs::remove_dir_all(paths.backup);
     }
 }
 
-fn render_script(pid: u32, bundle: &Path, dmg: &Path, result: &Path, log: &Path) -> String {
+/// 由 bundle 推导同级暂存和备份路径. 暂存和备份必须与 bundle 同级, 不能拿父目录再向上取一层.
+fn replace_paths(bundle: &Path) -> Option<ReplacePaths> {
+    let parent = bundle.parent()?;
+    let name = bundle.file_name()?.to_str()?;
+    if bundle.extension()?.to_str()? != "app" {
+        return None;
+    }
+    let staging = parent.join(format!("{name}.new"));
+    let backup = parent.join(format!("{name}.old"));
+    if staging.parent() != Some(parent) || backup.parent() != Some(parent) {
+        return None;
+    }
+    Some(ReplacePaths { staging, backup })
+}
+
+struct ReplacePaths {
+    staging: PathBuf,
+    backup: PathBuf,
+}
+
+fn render_script(
+    pid: u32,
+    bundle: &Path,
+    dmg: &Path,
+    paths: &ReplacePaths,
+    result: &Path,
+    log: &Path,
+) -> String {
     format!(
         r#"#!/bin/bash
 set -euo pipefail
@@ -87,6 +121,8 @@ echo "[apply-update] start pid={pid}"
 old_pid={pid}
 bundle={bundle}
 dmg={dmg}
+staging={staging}
+backup={backup}
 result={result}
 fail() {{
   printf '%s\n' "$1" > "$result"
@@ -106,6 +142,9 @@ done
 if [[ "$alive" -eq 1 ]]; then
   fail '旧进程未按时退出, 请稍后重新检查更新'
 fi
+if [[ "$(dirname "$staging")" != "$(dirname "$bundle")" || "$(dirname "$backup")" != "$(dirname "$bundle")" ]]; then
+  fail '替换路径不在应用包同级, 已中止'
+fi
 parent="$(dirname "$bundle")"
 if [[ ! -w "$parent" ]]; then
   fail '应用目录不可写, 请手动打开 dmg 拖拽安装'
@@ -116,16 +155,14 @@ cleanup_mount() {{
   rm -rf "$mount_point"
 }}
 trap cleanup_mount EXIT
-hdiutil attach -nobrowse -readonly -mountpoint "$mount_point" "$dmg" >/dev/null || fail '无法挂载更新镜像, 请手动打开 dmg 拖拽安装'
+hdiutil attach -nobrowse -readonly -mountpoint "$mount_point" "$dmg" || fail '无法挂载更新镜像, 请手动打开 dmg 拖拽安装'
 app_source="$(find "$mount_point" -maxdepth 1 -name '*.app' -type d | head -n 1)"
 if [[ -z "$app_source" ]]; then
   fail '更新镜像中没有应用包, 请手动打开 dmg 拖拽安装'
 fi
-staging="$parent/$(basename "$bundle").new"
 rm -rf "$staging"
 ditto "$app_source" "$staging" || fail '复制新应用失败, 请手动打开 dmg 拖拽安装'
 xattr -dr com.apple.quarantine "$staging" >/dev/null 2>&1 || true
-backup="${{bundle}}.old"
 rm -rf "$backup"
 mv "$bundle" "$backup" || fail '无法让出当前应用, 请手动打开 dmg 拖拽安装'
 if ! mv "$staging" "$bundle"; then
@@ -142,6 +179,8 @@ echo "[apply-update] completed"
         pid = pid,
         bundle = shell_quote(bundle),
         dmg = shell_quote(dmg),
+        staging = shell_quote(&paths.staging),
+        backup = shell_quote(&paths.backup),
         result = shell_quote(result),
         log = shell_quote(log),
     )
@@ -149,4 +188,39 @@ echo "[apply-update] completed"
 
 fn shell_quote(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundle_root_accepts_app_macos_binary() {
+        let exe = Path::new("/Applications/Synly.app/Contents/MacOS/synly");
+        assert_eq!(
+            bundle_root(exe).as_deref(),
+            Some(Path::new("/Applications/Synly.app"))
+        );
+    }
+
+    #[test]
+    fn bundle_root_rejects_plain_binary() {
+        assert_eq!(bundle_root(Path::new("/tmp/synly")), None);
+    }
+
+    #[test]
+    fn replace_paths_are_siblings_of_the_bundle() {
+        let bundle = Path::new("/Applications/Synly.app");
+        let paths = replace_paths(bundle).expect("layout");
+        assert_eq!(paths.staging, Path::new("/Applications/Synly.app.new"));
+        assert_eq!(paths.backup, Path::new("/Applications/Synly.app.old"));
+        assert_eq!(paths.staging.parent(), bundle.parent());
+        assert_eq!(paths.backup.parent(), bundle.parent());
+        assert_ne!(paths.staging.parent(), Some(Path::new("/")));
+    }
+
+    #[test]
+    fn replace_paths_reject_a_plain_directory() {
+        assert!(replace_paths(Path::new("/Applications/Synly")).is_none());
+    }
 }
