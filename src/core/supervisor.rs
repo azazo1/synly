@@ -247,9 +247,13 @@ impl AppSupervisor {
                             applied.audio_mode = previous.audio_mode;
                             applied.input.mode = previous.input.mode;
                         }
+                        if let Some(previous) = self.snapshot.applied.as_ref() {
+                            applied.audio_layout = previous.audio_layout;
+                        }
                         self.snapshot.applied = Some(applied);
-                        self.snapshot.pending = capability_change
-                            .then(|| self.snapshot.desired.clone());
+                        self.snapshot.pending = (capability_change || audio_layout_pending(
+                            self.snapshot.applied.as_ref(), &self.snapshot.desired,
+                        )).then(|| self.snapshot.desired.clone());
                     }
                     self.publish();
                 }
@@ -292,6 +296,19 @@ impl AppSupervisor {
                 }
                 self.update_capabilities();
                 self.update_tuning();
+                self.publish();
+            }
+            AppCommand::SetAudioLayout(layout) => {
+                self.snapshot.desired.audio_layout = layout;
+                self.config.runtime.audio_layout = layout;
+                self.save_settings();
+                // 布局属于连接建立时的协商参数, 不更改现有通道的 codec.
+                self.snapshot.pending = (audio_layout_pending(
+                    self.snapshot.applied.as_ref(), &self.snapshot.desired,
+                ) || capability_fields_changed(
+                    self.snapshot.applied.as_ref(), &self.snapshot.desired,
+                )).then(|| self.snapshot.desired.clone());
+                tracing::info!(?layout, "音频接收布局已保存, 下次连接生效");
                 self.publish();
             }
             AppCommand::SetInputMode(mode) => {
@@ -606,7 +623,9 @@ impl AppSupervisor {
                         && local.audio_mode == self.snapshot.desired.audio_mode
                         && local.input_mode == self.snapshot.desired.input.mode
                     {
-                        self.snapshot.pending = None;
+                        self.snapshot.pending = audio_layout_pending(
+                            self.snapshot.applied.as_ref(), &self.snapshot.desired,
+                        ).then(|| self.snapshot.desired.clone());
                     }
                 }
                 self.sync_active_flags();
@@ -1030,6 +1049,10 @@ fn requires_reconnect(previous: &RuntimeConfig, next: &RuntimeConfig) -> bool {
         || previous.trusted_only != next.trusted_only
 }
 
+fn audio_layout_pending(applied: Option<&RuntimeConfig>, desired: &RuntimeConfig) -> bool {
+    applied.is_some_and(|applied| applied.audio_layout != desired.audio_layout)
+}
+
 fn capability_fields_changed(
     applied: Option<&RuntimeConfig>,
     desired: &RuntimeConfig,
@@ -1146,6 +1169,36 @@ mod tests {
             ClipboardMode::Both
         );
         assert!(supervisor.snapshot.capabilities_acknowledged);
+    }
+
+    #[test]
+    fn capability_ack_keeps_layout_pending_until_new_session() {
+        use crate::audio::AudioLayout;
+        let (mut supervisor, _) = AppSupervisor::new(test_config(), false);
+        supervisor.snapshot.applied = Some(RuntimeConfig::default());
+        supervisor.snapshot.desired.audio_layout = AudioLayout::Surround71;
+        supervisor.snapshot.pending = Some(supervisor.snapshot.desired.clone());
+        let peer = crate::runtime_control::RuntimePeerSummary {
+            device_id: Uuid::new_v4(), display_name: "peer".into(),
+        };
+        supervisor.handle_runtime_event(RuntimeEvent::Connected(peer.clone()));
+        let capabilities = RuntimeCapabilities {
+            clipboard_mode: supervisor.snapshot.desired.clipboard_mode,
+            audio_mode: supervisor.snapshot.desired.audio_mode,
+            input_mode: supervisor.snapshot.desired.input.mode,
+        };
+        let event = || RuntimeEvent::Capabilities {
+            peer: peer.clone(), local: capabilities, remote: capabilities,
+            epoch: CapabilityEpoch { host_generation: 1, client_generation: 1 },
+            acknowledged: true,
+        };
+        supervisor.handle_runtime_event(event());
+        assert_eq!(supervisor.snapshot.applied.as_ref().unwrap().audio_layout, AudioLayout::Stereo);
+        assert_eq!(supervisor.snapshot.pending.as_ref().unwrap().audio_layout, AudioLayout::Surround71);
+        // 模拟新连接已从 desired 构造, 随后的 ACK 才能清除布局待生效状态.
+        supervisor.snapshot.applied = Some(supervisor.snapshot.desired.clone());
+        supervisor.handle_runtime_event(event());
+        assert!(supervisor.snapshot.pending.is_none());
     }
 
     #[test]

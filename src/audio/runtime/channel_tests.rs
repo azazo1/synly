@@ -5,6 +5,30 @@ use crate::audio::protocol::{RTP_PAYLOAD_TYPE_AUDIO, RtpHeader, write_audio_pack
 use crate::audio::receiver::{AudioDepacketizer, QueuedAudioFrame};
 use std::sync::Arc;
 
+#[test]
+fn invalid_codec_is_rejected_before_registering_or_spawning_channel() {
+    // 故意不创建 Tokio runtime. 若无效参数到达 socket 注册或 spawn, 测试会 panic.
+    let peer = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    for duration in [0, 1, 3, 120, u32::MAX] {
+        for direction in [AudioChannelDirection::HostToClient, AudioChannelDirection::ClientToHost] {
+            let receiver = bind_and_spawn_receiver_with_config(
+                [7; 32], direction, peer,
+                CodecConfig { packet_duration_ms: duration, ..CodecConfig::default() },
+            );
+            let error = receiver.err().expect("无效接收参数必须同步失败");
+            assert!(matches!(error.downcast_ref::<crate::audio::error::Error>(),
+                Some(crate::audio::error::Error::InvalidConfig(_))));
+            let sender = spawn_sender_with_config(
+                [7; 32], [8; 32], direction, SocketAddr::new(peer, 9),
+                CodecConfig { packet_duration_ms: duration, ..CodecConfig::default() },
+            );
+            let error = sender.err().expect("无效发送参数必须同步失败");
+            assert!(matches!(error.downcast_ref::<crate::audio::error::Error>(),
+                Some(crate::audio::error::Error::InvalidConfig(_))));
+        }
+    }
+}
+
 #[tokio::test]
 async fn receiver_rebinding_rotates_keys_before_any_udp_packet() {
     let peer = IpAddr::V4(Ipv4Addr::LOCALHOST);

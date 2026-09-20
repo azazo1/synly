@@ -13,7 +13,7 @@ use crate::host::{
     ActiveSlotReserver, SessionCapabilityProfile, SlotReservation, runtime_options_for_profile,
 };
 use crate::protocol::{
-    CapabilityEpoch, ClipboardPayload, ControlMessage, DeviceIdentity, FileChunkHeader, Frame,
+    CapabilityEpoch, AudioLayout as ProtocolAudioLayout, ClipboardPayload, ControlMessage, DeviceIdentity, FileChunkHeader, Frame,
     FrameReader, FrameWriter, PROTOCOL_VERSION, PairAuthMethod, PairRequestPayload,
     RuntimeCapabilities, SessionAgreement, TransferLimits, frame_size_limit_message,
 };
@@ -431,6 +431,7 @@ async fn connect_and_run_session(
             SyncSessionOptions {
                 clipboard_mode: options.clipboard_mode,
                 audio_mode: options.audio_mode,
+                audio_layout: options.audio_layout,
                 input_mode: options.input_mode,
                 input_options: options.input.clone(),
                 input_inbox: None,
@@ -1921,6 +1922,7 @@ async fn connect_to_untrusted_peer(
 pub(crate) struct SyncSessionOptions<'a> {
     pub(crate) clipboard_mode: ClipboardMode,
     pub(crate) audio_mode: AudioMode,
+    pub(crate) audio_layout: audio::AudioLayout,
     pub(crate) input_mode: InputMode,
     pub(crate) input_options: InputRuntimeOptions,
     pub(crate) input_inbox: Option<InputSocketInbox>,
@@ -2053,6 +2055,7 @@ struct CapabilityRefreshContext<'a> {
     pub(crate) peer_device_id: Uuid,
     pub(crate) remote_socket_addr: SocketAddr,
     pub(crate) audio_master_secret: [u8; 32],
+    pub(crate) audio_layout: audio::AudioLayout,
     pub(crate) input_master_secret: [u8; 32],
     pub(crate) input_options: &'a InputRuntimeOptions,
     pub(crate) input_inbox: Option<&'a InputSocketInbox>,
@@ -2133,15 +2136,20 @@ async fn refresh_capability_tasks(
             Some(AudioPlan {
                 role: LocalAudioRole::Receive,
                 direction,
-            }) => match audio::bind_and_spawn_receiver(
+            }) => match audio::bind_and_spawn_receiver_with_config(
                 context.audio_master_secret,
                 direction,
                 context.remote_socket_addr.ip(),
+                audio::CodecConfig { layout: context.audio_layout, ..audio::CodecConfig::default() },
             ) {
                 Ok((task, port, channel_id)) => {
                     context
                         .tx
-                        .send(Frame::Control(ControlMessage::AudioUdpReady { epoch, port, channel_id }))
+                        .send(Frame::Control(ControlMessage::AudioUdpReady { epoch, port, layout: match context.audio_layout {
+                                audio::AudioLayout::Stereo => ProtocolAudioLayout::Stereo,
+                                audio::AudioLayout::Surround51 => ProtocolAudioLayout::Surround51,
+                                audio::AudioLayout::Surround71 => ProtocolAudioLayout::Surround71,
+                            }, channel_id }))
                         .await?;
                     runtime.audio_task = Some(task);
                 }
@@ -2423,6 +2431,7 @@ pub(crate) async fn run_sync_session(
             peer_device_id: session.remote.device_id,
             remote_socket_addr,
             audio_master_secret,
+            audio_layout: options.audio_layout,
             input_master_secret,
             input_options: &input_options,
             input_inbox: options.input_inbox.as_ref(),
@@ -2464,6 +2473,7 @@ pub(crate) async fn run_sync_session(
                 peer_device_id: session.remote.device_id,
                 remote_socket_addr,
                 audio_master_secret,
+                audio_layout: options.audio_layout,
                 input_master_secret,
                 input_options: &input_options,
                 input_inbox: options.input_inbox.as_ref(),
@@ -2542,6 +2552,7 @@ pub(crate) async fn run_sync_session(
                             peer_device_id: session.remote.device_id,
                             remote_socket_addr,
                             audio_master_secret,
+                            audio_layout: options.audio_layout,
                             input_master_secret,
                             input_options: &input_options,
                             input_inbox: options.input_inbox.as_ref(),
@@ -2602,6 +2613,7 @@ pub(crate) async fn run_sync_session(
                             peer_device_id: session.remote.device_id,
                             remote_socket_addr,
                             audio_master_secret,
+                            audio_layout: options.audio_layout,
                             input_master_secret,
                             input_options: &input_options,
                             input_inbox: options.input_inbox.as_ref(),
@@ -2653,6 +2665,7 @@ pub(crate) async fn run_sync_session(
                             peer_device_id: session.remote.device_id,
                             remote_socket_addr,
                             audio_master_secret,
+                            audio_layout: options.audio_layout,
                             input_master_secret,
                             input_options: &input_options,
                             input_inbox: options.input_inbox.as_ref(),
@@ -2680,6 +2693,7 @@ pub(crate) async fn run_sync_session(
                             peer_device_id: session.remote.device_id,
                             remote_socket_addr,
                             audio_master_secret,
+                            audio_layout: options.audio_layout,
                             input_master_secret,
                             input_options: &input_options,
                             input_inbox: options.input_inbox.as_ref(),
@@ -2731,7 +2745,7 @@ pub(crate) async fn run_sync_session(
                 session_tasks.track(&task);
                 capability_runtime.input_task = Some(task);
             }
-            Frame::Control(ControlMessage::AudioUdpReady { epoch, port, channel_id }) => {
+            Frame::Control(ControlMessage::AudioUdpReady { epoch, port, layout, channel_id }) => {
                 if !capability_state.current_epoch(epoch) {
                     tracing::debug!(?epoch, current = ?capability_state.epoch(), "忽略过期音频接收端口");
                     continue;
@@ -2743,7 +2757,13 @@ pub(crate) async fn run_sync_session(
                     && capability_runtime.audio_task.is_none()
                 {
                     let remote_audio_addr = SocketAddr::new(remote_socket_addr.ip(), port);
-                    match audio::spawn_sender(audio_master_secret, channel_id, direction, remote_audio_addr) {
+                    let codec_layout = match layout {
+                        ProtocolAudioLayout::Stereo => audio::AudioLayout::Stereo,
+                        ProtocolAudioLayout::Surround51 => audio::AudioLayout::Surround51,
+                        ProtocolAudioLayout::Surround71 => audio::AudioLayout::Surround71,
+                    };
+                    let codec = audio::CodecConfig { layout: codec_layout, ..audio::CodecConfig::default() };
+                    match audio::spawn_sender_with_config(audio_master_secret, channel_id, direction, remote_audio_addr, codec) {
                         Ok(task) => {
                             capability_runtime.audio_task = Some(task);
                         }

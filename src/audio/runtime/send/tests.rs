@@ -1,6 +1,7 @@
 use super::*;
 use super::super::crypto::AudioDecryptor;
 use crate::audio::capture::CaptureStatus;
+use crate::audio::config::CodecConfig;
 use crate::audio::error::{Error, Result as AudioResult};
 use crate::audio::protocol::{ParsedPacket, parse_datagram};
 use std::sync::atomic::{AtomicUsize, Ordering};

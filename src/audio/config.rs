@@ -1,28 +1,17 @@
 use crate::audio::codec::OpusMultistreamConfig;
 use crate::audio::error::{Error, Result};
+use serde::{Deserialize, Serialize};
 
 pub const SAMPLE_RATE: u32 = 48_000;
 pub const DEFAULT_PACKET_DURATION_MS: u32 = 5;
 pub const DEFAULT_INITIAL_DROP_MS: u32 = 500;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AudioLayout {
+    #[default]
     Stereo,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "环绕声布局由 codec 支持, 尚未通过 CLI 暴露"
-        )
-    )]
     Surround51,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "环绕声布局由 codec 支持, 尚未通过 CLI 暴露"
-        )
-    )]
     Surround71,
 }
 

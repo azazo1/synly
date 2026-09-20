@@ -22,6 +22,20 @@ audio-test:
     cargo test --offline --bin synly audio::
     cargo test --offline -p synly-core protocol::tests::audio_offer
 
+# just audio-sdl2-test
+# 在已提供 SDL2 开发库的 Unix 主机上验证布局与生命周期, 不打开设备.
+[unix]
+audio-sdl2-test:
+    pkg-config --exists sdl2
+    cargo test --offline --features sdl2-audio --bin synly audio::sdl2::
+    cargo clippy --offline --all-targets --features sdl2-audio
+
+# 在独立测试进程中使用 SDL dummy 驱动验证产品播放路径, 不访问物理声卡.
+[unix]
+audio-sdl2-dummy-test:
+    pkg-config --exists sdl2
+    SDL_AUDIODRIVER=dummy cargo test --offline --features sdl2-audio --bin synly audio::sdl2::dummy_tests::dummy_playback_exercises_real_sdl_queue_and_reinitialization -- --exact --ignored --test-threads=1 --nocapture
+
 # 验证音频许可全文, 失败拒绝行为与归档随附, 不运行应用.
 [unix]
 audio-notices-test:

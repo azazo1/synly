@@ -96,6 +96,7 @@ pub(crate) fn spawn_host_session(
                 SyncSessionOptions {
                     clipboard_mode: session_options.clipboard_mode,
                     audio_mode: session_options.audio_mode,
+                    audio_layout: session_options.audio_layout,
                     input_mode: session_options.input_mode,
                     input_options: session_options.input.clone(),
                     input_inbox: Some(input_inbox),

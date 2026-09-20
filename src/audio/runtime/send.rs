@@ -4,7 +4,7 @@ use super::workers::Workers;
 use super::{AUDIO_IO_TIMEOUT, AudioChannelDirection};
 use crate::audio::capture::{AudioInput, open_input};
 use crate::audio::codec::OpusEncoder;
-use crate::audio::config::{CaptureConfig, CodecConfig, StreamParams};
+use crate::audio::config::{CaptureConfig, StreamParams};
 use crate::audio::sender::AudioPacketizer;
 use anyhow::{Context, Result};
 use std::sync::Arc;
@@ -16,8 +16,8 @@ pub(super) async fn run(
     stop: CancellationToken,
     master_secret: [u8; 32],
     direction: AudioChannelDirection,
+    stream: StreamParams,
 ) -> Result<()> {
-    let stream = CodecConfig::default().stream_params()?;
     let capture_stream = stream.clone();
     run_with_input(socket, stop, master_secret, direction, stream, move || {
         open_input(&CaptureConfig::default(), &capture_stream)

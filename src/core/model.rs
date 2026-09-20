@@ -163,6 +163,7 @@ pub enum AppCommand {
     ConnectPeer(String),
     SetClipboardMode(ClipboardMode),
     SetAudioMode(AudioMode),
+    SetAudioLayout(crate::audio::AudioLayout),
     SetInputMode(InputMode),
     SelectPaths(Vec<PathBuf>),
     Disconnect,

@@ -39,6 +39,7 @@ fn main() {
     let target = env::var("TARGET").unwrap_or_default();
     embed_windows_resources(&target);
     link_opus(&target, opus_link_preference());
+    link_sdl2_if_enabled();
 
     if target.contains("apple-darwin") {
         build_macos_native();
@@ -55,6 +56,33 @@ fn emit_build_version() {
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "dev-build".to_string());
     println!("cargo:rustc-env=SYNLY_BUILD_VERSION={version}");
+}
+
+fn link_sdl2_if_enabled() {
+    if env::var_os("CARGO_FEATURE_SDL2_AUDIO").is_none() {
+        return;
+    }
+    println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
+    let output = Command::new("pkg-config")
+        .args(["--libs-only-L", "--libs-only-l", "sdl2"])
+        .output()
+        .expect("sdl2-audio requires pkg-config");
+    if !output.status.success() {
+        panic!("sdl2-audio requires pkg-config metadata for sdl2");
+    }
+    let flags = String::from_utf8(output.stdout).expect("pkg-config returned non-UTF8 SDL2 flags");
+    let mut saw_library = false;
+    for flag in flags.split_whitespace() {
+        if let Some(path) = flag.strip_prefix("-L") {
+            println!("cargo:rustc-link-search=native={path}");
+        } else if let Some(name) = flag.strip_prefix("-l") {
+            saw_library = true;
+            println!("cargo:rustc-link-lib={name}");
+        }
+    }
+    if !saw_library {
+        panic!("pkg-config returned no SDL2 library flag");
+    }
 }
 
 fn emit_fake_dist_cfg() {

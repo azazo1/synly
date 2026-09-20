@@ -5,6 +5,7 @@ use super::schema::{
     RuntimeConfig, SynlyConfig, TransferConfig, TrustedDeviceConfig, UiConfig, UpdateConfig,
 };
 
+use crate::audio::AudioLayout;
 use crate::settings::{
     AudioMode, ClipboardMode, ConnectionPreference, FileSyncMode, InitialSyncMode,
 };
@@ -58,6 +59,8 @@ struct RuntimeFileConfig {
     sync_delete: bool,
     clipboard_mode: ClipboardMode,
     audio_mode: AudioMode,
+    #[serde(default)]
+    audio_layout: AudioLayout,
     interval_secs: u64,
     max_folder_depth: Option<usize>,
     accept: bool,
@@ -317,6 +320,7 @@ impl RuntimeFileConfig {
             sync_delete: self.sync_delete,
             clipboard_mode: self.clipboard_mode,
             audio_mode: self.audio_mode,
+            audio_layout: self.audio_layout,
             input,
             interval_secs: self.interval_secs,
             max_folder_depth: self.max_folder_depth,
@@ -340,6 +344,7 @@ impl From<&RuntimeConfig> for RuntimeFileConfig {
             sync_delete: runtime.sync_delete,
             clipboard_mode: runtime.clipboard_mode,
             audio_mode: runtime.audio_mode,
+            audio_layout: runtime.audio_layout,
             interval_secs: runtime.interval_secs,
             max_folder_depth: runtime.max_folder_depth,
             accept: runtime.accept,

@@ -4,10 +4,13 @@ use crate::audio::error::Result;
 use crate::audio::playback::AudioOutput;
 
 #[cfg(target_os = "macos")]
+#[cfg_attr(feature = "sdl2-audio", allow(dead_code))]
 mod macos;
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg_attr(feature = "sdl2-audio", allow(dead_code))]
 mod unsupported;
 #[cfg(target_os = "windows")]
+#[cfg_attr(feature = "sdl2-audio", allow(dead_code))]
 mod windows;
 
 pub fn open_input(config: &CaptureConfig, stream: &StreamParams) -> Result<Box<dyn AudioInput>> {
@@ -26,15 +29,19 @@ pub fn open_input(config: &CaptureConfig, stream: &StreamParams) -> Result<Box<d
 }
 
 pub fn open_output(config: &PlaybackConfig, stream: &StreamParams) -> Result<Box<dyn AudioOutput>> {
-    #[cfg(target_os = "macos")]
+    #[cfg(feature = "sdl2-audio")]
+    {
+        crate::audio::sdl2::SdlOutput::open(config, stream)
+    }
+    #[cfg(all(not(feature = "sdl2-audio"), target_os = "macos"))]
     {
         macos::open_output(config, stream)
     }
-    #[cfg(target_os = "windows")]
+    #[cfg(all(not(feature = "sdl2-audio"), target_os = "windows"))]
     {
         windows::open_output(config, stream)
     }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(all(not(feature = "sdl2-audio"), not(any(target_os = "macos", target_os = "windows"))))]
     {
         unsupported::open_output(config, stream)
     }

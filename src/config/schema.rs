@@ -1,3 +1,4 @@
+use crate::audio::AudioLayout;
 use crate::input::{CursorMode, InputMode, KeyMappingConfig, ScreenEdge};
 use crate::path_expand::expand_config_path_string;
 use crate::protocol::TransferLimits;
@@ -45,6 +46,7 @@ pub struct RuntimeConfig {
     pub sync_delete: bool,
     pub clipboard_mode: ClipboardMode,
     pub audio_mode: AudioMode,
+    pub audio_layout: AudioLayout,
     pub input: InputConfig,
     pub interval_secs: u64,
     pub max_folder_depth: Option<usize>,
@@ -210,6 +212,7 @@ impl Default for RuntimeConfig {
             sync_delete: false,
             clipboard_mode: ClipboardMode::Off,
             audio_mode: AudioMode::Off,
+            audio_layout: AudioLayout::Stereo,
             input: InputConfig::default(),
             interval_secs: 3,
             max_folder_depth: None,

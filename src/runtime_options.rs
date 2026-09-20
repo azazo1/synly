@@ -1,3 +1,4 @@
+use crate::audio::AudioLayout;
 use crate::clipboard::ClipboardRuntimeOptions;
 use crate::config::{DiscoveryConfig, RuntimeConfig, SynlyConfig};
 use crate::discovery::DiscoveredPeer;
@@ -21,6 +22,7 @@ pub struct RuntimeOptions {
     pub sync_delete: bool,
     pub clipboard_mode: ClipboardMode,
     pub audio_mode: AudioMode,
+    pub audio_layout: AudioLayout,
     pub input_mode: InputMode,
     pub input: InputRuntimeOptions,
     pub notifications_enabled: bool,
@@ -101,6 +103,7 @@ pub fn runtime_options_from_config(
         sync_delete,
         clipboard_mode: runtime.clipboard_mode,
         audio_mode: runtime.audio_mode,
+        audio_layout: runtime.audio_layout,
         input_mode: runtime.input.mode,
         input,
         notifications_enabled: config.notifications.enabled,

@@ -425,6 +425,13 @@ fn wire_window_callbacks(
     });
 
     let commands = handle.commands();
+    window.on_set_audio_layout(move |index| {
+        guard_callback("set_audio_layout", || {
+            send_command(&commands, AppCommand::SetAudioLayout(audio_layout_from_index(index)))
+        })
+    });
+
+    let commands = handle.commands();
     window.on_set_audio_mode(move |index| {
         guard_callback("set_audio_mode", || {
             send_command(
@@ -906,6 +913,7 @@ fn apply_snapshot(
     window.set_input_service_installed(snapshot.input_service_installed);
     window.set_clipboard_mode_index(clipboard_mode_index(snapshot.desired.clipboard_mode));
     window.set_audio_mode_index(audio_mode_index(snapshot.desired.audio_mode));
+    window.set_audio_layout_index(audio_layout_index(snapshot.desired.audio_layout));
     window.set_input_mode_index(input_mode_index(snapshot.desired.input.mode));
     window.set_desired_summary(runtime_capability_summary(&snapshot.desired).into());
     window.set_applied_summary(
@@ -1205,6 +1213,7 @@ fn apply_settings_to_window(
     );
     window.set_clipboard_mode_index(clipboard_mode_index(runtime.clipboard_mode));
     window.set_audio_mode_index(audio_mode_index(runtime.audio_mode));
+    window.set_audio_layout_index(audio_layout_index(runtime.audio_layout));
     window.set_input_mode_index(input_mode_index(runtime.input.mode));
     window.set_input_edge_index(input_edge_index(runtime.input.edge));
     window.set_input_hotkey(runtime.input.hotkey.clone().into());
@@ -1329,6 +1338,7 @@ fn settings_from_window(
         sync_delete: window.get_sync_delete(),
         clipboard_mode: clipboard_mode_from_index(window.get_clipboard_mode_index()),
         audio_mode: audio_mode_from_index(window.get_audio_mode_index()),
+        audio_layout: audio_layout_from_index(window.get_audio_layout_index()),
         input: crate::config::InputConfig {
             mode: input_mode_from_index(window.get_input_mode_index()),
             edge: input_edge_from_index(window.get_input_edge_index()),
@@ -1564,6 +1574,22 @@ fn clipboard_mode_from_index(index: i32) -> ClipboardMode {
         2 => ClipboardMode::Receive,
         3 => ClipboardMode::Both,
         _ => ClipboardMode::Off,
+    }
+}
+
+fn audio_layout_index(layout: crate::audio::AudioLayout) -> i32 {
+    match layout {
+        crate::audio::AudioLayout::Stereo => 0,
+        crate::audio::AudioLayout::Surround51 => 1,
+        crate::audio::AudioLayout::Surround71 => 2,
+    }
+}
+
+fn audio_layout_from_index(index: i32) -> crate::audio::AudioLayout {
+    match index {
+        1 => crate::audio::AudioLayout::Surround51,
+        2 => crate::audio::AudioLayout::Surround71,
+        _ => crate::audio::AudioLayout::Stereo,
     }
 }
 

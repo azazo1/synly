@@ -2,7 +2,7 @@ use super::crypto::AudioDecryptor;
 use super::queue::FrameQueue;
 use super::workers::Workers;
 use super::{AUDIO_IO_TIMEOUT, AudioChannelDirection};
-use crate::audio::config::{CodecConfig, DEFAULT_INITIAL_DROP_MS, PlaybackConfig, StreamParams};
+use crate::audio::config::{DEFAULT_INITIAL_DROP_MS, PlaybackConfig, StreamParams};
 use crate::audio::playback::{AudioOutput, open_output};
 use crate::audio::receiver::{AudioDepacketizer, QueuedAudioFrame};
 use anyhow::{Context, Result};
@@ -17,8 +17,8 @@ pub(super) async fn run(
     master_secret: [u8; 32],
     direction: AudioChannelDirection,
     expected_peer_ip: IpAddr,
+    stream: StreamParams,
 ) -> Result<()> {
-    let stream = CodecConfig::default().stream_params()?;
     let playback_stream = stream.clone();
     run_with_output(socket, stop, master_secret, direction, expected_peer_ip, stream, move || {
         open_output(&PlaybackConfig::default(), &playback_stream)

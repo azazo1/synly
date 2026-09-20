@@ -10,6 +10,7 @@ resolver = "3"
 
 [features]
 default = []
+sdl2-audio = []
 input-screen-mock = []
 input-macos-trackpad-debug = []
 input-receiver-mock = []

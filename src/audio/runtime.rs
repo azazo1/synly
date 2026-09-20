@@ -12,6 +12,7 @@ mod tests;
 mod channel_tests;
 
 use anyhow::{Context, Result};
+use crate::audio::config::CodecConfig;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -55,32 +56,36 @@ impl Drop for AudioTaskHandle {
     }
 }
 
-pub fn bind_and_spawn_receiver(
+pub fn bind_and_spawn_receiver_with_config(
     master_secret: [u8; 32],
     direction: AudioChannelDirection,
     expected_peer_ip: IpAddr,
+    codec: CodecConfig,
 ) -> Result<(AudioTaskHandle, u16, [u8; 32])> {
+    let stream = codec.stream_params().context("音频接收参数无效")?;
     let (socket, channel_secret, channel_id) = prepare_receiver(master_secret, expected_peer_ip)?;
     let local_port = socket.local_addr()?.port();
     let stop = CancellationToken::new();
     let task_stop = stop.clone();
-    let task = tokio::spawn(receive::run(socket, task_stop, channel_secret, direction, expected_peer_ip));
+    let task = tokio::spawn(receive::run(socket, task_stop, channel_secret, direction, expected_peer_ip, stream));
     Ok((AudioTaskHandle { stop, task: Some(task) }, local_port, channel_id))
 }
 
-pub fn spawn_sender(
+pub fn spawn_sender_with_config(
     master_secret: [u8; 32],
     channel_id: [u8; 32],
     direction: AudioChannelDirection,
     remote_addr: SocketAddr,
+    codec: CodecConfig,
 ) -> Result<AudioTaskHandle> {
+    let stream = codec.stream_params().context("音频发送参数无效")?;
     let channel_secret = crypto::derive_channel_secret(master_secret, channel_id)?;
     let socket = bind_socket(remote_addr.ip())?;
     let stop = CancellationToken::new();
     let task_stop = stop.clone();
     let task = tokio::spawn(async move {
         socket.connect(remote_addr).await.context("连接音频 UDP 接收端失败")?;
-        send::run(socket, task_stop, channel_secret, direction).await
+        send::run(socket, task_stop, channel_secret, direction, stream).await
     });
     Ok(AudioTaskHandle { stop, task: Some(task) })
 }
