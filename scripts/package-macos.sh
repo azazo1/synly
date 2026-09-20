@@ -51,6 +51,8 @@ if ! file "$binary" | grep -q 'Mach-O'; then
     exit 1
 fi
 
+bash "$(dirname "${BASH_SOURCE[0]}")/check-macos-audio-linkage.sh" "$binary"
+
 printf '[package] assembling Synly.app\n'
 mkdir -p "$output_dir"
 rm -rf "$app_bundle"
