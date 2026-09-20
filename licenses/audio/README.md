@@ -15,7 +15,7 @@ Synly 的桌面音频实现包含来自以下上游的移植和改写. 原作者
 相关路径为 `src/audio/`, `native/macos_audio.m` 和 `native/macos_*audio*.h` / `native/macos_capture_*.h` / `native/macos_playback_*.h`. 修改者为 Synly 贡献者, 音频重构的修改日期与逐次差异由对应源码版本的 Git 历史记录. 当前实现并非上游软件的原样复制:
 
 - Rust 所有权, Tokio 任务和有界队列替换部分 C/C++ 内存池与线程控制.
-- 桌面捕获和播放使用 WASAPI/Core Audio/AudioQueue, 尚不是 SDL renderer 的完整逐行替换.
+- 桌面捕获仍使用 WASAPI/Core Audio. 发布包播放使用 SDL2 renderer 移植; 日常源码构建默认仍是 WASAPI/AudioQueue.
 - macOS 增加实际 PCM 格式校验, 无互斥样本环, 清理失败资源隔离, 回调停滞检测和属性通知生命周期管理.
 - FEC 接收修正顺序包快速路径漏恢复和序号零值哨兵问题, 保留明确的上游对照差异.
 - 传输外层采用 Synly 的 TLS 协商, ChaCha20-Poly1305 和防重放机制, 不提供 GameStream RTSP/AES-CBC 互操作兼容性.
@@ -23,6 +23,8 @@ Synly 的桌面音频实现包含来自以下上游的移植和改写. 原作者
 详细函数映射和测试边界见对应 Synly 源码中的 `docs/audio-port.md`, `docs/audio-platform-audit.md`, `docs/audio-fec-vectors.md` 和 `docs/audio-queue-vectors.md`.
 
 独立对照测试使用 nanors 的固定版本, 不将其 C 实现链接进产品. nanors 的 MIT 声明已经随测试源码保留在 `native/tests/audio-fec-nanors-LICENSE.txt`. 重新生成对照数据时仍须保留该声明. Opus 及其它实际链接的依赖必须按发布构建使用的具体版本另外核对, 本目录不是完整依赖清单.
+
+发布包若启用 SDL2 播放, 会额外随附 [SDL2-LICENSE.txt](SDL2-LICENSE.txt). macOS Homebrew 的 sdl2-compat 运行时加载 SDL3, 此时还会随附 [SDL3-LICENSE.txt](SDL3-LICENSE.txt). 这两份是 zlib 许可的运行库全文, 不是 Sunshine/Moonlight 的移植源码.
 
 ## 源码与再分发
 

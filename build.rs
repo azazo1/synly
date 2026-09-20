@@ -63,6 +63,23 @@ fn link_sdl2_if_enabled() {
         return;
     }
     println!("cargo:rerun-if-env-changed=PKG_CONFIG_PATH");
+    println!("cargo:rerun-if-env-changed=SDL2_LIB_DIR");
+    println!("cargo:rerun-if-env-changed=SYNLY_BUNDLE_SDL");
+    println!("cargo:rerun-if-env-changed=VCPKG_ROOT");
+    println!("cargo:rerun-if-env-changed=VCPKG_INSTALLATION_ROOT");
+    println!("cargo:rerun-if-env-changed=VCPKG_DEFAULT_TRIPLET");
+    let target = env::var("TARGET").unwrap_or_default();
+    if target.contains("windows") {
+        link_sdl2_windows(&target);
+    } else {
+        link_sdl2_pkg_config();
+    }
+    if env_flag_enabled("SYNLY_BUNDLE_SDL") && target.contains("linux") {
+        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN");
+    }
+}
+
+fn link_sdl2_pkg_config() {
     let output = Command::new("pkg-config")
         .args(["--libs-only-L", "--libs-only-l", "sdl2"])
         .output()
@@ -83,6 +100,45 @@ fn link_sdl2_if_enabled() {
     if !saw_library {
         panic!("pkg-config returned no SDL2 library flag");
     }
+}
+
+fn link_sdl2_windows(target: &str) {
+    if let Some(dir) = env::var_os("SDL2_LIB_DIR").map(PathBuf::from) {
+        if dir.is_dir() {
+            println!("cargo:rustc-link-search=native={}", dir.display());
+            println!("cargo:rustc-link-lib=SDL2");
+            return;
+        }
+        panic!("SDL2_LIB_DIR does not exist: {}", dir.display());
+    }
+    if let Some(dir) = find_vcpkg_sdl2_lib_dir(target) {
+        println!("cargo:rustc-link-search=native={}", dir.display());
+        println!("cargo:rustc-link-lib=SDL2");
+        return;
+    }
+    panic!("sdl2-audio on Windows requires SDL2.lib via SDL2_LIB_DIR or vcpkg sdl2:x64-windows");
+}
+
+fn find_vcpkg_sdl2_lib_dir(target: &str) -> Option<PathBuf> {
+    let root = env::var_os("VCPKG_ROOT")
+        .or_else(|| env::var_os("VCPKG_INSTALLATION_ROOT"))
+        .map(PathBuf::from)?;
+    let mut triplets = vec![
+        default_vcpkg_triplet(target, false),
+        "x64-windows".to_string(),
+        "arm64-windows".to_string(),
+    ];
+    if let Ok(explicit) = env::var("VCPKG_DEFAULT_TRIPLET") {
+        triplets.insert(0, explicit);
+    }
+    triplets.dedup();
+    for triplet in triplets {
+        let dir = root.join("installed").join(&triplet).join("lib");
+        if dir.join("SDL2.lib").is_file() {
+            return Some(dir);
+        }
+    }
+    None
 }
 
 fn emit_fake_dist_cfg() {

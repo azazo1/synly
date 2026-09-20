@@ -14,7 +14,7 @@ Synly 支持 Windows, macOS 和 Linux. 文件与剪贴板同步可在三大平�
 - 可信设备使用身份公钥和长期 mTLS 免 PIN 重连.
 - 文件同步支持 off, send, receive, both 和 auto.
 - 剪贴板同步支持文本, RTF, HTML, 图片和受大小限制的文件.
-- 音频支持单向 send 和 receive.
+- 音频支持单向 send 和 receive. 发布包播放使用 SDL2 并随附运行库; 源码日常构建默认仍是平台原生播放.
 - 输入支持单向 send 和 receive, 包含边缘切换和紧急收回热键, 以及面向光标捕获游戏的光标模式(相对增量注入, 支持手动开关与自动检测).
 - 剪贴板, 音频和输入模式使用 protocol 17 capability generation 热协商.
 - 文件扫描间隔和删除策略可在当前会话中更新.
@@ -76,11 +76,11 @@ git push origin main --follow-tags
 
 ### Windows
 
-推荐使用 MSVC 工具链和 Windows 10/11 SDK. 音频依赖 Opus.
+推荐使用 MSVC 工具链和 Windows 10/11 SDK. 音频依赖 Opus. 发布构建还需要动态 SDL2.
 
 ```powershell
 rustup default stable-x86_64-pc-windows-msvc
-vcpkg install opus:x64-windows-static
+vcpkg install opus:x64-windows-static sdl2:x64-windows
 $env:VCPKG_ROOT="C:\path\to\vcpkg"
 just dist
 ```
@@ -97,10 +97,12 @@ macOS 音频采集要求 macOS 14.0 或更高版本.
 
 ```shell
 xcode-select --install
-brew install pkg-config opus
+brew install pkg-config opus sdl2 sdl3
 rustup default stable
 cargo build --release
 ```
+
+`just dist` 会启用 `sdl2-audio` 并把 SDL2 (Homebrew 上的 sdl2-compat 还需要 SDL3) 复制进应用包. 日常 `cargo run` 仍使用 AudioQueue.
 
 ### Linux
 
@@ -108,7 +110,7 @@ Debian 或 Ubuntu:
 
 ```shell
 sudo apt update
-sudo apt install -y build-essential pkg-config libopus-dev
+sudo apt install -y build-essential pkg-config libopus-dev libsdl2-dev
 rustup default stable
 cargo build --release
 ```
@@ -116,12 +118,12 @@ cargo build --release
 Fedora:
 
 ```shell
-sudo dnf install -y gcc gcc-c++ make pkgconf-pkg-config opus-devel
+sudo dnf install -y gcc gcc-c++ make pkgconf-pkg-config opus-devel SDL2-devel
 rustup default stable
 cargo build --release
 ```
 
-Linux 音频和输入运行时目前不可用, 但文件与剪贴板同步不受影响.
+Linux 发布包随附 SDL2, 可以播放对端音频, 系统采集和输入运行时目前仍不可用. 文件与剪贴板同步不受影响.
 
 ### Android
 

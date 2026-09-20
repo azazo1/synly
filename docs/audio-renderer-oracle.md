@@ -29,7 +29,7 @@ just audio-renderer-test /path/to/moonlight-qt
 
 ## 可选 SDL2 产品后端
 
-工程现在提供 `sdl2-audio` feature. 启用后, `platform::open_output` 选择 `src/audio/sdl2.rs` 的 raw SDL2 FFI; 默认 feature 仍使用 WASAPI/AudioQueue. 该实现复用了原始 renderer 的 float32, `max(480, 3 * samplesPerFrame)`, queued-audio 水位和 stopped-device 检查, 并按上游在 SDL 入队失败时记录错误后返回成功.
+工程提供 `sdl2-audio` feature. 启用后, `platform::open_output` 选择 `src/audio/sdl2.rs` 的 raw SDL2 FFI. `just dist` 和发布 CI 启用该 feature, 并把运行库打进安装包; 日常 `cargo run` 的默认 feature 仍使用 WASAPI/AudioQueue. 该实现复用了原始 renderer 的 float32, `max(480, 3 * samplesPerFrame)`, queued-audio 水位和 stopped-device 检查, 并按上游在 SDL 入队失败时记录错误后返回成功.
 
 SDL2 打开入口在初始化子系统前验证 PCM 请求: Opus 支持的 8/12/16/24/48 kHz, 2/6/8 声道和 5/10/20/40/60 ms. 一帧内存也在打开设备前准备. 空或含 NUL 的设备标识返回 InvalidConfig; 其他指定设备标识返回 UnsupportedPlatform. 平台设备标识并不等同 SDL 显示名称, 当前仅支持默认输出, 不会静默丢弃指定设备要求. `validation_tests.rs` 覆盖 75 个合法参数组合, 并通过平台入口验证非法参数的提前拒绝, 不打开声卡.
 

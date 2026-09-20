@@ -58,6 +58,16 @@ audio-sdl2-dummy-test:
 audio-notices-test:
     bash scripts/tests/audio-notices.sh
 
+# 验证 macOS 音频动态库门禁: 未随包的 SDL2 必须失败, 包内路径必须存在对应库.
+[macos]
+macos-audio-linkage-test:
+    bash scripts/tests/macos-audio-linkage.sh
+
+# 验证 macOS SDL 随包脚本对原生构建放行, 对缺失库失败.
+[macos]
+macos-sdl-bundle-test:
+    bash scripts/tests/macos-sdl-bundle.sh
+
 # 验证音频许可全文, 失败拒绝行为与 Windows ZIP 随附, 不运行应用.
 [windows]
 audio-notices-test:
@@ -154,7 +164,7 @@ build-version:
 build-version:
     powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-version.ps1
 
-# 构建当前平台的可分发 release 产物.
+# 构建当前平台的可分发 release 产物. 播放后端为 SDL2, 运行库随包复制.
 [windows]
 [script('powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File')]
 dist:
@@ -162,19 +172,19 @@ dist:
     $version = (powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-version.ps1 | Select-Object -Last 1).Trim()
     if ([string]::IsNullOrWhiteSpace($version)) { throw 'Unable to resolve the build version' }
     $env:SYNLY_BUILD_VERSION = $version
-    cargo build --release
+    cargo build --release --features sdl2-audio
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows.ps1 -Binary target/release/synly.exe -OutputDir dist
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 [macos]
 dist:
-    SYNLY_BUILD_VERSION="$(bash scripts/build-version.sh)" cargo build --release
+    SYNLY_BUILD_VERSION="$(bash scripts/build-version.sh)" cargo build --release --features sdl2-audio
     bash scripts/package-macos.sh
 
 [linux]
 dist:
-    SYNLY_BUILD_VERSION="$(bash scripts/build-version.sh)" cargo build --release
+    SYNLY_BUILD_VERSION="$(bash scripts/build-version.sh)" SYNLY_BUNDLE_SDL=1 cargo build --release --features sdl2-audio
     bash scripts/package-linux.sh
 
 # 产出用于自动更新测试的 fake 构建, 版本固定为 v0.0.0.
@@ -184,19 +194,19 @@ fake-dist:
     $ErrorActionPreference = 'Stop'
     $env:SYNLY_BUILD_VERSION = 'v0.0.0'
     $env:SYNLY_FAKE_DIST = '1'
-    cargo build --release
+    cargo build --release --features sdl2-audio
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     powershell -NoProfile -ExecutionPolicy Bypass -File scripts/package-windows.ps1 -Binary target/release/synly.exe -OutputDir dist -Version v0.0.0 -Fake
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 [macos]
 fake-dist:
-    SYNLY_BUILD_VERSION=v0.0.0 SYNLY_FAKE_DIST=1 cargo build --release
+    SYNLY_BUILD_VERSION=v0.0.0 SYNLY_FAKE_DIST=1 cargo build --release --features sdl2-audio
     SYNLY_FAKE_DIST=1 bash scripts/package-macos.sh v0.0.0 "$(rustc -vV | sed -n 's/^host: //p')" dist
 
 [linux]
 fake-dist:
-    SYNLY_BUILD_VERSION=v0.0.0 SYNLY_FAKE_DIST=1 cargo build --release
+    SYNLY_BUILD_VERSION=v0.0.0 SYNLY_FAKE_DIST=1 SYNLY_BUNDLE_SDL=1 cargo build --release --features sdl2-audio
     SYNLY_FAKE_DIST=1 bash scripts/package-linux.sh v0.0.0 "$(rustc -vV | sed -n 's/^host: //p')" dist
 
 # just gradlew testDebugUnitTest

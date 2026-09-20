@@ -60,6 +60,6 @@ cmp "$work/repo/target/release/synly" "$work/unpacked/synly"
 for name in "${files[@]}"; do cmp "$root/licenses/audio/$name" "$work/unpacked/audio-licenses/$name"; done
 # 暂存目录应全部回收, 只留下最终归档.
 shopt -s nullglob
-leftovers=("$work/repo/dist with spaces"/audio-notices.*)
+leftovers=("$work/repo/dist with spaces"/audio-notices.* "$work/repo/dist with spaces"/linux-stage.*)
 [[ ${#leftovers[@]} -eq 0 ]]
 printf '音频许可随附测试通过, 测试产物保留于 %s\n' "$work"

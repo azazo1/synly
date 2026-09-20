@@ -51,8 +51,6 @@ if ! file "$binary" | grep -q 'Mach-O'; then
     exit 1
 fi
 
-bash "$(dirname "${BASH_SOURCE[0]}")/check-macos-audio-linkage.sh" "$binary"
-
 printf '[package] assembling Synly.app\n'
 mkdir -p "$output_dir"
 rm -rf "$app_bundle"
@@ -61,6 +59,8 @@ cp "$binary" "$app_bundle/Contents/MacOS/synly"
 chmod 755 "$app_bundle/Contents/MacOS/synly"
 cp "$icon" "$app_bundle/Contents/Resources/synly.icns"
 bash "$(dirname "${BASH_SOURCE[0]}")/package-audio-notices.sh" "$app_bundle/Contents/Resources/audio-licenses"
+bash "$(dirname "${BASH_SOURCE[0]}")/bundle-macos-sdl.sh" "$app_bundle"
+bash "$(dirname "${BASH_SOURCE[0]}")/check-macos-audio-linkage.sh" "$app_bundle/Contents/MacOS/synly"
 
 printf '%s\n' \
     '<?xml version="1.0" encoding="UTF-8"?>' \
@@ -112,6 +112,14 @@ test -f "$app_bundle/Contents/Info.plist"
 test -f "$app_bundle/Contents/Resources/synly.icns"
 test -s "$app_bundle/Contents/Resources/audio-licenses/README.md"
 test -s "$dmg_root/Synly.app/Contents/Resources/audio-licenses/sunshine-GPL-3.0.txt"
+if otool -L "$app_bundle/Contents/MacOS/synly" | grep -q libSDL2; then
+    test -f "$app_bundle/Contents/Frameworks/libSDL2.dylib"
+    test -s "$app_bundle/Contents/Resources/audio-licenses/SDL2-LICENSE.txt"
+    if strings "$app_bundle/Contents/Frameworks/libSDL2.dylib" | grep -q 'sdl2-compat:'; then
+        test -f "$app_bundle/Contents/Frameworks/libSDL3.dylib"
+        test -s "$app_bundle/Contents/Resources/audio-licenses/SDL3-LICENSE.txt"
+    fi
+fi
 test -L "$dmg_root/Applications"
 test -f "$dmg_path"
 printf '[package] completed %s\n' "$dmg_path"
