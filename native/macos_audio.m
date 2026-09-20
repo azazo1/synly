@@ -176,8 +176,8 @@ static OSStatus ar_system_audio_io_proc(
   tapDescription.muteBehavior = CATapUnmuted;
 
   status = AudioHardwareCreateProcessTap(tapDescription, &tapObjectID);
-  if (status != noErr) {
-    ar_set_error("AudioHardwareCreateProcessTap failed with status %d", (int) status);
+  if (status != noErr || tapObjectID == kAudioObjectUnknown) {
+    ar_set_error("创建音频 tap 未返回有效对象, OSStatus=%d", (int) status);
     return false;
   }
 
@@ -200,8 +200,8 @@ static OSStatus ar_system_audio_io_proc(
   };
 
   status = AudioHardwareCreateAggregateDevice((__bridge CFDictionaryRef) aggregate, &aggregateDeviceID);
-  if (status != noErr && status != 'ExtA') {
-    ar_set_error("AudioHardwareCreateAggregateDevice failed with status %d", (int) status);
+  if ((status != noErr && status != 'ExtA') || aggregateDeviceID == kAudioObjectUnknown) {
+    ar_set_error("创建聚合音频设备未返回有效对象, OSStatus=%d", (int) status);
     return false;
   }
 
@@ -302,7 +302,8 @@ static OSStatus ar_system_audio_io_proc(
     return false;
   }
   if (ar_audio_change_reasons(state.changes) != 0) {
-    ar_set_error("初始化期间捕获设备属性发生变化, 需要重新查询设备");
+    ar_set_error("初始化期间捕获设备属性发生变化, reasons=0x%x, 需要重新查询设备",
+                 (unsigned)ar_audio_change_reasons(state.changes));
     return false;
   }
   startAttempted = true;
@@ -592,6 +593,11 @@ void *ar_macos_playback_create(uint32_t sample_rate, uint32_t channels, uint32_t
     pthread_mutex_unlock(&g_audio_lifecycle);
     return handle;
   }
+}
+
+uint32_t ar_macos_playback_resumed_gaps(void *handle) {
+  ARPlaybackEngine *engine = handle;
+  return atomic_load_explicit(&engine->ring.resumed_gaps, memory_order_relaxed);
 }
 
 void ar_macos_playback_stats(void *handle, uint64_t *dropped, uint32_t *high_water) {

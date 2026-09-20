@@ -176,17 +176,18 @@ static OSStatus fake_dispose(AudioQueueRef handle, Boolean immediate) {
 
 static AudioDeviceIOProc capture_proc;
 static void *capture_context;
+static bool missing_tap_id, missing_aggregate_id, aggregate_exta;
 static OSStatus fake_create_tap(id description, AudioObjectID *out) {
   (void)description;
   OSStatus status = result_for(TAP_CREATE);
-  if (status == noErr) *out = 101;
+  if (status == noErr && !missing_tap_id) *out = 101;
   return status;
 }
 static OSStatus fake_create_aggregate(CFDictionaryRef description, AudioObjectID *out) {
   (void)description;
   OSStatus status = result_for(AGG_CREATE);
-  if (status == noErr) *out = 102;
-  return status;
+  if (status == noErr && !missing_aggregate_id) *out = 102;
+  return status == noErr && aggregate_exta ? 'ExtA' : status;
 }
 static OSStatus fake_set_property(AudioObjectID object, const AudioObjectPropertyAddress *address,
                                  UInt32 qualifier_size, const void *qualifier, UInt32 size, const void *data) {
@@ -322,6 +323,7 @@ static void reset_test(void) {
   fail_primary = fail_cleanup = fail_allocation = allocation_step = 0;
   api_calls = enqueue_calls = dispose_calls = queue_count = 0;
   cleanup_count = 0;
+  missing_tap_id = missing_aggregate_id = aggregate_exta = false;
   capture_proc = NULL;
   capture_context = NULL;
   atomic_store(&g_audio_cleanup_failure, 0);
@@ -619,7 +621,31 @@ static void test_real_capture_stall_wait(void) {
 #include "macos-capture-change-cases.h"
 #include "macos-playback-change-cases.h"
 
+static void test_creation_object_ids(void) {
+  for (int scenario = 0; scenario < 4; scenario++) {
+    reset_test();
+    @autoreleasepool {
+      missing_tap_id = scenario == 0;
+      missing_aggregate_id = scenario == 1 || scenario == 2;
+      aggregate_exta = scenario >= 2;
+      void *handle = ar_macos_capture_create(NULL, 48000, 2, 240);
+      if (scenario == 3) {
+        assert(handle != NULL);
+        assert(ar_macos_capture_destroy(handle) == 0);
+      } else {
+        assert(handle == NULL);
+        assert(capture_proc == NULL);
+        if (scenario != 0) {
+          assert(cleanup_count == 1 && cleanup_order[0] == TAP_DESTROY);
+        }
+      }
+    }
+  }
+  reset_test();
+}
+
 int main(void) {
+  test_creation_object_ids();
   puts("[1/5] AudioQueue 各初始化故障, 同步销毁与隔离后迟到回调");
   test_playback_lifecycle();
   test_serialized_cleanup_failure();

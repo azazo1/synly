@@ -6,8 +6,9 @@ use crate::audio::playback::AudioOutput;
 use std::ffi::{c_char, c_void};
 mod lifecycle;
 mod backpressure;
+mod submission;
 use lifecycle::RuntimeUsers;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const SDL_INIT_AUDIO: u32 = 0x0000_0010;
 const SDL_AUDIO_F32SYS: u16 = if cfg!(target_endian = "little") { 0x8120 } else { 0x9120 };
@@ -38,6 +39,7 @@ unsafe extern "C" {
     fn SDL_GetQueuedAudioSize(device: u32) -> u32;
     fn SDL_QueueAudio(device: u32, data: *const c_void, len: u32) -> i32;
     fn SDL_GetError() -> *const c_char;
+    fn SDL_Delay(ms: u32);
 }
 
 fn sdl_error(context: &str) -> Error {
@@ -133,29 +135,27 @@ impl SdlOutput {
 }
 
 impl AudioOutput for SdlOutput {
-    fn submit_frame(&mut self, frame: &[f32], timeout: Duration) -> Result<()> {
-        if frame.len() != self.buffer.len() {
-            return Err(Error::Backend("SDL2 音频提交必须为完整协商帧".into()));
-        }
-        let started = Instant::now();
-        backpressure::wait_for_space(
-            self.frame_bytes,
+    fn submit_frame(&mut self, frame: &[f32], _timeout: Duration) -> Result<()> {
+        // SDL renderer 使用上游固定轮询次数, 不采用原生后端的调用方时间预算.
+        debug_assert_eq!(self.frame_bytes, std::mem::size_of_val(self.buffer.as_slice()));
+        submission::submit(
+            frame,
+            &mut self.buffer,
             self.frame_duration.as_millis() as u32,
-            timeout,
             || {
                 if unsafe { SDL_GetAudioDeviceStatus(self.device) } == SDL_AUDIO_STOPPED {
                     return Err(sdl_error("音频设备已停止"));
                 }
                 Ok(unsafe { SDL_GetQueuedAudioSize(self.device) as usize })
             },
-            || started.elapsed(),
-            std::thread::sleep,
-        )?;
-        self.buffer.copy_from_slice(frame);
-        let byte_len = u32::try_from(self.frame_bytes).map_err(|_| Error::InvalidConfig("SDL2 音频帧字节数超过 u32"))?;
-        let status = unsafe { SDL_QueueAudio(self.device, self.buffer.as_ptr().cast(), byte_len) };
-        if status != 0 { return Err(sdl_error("音频帧入队失败")); }
-        Ok(())
+            |duration| unsafe { SDL_Delay(duration.as_millis() as u32) },
+            |pcm, byte_len| {
+                if unsafe { SDL_QueueAudio(self.device, pcm.as_ptr().cast(), byte_len) } < 0 {
+                    return Err(sdl_error("音频帧入队失败"));
+                }
+                Ok(())
+            },
+        )
     }
 }
 

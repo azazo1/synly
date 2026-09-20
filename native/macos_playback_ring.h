@@ -5,11 +5,17 @@
 typedef struct {
   ARAudioRing samples;
   uint32_t watermark_frames;
+  // 仅消费者更新状态, 统计值供工作线程读取. 不在实时回调打印日志.
+  bool consumed_audio;
+  bool pending_gap;
+  _Atomic uint32_t resumed_gaps;
 } ARPlaybackRing;
 
 static int ar_playback_ring_init(ARPlaybackRing *ring, uint32_t rate, uint32_t channels, uint32_t frame_size) {
   memset(ring, 0, sizeof(*ring));
   if (!ar_audio_ring_format_valid(rate, channels, frame_size)) return KERN_INVALID_ARGUMENT;
+  atomic_init(&ring->resumed_gaps, 0);
+  if (!atomic_is_lock_free(&ring->resumed_gaps)) return KERN_NOT_SUPPORTED;
   ring->watermark_frames = (uint32_t)(((uint64_t)rate * 50 + 999) / 1000);
   return ar_audio_ring_init(&ring->samples, (uint64_t)ring->watermark_frames + frame_size, channels, frame_size);
 }
@@ -40,6 +46,12 @@ static int ar_playback_ring_fill(ARPlaybackRing *ring, float *out, uint32_t coun
   uint32_t copied;
   int result = ar_audio_ring_take(&ring->samples, out, count, true, &copied);
   if (result != 0) return result;
+  if (copied != 0) {
+    if (ring->pending_gap) atomic_fetch_add_explicit(&ring->resumed_gaps, 1, memory_order_relaxed);
+    ring->consumed_audio = true;
+    ring->pending_gap = false;
+  }
+  if (copied < count && ring->consumed_audio) ring->pending_gap = true;
   memset(out + copied, 0, (size_t)(count - copied) * sizeof(float));
   if (copied != 0) ar_audio_ring_notify(&ring->samples);
   return atomic_load_explicit(&ring->samples.closed, memory_order_acquire) ? -1 : 0;

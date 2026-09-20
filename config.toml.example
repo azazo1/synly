@@ -42,6 +42,8 @@ paths = []
 sync_delete = false
 clipboard_mode = "off"
 audio_mode = "off"
+# 接收声道: stereo, surround51 或 surround71. 下次连接生效, 不自动检测声卡能力.
+audio_layout = "stereo"
 interval_secs = 3
 accept = false
 trust_device = false

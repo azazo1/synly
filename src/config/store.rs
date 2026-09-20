@@ -841,6 +841,41 @@ mod tests {
     }
 
     #[test]
+    fn audio_layout_survives_atomic_save_and_reload() {
+        let dir = unique_test_dir("audio-layout");
+        let mut config = load_or_create_in_dir(&dir).unwrap();
+        for layout in [AudioLayout::Surround51, AudioLayout::Surround71, AudioLayout::Stereo] {
+            config.runtime.audio_layout = layout;
+            write_toml_atomic(&dir.join(CONFIG_FILE_NAME), &MainConfigFile::from(&config)).unwrap();
+            let reloaded = load_or_create_in_dir(&dir).unwrap();
+            assert_eq!(reloaded.runtime.audio_layout, layout);
+            assert_eq!(reloaded.runtime, config.runtime);
+            assert_eq!(reloaded.device.device_id, config.device.device_id);
+        }
+        cleanup_dir(&dir);
+    }
+
+    #[test]
+    fn absent_audio_layout_defaults_but_invalid_values_are_not_silently_replaced() {
+        let main = MainConfigFile::new(Uuid::new_v4());
+        let mut document = toml::Value::try_from(&main).unwrap();
+        document["runtime"].as_table_mut().unwrap().remove("audio_layout");
+        let parsed: MainConfigFile = document.clone().try_into().unwrap();
+        assert_eq!(parsed.runtime.into_runtime(parsed.input).audio_layout, AudioLayout::Stereo);
+        for invalid in [toml::Value::String("surround91".into()), toml::Value::Integer(6)] {
+            document["runtime"].as_table_mut().unwrap().insert("audio_layout".into(), invalid);
+            assert!(document.clone().try_into::<MainConfigFile>().is_err());
+        }
+        // 明确锁定文件格式的枚举值, 防止改名造成已保存的声道设置无法读回.
+        for (name, layout) in [("stereo", AudioLayout::Stereo),
+            ("surround51", AudioLayout::Surround51), ("surround71", AudioLayout::Surround71)] {
+            document["runtime"].as_table_mut().unwrap().insert("audio_layout".into(), name.into());
+            let parsed: MainConfigFile = document.clone().try_into().unwrap();
+            assert_eq!(parsed.runtime.into_runtime(parsed.input).audio_layout, layout);
+        }
+    }
+
+    #[test]
     fn unknown_and_missing_fields_are_rejected() {
         let mut main = MainConfigFile::new(Uuid::new_v4());
         main.input.key_mapping.macos_to_windows = BTreeMap::new();

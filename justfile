@@ -17,6 +17,23 @@ headless *args:
 test:
     cargo test
 
+# 显式访问真实声卡: 先播放低音量提示音, 再采集系统音频统计, 不保存录音.
+[macos]
+audio-hardware-test:
+    SYNLY_AUDIO_HARDWARE_TEST=1 cargo test --offline --bin synly audio::hardware_tests::local_capture_and_playback -- --exact --ignored --test-threads=1 --nocapture
+
+# 使用已安装的 SDL2 播放后端启动 GUI, 不改变默认构建后端.
+[unix]
+run-sdl2:
+    pkg-config --exists sdl2
+    cargo run --features sdl2-audio --
+
+# 显式使用真实 SDL2 输出播放提示音, 然后验证 macOS 系统捕获, 不保存录音.
+[macos]
+audio-sdl2-hardware-test:
+    pkg-config --exists sdl2
+    SYNLY_AUDIO_HARDWARE_TEST=1 cargo test --offline --features sdl2-audio --bin synly audio::hardware_tests::local_capture_and_playback -- --exact --ignored --test-threads=1 --nocapture
+
 # 运行音频编解码, 队列及 UDP 流水线测试.
 audio-test:
     cargo test --offline --bin synly audio::

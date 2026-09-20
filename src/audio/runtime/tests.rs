@@ -67,7 +67,13 @@ impl crate::audio::capture::AudioInput for FeedInput {
 
 #[tokio::test]
 async fn capture_encode_and_udp_stages_deliver_decodable_audio_and_fec() {
-    let stream = CodecConfig::default().stream_params().unwrap();
+    for layout in [crate::audio::AudioLayout::Stereo, crate::audio::AudioLayout::Surround51, crate::audio::AudioLayout::Surround71] {
+        verify_capture_transport(layout).await;
+    }
+}
+
+async fn verify_capture_transport(layout: crate::audio::AudioLayout) {
+    let stream = CodecConfig { layout, ..CodecConfig::default() }.stream_params().unwrap();
     let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     sender.connect(receiver.local_addr().unwrap()).await.unwrap();
@@ -78,8 +84,20 @@ async fn capture_encode_and_udp_stages_deliver_decodable_audio_and_fec() {
         sender, stop.clone(), [7; 32], AudioChannelDirection::HostToClient, stream.clone(),
         move || Ok(Box::new(FeedInput { frames: frames.take().expect("此测试不应重建设备") })),
     ));
-    for _ in 0..5 {
-        feed.send(vec![0.1; stream.samples_per_frame()]).unwrap();
+    let mut reference_encoder = OpusEncoder::new(stream.opus_config(), stream.bitrate).unwrap();
+    let mut reference_packets = Vec::new();
+    for frame_index in 0..5 {
+        let samples: Vec<f32> = (0..stream.samples_per_frame()).map(|index| {
+            let channel = index % usize::from(stream.channels);
+            let sample = frame_index * stream.frame_size() + index / usize::from(stream.channels);
+            let frequency = 150.0 + channel as f32 * 75.0;
+            (sample as f32 * frequency * std::f32::consts::TAU / stream.sample_rate as f32).sin() * 0.1
+        }).collect();
+        let mut encoded = vec![0; 1400];
+        let length = reference_encoder.encode_float(&samples, &mut encoded).unwrap();
+        encoded.truncate(length);
+        reference_packets.push(encoded);
+        feed.send(samples).unwrap();
     }
     let mut decryptor = AudioDecryptor::new([7; 32], AudioChannelDirection::HostToClient).unwrap();
     let mut decoder = crate::audio::codec::OpusDecoder::new(stream.opus_config()).unwrap();
@@ -94,6 +112,8 @@ async fn capture_encode_and_udp_stages_deliver_decodable_audio_and_fec() {
             match crate::audio::protocol::parse_datagram(&packet).unwrap() {
                 crate::audio::protocol::ParsedPacket::Audio { rtp, payload } => {
                     assert_eq!(rtp.sequence_number, audio_count);
+                    // 与绕过采集队列/分包/加密/UDP的独立编码器逐包比较, 捕获错序或声道截断.
+                    assert_eq!(payload.as_slice(), reference_packets[audio_count as usize].as_slice());
                     assert_eq!(decoder.decode_float(Some(&payload), &mut pcm).unwrap(), pcm.len());
                     assert!(pcm.iter().all(|sample| sample.is_finite()));
                     audio_count += 1;
@@ -106,6 +126,67 @@ async fn capture_encode_and_udp_stages_deliver_decodable_audio_and_fec() {
     tokio::time::timeout(Duration::from_secs(2), task).await.unwrap().unwrap().unwrap();
     assert!(reception.is_ok());
     assert_eq!((audio_count, fec_count), (5, 2));
+}
+
+#[tokio::test]
+async fn multichannel_capture_to_playback_uses_full_pcm_frames() {
+    for layout in [crate::audio::AudioLayout::Surround51, crate::audio::AudioLayout::Surround71] {
+        let stream = CodecConfig { layout, ..CodecConfig::default() }.stream_params().unwrap();
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        sender.connect(receiver.local_addr().unwrap()).await.unwrap();
+        let stop = CancellationToken::new();
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let output_frames = Arc::clone(&recorded);
+        let output_stop = stop.clone();
+        let receive_task = tokio::spawn(receive::run_with_output(
+            receiver, stop.clone(), [9; 32], AudioChannelDirection::ClientToHost,
+            IpAddr::V4(Ipv4Addr::LOCALHOST), stream.clone(),
+            move || Ok(Box::new(RecordingOutput {
+                frames: Arc::clone(&output_frames), stop: output_stop.clone(), expected: 8,
+            })),
+        ));
+        let (feed, frames) = std::sync::mpsc::channel();
+        let mut frames = Some(frames);
+        let send_task = tokio::spawn(send::run_with_input(
+            sender, stop.clone(), [9; 32], AudioChannelDirection::ClientToHost, stream.clone(),
+            move || Ok(Box::new(FeedInput { frames: frames.take().expect("测试采集端不应重建") })),
+        ));
+        // 按帧时长供给, 穿过产品接收端的启动丢弃窗口, 避免制造人为网络积压.
+        let progress = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut timer = tokio::time::interval(Duration::from_millis(5));
+            let mut sample_index = 0usize;
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = stop.cancelled() => break,
+                    _ = timer.tick() => {
+                        let pcm = (0..stream.samples_per_frame()).map(|index| {
+                            let channel = index % usize::from(stream.channels);
+                            let sample = sample_index + index / usize::from(stream.channels);
+                            (sample as f32 * (150.0 + channel as f32 * 75.0)
+                                * std::f32::consts::TAU / stream.sample_rate as f32).sin() * 0.1
+                        }).collect();
+                        sample_index += stream.frame_size();
+                        if feed.send(pcm).is_err() { break; }
+                    }
+                }
+            }
+        }).await;
+        stop.cancel();
+        tokio::time::timeout(Duration::from_secs(2), send_task).await.unwrap().unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), receive_task).await.unwrap().unwrap().unwrap();
+        assert!(progress.is_ok());
+        let frames = recorded.lock().unwrap();
+        assert_eq!(frames.len(), 8);
+        assert!(frames.iter().all(|frame| frame.len() == stream.samples_per_frame()
+            && frame.iter().all(|sample| sample.is_finite())));
+        for channel in 0..usize::from(stream.channels) {
+            let energy: f32 = frames.iter().flat_map(|frame| frame.iter().skip(channel)
+                .step_by(usize::from(stream.channels))).map(|sample| sample * sample).sum();
+            assert!(energy > 0.001, "{layout:?} 声道 {channel} 不应静音");
+        }
+    }
 }
 
 struct RecordingOutput {

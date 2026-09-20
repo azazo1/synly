@@ -1,4 +1,5 @@
 use super::*;
+use std::time::Instant;
 use crate::audio::config::{AudioLayout, CodecConfig};
 
 unsafe extern "C" {
@@ -33,9 +34,12 @@ fn dummy_playback_exercises_real_sdl_queue_and_reinitialization() {
             }
             let queued = unsafe { SDL_GetQueuedAudioSize(output.device) };
             assert_eq!(queued as usize, packets as usize * output.frame_bytes);
-            assert!(matches!(output.submit_frame(&frame, Duration::ZERO),
-                Err(Error::Io(ref error)) if error.kind() == std::io::ErrorKind::TimedOut));
+            output.submit_frame(&[], Duration::ZERO).unwrap();
             assert_eq!(unsafe { SDL_GetQueuedAudioSize(output.device) }, queued);
+            // 对照上游: 暂停状态不算 STOPPED, 耗尽轮询仍追加一帧.
+            output.submit_frame(&frame, Duration::ZERO).unwrap();
+            assert_eq!(unsafe { SDL_GetQueuedAudioSize(output.device) } as usize,
+                queued as usize + output.frame_bytes);
             unsafe { SDL_PauseAudioDevice(output.device, 0) };
             // 驱动实际消费队列后应恢复提交. 不断言精确调度时延.
             let deadline = Instant::now() + Duration::from_secs(3);

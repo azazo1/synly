@@ -66,6 +66,21 @@ static void test_budget_and_timeouts(void) {
 }
 
 static void test_zero_fill_and_wrap(void) {
+  ARPlaybackRing diagnostic;
+  assert(ar_playback_ring_init(&diagnostic, 8000, 2, 40) == 0);
+  float tone[80] = {0.25f}, probe[160];
+  fill(&diagnostic, probe, 80);
+  assert(atomic_load(&diagnostic.resumed_gaps) == 0);
+  assert(ar_playback_ring_submit(&diagnostic, tone, 80, 0) == 0);
+  fill(&diagnostic, probe, 160);
+  fill(&diagnostic, probe, 80);
+  assert(atomic_load(&diagnostic.resumed_gaps) == 0);
+  assert(ar_playback_ring_submit(&diagnostic, tone, 80, 0) == 0);
+  fill(&diagnostic, probe, 80);
+  assert(atomic_load(&diagnostic.resumed_gaps) == 1);
+  fill(&diagnostic, probe, 80);
+  assert(atomic_load(&diagnostic.resumed_gaps) == 1);
+  ar_audio_ring_free(&diagnostic.samples);
   ARPlaybackRing ring;
   assert(ar_playback_ring_init(&ring, 8000, 2, 40) == 0);
   float frame[80], out[160];

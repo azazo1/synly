@@ -29,7 +29,7 @@ just audio-renderer-test /path/to/moonlight-qt
 
 ## 可选 SDL2 产品后端
 
-工程现在提供 `sdl2-audio` feature. 启用后, `platform::open_output` 选择 `src/audio/sdl2.rs` 的 raw SDL2 FFI; 默认 feature 仍使用 WASAPI/AudioQueue. 该实现复用了原始 renderer 的 float32, `max(480, 3 * samplesPerFrame)`, queued-audio 水位和 stopped-device 检查, 并把 SDL 入队失败报告为可恢复错误.
+工程现在提供 `sdl2-audio` feature. 启用后, `platform::open_output` 选择 `src/audio/sdl2.rs` 的 raw SDL2 FFI; 默认 feature 仍使用 WASAPI/AudioQueue. 该实现复用了原始 renderer 的 float32, `max(480, 3 * samplesPerFrame)`, queued-audio 水位和 stopped-device 检查, 并按上游在 SDL 入队失败时记录错误后返回成功.
 
 SDL2 打开入口在初始化子系统前验证 PCM 请求: Opus 支持的 8/12/16/24/48 kHz, 2/6/8 声道和 5/10/20/40/60 ms. 一帧内存也在打开设备前准备. 空或含 NUL 的设备标识返回 InvalidConfig; 其他指定设备标识返回 UnsupportedPlatform. 平台设备标识并不等同 SDL 显示名称, 当前仅支持默认输出, 不会静默丢弃指定设备要求. `validation_tests.rs` 覆盖 75 个合法参数组合, 并通过平台入口验证非法参数的提前拒绝, 不打开声卡.
 
@@ -39,16 +39,18 @@ SDL2 不在 Cargo.lock 中, 也没有被自动安装. 启用 feature 时需要�
 
 `src/audio/sdl2/lifecycle.rs` 将子系统初始化, 引用发布和最后一次退出放在同一互斥锁内. 初始化失败不增加引用, 最后一次退出完成前不能开始新初始化. 锁不进入 PCM 提交路径, 只约束输出对象的创建与销毁. 生命周期回归使用内存替身, 检查失败重试, 多引用释放顺序, Init/Quit 持锁边界和 8 线程共 8,000 次引用操作. 这不验证外部组件直接调用 SDL 的生命周期, 也不替代驱动测试.
 
-SDL2 提交由 `src/audio/sdl2/backpressure.rs` 等待整包取整后的队列水位降到 50 ms 以内, 每次等待请求不超过 1 ms, 时间预算取调用方 timeout 与 100 ms 的较小值. 每轮先检查设备状态, 包括最后一次等待后. 队列恢复后才复制和提交 PCM. 零 timeout 可立即提交低水位队列; 已经等待过的调用到达截止时间后拒绝提交, 即使此时队列刚恢复. 系统调度可能使实际唤醒晚于预算, 不把该预算表述为硬实时保证.
+SDL2 提交的 `src/audio/sdl2/backpressure.rs` 对照上游 `sdlaud.cpp:112-125`: 最多 100 次先检查 STOPPED, 再按整包取整比较 50 ms 水位, 超水位调用 `SDL_Delay(1)`. 耗尽 100 次后仍入队, 不追加状态检查. 空帧直接成功; SDL_QueueAudio 负返回值记录错误, 仍向上层返回成功, 避免与上游不同的设备重建. SDL 分支使用固定轮询次数, 不采用 AudioOutput 的调用方 timeout. 系统调度可延长实际等待, 100 次不是硬实时 100 ms 保证.
 
-这是有意的上游差异: 原始 SDL renderer 等待 100 次后继续入队, Synly 返回 TimedOut 并交给既有恢复路径. 虚拟时间测试覆盖三种布局和五种时长的 30 个水位边界, 等待中消费, 0/0.5/8/100 ms 预算, 以及首次/2 ms/100 ms 时设备停止, 不调用真实音频设备.
+内存测试覆盖三种布局和五种时长的 30 个水位边界, 等待中消费, 耗尽后继续以及第 0/2/99/100 次等待后的停止状态边界. 最后一个边界与原始循环一致, 第 100 次等待后才停止不会由该次提交检测到. 原生后端仍保留自己的超时错误语义.
+
+`src/audio/sdl2/submission.rs` 由实际 SdlOutput 调用, 将设备查询/延时/入队作为闭包边界. 故障注入测试验证入队错误后本次仍成功且下帧可提交, STOPPED 查询错误会阻止复制和入队, 空帧/不完整帧不会调用设备, 100 次等待耗尽后仅入队一次. 测试不依赖错误文案, 不故意破坏真实设备; SDL 错误码到 Rust 错误的 FFI 包装仍由源码对照, dummy 路径验证成功入队.
 
 音频 runtime 提供 `bind_and_spawn_receiver_with_config` 和 `spawn_sender_with_config`, 让上层会话传入 `CodecConfig` 选择 stereo, 5.1 或 7.1. `AudioUdpReady` 携带 `AudioLayout`, 由接收端声明布局, 发送端按声明编码. 这不是探测两端声卡能力并自动选择布局. 两个公开入口在绑定 UDP 和启动任务前同步调用 `CodecConfig::stream_params`, 将已解析参数交给后台流水线. 无效帧时长不会先返回端口或任务句柄再异步失败. `runtime/channel_tests.rs` 在没有 Tokio runtime 的环境下验证两个方向的发送/接收入口拒绝无效时长; 设备可用性和实际 codec 初始化失败仍由工作线程报告.
 
 本机通过 `pkg-config` 检测到 SDL2 2.32.70. 新增的 `just audio-sdl2-test` 会先要求 `pkg-config --exists sdl2`, 再由 `build.rs` 在 `sdl2-audio` feature 下解析 SDL2 的 `-L` 和 `-l` flags. 该 recipe 已完成真实 SDL2 链接, 运行布局测试和 feature Clippy. 测试没有调用 `SdlOutput::open`, 所以没有打开真实音频设备.
 
 
-独立入口 `just audio-sdl2-dummy-test` 设置 `SDL_AUDIODRIVER=dummy`, 精确选择一个默认忽略的测试并串行执行. 测试先检查实际驱动名称, 再调用产品打开/提交/关闭代码, 已通过 stereo/5.1/7.1 与五种帧时长的 15 个组合. 暂停设备后检查帧字节数和超水位拒绝不增加队列, 恢复设备后检查消费和重新提交, 最后确认嵌套引用释放与子系统重新初始化. 它使用真实 SDL 库和 dummy 消费线程, 不访问物理声卡, 不验证音质或扬声器映射.
+独立入口 `just audio-sdl2-dummy-test` 设置 `SDL_AUDIODRIVER=dummy`, 精确选择一个默认忽略的测试并串行执行. 测试先检查实际驱动名称, 再调用产品打开/提交/关闭代码, 已通过 stereo/5.1/7.1 与五种帧时长的 15 个组合. 暂停设备后检查帧字节数, 空帧不增加队列, 超水位耗尽轮询仍追加一帧, 恢复设备后检查消费和重新提交, 最后确认嵌套引用释放与子系统重新初始化. 它使用真实 SDL 库和 dummy 消费线程, 不访问物理声卡, 不验证音质或扬声器映射.
 
 `RuntimeConfig.audio_layout` 持久化并沿 `RuntimeOptions` 和 `SyncSessionOptions` 传到 capability refresh. 接收端用该布局启动 codec, 并在 `AudioUdpReady` 中声明; 发送端按声明选择 codec. 旧配置和旧 `AudioUdpReady` 缺少布局时均默认为 stereo. GUI 的 "接收声道" 提供立体声, 5.1 和 7.1, 选择后立即发送保存命令, 下次连接生效. 当前通道继续使用建立时的布局, 不在运行中改动 codec. 此设置不把立体声源自动变成真实环绕声.
 
@@ -67,7 +69,7 @@ SDL2 提交由 `src/audio/sdl2/backpressure.rs` 等待整包取整后的队列�
 
 这里只比较提交前的软件队列, 不包括声卡/系统音频引擎缓冲. Synly 的容量在 50 ms 水位之外预留一完整协商帧, 不是总播放延迟上限为 50 ms.
 
-## 当前逐函数映射
+## 原生后端逐函数映射
 
 | Moonlight 原始位置 | Synly 对应 | 保留或差异 |
 | --- | --- | --- |
@@ -80,4 +82,4 @@ SDL2 提交由 `src/audio/sdl2/backpressure.rs` 等待整包取整后的队列�
 | `submitAudio:127-133` | 原生 submit_frame 错误进入 runtime/render 重建 | Synly 不把入队失败当作成功, 没有复制上游只记录错误的处理 |
 | `getAudioBufferFormat:136-139` | 平台 interleaved f32 | 格式一致, 不证明驱动格式转换行为一致 |
 
-以上对照证明了保留规则和差异的实际控制流, **没有把原始 SDL renderer 接入 Synly 的产品播放路径**. Synly 另外将可移植的网络积压判断集中在 `src/audio/runtime/sdl_policy.rs`, 由 `runtime/render.rs` 使用. 这只复用 SDL renderer 的 30 ms 网络丢弃规则, 没有伪装成 SDL API, 也没有改变原生后端的精确水位和错误语义. 当前 WASAPI/AudioQueue 仍是行为适配. 实现真正 SDL renderer, 或对继续采用原生后端的目标边界作出明确选择, 仍是整体移植目标的未完成项. SDL 生命周期, 真实设备切换, 上层 renderer 重建时序和端到端延迟不能由本替身测试代替.
+上述表格只描述默认原生后端. 可选 SDL2 路径采用 Rust FFI 移植, 没有将原始 C++ 类直接编译进产品. 它已复制 float32/三包请求/整包水位/100 次轮询/入队失败仅记录的规则, 网络积压判断由 `runtime/render.rs` 调用 `sdl_policy.rs` 完成. 生命周期为支持多个输出而使用共享引用管理, 参数预校验和完整非空帧约束也是 Synly 的边界. 真实设备切换, 上层重建时序和端到端延迟仍不能由内存替身或 dummy 驱动证明.

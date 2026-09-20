@@ -9,6 +9,8 @@ mod protocol;
 mod receiver;
 mod runtime;
 mod sender;
+#[cfg(all(test, target_os = "macos"))]
+mod hardware_tests;
 #[cfg(feature = "sdl2-audio")]
 mod sdl2;
 
