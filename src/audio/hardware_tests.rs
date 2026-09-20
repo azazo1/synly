@@ -32,15 +32,9 @@ fn diagnostic_tone_has_no_frame_boundary_phase_reset() {
     assert!(energy > 8.0 && energy < 10.0);
 }
 
-#[test]
-#[ignore = "访问真实声卡并播放提示音, 必须经用户允许后单独运行"]
-fn local_capture_and_playback() {
-    assert_eq!(std::env::var("SYNLY_AUDIO_HARDWARE_TEST").as_deref(), Ok("1"));
-    let _diagnostic_log = tracing::subscriber::set_default(
-        tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).with_writer(std::io::stderr).finish(),
-    );
+fn play_diagnostic_tone() {
     let stream = CodecConfig::default().stream_params().unwrap();
-    eprintln!("[1/2] 播放低音量 440 Hz 提示音, 约 1 秒");
+    eprintln!("播放低音量 440 Hz 提示音, 约 1 秒");
     {
         let mut output = super::platform::open_output(&PlaybackConfig::default(), &stream).unwrap();
         let mut longest_submit = Duration::ZERO;
@@ -55,6 +49,30 @@ fn local_capture_and_playback() {
             playback_started.elapsed().as_millis(), longest_submit.as_micros());
         std::thread::sleep(Duration::from_millis(300));
     }
+}
+
+#[test]
+#[ignore = "仅播放真实声卡提示音, 必须经用户允许后单独运行"]
+fn local_playback_only() {
+    assert_eq!(std::env::var("SYNLY_AUDIO_HARDWARE_TEST").as_deref(), Ok("1"));
+    let _diagnostic_log = tracing::subscriber::set_default(
+        tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).with_writer(std::io::stderr).finish(),
+    );
+    eprintln!("纯播放诊断: 不采集声音, 不建立网络连接");
+    play_diagnostic_tone();
+    eprintln!("播放提交完成. 是否有点噪仍需听感确认, 测试通过仅说明 API 未报错");
+}
+
+#[test]
+#[ignore = "访问真实声卡并播放提示音, 必须经用户允许后单独运行"]
+fn local_capture_and_playback() {
+    assert_eq!(std::env::var("SYNLY_AUDIO_HARDWARE_TEST").as_deref(), Ok("1"));
+    let _diagnostic_log = tracing::subscriber::set_default(
+        tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).with_writer(std::io::stderr).finish(),
+    );
+    let stream = CodecConfig::default().stream_params().unwrap();
+    eprintln!("[1/2] 播放诊断");
+    play_diagnostic_tone();
     eprintln!("[2/2] 采集系统音频 5 秒, 仅统计帧数与峰值, 不保存 PCM");
     let mut input = None;
     for attempt in 1..=3 {
