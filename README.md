@@ -74,6 +74,16 @@ git push origin main --follow-tags
 
 正式发布 Android 签名 APK 前, 在仓库 secrets 中设置 `SYNLY_ANDROID_KEYSTORE_BASE64`, `SYNLY_ANDROID_KEYSTORE_PASSWORD`, `SYNLY_ANDROID_KEY_ALIAS` 和 `SYNLY_ANDROID_KEY_PASSWORD`. 未设置时 tag 发布会失败, 分支/PR 和空 tag 手动触发仍构建 debug APK.
 
+### 从便携版迁移到安装版
+
+0.10.1 及更早的 Windows zip 与 Linux tar.gz 是解压即用的便携形态, 它们按 `-portable` 变体匹配更新资产, 而新版本只提供安装包, 所以旧实例不会自己跨过来, 需要手动迁移一次:
+
+1. 退出正在运行的旧实例, Windows 从托盘退出, Linux 结束进程.
+2. 安装新版本: Windows 运行 `synly-<version>-windows-<arch>-setup.exe`, Linux 解包 `synly-<version>-linux-<arch>-setup.tar.gz` 后执行 `./install.sh --silent`.
+3. 从新的入口启动一次 (Windows 开始菜单, Linux `~/.local/bin/synly`), 确认设置与受信设备都还在, 再删除旧的解包目录.
+
+迁移只更换程序文件: 数据目录不变, 安装与卸载都不会触碰它, 迁移后的版本可以继续自动更新. 安装布局见各平台小节.
+
 ### Windows
 
 推荐使用 MSVC 工具链和 Windows 10/11 SDK. 音频依赖 Opus. 发布构建还需要动态 SDL2 和 Inno Setup 6.3 以上 (即 `ISCC.exe`, 放在 PATH 或默认安装位置, 也可以用 `SYNLY_ISCC` 指定).
