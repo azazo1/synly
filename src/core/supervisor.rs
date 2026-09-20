@@ -299,17 +299,29 @@ impl AppSupervisor {
                 self.publish();
             }
             AppCommand::SetAudioLayout(layout) => {
-                self.snapshot.desired.audio_layout = layout;
-                self.config.runtime.audio_layout = layout;
-                self.save_settings();
-                // 布局属于连接建立时的协商参数, 不更改现有通道的 codec.
-                self.snapshot.pending = (audio_layout_pending(
-                    self.snapshot.applied.as_ref(), &self.snapshot.desired,
-                ) || capability_fields_changed(
-                    self.snapshot.applied.as_ref(), &self.snapshot.desired,
-                )).then(|| self.snapshot.desired.clone());
-                tracing::info!(?layout, "音频接收布局已保存, 下次连接生效");
-                self.publish();
+                if self.snapshot.desired.audio_layout != layout {
+                    let connected = self.session.is_some();
+                    self.snapshot.desired.audio_layout = layout;
+                    self.config.runtime.audio_layout = layout;
+                    self.save_settings();
+                    if connected {
+                        // 布局属于连接建立时的协商参数, 无法在现有通道上热改,
+                        // 因此变更后立刻安全重连, 让新布局当场生效.
+                        tracing::info!(?layout, "音频接收布局变化, 安全重连后生效");
+                        self.snapshot.pending = Some(self.snapshot.desired.clone());
+                        self.snapshot.lifecycle = AppLifecycle::Reconfiguring;
+                        self.publish();
+                        self.stop_session().await;
+                        self.start_session().await;
+                    } else {
+                        self.snapshot.pending = audio_layout_pending(
+                            self.snapshot.applied.as_ref(), &self.snapshot.desired,
+                        )
+                        .then(|| self.snapshot.desired.clone());
+                        tracing::info!(?layout, "音频接收布局已保存, 连接时生效");
+                        self.publish();
+                    }
+                }
             }
             AppCommand::SetInputMode(mode) => {
                 self.snapshot.desired.input.mode = mode;
@@ -333,13 +345,7 @@ impl AppSupervisor {
                 }
             }
             AppCommand::Disconnect => self.stop_session().await,
-            AppCommand::DisconnectPeer(device_id) => {
-                if let Some(session) = &self.session {
-                    let _ = session
-                        .commands
-                        .send(RuntimeCommand::DisconnectPeer(device_id));
-                }
-            }
+            AppCommand::DisconnectPeer(device_id) => self.disconnect_peer(device_id).await,
             AppCommand::SwitchActiveSession(device_id) => {
                 if let Some(session) = &self.session {
                     let _ = session
@@ -371,20 +377,18 @@ impl AppSupervisor {
                         self.config.preferred_active = None;
                         self.save_settings();
                     }
-                    if let Some(session) = &self.session {
-                        if was_preferred {
-                            let _ = session.commands.send(RuntimeCommand::ClearPreferredActive);
-                        }
-                        if self
-                            .snapshot
-                            .sessions
-                            .iter()
-                            .any(|session| session.device_id == device_id)
-                        {
-                            let _ = session
-                                .commands
-                                .send(RuntimeCommand::DisconnectPeer(device_id));
-                        }
+                    if was_preferred
+                        && let Some(session) = &self.session
+                    {
+                        let _ = session.commands.send(RuntimeCommand::ClearPreferredActive);
+                    }
+                    if self
+                        .snapshot
+                        .sessions
+                        .iter()
+                        .any(|session| session.device_id == device_id)
+                    {
+                        self.disconnect_peer(device_id).await;
                     }
                     self.publish();
                 }
@@ -832,6 +836,28 @@ impl AppSupervisor {
         self.publish();
     }
 
+    /// 断开指定对端.
+    ///
+    /// host 侧由 runtime 逐个结束对应会话; join 侧只连接一个对端, 而且它的 runtime 不接收
+    /// 运行时命令, 所以这里直接结束整个会话, 否则设备列表里的 "断开" 不会有任何反应.
+    async fn disconnect_peer(&mut self, device_id: Uuid) {
+        let join_side = self.snapshot.desired.connection != Some(ConnectionPreference::Host);
+        let is_current_peer = self.snapshot.sessions.is_empty()
+            || self
+                .snapshot
+                .sessions
+                .iter()
+                .any(|session| session.device_id == device_id);
+        if join_side && is_current_peer && self.session.is_some() {
+            tracing::info!(%device_id, "join 侧断开当前对端, 结束本次会话");
+            self.stop_session().await;
+            return;
+        }
+        if let Some(session) = &self.session {
+            let _ = session.commands.send(RuntimeCommand::DisconnectPeer(device_id));
+        }
+    }
+
     fn update_capabilities(&mut self) {
         let capabilities = self.current_capabilities();
         if let Some(session) = &self.session {
@@ -1229,6 +1255,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn join_side_disconnect_peer_stops_the_session() {
+        let (mut supervisor, _) = AppSupervisor::new(test_config(), false);
+        let device_id = Uuid::new_v4();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let task_shutdown = shutdown.clone();
+        let task = tokio::spawn(async move {
+            task_shutdown.cancelled().await;
+        });
+        let (capabilities, _) = watch::channel(RuntimeCapabilities {
+            clipboard_mode: ClipboardMode::Off,
+            audio_mode: AudioMode::Off,
+            input_mode: InputMode::Off,
+        });
+        let (tuning, _) = watch::channel(test_tuning());
+        supervisor.session = Some(SessionHandle {
+            id: Uuid::new_v4(),
+            shutdown,
+            capabilities,
+            tuning,
+            commands: mpsc::unbounded_channel().0,
+            task,
+        });
+        supervisor.snapshot.desired.connection = Some(ConnectionPreference::Join);
+        supervisor.snapshot.sessions = vec![SessionView {
+            device_id,
+            display_name: "host".to_string(),
+            active: true,
+            remote_capabilities: None,
+            capability_epoch: None,
+            capabilities_acknowledged: true,
+        }];
+
+        // join 侧的 runtime 不接收运行时命令, 断开列表里的对端必须直接结束会话.
+        supervisor
+            .handle_command(AppCommand::DisconnectPeer(device_id))
+            .await;
+
+        assert!(supervisor.session.is_none());
+        assert!(supervisor.snapshot.sessions.is_empty());
+        assert_eq!(supervisor.snapshot.lifecycle, AppLifecycle::Idle);
+    }
+
+    #[tokio::test]
     async fn stale_session_finish_does_not_clear_current_session() {
         let (mut supervisor, _) = AppSupervisor::new(test_config(), false);
         let current_session_id = Uuid::new_v4();
@@ -1244,7 +1313,35 @@ mod tests {
             input_mode: InputMode::Off,
         };
         let (capabilities, _) = watch::channel(capabilities);
-        let (tuning, _) = watch::channel(RuntimeTuning {
+        let (tuning, _) = watch::channel(test_tuning());
+        supervisor.session = Some(SessionHandle {
+            id: current_session_id,
+            shutdown: shutdown.clone(),
+            capabilities,
+            tuning,
+            commands: mpsc::unbounded_channel().0,
+            task,
+        });
+        supervisor.snapshot.applied = Some(RuntimeConfig::default());
+
+        supervisor
+            .handle_internal_event(InternalEvent::SessionFinished {
+                session_id: stale_session_id,
+                result: Ok(()),
+            })
+            .await;
+
+        assert_eq!(
+            supervisor.session.as_ref().map(|session| session.id),
+            Some(current_session_id)
+        );
+        assert!(supervisor.snapshot.applied.is_some());
+        shutdown.cancel();
+        supervisor.session.take().unwrap().task.await.unwrap();
+    }
+
+    fn test_tuning() -> RuntimeTuning {
+        RuntimeTuning {
             interval_secs: 3,
             sync_delete: false,
             notifications_enabled: true,
@@ -1270,31 +1367,7 @@ mod tests {
                 max_cache_bytes: None,
                 cache_dir: std::path::PathBuf::from("."),
             },
-        });
-        supervisor.session = Some(SessionHandle {
-            id: current_session_id,
-            shutdown: shutdown.clone(),
-            capabilities,
-            tuning,
-            commands: mpsc::unbounded_channel().0,
-            task,
-        });
-        supervisor.snapshot.applied = Some(RuntimeConfig::default());
-
-        supervisor
-            .handle_internal_event(InternalEvent::SessionFinished {
-                session_id: stale_session_id,
-                result: Ok(()),
-            })
-            .await;
-
-        assert_eq!(
-            supervisor.session.as_ref().map(|session| session.id),
-            Some(current_session_id)
-        );
-        assert!(supervisor.snapshot.applied.is_some());
-        shutdown.cancel();
-        supervisor.session.take().unwrap().task.await.unwrap();
+        }
     }
 
     fn test_config() -> SynlyConfig {
