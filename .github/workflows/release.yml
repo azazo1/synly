@@ -271,9 +271,12 @@ jobs:
         run: |
           set -euo pipefail
           setup="dist/synly-$PACKAGE_VERSION-linux-${{ matrix.arch }}-setup.tar.gz"
-          tar -tzf "$setup" | grep -qx 'install.sh'
-          tar -tzf "$setup" | grep -q '^payload/'
-          tar -tzf "$setup" | grep -q '^payload/synly$'
+          # 归档列表可能长过管道缓冲, 直接接 grep -q 会让 tar 在 grep 退出后收到 SIGPIPE,
+          # pipefail 下整条管道就失败了, 所以先落成变量再匹配.
+          listing="$(tar -tzf "$setup")"
+          grep -qx 'install.sh' <<<"$listing"
+          grep -q '^payload/' <<<"$listing"
+          grep -qx 'payload/synly' <<<"$listing"
 
           staging="$(mktemp -d)"
           prefix="$(mktemp -d)"
