@@ -40,6 +40,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -107,6 +108,11 @@ private fun HomeScreen(onOpenSettings: () -> Unit, onOpenLogs: () -> Unit) {
     var batteryIgnored by remember { mutableStateOf(false) }
     var revealReceived by remember { mutableStateOf(false) }
     val lifecycleOwner = LocalLifecycleOwner.current
+    LaunchedEffect(uiState.state) {
+        if (uiState.state == FfiClientState.CONNECTED) {
+            settings = SettingsStore.load(context)
+        }
+    }
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
@@ -177,6 +183,7 @@ private fun HomeScreen(onOpenSettings: () -> Unit, onOpenLogs: () -> Unit) {
                             Text("最近连接", style = MaterialTheme.typography.titleSmall)
                             settings.recentTargets.forEach { target ->
                                 RecentTargetCard(
+                                    label = SynlyEngine.targetLabel(context, target),
                                     target = target,
                                     onClick = { connectSync(context, target) },
                                 )
@@ -554,11 +561,11 @@ private fun StatusCard(
 }
 
 @Composable
-private fun RecentTargetCard(target: SynlyTarget, onClick: () -> Unit) {
+private fun RecentTargetCard(label: String, target: SynlyTarget, onClick: () -> Unit) {
     OutlinedCard(onClick = onClick, modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text(
-                target.peerDeviceId?.let { "已连接设备 $it" } ?: "历史地址",
+                label,
                 style = MaterialTheme.typography.titleSmall,
             )
             Text(

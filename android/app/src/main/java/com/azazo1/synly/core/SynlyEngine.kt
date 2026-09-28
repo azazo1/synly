@@ -290,7 +290,7 @@ object SynlyEngine {
         start(context, allowAutoReconnect = false)
     }
 
-    private fun targetLabel(context: Context, target: SynlyTarget): String {
+    fun targetLabel(context: Context, target: SynlyTarget): String {
         val trustedName = target.peerDeviceId
             ?.let { id ->
                 TrustedDeviceStore.list(context).firstOrNull { it.deviceId == id }?.deviceName

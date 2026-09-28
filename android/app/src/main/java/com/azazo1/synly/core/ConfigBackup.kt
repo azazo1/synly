@@ -109,7 +109,9 @@ object ConfigBackup {
     private fun parseTargets(array: JSONArray?): List<SynlyTarget> {
         if (array == null) return emptyList()
         return (0 until array.length()).mapNotNull { index ->
-            parseTarget(array.optJSONObject(index))
+            array.optJSONObject(index)?.let { obj ->
+                runCatching { parseTarget(obj) }.getOrNull()
+            }
         }
     }
 
