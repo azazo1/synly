@@ -7,24 +7,6 @@ import android.graphics.BitmapFactory
 import java.io.ByteArrayOutputStream
 
 object ClipboardReader {
-    @Volatile
-    private var lastSignature: String? = null
-
-    @Volatile
-    private var suppressSignature: String? = null
-
-    fun takePending(context: Context, onPayload: (ClipboardPayload) -> Unit) {
-        val payload = readNow(context) ?: return
-        val signature = payload.signature()
-        if (signature == lastSignature) return
-        lastSignature = signature
-        if (signature == suppressSignature) {
-            suppressSignature = null
-            return
-        }
-        onPayload(payload)
-    }
-
     fun readNow(context: Context): ClipboardPayload? {
         val clipboard = context.getSystemService(ClipboardManager::class.java)
         val clip = clipboard.primaryClip ?: return null
@@ -57,19 +39,6 @@ object ClipboardReader {
             }
         }
         return null
-    }
-
-    fun suppress(payload: ClipboardPayload) {
-        suppressSignature = payload.signature()
-    }
-
-    fun markSent(payload: ClipboardPayload) {
-        lastSignature = payload.signature()
-    }
-
-    fun reset() {
-        lastSignature = null
-        suppressSignature = null
     }
 
     private fun readImageBytes(context: Context, uri: android.net.Uri): ByteArray? {

@@ -36,7 +36,6 @@ object ClipboardSend {
                 clipUris.drop(1).forEach { clip.addItem(ClipData.Item(it)) }
                 context.getSystemService(ClipboardManager::class.java)
                     .setPrimaryClip(clip)
-                ClipboardReader.markSent(payload)
                 if (!SynlyEngine.sendClipboard(payload)) {
                     error("发送失败")
                 }

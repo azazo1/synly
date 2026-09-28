@@ -14,13 +14,10 @@ import kotlinx.coroutines.withContext
 
 /**
  * 手动发送剪贴板的读取界面.
- * 用户点击通知或快速发送按钮后, 通过本界面读取当前剪贴板并同步给桌面端,
- * 完成后立即关闭.
+ * 用户点击通知操作或首页快速发送按钮后, 通过本界面读取当前剪贴板并同步给桌面端,
+ * 完成后立即关闭. 应用不会在剪贴板变化时自动读取和发送.
  */
 class ClipboardReadActivity : ComponentActivity() {
-    private val manual: Boolean
-        get() = intent.getBooleanExtra(EXTRA_MANUAL, false)
-
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         SynlyEngine.init(applicationContext)
@@ -41,35 +38,24 @@ class ClipboardReadActivity : ComponentActivity() {
         lifecycleScope.launch {
             try {
                 val message = withContext(Dispatchers.IO) {
-                    if (manual) {
+                    if (!SynlyEngine.canSend()) {
+                        SynlyEngine.start(applicationContext)
+                        val deadline = System.currentTimeMillis() + CONNECT_WAIT_MS
+                        while (System.currentTimeMillis() < deadline && !SynlyEngine.canSend()) {
+                            delay(100)
+                        }
                         if (!SynlyEngine.canSend()) {
-                            SynlyEngine.start(applicationContext)
-                            val deadline = System.currentTimeMillis() + CONNECT_WAIT_MS
-                            while (System.currentTimeMillis() < deadline && !SynlyEngine.canSend()) {
-                                delay(100)
-                            }
-                            if (!SynlyEngine.canSend()) {
-                                return@withContext getString(R.string.send_clipboard_disconnected)
-                            }
+                            return@withContext getString(R.string.send_clipboard_disconnected)
                         }
-                        val payload = ClipboardReader.readNow(applicationContext)
-                            ?: return@withContext getString(R.string.send_clipboard_empty)
-                        if (!SynlyEngine.sendClipboard(payload)) {
-                            return@withContext getString(R.string.send_clipboard_failed)
-                        }
-                        getString(R.string.send_clipboard_sent)
-                    } else {
-                        if (SynlyEngine.canSend()) {
-                            ClipboardReader.takePending(applicationContext) { payload ->
-                                SynlyEngine.sendClipboard(payload)
-                            }
-                        }
-                        null
                     }
+                    val payload = ClipboardReader.readNow(applicationContext)
+                        ?: return@withContext getString(R.string.send_clipboard_empty)
+                    if (!SynlyEngine.sendClipboard(payload)) {
+                        return@withContext getString(R.string.send_clipboard_failed)
+                    }
+                    getString(R.string.send_clipboard_sent)
                 }
-                if (message != null) {
-                    Toast.makeText(this@ClipboardReadActivity, message, Toast.LENGTH_SHORT).show()
-                }
+                Toast.makeText(this@ClipboardReadActivity, message, Toast.LENGTH_SHORT).show()
             } finally {
                 finish()
             }
@@ -77,8 +63,6 @@ class ClipboardReadActivity : ComponentActivity() {
     }
 
     companion object {
-        const val EXTRA_MANUAL = "manual"
-
         private const val READ_DELAY_MS = 120L
         private const val CONNECT_WAIT_MS = 3000L
     }

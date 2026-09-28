@@ -4,7 +4,6 @@ import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
-import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.net.ConnectivityManager
@@ -17,7 +16,6 @@ import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.azazo1.synly.MainActivity
 import com.azazo1.synly.R
-import com.azazo1.synly.core.ClipboardReadGate
 import com.azazo1.synly.core.SynlyEngine
 import com.azazo1.synly.core.SynlyLog
 import kotlinx.coroutines.CoroutineScope
@@ -61,10 +59,6 @@ class ClipboardSyncService : android.app.Service() {
     private var lastNotificationDevice: String? = null
     private var lastNotificationTarget: String? = null
 
-    private val clipboardListener = ClipboardManager.OnPrimaryClipChangedListener {
-        maybeReadClipboard()
-    }
-
     override fun onCreate() {
         super.onCreate()
         createChannel()
@@ -80,8 +74,6 @@ class ClipboardSyncService : android.app.Service() {
         )
         acquireMulticastLock()
         monitorDefaultNetwork()
-        getSystemService(ClipboardManager::class.java)
-            .addPrimaryClipChangedListener(clipboardListener)
         if (notificationJob == null) {
             notificationJob = scope.launch {
                 SynlyEngine.uiState.collect { ui ->
@@ -106,8 +98,6 @@ class ClipboardSyncService : android.app.Service() {
 
     override fun onDestroy() {
         stopForeground(STOP_FOREGROUND_REMOVE)
-        getSystemService(ClipboardManager::class.java)
-            .removePrimaryClipChangedListener(clipboardListener)
         stopMonitoringDefaultNetwork()
         releaseMulticastLock()
         notificationJob?.cancel()
@@ -154,8 +144,7 @@ class ClipboardSyncService : android.app.Service() {
         val sendClipboardPending = PendingIntent.getActivity(
             this,
             3,
-            Intent(this, ClipboardReadActivity::class.java)
-                .putExtra(ClipboardReadActivity.EXTRA_MANUAL, true),
+            Intent(this, ClipboardReadActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         val target = targetLabel ?: getString(R.string.sync_notification_unknown)
@@ -318,18 +307,4 @@ class ClipboardSyncService : android.app.Service() {
         getSystemService(NotificationManager::class.java)
             .notify(NOTIFICATION_ID, buildNotification(state, connectedDevice, targetLabel))
     }
-
-    private fun maybeReadClipboard() {
-        if (!SynlyEngine.canSend()) return
-        if (!ClipboardReadGate.tryAcquire()) return
-        runCatching {
-            startActivity(
-                Intent(this, ClipboardReadActivity::class.java)
-                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-            )
-        }.onFailure {
-            SynlyLog.w(TAG, "启动剪贴板读取界面失败", it)
-        }
-    }
-
 }

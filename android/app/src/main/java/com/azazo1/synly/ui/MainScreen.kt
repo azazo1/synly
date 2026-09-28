@@ -334,8 +334,7 @@ private fun HomeScreen(onOpenSettings: () -> Unit, onOpenLogs: () -> Unit) {
                             Button(
                                 onClick = {
                                     context.startActivity(
-                                        Intent(context, ClipboardReadActivity::class.java)
-                                            .putExtra(ClipboardReadActivity.EXTRA_MANUAL, true),
+                                        Intent(context, ClipboardReadActivity::class.java),
                                     )
                                 },
                                 modifier = Modifier.weight(1f),

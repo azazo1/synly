@@ -148,7 +148,7 @@ tar -xzf synly-<version>-linux-<arch>-setup.tar.gz
 
 ### Android
 
-Android 端是剪贴板同步客户端, 仅支持局域网内主动连接桌面 host. 它复用 `crates/synly-core` 的协议与加密实现, 通过 uniffi 生成 Kotlin 绑定, UI 使用 Jetpack Compose. Android 10+ 限制后台应用读取剪贴板, 因此后台同步依赖前台服务监听剪贴板变化, 并通过透明的 `ClipboardReadActivity` 短暂抢占前台焦点完成读取 (哈希去重), 需要用户授予"显示在其他应用上层"权限; 前台服务持有网络会话并负责重连.
+Android 端是剪贴板同步客户端, 仅支持局域网内主动连接桌面 host. 它复用 `crates/synly-core` 的协议与加密实现, 通过 uniffi 生成 Kotlin 绑定, UI 使用 Jetpack Compose. Android 10+ 限制后台应用读取剪贴板, 因此发送剪贴板必须由用户主动触发: 首页快速发送按钮或通知栏操作会通过透明的 `ClipboardReadActivity` 短暂抢占前台焦点完成读取, 读取后立即发送并关闭界面; 应用不会在剪贴板内容变化时自动读取和发送. 前台服务持有网络会话并负责重连.
 
 v1 同步范围为文本, HTML 与 PNG 图片, 不支持文件与 RTF. 图片写入剪贴板时通过 FileProvider 提供 content URI. Android 12 及以上每次读取剪贴板时系统可能显示提示, 这是平台行为.
 

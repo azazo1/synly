@@ -374,13 +374,6 @@ object SynlyEngine {
                     event.remotePort?.toInt(),
                     event.remote.deviceId,
                 )
-                if (event.clientToHost) {
-                    val context = SynlyApplication.instance
-                    if (context != null) {
-                        val payload = ClipboardReader.readNow(context)
-                        if (payload != null) sendClipboard(payload)
-                    }
-                }
             }
 
             is FfiClientEvent.ClipboardReceived -> {

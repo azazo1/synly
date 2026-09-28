@@ -43,7 +43,6 @@ object ClipboardWriter {
             else -> ClipData.newPlainText("synly", payload.text)
         } ?: return false
         clipboard.setPrimaryClip(clip)
-        ClipboardReader.suppress(payload)
         return true
     }
 
