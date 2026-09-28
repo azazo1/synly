@@ -298,7 +298,11 @@ object SynlyEngine {
         return trustedName ?: "${target.addresses.joinToString(", ")}:${target.port}"
     }
 
-    private fun rememberConnectedAddress(address: String?, remoteDeviceId: String) {
+    private fun rememberConnectedAddress(
+        address: String?,
+        remotePort: Int?,
+        remoteDeviceId: String,
+    ) {
         val context = SynlyApplication.instance ?: return
         val settings = SettingsStore.load(context)
         val target = settings.lastTarget ?: return
@@ -306,13 +310,18 @@ object SynlyEngine {
         val normalized = address?.trim()?.takeIf { it.isNotEmpty() }
             ?: target.addresses.firstOrNull()
             ?: return
+        val effectivePort = remotePort?.takeIf { it in 1..65535 } ?: target.port
         val addresses = buildList {
             add(normalized)
             target.addresses.forEach { candidate ->
                 if (candidate != normalized) add(candidate)
             }
         }
-        val updatedTarget = target.copy(addresses = addresses, peerDeviceId = remoteDeviceId)
+        val updatedTarget = target.copy(
+            addresses = addresses,
+            port = effectivePort,
+            peerDeviceId = remoteDeviceId,
+        )
         val recentTargets = buildList {
             add(updatedTarget)
             settings.recentTargets.forEach { recent ->
@@ -324,7 +333,7 @@ object SynlyEngine {
         }
         SettingsStore.save(context, settings.copy(lastTarget = updatedTarget, recentTargets = recentTargets))
         currentTarget = updatedTarget
-        SynlyLog.i(TAG, "已记忆最近成功对侧: $normalized:${target.port}")
+        SynlyLog.i(TAG, "已记忆最近成功对侧: $normalized:$effectivePort")
     }
 
     private fun handleEvent(event: FfiClientEvent) {
@@ -360,7 +369,11 @@ object SynlyEngine {
                         canReceive = event.hostToClient,
                     )
                 }
-                rememberConnectedAddress(event.remoteAddress, event.remote.deviceId)
+                rememberConnectedAddress(
+                    event.remoteAddress,
+                    event.remotePort?.toInt(),
+                    event.remote.deviceId,
+                )
                 if (event.clientToHost) {
                     val context = SynlyApplication.instance
                     if (context != null) {

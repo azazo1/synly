@@ -25,7 +25,7 @@ use uuid::Uuid;
 
 const PAIRING_TIMEOUT: Duration = Duration::from_secs(90);
 const TLS_UPGRADE_TIMEOUT: Duration = Duration::from_secs(15);
-const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const RECONNECT_BASE_DELAY: Duration = Duration::from_secs(2);
 const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(20);
 const REDISCOVER_TIMEOUT: Duration = Duration::from_secs(3);
@@ -90,6 +90,7 @@ pub enum ClientEvent {
         clipboard_agreement: SessionAgreement,
         remote_workspace: WorkspaceSummary,
         remote_address: Option<Ipv4Addr>,
+        remote_port: Option<u16>,
     },
     ClipboardReceived(ClipboardPayload),
     Disconnected {
@@ -839,22 +840,19 @@ async fn run_session(
     cancellation: &CancellationToken,
 ) -> Result<()> {
     set_state(state, ClientState::Connected);
-    let remote_address = session
-        .stream
-        .get_ref()
-        .0
-        .peer_addr()
-        .ok()
-        .and_then(|address| match address.ip() {
-            std::net::IpAddr::V4(address) => Some(address),
-            std::net::IpAddr::V6(_) => None,
-        });
+    let remote_socket = session.stream.get_ref().0.peer_addr().ok();
+    let remote_address = remote_socket.and_then(|address| match address.ip() {
+        std::net::IpAddr::V4(address) => Some(address),
+        std::net::IpAddr::V6(_) => None,
+    });
+    let remote_port = remote_socket.map(|address| address.port());
     listener.on_event(ClientEvent::Connected {
         remote: session.remote.clone(),
         agreement: session.agreement.clone(),
         clipboard_agreement: session.clipboard_agreement.clone(),
         remote_workspace: session.remote_workspace.clone(),
         remote_address,
+        remote_port,
     });
     tracing::info!(
         peer = %session.remote.device_name,

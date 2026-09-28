@@ -2116,7 +2116,8 @@ sealed class FfiClientEvent {
         val `clientToHost`: kotlin.Boolean, 
         val `hostToClient`: kotlin.Boolean, 
         val `remoteWorkspaceSummary`: kotlin.String,
-        val `remoteAddress`: kotlin.String?) : FfiClientEvent()
+        val `remoteAddress`: kotlin.String?,
+        val `remotePort`: kotlin.UShort?) : FfiClientEvent()
         
     {
         
@@ -2189,6 +2190,7 @@ public object FfiConverterTypeFfiClientEvent : FfiConverterRustBuffer<FfiClientE
                 FfiConverterBoolean.read(buf),
                 FfiConverterString.read(buf),
                 FfiConverterOptionalString.read(buf),
+                FfiConverterOptionalUShort.read(buf),
                 )
             5 -> FfiClientEvent.ClipboardReceived(
                 FfiConverterOptionalString.read(buf),
@@ -2241,6 +2243,7 @@ public object FfiConverterTypeFfiClientEvent : FfiConverterRustBuffer<FfiClientE
                 + FfiConverterBoolean.allocationSize(value.`hostToClient`)
                 + FfiConverterString.allocationSize(value.`remoteWorkspaceSummary`)
                 + FfiConverterOptionalString.allocationSize(value.`remoteAddress`)
+                + FfiConverterOptionalUShort.allocationSize(value.`remotePort`)
             )
         }
         is FfiClientEvent.ClipboardReceived -> {
@@ -2297,6 +2300,7 @@ public object FfiConverterTypeFfiClientEvent : FfiConverterRustBuffer<FfiClientE
                 FfiConverterBoolean.write(value.`hostToClient`, buf)
                 FfiConverterString.write(value.`remoteWorkspaceSummary`, buf)
                 FfiConverterOptionalString.write(value.`remoteAddress`, buf)
+                FfiConverterOptionalUShort.write(value.`remotePort`, buf)
                 Unit
             }
             is FfiClientEvent.ClipboardReceived -> {
@@ -2593,6 +2597,38 @@ internal object uniffiCallbackInterfaceFfiLogListener {
  * @suppress
  */
 public object FfiConverterTypeFfiLogListener: FfiConverterCallbackInterface<FfiLogListener>()
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalUShort: FfiConverterRustBuffer<kotlin.UShort?> {
+    override fun read(buf: ByteBuffer): kotlin.UShort? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterUShort.read(buf)
+    }
+
+    override fun allocationSize(value: kotlin.UShort?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterUShort.allocationSize(value)
+        }
+    }
+
+    override fun write(value: kotlin.UShort?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterUShort.write(value, buf)
+        }
+    }
+}
 
 
 
