@@ -70,6 +70,7 @@ object ConfigBackup {
             .put("device_name", settings.deviceName)
             .put("auto_reconnect", settings.autoReconnect)
             .put("last_target", targetJson(settings.lastTarget))
+            .put("recent_targets", targetsJson(settings.recentTargets))
     }
 
     private fun parseSettings(obj: JSONObject): SynlySettings {
@@ -81,6 +82,7 @@ object ConfigBackup {
         val maxClipboardCacheBytes =
             obj.optLong("max_clipboard_cache_bytes", 512L * 1024 * 1024)
                 .coerceIn(1L, MAX_CLIPBOARD_CACHE_BYTES)
+        val lastTarget = parseTarget(obj.optJSONObject("last_target"))
         return SynlySettings(
             clipboardMode = clipboardMode,
             mdnsEnabled = obj.optBoolean("mdns_enabled", true),
@@ -92,8 +94,23 @@ object ConfigBackup {
             maxClipboardCacheBytes = maxClipboardCacheBytes,
             deviceName = obj.optString("device_name", DEFAULT_DEVICE_NAME),
             autoReconnect = obj.optBoolean("auto_reconnect", true),
-            lastTarget = parseTarget(obj.optJSONObject("last_target")),
+            lastTarget = lastTarget,
+            recentTargets = parseTargets(obj.optJSONArray("recent_targets"))
+                .ifEmpty { listOfNotNull(lastTarget) },
         )
+    }
+
+    private fun targetsJson(targets: List<SynlyTarget>): JSONArray {
+        val array = JSONArray()
+        targets.forEach { array.put(targetJson(it)) }
+        return array
+    }
+
+    private fun parseTargets(array: JSONArray?): List<SynlyTarget> {
+        if (array == null) return emptyList()
+        return (0 until array.length()).mapNotNull { index ->
+            parseTarget(array.optJSONObject(index))
+        }
     }
 
     private fun targetJson(target: SynlyTarget?): Any {

@@ -111,6 +111,7 @@ private fun HomeScreen(onOpenSettings: () -> Unit, onOpenLogs: () -> Unit) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 batteryIgnored = isIgnoringBatteryOptimizations(context)
+                settings = SettingsStore.load(context)
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
@@ -172,6 +173,15 @@ private fun HomeScreen(onOpenSettings: () -> Unit, onOpenLogs: () -> Unit) {
                 Card {
                     Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Text("局域网设备", style = MaterialTheme.typography.titleMedium)
+                        if (settings.recentTargets.isNotEmpty()) {
+                            Text("最近连接", style = MaterialTheme.typography.titleSmall)
+                            settings.recentTargets.forEach { target ->
+                                RecentTargetCard(
+                                    target = target,
+                                    onClick = { connectSync(context, target) },
+                                )
+                            }
+                        }
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Button(
                                 onClick = {
@@ -539,6 +549,22 @@ private fun StatusCard(
     } else {
         Card(modifier = modifier) {
             content()
+        }
+    }
+}
+
+@Composable
+private fun RecentTargetCard(target: SynlyTarget, onClick: () -> Unit) {
+    OutlinedCard(onClick = onClick, modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(
+                target.peerDeviceId?.let { "已连接设备 $it" } ?: "历史地址",
+                style = MaterialTheme.typography.titleSmall,
+            )
+            Text(
+                "${target.addresses.joinToString()} : ${target.port}",
+                style = MaterialTheme.typography.bodySmall,
+            )
         }
     }
 }

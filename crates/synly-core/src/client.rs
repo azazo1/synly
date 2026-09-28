@@ -334,8 +334,8 @@ async fn connect_with_rediscovery(
         Err(original) => {
             if refresh_target_addresses(target, &config.discovery).await {
                 let socket = connect_any(&target.addresses, target.port).await?;
-                if let Some(socket) = socket {
-                    prioritize_connected_address(target, &socket);
+                if let Some(ref socket) = socket {
+                    prioritize_connected_address(target, socket);
                 }
                 return Ok(socket);
             }
@@ -344,8 +344,8 @@ async fn connect_with_rediscovery(
     }
     if refresh_target_addresses(target, &config.discovery).await {
         let socket = connect_any(&target.addresses, target.port).await?;
-        if let Some(socket) = socket {
-            prioritize_connected_address(target, &socket);
+        if let Some(ref socket) = socket {
+            prioritize_connected_address(target, socket);
         }
         return Ok(socket);
     }
@@ -842,7 +842,7 @@ async fn run_session(
     let remote_address = session
         .stream
         .get_ref()
-        .1
+        .0
         .peer_addr()
         .ok()
         .and_then(|address| match address.ip() {

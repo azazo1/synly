@@ -19,6 +19,7 @@ data class SynlySettings(
     val deviceName: String = DEFAULT_DEVICE_NAME,
     val autoReconnect: Boolean = true,
     val lastTarget: SynlyTarget? = null,
+    val recentTargets: List<SynlyTarget> = emptyList(),
 )
 
 data class SynlyTarget(
@@ -29,22 +30,22 @@ data class SynlyTarget(
 
 object SettingsStore {
     private const val PREFS = "synly_settings"
+    private const val MAX_RECENT_TARGETS = 8
 
     fun load(context: Context): SynlySettings {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        val targetJson = prefs.getString("last_target", null)
-        val lastTarget = targetJson?.let { raw ->
-            runCatching {
-                val obj = JSONObject(raw)
-                SynlyTarget(
-                    addresses = obj.getJSONArray("addresses").let { array ->
-                        (0 until array.length()).map { array.getString(it) }
-                    },
-                    port = obj.getInt("port"),
-                    peerDeviceId = obj.optString("peer_device_id").takeIf { it.isNotBlank() },
-                )
-            }.getOrNull()
+        val lastTarget = prefs.getString("last_target", null)?.let { raw ->
+            runCatching { parseTarget(JSONObject(raw)) }.getOrNull()
         }
+        val recentTargets = prefs.getString("recent_targets", null)?.let { raw ->
+            runCatching {
+                JSONArray(raw).let { array ->
+                    (0 until array.length()).mapNotNull { index ->
+                        array.optJSONObject(index)?.let(::parseTarget)
+                    }
+                }
+            }.getOrDefault(emptyList())
+        } ?: lastTarget?.let(::listOf).orEmpty()
         return SynlySettings(
             clipboardMode = parseMode(prefs.getString("clipboard_mode", null)),
             mdnsEnabled = prefs.getBoolean("mdns_enabled", true),
@@ -63,19 +64,17 @@ object SettingsStore {
             deviceName = prefs.getString("device_name", null) ?: DEFAULT_DEVICE_NAME,
             autoReconnect = prefs.getBoolean("auto_reconnect", true),
             lastTarget = lastTarget,
+            recentTargets = recentTargets.take(MAX_RECENT_TARGETS),
         )
     }
 
     fun save(context: Context, settings: SynlySettings) {
-        val target = settings.lastTarget?.let { target ->
-            val addresses = JSONArray()
-            target.addresses.forEach { addresses.put(it) }
-            JSONObject()
-                .put("addresses", addresses)
-                .put("port", target.port)
-                .put("peer_device_id", target.peerDeviceId.orEmpty())
-                .toString()
-        }
+        val lastTarget = settings.lastTarget?.let(::targetJson)
+        val recentTargets = JSONArray()
+        settings.recentTargets
+            .distinct()
+            .take(MAX_RECENT_TARGETS)
+            .forEach { recentTargets.put(targetJson(it)) }
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .edit()
             .putString("clipboard_mode", settings.clipboardMode.name)
@@ -88,9 +87,34 @@ object SettingsStore {
             .putLong("max_clipboard_cache_bytes", settings.maxClipboardCacheBytes)
             .putString("device_name", settings.deviceName)
             .putBoolean("auto_reconnect", settings.autoReconnect)
-            .putString("last_target", target.orEmpty())
+            .putString("last_target", lastTarget?.toString().orEmpty())
+            .putString("recent_targets", recentTargets.toString())
             .apply()
         ClipboardCache.prune(context)
+    }
+
+    private fun targetJson(target: SynlyTarget): JSONObject {
+        val addresses = JSONArray()
+        target.addresses.forEach { addresses.put(it) }
+        return JSONObject()
+            .put("addresses", addresses)
+            .put("port", target.port)
+            .put("peer_device_id", target.peerDeviceId.orEmpty())
+    }
+
+    private fun parseTarget(obj: JSONObject): SynlyTarget? {
+        val addresses = obj.optJSONArray("addresses") ?: return null
+        val port = obj.optInt("port", -1)
+        if (addresses.length() == 0 || port !in 1..65535) return null
+        val parsedAddresses = (0 until addresses.length())
+            .map { addresses.optString(it).trim() }
+            .filter(String::isNotBlank)
+        if (parsedAddresses.isEmpty()) return null
+        return SynlyTarget(
+            addresses = parsedAddresses,
+            port = port,
+            peerDeviceId = obj.optString("peer_device_id").takeIf { it.isNotBlank() },
+        )
     }
 
     private fun parseMode(raw: String?): FfiClipboardMode {
