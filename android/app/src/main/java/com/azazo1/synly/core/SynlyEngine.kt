@@ -298,6 +298,26 @@ object SynlyEngine {
         return trustedName ?: "${target.addresses.joinToString(", ")}:${target.port}"
     }
 
+    private fun rememberConnectedAddress(address: String, remoteDeviceId: String) {
+        val context = SynlyApplication.instance ?: return
+        val normalized = address.trim()
+        if (normalized.isEmpty()) return
+        val settings = SettingsStore.load(context)
+        val target = settings.lastTarget ?: return
+        if (target.peerDeviceId != null && target.peerDeviceId != remoteDeviceId) return
+        val addresses = buildList {
+            add(normalized)
+            target.addresses.forEach { candidate ->
+                if (candidate != normalized) add(candidate)
+            }
+        }
+        if (addresses == target.addresses) return
+        val updatedTarget = target.copy(addresses = addresses)
+        SettingsStore.save(context, settings.copy(lastTarget = updatedTarget))
+        currentTarget = updatedTarget
+        SynlyLog.i(TAG, "已记忆最近成功地址: $normalized:${target.port}")
+    }
+
     private fun handleEvent(event: FfiClientEvent) {
         if (handle == null && currentTarget == null) return
         when (event) {
@@ -330,6 +350,9 @@ object SynlyEngine {
                         canSend = event.clientToHost,
                         canReceive = event.hostToClient,
                     )
+                }
+                if (event.remoteAddress != null) {
+                    rememberConnectedAddress(event.remoteAddress, event.remote.deviceId)
                 }
                 if (event.clientToHost) {
                     val context = SynlyApplication.instance

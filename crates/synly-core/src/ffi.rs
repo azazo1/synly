@@ -350,6 +350,7 @@ pub enum FfiClientEvent {
         client_to_host: bool,
         host_to_client: bool,
         remote_workspace_summary: String,
+        remote_address: Option<String>,
     },
     ClipboardReceived {
         text: Option<String>,
@@ -390,11 +391,13 @@ impl From<client::ClientEvent> for FfiClientEvent {
                 agreement: _,
                 clipboard_agreement,
                 remote_workspace,
+                remote_address,
             } => Self::Connected {
                 remote: remote.into(),
                 client_to_host: clipboard_agreement.client_to_host,
                 host_to_client: clipboard_agreement.host_to_client,
                 remote_workspace_summary: remote_workspace.summary_lines().join(" | "),
+                remote_address: remote_address.map(|address| address.to_string()),
             },
             client::ClientEvent::ClipboardReceived(payload) => Self::ClipboardReceived {
                 text: payload.text,

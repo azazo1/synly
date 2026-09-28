@@ -89,6 +89,7 @@ pub enum ClientEvent {
         agreement: SessionAgreement,
         clipboard_agreement: SessionAgreement,
         remote_workspace: WorkspaceSummary,
+        remote_address: Option<Ipv4Addr>,
     },
     ClipboardReceived(ClipboardPayload),
     Disconnected {
@@ -325,19 +326,42 @@ async fn connect_with_rediscovery(
     target: &mut ClientTarget,
 ) -> Result<Option<TcpStream>> {
     match connect_any(&target.addresses, target.port).await {
-        Ok(socket @ Some(_)) => return Ok(socket),
+        Ok(Some(socket)) => {
+            prioritize_connected_address(target, &socket);
+            return Ok(Some(socket));
+        }
         Ok(None) => {}
         Err(original) => {
             if refresh_target_addresses(target, &config.discovery).await {
-                return connect_any(&target.addresses, target.port).await;
+                let socket = connect_any(&target.addresses, target.port).await?;
+                if let Some(socket) = socket {
+                    prioritize_connected_address(target, &socket);
+                }
+                return Ok(socket);
             }
             return Err(original);
         }
     }
     if refresh_target_addresses(target, &config.discovery).await {
-        return connect_any(&target.addresses, target.port).await;
+        let socket = connect_any(&target.addresses, target.port).await?;
+        if let Some(socket) = socket {
+            prioritize_connected_address(target, &socket);
+        }
+        return Ok(socket);
     }
     Ok(None)
+}
+
+fn prioritize_connected_address(target: &mut ClientTarget, socket: &TcpStream) {
+    let Ok(std::net::SocketAddr::V4(remote)) = socket.peer_addr() else {
+        return;
+    };
+    let address = *remote.ip();
+    if let Some(index) = target.addresses.iter().position(|candidate| *candidate == address) {
+        target.addresses.swap(0, index);
+    } else {
+        target.addresses.insert(0, address);
+    }
 }
 
 async fn refresh_target_addresses(
@@ -815,11 +839,22 @@ async fn run_session(
     cancellation: &CancellationToken,
 ) -> Result<()> {
     set_state(state, ClientState::Connected);
+    let remote_address = session
+        .stream
+        .get_ref()
+        .1
+        .peer_addr()
+        .ok()
+        .and_then(|address| match address.ip() {
+            std::net::IpAddr::V4(address) => Some(address),
+            std::net::IpAddr::V6(_) => None,
+        });
     listener.on_event(ClientEvent::Connected {
         remote: session.remote.clone(),
         agreement: session.agreement.clone(),
         clipboard_agreement: session.clipboard_agreement.clone(),
         remote_workspace: session.remote_workspace.clone(),
+        remote_address,
     });
     tracing::info!(
         peer = %session.remote.device_name,

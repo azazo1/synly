@@ -7,6 +7,9 @@ import android.app.PendingIntent
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
@@ -32,6 +35,7 @@ class ClipboardSyncService : android.app.Service() {
         private const val CHANNEL_ID = "synly_sync"
         private const val NOTIFICATION_ID = 1
         private const val NOTIFICATION_REFRESH_INTERVAL_MS = 60_000L
+        private const val CELLULAR_EXIT_DELAY_MS = 30_000L
 
         fun start(context: Context) {
             ContextCompat.startForegroundService(
@@ -50,6 +54,9 @@ class ClipboardSyncService : android.app.Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var notificationJob: Job? = null
     private var notificationRefreshJob: Job? = null
+    private var cellularExitJob: Job? = null
+    private var connectivityManager: ConnectivityManager? = null
+    private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var lastNotificationState: FfiClientState? = null
     private var lastNotificationDevice: String? = null
     private var lastNotificationTarget: String? = null
@@ -72,6 +79,7 @@ class ClipboardSyncService : android.app.Service() {
             buildNotification(currentUi.state, currentUi.connectedDevice, currentUi.targetLabel),
         )
         acquireMulticastLock()
+        monitorDefaultNetwork()
         getSystemService(ClipboardManager::class.java)
             .addPrimaryClipChangedListener(clipboardListener)
         if (notificationJob == null) {
@@ -100,6 +108,7 @@ class ClipboardSyncService : android.app.Service() {
         stopForeground(STOP_FOREGROUND_REMOVE)
         getSystemService(ClipboardManager::class.java)
             .removePrimaryClipChangedListener(clipboardListener)
+        stopMonitoringDefaultNetwork()
         releaseMulticastLock()
         notificationJob?.cancel()
         notificationJob = null
@@ -193,6 +202,87 @@ class ClipboardSyncService : android.app.Service() {
             Intent(this, ClipboardSendActivity::class.java).setAction(action),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
+    }
+
+    private fun monitorDefaultNetwork() {
+        if (networkCallback != null) return
+        val manager = getSystemService(ConnectivityManager::class.java) ?: return
+        connectivityManager = manager
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onCapabilitiesChanged(
+                network: Network,
+                networkCapabilities: NetworkCapabilities,
+            ) {
+                scope.launch { evaluateDefaultNetwork(networkCapabilities) }
+            }
+
+            override fun onLost(network: Network) {
+                scope.launch { refreshDefaultNetwork() }
+            }
+        }
+        runCatching {
+            manager.registerDefaultNetworkCallback(callback)
+            networkCallback = callback
+            refreshDefaultNetwork()
+        }.onFailure {
+            connectivityManager = null
+            SynlyLog.w(TAG, "注册默认网络监听失败", it)
+        }
+    }
+
+    private fun refreshDefaultNetwork() {
+        val manager = connectivityManager ?: return
+        val capabilities = manager.activeNetwork?.let(manager::getNetworkCapabilities)
+        evaluateDefaultNetwork(capabilities)
+    }
+
+    private fun evaluateDefaultNetwork(capabilities: NetworkCapabilities?) {
+        if (capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true) {
+            scheduleCellularExit()
+        } else {
+            cancelCellularExit()
+        }
+    }
+
+    private fun scheduleCellularExit() {
+        if (cellularExitJob != null) return
+        SynlyLog.i(TAG, "检测到移动数据, ${CELLULAR_EXIT_DELAY_MS / 1000} 秒后停止后台同步")
+        cellularExitJob = scope.launch {
+            delay(CELLULAR_EXIT_DELAY_MS)
+            if (isDefaultNetworkCellular()) {
+                SynlyLog.i(TAG, "移动数据持续存在, 停止后台同步服务")
+                cellularExitJob = null
+                stopSelf()
+            } else {
+                cellularExitJob = null
+            }
+        }
+    }
+
+    private fun cancelCellularExit() {
+        cellularExitJob?.let {
+            it.cancel()
+            cellularExitJob = null
+            SynlyLog.i(TAG, "默认网络已恢复为非移动数据, 取消自动退出")
+        }
+    }
+
+    private fun isDefaultNetworkCellular(): Boolean {
+        val manager = connectivityManager ?: return false
+        val capabilities = manager.activeNetwork?.let(manager::getNetworkCapabilities)
+        return capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true
+    }
+
+    private fun stopMonitoringDefaultNetwork() {
+        cellularExitJob?.cancel()
+        cellularExitJob = null
+        val manager = connectivityManager
+        val callback = networkCallback
+        if (manager != null && callback != null) {
+            runCatching { manager.unregisterNetworkCallback(callback) }
+        }
+        networkCallback = null
+        connectivityManager = null
     }
 
     private fun acquireMulticastLock() {

@@ -2115,7 +2115,8 @@ sealed class FfiClientEvent {
         val `remote`: uniffi.synly_core.FfiDeviceIdentity, 
         val `clientToHost`: kotlin.Boolean, 
         val `hostToClient`: kotlin.Boolean, 
-        val `remoteWorkspaceSummary`: kotlin.String) : FfiClientEvent()
+        val `remoteWorkspaceSummary`: kotlin.String,
+        val `remoteAddress`: kotlin.String?) : FfiClientEvent()
         
     {
         
@@ -2187,6 +2188,7 @@ public object FfiConverterTypeFfiClientEvent : FfiConverterRustBuffer<FfiClientE
                 FfiConverterBoolean.read(buf),
                 FfiConverterBoolean.read(buf),
                 FfiConverterString.read(buf),
+                FfiConverterOptionalString.read(buf),
                 )
             5 -> FfiClientEvent.ClipboardReceived(
                 FfiConverterOptionalString.read(buf),
@@ -2238,6 +2240,7 @@ public object FfiConverterTypeFfiClientEvent : FfiConverterRustBuffer<FfiClientE
                 + FfiConverterBoolean.allocationSize(value.`clientToHost`)
                 + FfiConverterBoolean.allocationSize(value.`hostToClient`)
                 + FfiConverterString.allocationSize(value.`remoteWorkspaceSummary`)
+                + FfiConverterOptionalString.allocationSize(value.`remoteAddress`)
             )
         }
         is FfiClientEvent.ClipboardReceived -> {
@@ -2293,6 +2296,7 @@ public object FfiConverterTypeFfiClientEvent : FfiConverterRustBuffer<FfiClientE
                 FfiConverterBoolean.write(value.`clientToHost`, buf)
                 FfiConverterBoolean.write(value.`hostToClient`, buf)
                 FfiConverterString.write(value.`remoteWorkspaceSummary`, buf)
+                FfiConverterOptionalString.write(value.`remoteAddress`, buf)
                 Unit
             }
             is FfiClientEvent.ClipboardReceived -> {
