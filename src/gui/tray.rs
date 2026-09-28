@@ -11,17 +11,36 @@ use std::cell::RefCell;
 use std::rc::{Rc, Weak};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 const OPEN_ID: &str = "synly.open";
 const CONNECT_ID: &str = "synly.connect";
-const CLIPBOARD_ID: &str = "synly.clipboard";
-const AUDIO_ID: &str = "synly.audio";
-const INPUT_ID: &str = "synly.input";
+const CLIPBOARD_ID_PREFIX: &str = "synly.clipboard";
+const AUDIO_ID_PREFIX: &str = "synly.audio";
+const INPUT_ID_PREFIX: &str = "synly.input";
 const CHECK_UPDATE_ID: &str = "synly.check-update";
 const AUTO_CHECK_ID: &str = "synly.auto-check";
 const QUIT_ID: &str = "synly.quit";
+
+/// 方向菜单项: (模式, 菜单项 id 后缀, 文案).
+/// 文案与主窗口快捷开关的下拉选项保持一致.
+const CLIPBOARD_MODES: [(ClipboardMode, &str, &str); 4] = [
+    (ClipboardMode::Off, "off", "关闭"),
+    (ClipboardMode::Send, "send", "发送"),
+    (ClipboardMode::Receive, "receive", "接收"),
+    (ClipboardMode::Both, "both", "双向"),
+];
+const AUDIO_MODES: [(AudioMode, &str, &str); 3] = [
+    (AudioMode::Off, "off", "关闭"),
+    (AudioMode::Send, "send", "发送"),
+    (AudioMode::Receive, "receive", "接收"),
+];
+const INPUT_MODES: [(InputMode, &str, &str); 3] = [
+    (InputMode::Off, "off", "关闭"),
+    (InputMode::Send, "send", "发送控制"),
+    (InputMode::Receive, "receive", "接受控制"),
+];
 
 #[derive(Clone)]
 pub struct TrayController {
@@ -46,19 +65,69 @@ struct TrayState {
     app_title: String,
     status_text: String,
     connected: bool,
-    clipboard_enabled: bool,
-    audio_enabled: bool,
-    input_enabled: bool,
+    clipboard_mode: ClipboardMode,
+    audio_mode: AudioMode,
+    input_mode: InputMode,
     auto_check: bool,
+}
+
+/// 一组互斥的方向菜单项, 同一时刻只有当前方向被勾选.
+struct ModeGroup<T> {
+    items: Vec<(T, CheckMenuItem)>,
+}
+
+impl<T: Copy + PartialEq> ModeGroup<T> {
+    fn build(id_prefix: &str, title: &str, modes: &[(T, &str, &str)]) -> Result<(Submenu, Self)> {
+        let submenu = Submenu::new(title, true);
+        let mut items = Vec::with_capacity(modes.len());
+        for (mode, key, label) in modes {
+            let item = CheckMenuItem::with_id(
+                format!("{id_prefix}.{key}"),
+                *label,
+                true,
+                false,
+                None,
+            );
+            submenu
+                .append(&item)
+                .with_context(|| format!("无法创建托盘菜单项 {title}/{label}"))?;
+            items.push((*mode, item));
+        }
+        Ok((submenu, Self { items }))
+    }
+
+    fn sync(&self, current: T) {
+        for (mode, item) in &self.items {
+            item.set_checked(*mode == current);
+        }
+    }
+}
+
+/// 托盘触发的方向切换.
+#[derive(Clone, Copy, PartialEq)]
+enum TrayModeChange {
+    Clipboard(ClipboardMode),
+    Audio(AudioMode),
+    Input(InputMode),
+}
+
+impl TrayModeChange {
+    fn command(self) -> AppCommand {
+        match self {
+            Self::Clipboard(mode) => AppCommand::SetClipboardMode(mode),
+            Self::Audio(mode) => AppCommand::SetAudioMode(mode),
+            Self::Input(mode) => AppCommand::SetInputMode(mode),
+        }
+    }
 }
 
 struct NativeTray {
     tray_icon: TrayIcon,
     status_item: MenuItem,
     connect_item: MenuItem,
-    clipboard_item: CheckMenuItem,
-    audio_item: CheckMenuItem,
-    input_item: CheckMenuItem,
+    clipboard_group: ModeGroup<ClipboardMode>,
+    audio_group: ModeGroup<AudioMode>,
+    input_group: ModeGroup<InputMode>,
     auto_check_item: CheckMenuItem,
     state: TrayState,
     _poll_timer: Timer,
@@ -121,9 +190,9 @@ impl TrayState {
             app_title: format!("Synly {version}"),
             status_text: String::new(),
             connected: false,
-            clipboard_enabled: false,
-            audio_enabled: false,
-            input_enabled: false,
+            clipboard_mode: ClipboardMode::Off,
+            audio_mode: AudioMode::Off,
+            input_mode: InputMode::Off,
             auto_check,
         };
         state.apply_app_snapshot(snapshot);
@@ -133,9 +202,9 @@ impl TrayState {
     fn apply_app_snapshot(&mut self, snapshot: &AppSnapshot) {
         self.status_text = format!("Synly {}", snapshot.lifecycle.label());
         self.connected = snapshot.applied.is_some();
-        self.clipboard_enabled = snapshot.desired.clipboard_mode != ClipboardMode::Off;
-        self.audio_enabled = snapshot.desired.audio_mode != AudioMode::Off;
-        self.input_enabled = snapshot.desired.input.mode != InputMode::Off;
+        self.clipboard_mode = snapshot.desired.clipboard_mode;
+        self.audio_mode = snapshot.desired.audio_mode;
+        self.input_mode = snapshot.desired.input.mode;
     }
 
     fn tooltip(&self) -> String {
@@ -156,27 +225,10 @@ impl NativeTray {
             true,
             None,
         );
-        let clipboard_item = CheckMenuItem::with_id(
-            CLIPBOARD_ID,
-            "剪贴板",
-            true,
-            state.clipboard_enabled,
-            None,
-        );
-        let audio_item = CheckMenuItem::with_id(
-            AUDIO_ID,
-            "音频",
-            true,
-            state.audio_enabled,
-            None,
-        );
-        let input_item = CheckMenuItem::with_id(
-            INPUT_ID,
-            "输入",
-            true,
-            state.input_enabled,
-            None,
-        );
+        let (clipboard_menu, clipboard_group) =
+            ModeGroup::build(CLIPBOARD_ID_PREFIX, "剪贴板", &CLIPBOARD_MODES)?;
+        let (audio_menu, audio_group) = ModeGroup::build(AUDIO_ID_PREFIX, "音频", &AUDIO_MODES)?;
+        let (input_menu, input_group) = ModeGroup::build(INPUT_ID_PREFIX, "输入", &INPUT_MODES)?;
         let separator_two = PredefinedMenuItem::separator();
         let check_update_item = MenuItem::with_id(CHECK_UPDATE_ID, "检查更新", true, None);
         let auto_check_item = CheckMenuItem::with_id(
@@ -194,9 +246,9 @@ impl NativeTray {
             &status_item,
             &separator_one,
             &connect_item,
-            &clipboard_item,
-            &audio_item,
-            &input_item,
+            &clipboard_menu,
+            &audio_menu,
+            &input_menu,
             &separator_two,
             &check_update_item,
             &auto_check_item,
@@ -222,29 +274,50 @@ impl NativeTray {
             move || poll_events(&inner),
         );
 
-        Ok(Self {
+        let mut tray = Self {
             tray_icon,
             status_item,
             connect_item,
-            clipboard_item,
-            audio_item,
-            input_item,
+            clipboard_group,
+            audio_group,
+            input_group,
             auto_check_item,
             state: state.clone(),
             _poll_timer: poll_timer,
-        })
+        };
+        // 菜单项创建时一律不勾选, 这里按当前状态补一次勾选.
+        tray.sync(state);
+        Ok(tray)
     }
 
+    /// 按最新状态刷新菜单, 状态未变化时直接跳过.
     fn apply_state(&mut self, state: &TrayState) {
         if self.state == *state {
             return;
         }
+        self.sync(state);
+    }
+
+    /// 乐观地把方向切换结果先画到菜单上.
+    /// 托盘菜单项被点击时平台可能自行翻转勾选, 这里覆盖回唯一勾选项,
+    /// 后续真实状态到达时会再做一次校准.
+    fn preview_mode_change(&mut self, change: TrayModeChange) {
+        let mut state = self.state.clone();
+        match change {
+            TrayModeChange::Clipboard(mode) => state.clipboard_mode = mode,
+            TrayModeChange::Audio(mode) => state.audio_mode = mode,
+            TrayModeChange::Input(mode) => state.input_mode = mode,
+        }
+        self.sync(&state);
+    }
+
+    fn sync(&mut self, state: &TrayState) {
         self.status_item.set_text(&state.status_text);
         self.connect_item
             .set_text(if state.connected { "断开" } else { "开始" });
-        self.clipboard_item.set_checked(state.clipboard_enabled);
-        self.audio_item.set_checked(state.audio_enabled);
-        self.input_item.set_checked(state.input_enabled);
+        self.clipboard_group.sync(state.clipboard_mode);
+        self.audio_group.sync(state.audio_mode);
+        self.input_group.sync(state.input_mode);
         self.auto_check_item.set_checked(state.auto_check);
         if let Err(error) = self.tray_icon.set_tooltip(Some(&state.tooltip())) {
             tracing::warn!(error = %error, "无法更新系统托盘提示");
@@ -314,8 +387,37 @@ fn handle_action(inner: &Weak<RefCell<ControllerInner>>, action: &str) {
     guard_callback("tray_action", || handle_action_inner(inner, action));
 }
 
+/// 把方向菜单项的 id 解析成方向切换, 其它菜单项返回 None.
+fn mode_change(action: &str) -> Option<TrayModeChange> {
+    let (group, key) = action.strip_prefix("synly.")?.split_once('.')?;
+    match group {
+        "clipboard" => Some(TrayModeChange::Clipboard(lookup_mode(
+            &CLIPBOARD_MODES,
+            key,
+        )?)),
+        "audio" => Some(TrayModeChange::Audio(lookup_mode(&AUDIO_MODES, key)?)),
+        "input" => Some(TrayModeChange::Input(lookup_mode(&INPUT_MODES, key)?)),
+        _ => None,
+    }
+}
+
+fn lookup_mode<T: Copy>(modes: &[(T, &str, &str)], key: &str) -> Option<T> {
+    modes
+        .iter()
+        .find(|(_, item_key, _)| *item_key == key)
+        .map(|(mode, _, _)| *mode)
+}
+
 fn handle_action_inner(inner: &Weak<RefCell<ControllerInner>>, action: &str) {
     let Some(inner) = inner.upgrade() else { return };
+    if let Some(change) = mode_change(action) {
+        let mut controller = inner.borrow_mut();
+        if let Some(tray) = controller.tray.as_mut() {
+            tray.preview_mode_change(change);
+        }
+        send_command(&controller.commands, change.command());
+        return;
+    }
     match action {
         OPEN_ID => {
             let window = inner.borrow().window.clone();
@@ -334,33 +436,6 @@ fn handle_action_inner(inner: &Weak<RefCell<ControllerInner>>, action: &str) {
                 AppCommand::Start
             };
             send_command(&inner.commands, command);
-        }
-        CLIPBOARD_ID => {
-            let inner = inner.borrow();
-            let mode = if inner.snapshots.borrow().desired.clipboard_mode == ClipboardMode::Off {
-                ClipboardMode::Both
-            } else {
-                ClipboardMode::Off
-            };
-            send_command(&inner.commands, AppCommand::SetClipboardMode(mode));
-        }
-        AUDIO_ID => {
-            let inner = inner.borrow();
-            let mode = if inner.snapshots.borrow().desired.audio_mode == AudioMode::Off {
-                AudioMode::Receive
-            } else {
-                AudioMode::Off
-            };
-            send_command(&inner.commands, AppCommand::SetAudioMode(mode));
-        }
-        INPUT_ID => {
-            let inner = inner.borrow();
-            let mode = if inner.snapshots.borrow().desired.input.mode == InputMode::Off {
-                InputMode::Receive
-            } else {
-                InputMode::Off
-            };
-            send_command(&inner.commands, AppCommand::SetInputMode(mode));
         }
         CHECK_UPDATE_ID => {
             let update = inner.borrow().update.clone();
