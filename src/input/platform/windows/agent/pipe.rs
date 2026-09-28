@@ -62,7 +62,8 @@ impl NativePipe {
             )
         };
         if handle == INVALID_HANDLE_VALUE {
-            return Err(Error::last_os_error()).context("failed to create Windows input agent pipe");
+            return Err(Error::last_os_error())
+                .context("failed to create Windows input agent pipe");
         }
         Self::from_handle(handle, true)
     }
@@ -156,8 +157,11 @@ impl NativePipe {
             }
             let transferred = self.read_once(&mut bytes[offset..], remaining)?;
             if transferred == 0 {
-                return Err(Error::new(ErrorKind::UnexpectedEof, "Windows input agent pipe closed"))
-                    .context("failed to read Windows input agent pipe");
+                return Err(Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "Windows input agent pipe closed",
+                ))
+                .context("failed to read Windows input agent pipe");
             }
             offset = offset.saturating_add(transferred);
         }
@@ -174,8 +178,11 @@ impl NativePipe {
             }
             let transferred = self.write_once(&bytes[offset..], remaining)?;
             if transferred == 0 {
-                return Err(Error::new(ErrorKind::WriteZero, "Windows input agent pipe closed"))
-                    .context("failed to write Windows input agent pipe");
+                return Err(Error::new(
+                    ErrorKind::WriteZero,
+                    "Windows input agent pipe closed",
+                ))
+                .context("failed to write Windows input agent pipe");
             }
             offset = offset.saturating_add(transferred);
         }
@@ -253,8 +260,11 @@ impl NativePipe {
                 unsafe {
                     GetOverlappedResult(self.handle, overlapped, &mut transferred, 1);
                 }
-                Err(Error::new(ErrorKind::TimedOut, "Windows input agent pipe operation timed out"))
-                    .context("Windows input agent pipe operation timed out")
+                Err(Error::new(
+                    ErrorKind::TimedOut,
+                    "Windows input agent pipe operation timed out",
+                ))
+                .context("Windows input agent pipe operation timed out")
             }
             _ => Err(Error::last_os_error()).context("failed to wait for Windows pipe operation"),
         }

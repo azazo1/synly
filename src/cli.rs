@@ -11,11 +11,7 @@ use clap::{Parser, Subcommand};
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
-    #[arg(
-        long,
-        global = true,
-        help = "以无界面模式运行, 会话参数从配置文件读取"
-    )]
+    #[arg(long, global = true, help = "以无界面模式运行, 会话参数从配置文件读取")]
     pub headless: bool,
 }
 

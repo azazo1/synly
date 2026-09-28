@@ -1,5 +1,5 @@
-use super::queue::FrameQueue;
 use super::AUDIO_IO_TIMEOUT;
+use super::queue::FrameQueue;
 use crate::audio::capture::{AudioInput, CaptureStatus};
 use crate::audio::config::StreamParams;
 use crate::audio::error::{Error, Result};
@@ -27,18 +27,28 @@ fn run_with_retry_delay(
 ) -> Result<()> {
     let mut attempts = 0u64;
     loop {
-        if stop.is_cancelled() { return Ok(()); }
+        if stop.is_cancelled() {
+            return Ok(());
+        }
         attempts = attempts.saturating_add(1);
         let started = Instant::now();
         let result = match open() {
             Ok(input) => {
-                if stop.is_cancelled() { return Ok(()); }
-                tracing::info!(attempts, elapsed_ms = started.elapsed().as_millis(), "系统音频捕获设备已就绪");
+                if stop.is_cancelled() {
+                    return Ok(());
+                }
+                tracing::info!(
+                    attempts,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "系统音频捕获设备已就绪"
+                );
                 capture_frames(input, &samples, &stop, stream)
             }
             Err(error) => Err(error),
         };
-        if stop.is_cancelled() { return Ok(()); }
+        if stop.is_cancelled() {
+            return Ok(());
+        }
         match result {
             Ok(()) => return Ok(()),
             Err(error @ (Error::Backend(_) | Error::Io(_))) => {
@@ -57,7 +67,9 @@ fn run_with_retry_delay(
                 _ = tokio::time::sleep(retry_delay) => false,
             }
         });
-        if cancelled { return Ok(()); }
+        if cancelled {
+            return Ok(());
+        }
     }
 }
 
@@ -73,7 +85,9 @@ fn capture_frames(
         match input.read_frame(&mut frame, AUDIO_IO_TIMEOUT)? {
             CaptureStatus::Timeout => continue,
             CaptureStatus::Ok => {
-                if stop.is_cancelled() || !samples.push(frame) { return Ok(()); }
+                if stop.is_cancelled() || !samples.push(frame) {
+                    return Ok(());
+                }
                 frame = vec![0.0; stream.samples_per_frame()];
             }
         }

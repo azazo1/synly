@@ -1,12 +1,12 @@
-use super::install::SERVICE_NAME;
-use super::protocol::{
-    SERVICE_CONNECT_TIMEOUT, SERVICE_PIPE_NAME, ServiceRequest, ServiceResponse, read_request,
-    write_response,
-};
 use super::super::agent::pipe::{NativePipe, PipeDirection};
 use super::super::agent::protocol::is_timeout_error;
 use super::super::agent::security::{
     process_image_path, process_session_id, token_user_sid_string, wide,
+};
+use super::install::SERVICE_NAME;
+use super::protocol::{
+    SERVICE_CONNECT_TIMEOUT, SERVICE_PIPE_NAME, ServiceRequest, ServiceResponse, read_request,
+    write_response,
 };
 use anyhow::{Context, Result, bail};
 use std::ffi::c_void;
@@ -21,11 +21,11 @@ use windows_sys::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows_sys::Win32::Security::{
-    AdjustTokenPrivileges, DuplicateTokenEx, LookupPrivilegeValueW, PSECURITY_DESCRIPTOR,
-    SE_ASSIGNPRIMARYTOKEN_NAME, SE_INCREASE_QUOTA_NAME, SE_PRIVILEGE_ENABLED, SE_TCB_NAME,
-    SECURITY_ATTRIBUTES, SecurityImpersonation, SetTokenInformation, TOKEN_ADJUST_PRIVILEGES,
-    TOKEN_ALL_ACCESS, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE, TOKEN_PRIVILEGES, TOKEN_QUERY,
-    LUID_AND_ATTRIBUTES, TokenPrimary, TokenSessionId,
+    AdjustTokenPrivileges, DuplicateTokenEx, LUID_AND_ATTRIBUTES, LookupPrivilegeValueW,
+    PSECURITY_DESCRIPTOR, SE_ASSIGNPRIMARYTOKEN_NAME, SE_INCREASE_QUOTA_NAME, SE_PRIVILEGE_ENABLED,
+    SE_TCB_NAME, SECURITY_ATTRIBUTES, SecurityImpersonation, SetTokenInformation,
+    TOKEN_ADJUST_PRIVILEGES, TOKEN_ALL_ACCESS, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
+    TOKEN_PRIVILEGES, TOKEN_QUERY, TokenPrimary, TokenSessionId,
 };
 use windows_sys::Win32::System::Environment::{CreateEnvironmentBlock, DestroyEnvironmentBlock};
 use windows_sys::Win32::System::JobObjects::{
@@ -120,8 +120,7 @@ pub fn run_service() -> Result<()> {
     }];
     let dispatched = unsafe { StartServiceCtrlDispatcherW(table.as_ptr()) };
     if dispatched == 0 {
-        return Err(std::io::Error::last_os_error())
-            .context("注册 Synly 输入服务分发失败");
+        return Err(std::io::Error::last_os_error()).context("注册 Synly 输入服务分发失败");
     }
     match SERVICE_RESULT.get() {
         Some(Ok(())) => Ok(()),
@@ -185,7 +184,7 @@ unsafe extern "system" fn service_ctrl_handler(
             if let Some(stop) = STOP_EVENT.get() {
                 unsafe {
                     windows_sys::Win32::System::Threading::SetEvent(
-                        stop.load(Ordering::Acquire) as HANDLE,
+                        stop.load(Ordering::Acquire) as HANDLE
                     );
                 }
             }
@@ -251,7 +250,11 @@ fn service_accept_loop() -> Result<()> {
                 continue;
             }
         };
-        let mut pipe = match NativePipe::create_server(SERVICE_PIPE_NAME, PipeDirection::Duplex, &security.attributes) {
+        let mut pipe = match NativePipe::create_server(
+            SERVICE_PIPE_NAME,
+            PipeDirection::Duplex,
+            &security.attributes,
+        ) {
             Ok(pipe) => pipe,
             Err(error) => {
                 tracing::warn!(error = %error, "创建输入服务管道失败, 稍后重试");
@@ -286,11 +289,7 @@ fn wait_for_client_close(pipe: &mut NativePipe) {
     let _ = pipe.read_exact(&mut buffer, Duration::from_secs(5));
 }
 
-fn handle_client(
-    pipe: &mut NativePipe,
-    console_session_id: u32,
-    user_token: HANDLE,
-) -> Result<()> {
+fn handle_client(pipe: &mut NativePipe, console_session_id: u32, user_token: HANDLE) -> Result<()> {
     let client_pid = match validate_client(pipe, console_session_id) {
         Ok(client_pid) => client_pid,
         Err(error) => {
@@ -308,17 +307,17 @@ fn handle_client(
         }
     };
     tracing::info!(request = request.name(), client_pid, "输入服务收到请求");
-        let result = match &request {
-            ServiceRequest::SpawnInputAgent {
-                command_pipe,
-                event_pipe,
-                token,
-            } => spawn_system_input_agent(
-                console_session_id,
-                user_token,
-                command_pipe,
-                event_pipe,
-                token,
+    let result = match &request {
+        ServiceRequest::SpawnInputAgent {
+            command_pipe,
+            event_pipe,
+            token,
+        } => spawn_system_input_agent(
+            console_session_id,
+            user_token,
+            command_pipe,
+            event_pipe,
+            token,
             client_pid,
         ),
     };
@@ -486,7 +485,8 @@ fn spawn_system_input_agent(
         )
     };
     if created == 0 {
-        return Err(std::io::Error::last_os_error()).context("CreateProcessAsUserW 启动输入代理失败");
+        return Err(std::io::Error::last_os_error())
+            .context("CreateProcessAsUserW 启动输入代理失败");
     }
     if unsafe { AssignProcessToJobObject(job, process_info.hProcess) } == 0 {
         tracing::warn!(error = %std::io::Error::last_os_error(), "输入代理加入 job 失败");
@@ -652,22 +652,24 @@ fn close_all_agent_processes() {
 }
 
 fn stop_requested() -> bool {
-    STOP_EVENT
-        .get()
-        .is_some_and(|event| {
-            let waited =
-                unsafe { WaitForSingleObject(event.load(Ordering::Acquire) as HANDLE, 0) };
-            waited == WAIT_OBJECT_0
-        })
+    STOP_EVENT.get().is_some_and(|event| {
+        let waited = unsafe { WaitForSingleObject(event.load(Ordering::Acquire) as HANDLE, 0) };
+        waited == WAIT_OBJECT_0
+    })
 }
 
 fn sleep_service() {
     if let Some(event) = STOP_EVENT.get() {
         unsafe {
-            WaitForSingleObject(event.load(Ordering::Acquire) as HANDLE, SERVICE_STOP_POLL_MS);
+            WaitForSingleObject(
+                event.load(Ordering::Acquire) as HANDLE,
+                SERVICE_STOP_POLL_MS,
+            );
         }
     } else {
-        std::thread::sleep(std::time::Duration::from_millis(u64::from(SERVICE_STOP_POLL_MS)));
+        std::thread::sleep(std::time::Duration::from_millis(u64::from(
+            SERVICE_STOP_POLL_MS,
+        )));
     }
 }
 
@@ -688,26 +690,21 @@ mod tests {
     #[test]
     fn pipe_arguments_require_expected_prefix_and_uuid() {
         let id = "736a2142-cf80-7767-fe7c-3586163d04c6";
-        assert!(validate_pipe_argument(
-            &format!(r"\\.\pipe\synly-input-command-{id}"),
-            "command"
-        )
-        .is_ok());
-        assert!(validate_pipe_argument(
-            &format!(r"\\.\pipe\synly-input-event-{id}"),
-            "event"
-        )
-        .is_ok());
+        assert!(
+            validate_pipe_argument(&format!(r"\\.\pipe\synly-input-command-{id}"), "command")
+                .is_ok()
+        );
+        assert!(
+            validate_pipe_argument(&format!(r"\\.\pipe\synly-input-event-{id}"), "event").is_ok()
+        );
         assert!(validate_pipe_argument(r"\\.\pipe\synly-input-command-bad", "command").is_err());
-        assert!(validate_pipe_argument(
-            &format!(r"\\.\pipe\synly-input-event-{id}"),
-            "command"
-        )
-        .is_err());
-        assert!(validate_pipe_argument(
-            &format!(r"\\.\pipe\other-input-command-{id}"),
-            "command"
-        )
-        .is_err());
+        assert!(
+            validate_pipe_argument(&format!(r"\\.\pipe\synly-input-event-{id}"), "command")
+                .is_err()
+        );
+        assert!(
+            validate_pipe_argument(&format!(r"\\.\pipe\other-input-command-{id}"), "command")
+                .is_err()
+        );
     }
 }

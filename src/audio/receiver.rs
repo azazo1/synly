@@ -114,7 +114,10 @@ impl RtpAudioQueue {
                     self.last_oos_sequence_number = rtp.sequence_number;
                     self.stats.packet_count_oos += 1;
                     if !self.received_oos_data {
-                        tracing::debug!(sequence = rtp.sequence_number, "音频检测到迟到包, 延长恢复等待");
+                        tracing::debug!(
+                            sequence = rtp.sequence_number,
+                            "音频检测到迟到包, 延长恢复等待"
+                        );
                         self.received_oos_data = true;
                     }
                 } else if self.received_oos_data
@@ -265,7 +268,9 @@ impl RtpAudioQueue {
                     || payload.is_empty()
                 {
                     self.stats.packet_count_fec_invalid += 1;
-                    return Err(Error::Protocol("invalid audio FEC block header or payload".into()));
+                    return Err(Error::Protocol(
+                        "invalid audio FEC block header or payload".into(),
+                    ));
                 }
                 Ok((*fec, payload.len()))
             }
@@ -286,7 +291,9 @@ impl RtpAudioQueue {
                     || block.fec_header.ssrc != fec_header.ssrc
                 {
                     self.stats.packet_count_fec_invalid += 1;
-                    return Err(Error::Protocol("inconsistent audio FEC block identity".into()));
+                    return Err(Error::Protocol(
+                        "inconsistent audio FEC block identity".into(),
+                    ));
                 }
                 return Ok(index);
             }

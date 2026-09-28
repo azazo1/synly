@@ -50,11 +50,7 @@ pub struct CapabilityState {
 }
 
 impl CapabilityState {
-    pub fn new(
-        host_role: bool,
-        local: RuntimeCapabilities,
-        remote: RuntimeCapabilities,
-    ) -> Self {
+    pub fn new(host_role: bool, local: RuntimeCapabilities, remote: RuntimeCapabilities) -> Self {
         Self {
             host_role,
             local_generation: 0,
@@ -105,7 +101,10 @@ impl CapabilityState {
         self.remote
     }
 
-    pub fn set_local(&mut self, capabilities: RuntimeCapabilities) -> Option<(u64, RuntimeCapabilities)> {
+    pub fn set_local(
+        &mut self,
+        capabilities: RuntimeCapabilities,
+    ) -> Option<(u64, RuntimeCapabilities)> {
         if capabilities == self.local {
             return None;
         }
@@ -168,7 +167,6 @@ impl CapabilityState {
     pub fn current_epoch(&self, epoch: CapabilityEpoch) -> bool {
         self.epoch() == epoch && self.is_local_acknowledged()
     }
-
 }
 
 fn intersect_capabilities(
@@ -208,7 +206,11 @@ mod tests {
     use crate::protocol::{CapabilityEpoch, RuntimeCapabilities};
     use crate::settings::{AudioMode, ClipboardMode};
 
-    fn caps(clipboard_mode: ClipboardMode, audio_mode: AudioMode, input_mode: InputMode) -> RuntimeCapabilities {
+    fn caps(
+        clipboard_mode: ClipboardMode,
+        audio_mode: AudioMode,
+        input_mode: InputMode,
+    ) -> RuntimeCapabilities {
         RuntimeCapabilities {
             clipboard_mode,
             audio_mode,
@@ -248,7 +250,13 @@ mod tests {
         client.apply_remote(1, host.local()).unwrap();
         client.set_local(caps(ClipboardMode::Receive, AudioMode::Off, InputMode::Off));
         host.apply_remote(1, client.local()).unwrap();
-        assert_eq!(host.epoch(), CapabilityEpoch { host_generation: 1, client_generation: 1 });
+        assert_eq!(
+            host.epoch(),
+            CapabilityEpoch {
+                host_generation: 1,
+                client_generation: 1
+            }
+        );
         assert_eq!(client.epoch(), host.epoch());
     }
 
@@ -259,8 +267,14 @@ mod tests {
             caps(ClipboardMode::Off, AudioMode::Off, InputMode::Off),
             caps(ClipboardMode::Off, AudioMode::Off, InputMode::Off),
         );
-        state.apply_remote(2, caps(ClipboardMode::Send, AudioMode::Off, InputMode::Off)).unwrap();
-        assert!(state.apply_remote(1, caps(ClipboardMode::Off, AudioMode::Off, InputMode::Off)).is_err());
+        state
+            .apply_remote(2, caps(ClipboardMode::Send, AudioMode::Off, InputMode::Off))
+            .unwrap();
+        assert!(
+            state
+                .apply_remote(1, caps(ClipboardMode::Off, AudioMode::Off, InputMode::Off))
+                .is_err()
+        );
     }
 
     #[test]
@@ -269,8 +283,9 @@ mod tests {
         let mut host = CapabilityState::new(true, off, off);
         let mut client = CapabilityState::new(false, off, off);
 
-        let (host_generation, host_caps) =
-            host.set_local(caps(ClipboardMode::Send, AudioMode::Off, InputMode::Off)).unwrap();
+        let (host_generation, host_caps) = host
+            .set_local(caps(ClipboardMode::Send, AudioMode::Off, InputMode::Off))
+            .unwrap();
         let (client_generation, client_caps) = client
             .set_local(caps(ClipboardMode::Receive, AudioMode::Off, InputMode::Off))
             .unwrap();
@@ -313,7 +328,10 @@ mod tests {
 
         assert!(
             state
-                .apply_remote(1, caps(ClipboardMode::Receive, AudioMode::Off, InputMode::Off))
+                .apply_remote(
+                    1,
+                    caps(ClipboardMode::Receive, AudioMode::Off, InputMode::Off)
+                )
                 .is_err()
         );
     }

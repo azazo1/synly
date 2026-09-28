@@ -12,7 +12,9 @@ fn checked_frame_layout(stream: &StreamParams) -> Result<(u32, usize)> {
         || !matches!(stream.channels, 2 | 6 | 8)
         || !matches!(stream.packet_duration_ms, 5 | 10 | 20 | 40 | 60)
     {
-        return Err(Error::InvalidConfig("macOS 音频参数不属于支持的 Opus PCM 格式"));
+        return Err(Error::InvalidConfig(
+            "macOS 音频参数不属于支持的 Opus PCM 格式",
+        ));
     }
     let frames = u32::try_from(stream.frame_size())
         .map_err(|_| Error::InvalidConfig("macOS 音频帧大小超过 u32"))?;
@@ -23,7 +25,9 @@ fn checked_frame_layout(stream: &StreamParams) -> Result<(u32, usize)> {
 
 pub fn open_input(config: &CaptureConfig, stream: &StreamParams) -> Result<Box<dyn AudioInput>> {
     if config.device_name.is_some() {
-        return Err(Error::UnsupportedPlatform("macOS 系统音频 tap 尚不支持指定设备"));
+        return Err(Error::UnsupportedPlatform(
+            "macOS 系统音频 tap 尚不支持指定设备",
+        ));
     }
     if stream.channels != 2 {
         return Err(Error::UnsupportedPlatform(
@@ -33,18 +37,17 @@ pub fn open_input(config: &CaptureConfig, stream: &StreamParams) -> Result<Box<d
 
     let (frame_size, samples_per_frame) = checked_frame_layout(stream)?;
     if unsafe { ar_macos_capture_supported() } == 0 {
-        return Err(Error::UnsupportedPlatform("macOS 系统音频捕获需要 14.2 或更新版本"));
+        return Err(Error::UnsupportedPlatform(
+            "macOS 系统音频捕获需要 14.2 或更新版本",
+        ));
     }
-    let handle = unsafe {
-        ar_macos_capture_create(
-            std::ptr::null(),
-            stream.sample_rate,
-            2,
-            frame_size,
-        )
-    };
+    let handle =
+        unsafe { ar_macos_capture_create(std::ptr::null(), stream.sample_rate, 2, frame_size) };
     let handle = NonNull::new(handle).ok_or_else(last_backend_error)?;
-    Ok(Box::new(MacosInput { handle, samples_per_frame }))
+    Ok(Box::new(MacosInput {
+        handle,
+        samples_per_frame,
+    }))
 }
 
 pub fn open_output(config: &PlaybackConfig, stream: &StreamParams) -> Result<Box<dyn AudioOutput>> {
@@ -53,15 +56,13 @@ pub fn open_output(config: &PlaybackConfig, stream: &StreamParams) -> Result<Box
     }
 
     let (frame_size, samples_per_frame) = checked_frame_layout(stream)?;
-    let handle = unsafe {
-        ar_macos_playback_create(
-            stream.sample_rate,
-            stream.channels as u32,
-            frame_size,
-        )
-    };
+    let handle =
+        unsafe { ar_macos_playback_create(stream.sample_rate, stream.channels as u32, frame_size) };
     let handle = NonNull::new(handle).ok_or_else(last_backend_error)?;
-    Ok(Box::new(MacosOutput { handle, samples_per_frame }))
+    Ok(Box::new(MacosOutput {
+        handle,
+        samples_per_frame,
+    }))
 }
 
 struct MacosInput {
@@ -76,10 +77,17 @@ impl Drop for MacosInput {
         let mut dropped = 0;
         let mut high_water = 0;
         unsafe { ar_macos_capture_stats(self.handle.as_ptr(), &mut dropped, &mut high_water) };
-        tracing::debug!(dropped_samples = dropped, high_water_samples = high_water, "关闭 macOS 捕获缓冲");
+        tracing::debug!(
+            dropped_samples = dropped,
+            high_water_samples = high_water,
+            "关闭 macOS 捕获缓冲"
+        );
         let status = unsafe { ar_macos_capture_destroy(self.handle.as_ptr()) };
         if status != 0 {
-            tracing::error!(status, "Core Audio 捕获清理失败, 已保留回调资源并禁用重新创建, 需要重启应用");
+            tracing::error!(
+                status,
+                "Core Audio 捕获清理失败, 已保留回调资源并禁用重新创建, 需要重启应用"
+            );
         }
     }
 }
@@ -121,10 +129,18 @@ impl Drop for MacosOutput {
         if resumed_gaps != 0 {
             tracing::warn!(resumed_gaps, "macOS 播放曾欠载补零后恢复, 可能产生点噪");
         }
-        tracing::debug!(dropped_samples = dropped, high_water_samples = high_water, resumed_gaps, "关闭 macOS 播放缓冲");
+        tracing::debug!(
+            dropped_samples = dropped,
+            high_water_samples = high_water,
+            resumed_gaps,
+            "关闭 macOS 播放缓冲"
+        );
         let status = unsafe { ar_macos_playback_destroy(self.handle.as_ptr()) };
         if status != 0 {
-            tracing::error!(status, "AudioQueue 销毁失败, 已保留回调资源并禁用重新创建, 需要重启应用");
+            tracing::error!(
+                status,
+                "AudioQueue 销毁失败, 已保留回调资源并禁用重新创建, 需要重启应用"
+            );
         }
     }
 }
@@ -154,7 +170,9 @@ fn last_backend_error() -> Error {
     let mut message = [0 as c_char; 512];
     unsafe {
         ar_macos_copy_error(message.as_mut_ptr(), message.len() as u32);
-        let message = CStr::from_ptr(message.as_ptr()).to_string_lossy().into_owned();
+        let message = CStr::from_ptr(message.as_ptr())
+            .to_string_lossy()
+            .into_owned();
         if ar_macos_audio_cleanup_failure() != 0 {
             Error::BackendFatal(message)
         } else {
@@ -174,14 +192,26 @@ mod tests {
         for duration in [0, 1, u32::MAX] {
             let mut stream = original.clone();
             stream.packet_duration_ms = duration;
-            assert!(matches!(open_input(&CaptureConfig::default(), &stream), Err(Error::InvalidConfig(_))));
-            assert!(matches!(open_output(&PlaybackConfig::default(), &stream), Err(Error::InvalidConfig(_))));
+            assert!(matches!(
+                open_input(&CaptureConfig::default(), &stream),
+                Err(Error::InvalidConfig(_))
+            ));
+            assert!(matches!(
+                open_output(&PlaybackConfig::default(), &stream),
+                Err(Error::InvalidConfig(_))
+            ));
         }
         for rate in [0, 44100, u32::MAX] {
             let mut stream = original.clone();
             stream.sample_rate = rate;
-            assert!(matches!(open_input(&CaptureConfig::default(), &stream), Err(Error::InvalidConfig(_))));
-            assert!(matches!(open_output(&PlaybackConfig::default(), &stream), Err(Error::InvalidConfig(_))));
+            assert!(matches!(
+                open_input(&CaptureConfig::default(), &stream),
+                Err(Error::InvalidConfig(_))
+            ));
+            assert!(matches!(
+                open_output(&PlaybackConfig::default(), &stream),
+                Err(Error::InvalidConfig(_))
+            ));
         }
     }
 
@@ -189,15 +219,23 @@ mod tests {
     fn partial_frames_never_reach_native_handles() {
         // 测试只执行提前返回路径, 禁止调用/销毁此哨兵句柄.
         let mut input = std::mem::ManuallyDrop::new(MacosInput {
-            handle: NonNull::dangling(), samples_per_frame: 480,
+            handle: NonNull::dangling(),
+            samples_per_frame: 480,
         });
         let mut output = std::mem::ManuallyDrop::new(MacosOutput {
-            handle: NonNull::dangling(), samples_per_frame: 480,
+            handle: NonNull::dangling(),
+            samples_per_frame: 480,
         });
         for length in [0, 1, 479, 481] {
             let mut frame = vec![0.0; length];
-            assert!(matches!(input.read_frame(&mut frame, Duration::ZERO), Err(Error::InvalidConfig(_))));
-            assert!(matches!(output.submit_frame(&frame, Duration::ZERO), Err(Error::InvalidConfig(_))));
+            assert!(matches!(
+                input.read_frame(&mut frame, Duration::ZERO),
+                Err(Error::InvalidConfig(_))
+            ));
+            assert!(matches!(
+                output.submit_frame(&frame, Duration::ZERO),
+                Err(Error::InvalidConfig(_))
+            ));
         }
     }
 }

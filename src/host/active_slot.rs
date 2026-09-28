@@ -73,8 +73,7 @@ impl ActiveSlot {
             .as_ref()
             .is_some_and(|(target, _)| *target == device_id);
         let is_preferred = self.preferred == Some(device_id) && self.active != Some(device_id);
-        let slot_free =
-            self.active.is_none() && self.reserved.is_none() && self.pending.is_none();
+        let slot_free = self.active.is_none() && self.reserved.is_none() && self.pending.is_none();
         if is_pending_target || is_preferred || slot_free {
             self.reserved = Some(device_id);
             SessionCapabilityProfile::Full
@@ -119,11 +118,7 @@ impl ActiveSlot {
     /// 会话结束时调用, 返回需要提升 (发送 Goodbye 促其重连) 的候选设备.
     ///
     /// 结束的恰是首选设备时, 槽位为其保留等待回归, 不提升其他设备.
-    pub fn on_session_end(
-        &mut self,
-        device_id: Uuid,
-        trusted_candidates: &[Uuid],
-    ) -> Option<Uuid> {
+    pub fn on_session_end(&mut self, device_id: Uuid, trusted_candidates: &[Uuid]) -> Option<Uuid> {
         if self.active == Some(device_id) {
             self.active = None;
             if self.preferred == Some(device_id) {
@@ -282,7 +277,10 @@ mod tests {
         let mut slot = slot();
         let device = Uuid::new_v4();
         make_active(&mut slot, device);
-        assert_eq!(slot.reserve(device), SessionCapabilityProfile::ClipboardOnly);
+        assert_eq!(
+            slot.reserve(device),
+            SessionCapabilityProfile::ClipboardOnly
+        );
     }
 
     #[test]

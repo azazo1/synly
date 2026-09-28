@@ -1,3 +1,4 @@
+use super::super::super::{CaptureContext, InputBackend, NativeEvent};
 use super::pipe::{NativePipe, PipeDirection};
 use super::protocol::{
     AgentRequest, AgentResponse, AgentToGuiPacket, GuiToAgentPacket, is_timeout_error, read_packet,
@@ -10,7 +11,6 @@ use super::{
     AGENT_HEARTBEAT_TIMEOUT, CLIENT_HEARTBEAT_INTERVAL, CONNECT_TIMEOUT, DISPATCH_TIMEOUT,
     REQUEST_DELIVERY_TIMEOUT,
 };
-use super::super::super::{CaptureContext, InputBackend, NativeEvent};
 use crate::input::{DesktopLayout, DisplayRect, InputMode, KeySnapshot, ModifierMask, Point};
 use anyhow::{Context, Result, anyhow, bail};
 use std::collections::HashMap;
@@ -157,12 +157,8 @@ fn request_elevation_inner(automatic: bool) -> Result<()> {
     transport.wait_until_created()?;
 
     let executable = agent_executable()?;
-    let service_spawned = spawn_agent_via_service(
-        &command_pipe_name,
-        &event_pipe_name,
-        &token,
-        parent_pid,
-    );
+    let service_spawned =
+        spawn_agent_via_service(&command_pipe_name, &event_pipe_name, &token, parent_pid);
     if !service_spawned {
         if automatic && super::super::service::manual_uninstall_requested() {
             tracing::warn!("输入服务已在本会话手动卸载, 自动恢复时跳过 UAC 回退");
@@ -179,7 +175,9 @@ fn request_elevation_inner(automatic: bool) -> Result<()> {
 
     let client = transport.wait_until_ready()?;
     let slot = AGENT.get_or_init(|| Mutex::new(None));
-    *slot.lock().map_err(|_| anyhow!("Windows input agent state poisoned"))? = Some(client);
+    *slot
+        .lock()
+        .map_err(|_| anyhow!("Windows input agent state poisoned"))? = Some(client);
     ELEVATION_REQUESTED.store(true, Ordering::Release);
     Ok(())
 }
@@ -200,12 +198,7 @@ fn spawn_agent_via_service(
             return false;
         }
     }
-    match spawn_agent_request(
-        command_pipe_name,
-        event_pipe_name,
-        token,
-        parent_pid,
-    ) {
+    match spawn_agent_request(command_pipe_name, event_pipe_name, token, parent_pid) {
         Ok(()) => {
             tracing::info!("已通过 SYSTEM 输入服务启动隐藏输入代理");
             true
@@ -224,12 +217,8 @@ fn spawn_agent_request(
     token: &str,
     parent_pid: u32,
 ) -> Result<()> {
-    match super::super::service::spawn_agent(
-        command_pipe_name,
-        event_pipe_name,
-        token,
-        parent_pid,
-    ) {
+    match super::super::service::spawn_agent(command_pipe_name, event_pipe_name, token, parent_pid)
+    {
         Ok(()) => Ok(()),
         Err(error) if is_service_path_mismatch(&error) => {
             if super::super::service::path_repair_attempted() {
@@ -248,9 +237,7 @@ fn spawn_agent_request(
                     )
                 }
                 Ok(false) => Err(error).context("用户取消了输入服务路径修复"),
-                Err(repair_error) => {
-                    Err(repair_error).context("重新配置 SYSTEM 输入服务失败")
-                }
+                Err(repair_error) => Err(repair_error).context("重新配置 SYSTEM 输入服务失败"),
             }
         }
         Err(error) => Err(error),
@@ -258,11 +245,9 @@ fn spawn_agent_request(
 }
 
 fn is_service_path_mismatch(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .to_string()
-            .contains("映像路径校验失败")
-    })
+    error
+        .chain()
+        .any(|cause| cause.to_string().contains("映像路径校验失败"))
 }
 
 fn try_install_service_once() -> bool {
@@ -360,8 +345,7 @@ pub(in crate::input) fn start_client(context: CaptureContext) -> Result<Arc<dyn 
     *client
         .secure_primary
         .lock()
-        .map_err(|_| anyhow!("Windows input agent secure desktop state poisoned"))? =
-        primary;
+        .map_err(|_| anyhow!("Windows input agent secure desktop state poisoned"))? = primary;
     let lease = client.next_lease.fetch_add(1, Ordering::AcqRel);
     client.active_lease.store(lease, Ordering::Release);
     *client
@@ -396,12 +380,7 @@ impl AgentClient {
                 }
                 anyhow!("Windows input agent {request_name} command queue unavailable: {error}")
             })?;
-        wait_for_agent_response(
-            request_name,
-            dispatch_rx,
-            response_rx,
-            DISPATCH_TIMEOUT,
-        )
+        wait_for_agent_response(request_name, dispatch_rx, response_rx, DISPATCH_TIMEOUT)
     }
 
     pub(super) fn notify(&self, request: AgentRequest) -> Result<()> {
@@ -488,9 +467,8 @@ pub(super) fn wait_for_agent_response(
         Ok(Ok(AgentResponse::Error(message))) => Err(anyhow!(message)),
         Ok(Ok(response)) => Ok(response),
         Ok(Err(message)) => Err(anyhow!(message)),
-        Err(error) => Err(error).with_context(|| {
-            format!("Windows input agent {request_name} response channel closed")
-        }),
+        Err(error) => Err(error)
+            .with_context(|| format!("Windows input agent {request_name} response channel closed")),
     }
 }
 
@@ -710,12 +688,7 @@ fn start_gui_transport(
             if let Err(error) = result {
                 let message = format!("{error:#}");
                 let _ = command_ready.send(Err(message.clone()));
-                fail_gui_transport(
-                    &command_alive,
-                    &command_pending,
-                    &command_context,
-                    &message,
-                );
+                fail_gui_transport(&command_alive, &command_pending, &command_context, &message);
                 tracing::error!(error = %message, "Windows 输入代理 command pipe 线程结束");
             }
         })
@@ -743,12 +716,7 @@ fn start_gui_transport(
             if let Err(error) = result {
                 let message = format!("{error:#}");
                 let _ = ready_tx.send(Err(message.clone()));
-                fail_gui_transport(
-                    &event_alive,
-                    &event_pending,
-                    &event_context,
-                    &message,
-                );
+                fail_gui_transport(&event_alive, &event_pending, &event_context, &message);
                 tracing::error!(error = %message, "Windows 输入代理 event pipe 线程结束");
             }
         })
@@ -866,13 +834,7 @@ fn gui_event_owner(
     ready
         .send(Ok(Arc::clone(&client)))
         .map_err(|_| anyhow!("Windows input agent readiness receiver closed"))?;
-    client_event_reader_loop(
-        pipe,
-        pending,
-        context,
-        alive,
-        client,
-    )
+    client_event_reader_loop(pipe, pending, context, alive, client)
 }
 
 pub(super) fn client_event_reader_loop(
@@ -955,7 +917,11 @@ pub(super) fn client_event_reader_loop(
                         context.emit_reliable(NativeEvent::Emergency);
                     }
                 }
-                tracing::warn!(secure, system_agent = is_system, "Windows 输入代理安全桌面状态变化");
+                tracing::warn!(
+                    secure,
+                    system_agent = is_system,
+                    "Windows 输入代理安全桌面状态变化"
+                );
             }
             _ => bail!("Windows input agent sent an unexpected packet"),
         }
@@ -1085,13 +1051,19 @@ pub(super) fn write_client_command(
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
             let message = format!("Windows input agent {request_name} response timed out");
             complete_pending_with_error(pending, id, message.clone());
-            tracing::warn!(request = request_name, "Windows 输入代理请求响应超时, 保持连接");
+            tracing::warn!(
+                request = request_name,
+                "Windows 输入代理请求响应超时, 保持连接"
+            );
             Ok(false)
         }
         Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
             let message = format!("Windows input agent {request_name} response channel closed");
             complete_pending_with_error(pending, id, message.clone());
-            tracing::warn!(request = request_name, "Windows 输入代理请求响应通道关闭, 保持连接");
+            tracing::warn!(
+                request = request_name,
+                "Windows 输入代理请求响应通道关闭, 保持连接"
+            );
             Ok(false)
         }
     }

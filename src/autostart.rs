@@ -17,8 +17,12 @@ fn apply_platform(enabled: bool, executable: PathBuf) -> Result<()> {
         remove_if_exists(&target)?;
         return Ok(());
     }
-    std::fs::create_dir_all(&directory)
-        .with_context(|| format!("failed to create autostart directory {}", directory.display()))?;
+    std::fs::create_dir_all(&directory).with_context(|| {
+        format!(
+            "failed to create autostart directory {}",
+            directory.display()
+        )
+    })?;
     let executable = xml_escape(&executable.to_string_lossy());
     let contents = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\">\n<dict>\n  <key>Label</key>\n  <string>dev.azazo.synly</string>\n  <key>ProgramArguments</key>\n  <array>\n    <string>{executable}</string>\n  </array>\n  <key>RunAtLoad</key>\n  <true/>\n</dict>\n</plist>\n"
@@ -37,8 +41,12 @@ fn apply_platform(enabled: bool, executable: PathBuf) -> Result<()> {
         remove_if_exists(&target)?;
         return Ok(());
     }
-    std::fs::create_dir_all(&directory)
-        .with_context(|| format!("failed to create autostart directory {}", directory.display()))?;
+    std::fs::create_dir_all(&directory).with_context(|| {
+        format!(
+            "failed to create autostart directory {}",
+            directory.display()
+        )
+    })?;
     let executable = desktop_exec_escape(&executable.to_string_lossy());
     let contents = format!(
         "[Desktop Entry]\nType=Application\nName=Synly\nExec=\"{executable}\"\nTerminal=false\nX-GNOME-Autostart-enabled=true\n"

@@ -45,12 +45,7 @@ pub fn current_arch() -> &'static str {
 ///
 /// 安装版与便携版的变体段不同, 不做跨变体降级匹配: 匹配不到就报错, 让用户去 Release 页
 /// 手动下载.
-pub fn asset_name_for(
-    tag: &str,
-    platform: &str,
-    arch: &str,
-    form: DistributionForm,
-) -> String {
+pub fn asset_name_for(tag: &str, platform: &str, arch: &str, form: DistributionForm) -> String {
     let base = format!("{APP_NAME}-{}-{platform}-{arch}", strip_v_prefix(tag));
     match (platform, form) {
         ("windows", DistributionForm::Installer) => format!("{base}-setup.exe"),

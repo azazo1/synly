@@ -14,15 +14,18 @@ pub fn init() -> Result<WorkerGuard> {
         .join("synly")
         .join("logs")
         .join("input-agent");
-    std::fs::create_dir_all(&log_dir)
-        .with_context(|| format!("failed to create input agent log directory {}", log_dir.display()))?;
+    std::fs::create_dir_all(&log_dir).with_context(|| {
+        format!(
+            "failed to create input agent log directory {}",
+            log_dir.display()
+        )
+    })?;
     let file_appender = tracing_appender::rolling::daily(log_dir, "input-agent.trace.log");
     let (file_writer, guard) = tracing_appender::non_blocking(file_appender);
-    let console_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
-    let trace_filter = EnvFilter::new(
-        "info,synly_input_agent=trace,synly::input::platform::windows::agent=trace",
-    );
+    let console_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let trace_filter =
+        EnvFilter::new("info,synly_input_agent=trace,synly::input::platform::windows::agent=trace");
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()

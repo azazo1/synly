@@ -3,16 +3,13 @@ use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LocalFree};
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-    SDDL_REVISION_1,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows_sys::Win32::Security::{
     GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_ELEVATION, TOKEN_QUERY,
     TOKEN_USER, TokenElevation, TokenUser,
 };
-use windows_sys::Win32::System::Pipes::{
-    GetNamedPipeClientProcessId, GetNamedPipeServerProcessId,
-};
+use windows_sys::Win32::System::Pipes::{GetNamedPipeClientProcessId, GetNamedPipeServerProcessId};
 use windows_sys::Win32::System::RemoteDesktop::ProcessIdToSessionId;
 use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetCurrentProcessId, OpenProcess, OpenProcessToken,
@@ -138,7 +135,9 @@ fn is_access_denied_error(error: &anyhow::Error) -> bool {
 }
 
 fn validate_install_directory(left: &Path, right: &Path) -> Result<()> {
-    if normalize_path(left.parent().unwrap_or(left)) != normalize_path(right.parent().unwrap_or(right)) {
+    if normalize_path(left.parent().unwrap_or(left))
+        != normalize_path(right.parent().unwrap_or(right))
+    {
         bail!("Windows input agent and GUI are not installed in the same directory");
     }
     Ok(())
@@ -226,13 +225,7 @@ pub(crate) fn current_user_sid_string() -> Result<String> {
 pub(crate) fn token_user_sid_string(token: HANDLE) -> Result<String> {
     let mut required = 0u32;
     unsafe {
-        GetTokenInformation(
-            token,
-            TokenUser,
-            std::ptr::null_mut(),
-            0,
-            &mut required,
-        );
+        GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut required);
     }
     if required == 0 {
         unsafe {

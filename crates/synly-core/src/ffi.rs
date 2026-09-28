@@ -10,8 +10,8 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use tracing::{Event, Subscriber, field::Visit};
 use tracing_subscriber::layer::{Context, Layer};
-use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::prelude::*;
+use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
 use uuid::Uuid;
 
@@ -43,7 +43,8 @@ impl Visit for MessageVisitor {
         if field.name() == "message" {
             self.message = Some(value.to_string());
         } else {
-            self.fields.push((field.name().to_string(), value.to_string()));
+            self.fields
+                .push((field.name().to_string(), value.to_string()));
         }
     }
 
@@ -324,7 +325,11 @@ impl From<crate::discovery::DiscoveredPeer> for FfiDiscoveredPeer {
             protocol_version: peer.protocol_version,
             clipboard_mode: peer.clipboard_mode.into(),
             port: peer.port,
-            addresses: peer.addresses.into_iter().map(|address| address.to_string()).collect(),
+            addresses: peer
+                .addresses
+                .into_iter()
+                .map(|address| address.to_string())
+                .collect(),
             source: peer.source.into(),
         }
     }
@@ -441,9 +446,7 @@ impl client::ClientListener for ListenerBridge {
 #[derive(Debug, uniffi::Error)]
 #[uniffi(flat_error)]
 pub enum FfiError {
-    Failed {
-        message: String,
-    },
+    Failed { message: String },
 }
 
 impl std::fmt::Display for FfiError {
@@ -519,7 +522,9 @@ impl FfiClientHandle {
     }
 
     pub fn set_clipboard_mode(&self, mode: FfiClipboardMode) -> Result<(), FfiError> {
-        self.inner.set_clipboard_mode(mode.into()).map_err(Into::into)
+        self.inner
+            .set_clipboard_mode(mode.into())
+            .map_err(Into::into)
     }
 
     pub fn update_trusted_devices(
@@ -540,7 +545,9 @@ impl FfiClientHandle {
     }
 
     pub fn stop(&self) -> Result<(), FfiError> {
-        runtime().block_on(self.inner.stop_and_wait()).map_err(Into::into)
+        runtime()
+            .block_on(self.inner.stop_and_wait())
+            .map_err(Into::into)
     }
 }
 
@@ -627,8 +634,10 @@ pub fn browse_devices(
     timeout_ms: u64,
 ) -> Result<Vec<FfiDiscoveredPeer>, FfiError> {
     let discovery = into_discovery_config(config);
-    let peers = runtime()
-        .block_on(crate::discovery::browse(Duration::from_millis(timeout_ms), &discovery))?;
+    let peers = runtime().block_on(crate::discovery::browse(
+        Duration::from_millis(timeout_ms),
+        &discovery,
+    ))?;
     Ok(peers.into_iter().map(Into::into).collect())
 }
 

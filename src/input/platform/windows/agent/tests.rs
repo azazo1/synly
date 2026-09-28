@@ -1,3 +1,4 @@
+use super::super::super::NativeEvent;
 use super::client::{
     AgentBackend, AgentClient, ClientCommand, ClientCursorState, ClientQueueItem, CursorUpdate,
     client_event_reader_loop, command_writer_loop, current_client, request_elevation,
@@ -13,7 +14,6 @@ use super::server::{
     AgentHeartbeat, AgentMotion, AgentMotionSlot, AgentOutput, agent_event_writer_loop,
 };
 use super::{AGENT_HEARTBEAT_TIMEOUT, CONNECT_TIMEOUT, REQUEST_DELIVERY_TIMEOUT};
-use super::super::super::NativeEvent;
 use crate::input::{DesktopLayout, DisplayRect, Point};
 use anyhow::{Result, bail};
 use std::collections::HashMap;
@@ -122,7 +122,10 @@ fn cursor_notifications_keep_only_the_latest_value() {
             .unwrap();
     }
 
-    assert!(matches!(receiver.try_recv().unwrap(), ClientQueueItem::Cursor));
+    assert!(matches!(
+        receiver.try_recv().unwrap(),
+        ClientQueueItem::Cursor
+    ));
     assert!(receiver.try_recv().is_err());
     let latest = client.cursor.latest.lock().unwrap().unwrap();
     assert_eq!(latest.point, Point { x: 19_999, y: 10 });
@@ -195,7 +198,13 @@ fn native_dual_pipe_transport_survives_cursor_lifecycle_and_event_pressure() {
         event_created.send(()).unwrap();
         pipe.connect_server(CONNECT_TIMEOUT)?;
         let event_client = Arc::new(test_client(event_commands, Arc::clone(&event_alive)));
-        client_event_reader_loop(pipe, event_pending, event_context, event_alive, event_client)
+        client_event_reader_loop(
+            pipe,
+            event_pending,
+            event_context,
+            event_alive,
+            event_client,
+        )
     });
 
     created_rx.recv_timeout(CONNECT_TIMEOUT).unwrap();
@@ -360,12 +369,8 @@ fn native_pipe_rejects_invalid_frame_length() {
         read_packet::<GuiToAgentPacket>(&mut pipe, Duration::from_secs(1))
     });
     created_rx.recv_timeout(CONNECT_TIMEOUT).unwrap();
-    let mut client = NativePipe::connect_client(
-        &name,
-        PipeDirection::ClientToServer,
-        CONNECT_TIMEOUT,
-    )
-    .unwrap();
+    let mut client =
+        NativePipe::connect_client(&name, PipeDirection::ClientToServer, CONNECT_TIMEOUT).unwrap();
     client
         .write_all(
             &(u32::try_from(IPC_MAX_FRAME).unwrap() + 1).to_be_bytes(),
@@ -388,12 +393,8 @@ fn native_pipe_reports_half_frame_when_peer_exits() {
         read_packet::<GuiToAgentPacket>(&mut pipe, Duration::from_secs(1))
     });
     created_rx.recv_timeout(CONNECT_TIMEOUT).unwrap();
-    let mut client = NativePipe::connect_client(
-        &name,
-        PipeDirection::ClientToServer,
-        CONNECT_TIMEOUT,
-    )
-    .unwrap();
+    let mut client =
+        NativePipe::connect_client(&name, PipeDirection::ClientToServer, CONNECT_TIMEOUT).unwrap();
     client
         .write_all(&16u32.to_be_bytes(), Duration::from_secs(1))
         .unwrap();
@@ -418,12 +419,8 @@ fn native_pipe_read_timeout_is_cancelled() {
         pipe.read_exact(&mut byte, Duration::from_millis(50))
     });
     created_rx.recv_timeout(CONNECT_TIMEOUT).unwrap();
-    let _client = NativePipe::connect_client(
-        &name,
-        PipeDirection::ClientToServer,
-        CONNECT_TIMEOUT,
-    )
-    .unwrap();
+    let _client =
+        NativePipe::connect_client(&name, PipeDirection::ClientToServer, CONNECT_TIMEOUT).unwrap();
 
     let error = server.join().unwrap().unwrap_err();
     assert!(is_timeout_error(&error));
@@ -431,10 +428,7 @@ fn native_pipe_read_timeout_is_cancelled() {
 
 #[test]
 fn reliable_request_timeout_keeps_transport_alive() {
-    let name = format!(
-        r"\\.\pipe\synly-test-response-timeout-{}",
-        Uuid::new_v4()
-    );
+    let name = format!(r"\\.\pipe\synly-test-response-timeout-{}", Uuid::new_v4());
     let (created_tx, created_rx) = std::sync::mpsc::sync_channel(1);
     let alive = Arc::new(AtomicBool::new(true));
     let server_name = name.clone();
@@ -456,12 +450,8 @@ fn reliable_request_timeout_keeps_transport_alive() {
         )
     });
     created_rx.recv_timeout(CONNECT_TIMEOUT).unwrap();
-    let mut client = NativePipe::connect_client(
-        &name,
-        PipeDirection::ServerToClient,
-        CONNECT_TIMEOUT,
-    )
-    .unwrap();
+    let mut client =
+        NativePipe::connect_client(&name, PipeDirection::ServerToClient, CONNECT_TIMEOUT).unwrap();
     let packet = read_packet::<GuiToAgentPacket>(&mut client, REQUEST_DELIVERY_TIMEOUT).unwrap();
     assert!(matches!(
         packet,
@@ -481,9 +471,7 @@ fn agent_heartbeat_only_expires_after_the_full_timeout() {
     let heartbeat = AgentHeartbeat::new(started);
 
     assert!(!heartbeat.expired(started + AGENT_HEARTBEAT_TIMEOUT));
-    assert!(heartbeat.expired(
-        started + AGENT_HEARTBEAT_TIMEOUT + Duration::from_millis(1)
-    ));
+    assert!(heartbeat.expired(started + AGENT_HEARTBEAT_TIMEOUT + Duration::from_millis(1)));
 }
 
 #[test]

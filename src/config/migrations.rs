@@ -107,9 +107,7 @@ fn migrate_unversioned_document(
         }
     }
     if version > current_version {
-        bail!(
-            "unsupported {file_name} version {version}, current version is {current_version}"
-        );
+        bail!("unsupported {file_name} version {version}, current version is {current_version}");
     }
     Ok(MigrationDocument { document, migrated })
 }
@@ -138,7 +136,10 @@ fn set_version(document: &mut toml::Value, version: u32, file_name: &str) -> Res
     let table = document
         .as_table_mut()
         .with_context(|| format!("{file_name} must contain a TOML table"))?;
-    table.insert("version".to_string(), toml::Value::Integer(i64::from(version)));
+    table.insert(
+        "version".to_string(),
+        toml::Value::Integer(i64::from(version)),
+    );
     Ok(())
 }
 
@@ -217,12 +218,18 @@ fn insert_main_v4_update_and_dock(document: &mut toml::Value) -> Result<()> {
         .and_then(toml::Value::as_table_mut)
         .context("config.toml ui must be a TOML table")?;
     if !ui.contains_key("hide_dock_when_hidden") {
-        ui.insert("hide_dock_when_hidden".to_string(), toml::Value::Boolean(true));
+        ui.insert(
+            "hide_dock_when_hidden".to_string(),
+            toml::Value::Boolean(true),
+        );
     }
     if !table.contains_key("update") {
         let mut update = toml::map::Map::new();
         update.insert("auto_check".to_string(), toml::Value::Boolean(true));
-        update.insert("skipped_version".to_string(), toml::Value::String(String::new()));
+        update.insert(
+            "skipped_version".to_string(),
+            toml::Value::String(String::new()),
+        );
         table.insert("update".to_string(), toml::Value::Table(update));
     }
     Ok(())
@@ -255,7 +262,10 @@ mod tests {
             })
         );
         let table = migration.document.as_table().unwrap();
-        assert_eq!(table.get("version").and_then(toml::Value::as_integer), Some(4));
+        assert_eq!(
+            table.get("version").and_then(toml::Value::as_integer),
+            Some(4)
+        );
         let ui = table.get("ui").and_then(toml::Value::as_table).unwrap();
         assert!(!ui.contains_key("first_run_completed"));
         assert!(!ui.contains_key("window_width"));
@@ -288,7 +298,10 @@ mod tests {
             migrate_main_config("version = 1\n[input]\nreverse_mouse_wheel = true\n").unwrap();
         assert!(migration.migrated);
         let table = migration.document.as_table().unwrap();
-        assert_eq!(table.get("version").and_then(toml::Value::as_integer), Some(4));
+        assert_eq!(
+            table.get("version").and_then(toml::Value::as_integer),
+            Some(4)
+        );
         let input = table.get("input").and_then(toml::Value::as_table).unwrap();
         assert_eq!(
             input.get("native_scroll_macos_to_windows"),
@@ -314,7 +327,10 @@ mod tests {
             migrate_main_config("version = 2\n[input]\nblock_switch_on_press = true\n").unwrap();
         assert!(migration.migrated);
         let table = migration.document.as_table().unwrap();
-        assert_eq!(table.get("version").and_then(toml::Value::as_integer), Some(4));
+        assert_eq!(
+            table.get("version").and_then(toml::Value::as_integer),
+            Some(4)
+        );
         let input = table.get("input").and_then(toml::Value::as_table).unwrap();
         assert_eq!(
             input.get("filter_app_events"),
@@ -331,7 +347,10 @@ mod tests {
         let migration = migrate_main_config("version = 3\n[ui]\nstart_hidden = true\n").unwrap();
         assert!(migration.migrated);
         let table = migration.document.as_table().unwrap();
-        assert_eq!(table.get("version").and_then(toml::Value::as_integer), Some(4));
+        assert_eq!(
+            table.get("version").and_then(toml::Value::as_integer),
+            Some(4)
+        );
         let ui = table.get("ui").and_then(toml::Value::as_table).unwrap();
         assert_eq!(
             ui.get("hide_dock_when_hidden"),

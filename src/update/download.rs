@@ -35,8 +35,8 @@ pub fn expected_sha256(sums: &str, file_name: &str) -> Result<[u8; 32]> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let (hash, name) = split_sum_line(line)
-            .with_context(|| format!("无法解析 SHA256SUMS 行: {line}"))?;
+        let (hash, name) =
+            split_sum_line(line).with_context(|| format!("无法解析 SHA256SUMS 行: {line}"))?;
         if name == file_name {
             return parse_sha256(hash);
         }
@@ -142,10 +142,7 @@ pub async fn download_archive(
         let chunk = chunk.context("读取更新包分片失败")?;
         writer.write_all(&chunk).await?;
         received += chunk.len() as u64;
-        on_progress(DownloadProgress {
-            received,
-            total,
-        });
+        on_progress(DownloadProgress { received, total });
     }
     if cancel.is_cancelled() {
         writer.flush().await.ok();
@@ -196,7 +193,10 @@ mod tests {
     fn parses_binary_marker_and_crlf() {
         let sums = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef *synly-0.8.0-linux-x86_64.tar.gz\r\n";
         let hash = expected_sha256(sums, "synly-0.8.0-linux-x86_64.tar.gz").unwrap();
-        assert_eq!(hex_encode(&hash), "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+        assert_eq!(
+            hex_encode(&hash),
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        );
     }
 
     #[tokio::test]

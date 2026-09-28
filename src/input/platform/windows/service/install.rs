@@ -10,18 +10,18 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::System::Services::{
     ChangeServiceConfig2W, ChangeServiceConfigW, CloseServiceHandle, ControlService,
     CreateServiceW, DeleteService, OpenSCManagerW, OpenServiceW, QUERY_SERVICE_CONFIGW,
-    QueryServiceConfigW, QueryServiceStatus,
-    SC_HANDLE, SC_MANAGER_ALL_ACCESS, SC_MANAGER_CONNECT, SERVICE_ALL_ACCESS, SERVICE_AUTO_START,
-    SERVICE_CHANGE_CONFIG, SERVICE_CONFIG_DELAYED_AUTO_START_INFO, SERVICE_CONFIG_DESCRIPTION,
-    SERVICE_CONTROL_STOP, SERVICE_DELAYED_AUTO_START_INFO, SERVICE_DESCRIPTIONW,
-    SERVICE_ERROR_NORMAL, SERVICE_NO_CHANGE, SERVICE_QUERY_CONFIG, SERVICE_QUERY_STATUS,
-    SERVICE_RUNNING, SERVICE_START, SERVICE_STOP, SERVICE_STOPPED, SERVICE_WIN32_OWN_PROCESS,
-    SERVICE_STATUS, StartServiceW,
+    QueryServiceConfigW, QueryServiceStatus, SC_HANDLE, SC_MANAGER_ALL_ACCESS, SC_MANAGER_CONNECT,
+    SERVICE_ALL_ACCESS, SERVICE_AUTO_START, SERVICE_CHANGE_CONFIG,
+    SERVICE_CONFIG_DELAYED_AUTO_START_INFO, SERVICE_CONFIG_DESCRIPTION, SERVICE_CONTROL_STOP,
+    SERVICE_DELAYED_AUTO_START_INFO, SERVICE_DESCRIPTIONW, SERVICE_ERROR_NORMAL, SERVICE_NO_CHANGE,
+    SERVICE_QUERY_CONFIG, SERVICE_QUERY_STATUS, SERVICE_RUNNING, SERVICE_START, SERVICE_STATUS,
+    SERVICE_STOP, SERVICE_STOPPED, SERVICE_WIN32_OWN_PROCESS, StartServiceW,
 };
 
 pub(crate) const SERVICE_NAME: &str = "SynlyInputService";
 pub(crate) const SERVICE_DISPLAY_NAME: &str = "Synly Input Service";
-pub(crate) const SERVICE_DESCRIPTION: &str = "以 SYSTEM 权限拉起 Synly 输入代理, 支持 UAC 与锁屏输入控制";
+pub(crate) const SERVICE_DESCRIPTION: &str =
+    "以 SYSTEM 权限拉起 Synly 输入代理, 支持 UAC 与锁屏输入控制";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ServiceStatus {
@@ -42,14 +42,17 @@ impl ServiceStatus {
 
 fn service_bin_path() -> Result<String> {
     let executable = std::env::current_exe().context("无法定位当前 Synly 可执行文件")?;
-    Ok(format!(
-        "\"{}\" __service",
-        executable.to_string_lossy()
-    ))
+    Ok(format!("\"{}\" __service", executable.to_string_lossy()))
 }
 
 pub fn install() -> Result<()> {
-    let scm = unsafe { OpenSCManagerW(std::ptr::null_mut(), std::ptr::null_mut(), SC_MANAGER_ALL_ACCESS) };
+    let scm = unsafe {
+        OpenSCManagerW(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            SC_MANAGER_ALL_ACCESS,
+        )
+    };
     if scm.is_null() {
         return Err(std::io::Error::last_os_error())
             .context("打开 Windows 服务管理器失败, 安装输入服务需要管理员权限");
@@ -174,7 +177,13 @@ pub fn install() -> Result<()> {
 /// 自动更新由安装器落地后, 正在运行的服务进程仍映射着更新前的映像; 只有重启服务,
 /// SYSTEM 侧才会用新版本代码运行. 服务未安装时退化为安装, 已停止时只做启动.
 pub fn restart() -> Result<()> {
-    let scm = unsafe { OpenSCManagerW(std::ptr::null_mut(), std::ptr::null_mut(), SC_MANAGER_ALL_ACCESS) };
+    let scm = unsafe {
+        OpenSCManagerW(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            SC_MANAGER_ALL_ACCESS,
+        )
+    };
     if scm.is_null() {
         return Err(std::io::Error::last_os_error())
             .context("打开 Windows 服务管理器失败, 重启输入服务需要管理员权限");
@@ -234,14 +243,8 @@ fn registered_bin_path_matches(service: SC_HANDLE, expected: &str) -> Result<boo
         return Err(error).context("查询输入服务注册路径失败");
     }
     let mut buffer = vec![0u8; needed as usize];
-    let ok = unsafe {
-        QueryServiceConfigW(
-            service,
-            buffer.as_mut_ptr().cast(),
-            needed,
-            &mut needed,
-        )
-    };
+    let ok =
+        unsafe { QueryServiceConfigW(service, buffer.as_mut_ptr().cast(), needed, &mut needed) };
     if ok == 0 {
         return Err(std::io::Error::last_os_error()).context("查询输入服务注册路径失败");
     }
@@ -256,10 +259,7 @@ fn registered_bin_path_matches(service: SC_HANDLE, expected: &str) -> Result<boo
         }
     }
     let registered = unsafe {
-        String::from_utf16_lossy(std::slice::from_raw_parts(
-            config.lpBinaryPathName,
-            length,
-        ))
+        String::from_utf16_lossy(std::slice::from_raw_parts(config.lpBinaryPathName, length))
     };
     Ok(registered == expected)
 }
@@ -285,20 +285,20 @@ fn stop_service(service: SC_HANDLE) -> Result<()> {
 }
 
 pub fn uninstall() -> Result<()> {
-    let scm = unsafe { OpenSCManagerW(std::ptr::null_mut(), std::ptr::null_mut(), SC_MANAGER_ALL_ACCESS) };
+    let scm = unsafe {
+        OpenSCManagerW(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            SC_MANAGER_ALL_ACCESS,
+        )
+    };
     if scm.is_null() {
         return Err(std::io::Error::last_os_error())
             .context("打开 Windows 服务管理器失败, 卸载输入服务需要管理员权限");
     }
     let scm = ServiceManagerHandle(scm);
     let service_name = wide(SERVICE_NAME);
-    let service = unsafe {
-        OpenServiceW(
-            scm.0,
-            service_name.as_ptr(),
-            SERVICE_ALL_ACCESS,
-        )
-    };
+    let service = unsafe { OpenServiceW(scm.0, service_name.as_ptr(), SERVICE_ALL_ACCESS) };
     if service.is_null() {
         let error = std::io::Error::last_os_error();
         if error.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST as i32) {
@@ -343,15 +343,19 @@ pub fn uninstall() -> Result<()> {
 }
 
 pub fn status() -> Result<ServiceStatus> {
-    let scm = unsafe { OpenSCManagerW(std::ptr::null_mut(), std::ptr::null_mut(), SC_MANAGER_CONNECT) };
+    let scm = unsafe {
+        OpenSCManagerW(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            SC_MANAGER_CONNECT,
+        )
+    };
     if scm.is_null() {
         return Err(std::io::Error::last_os_error()).context("打开 Windows 服务管理器失败");
     }
     let scm = ServiceManagerHandle(scm);
     let service_name = wide(SERVICE_NAME);
-    let service = unsafe {
-        OpenServiceW(scm.0, service_name.as_ptr(), SERVICE_QUERY_STATUS)
-    };
+    let service = unsafe { OpenServiceW(scm.0, service_name.as_ptr(), SERVICE_QUERY_STATUS) };
     if service.is_null() {
         let error = std::io::Error::last_os_error();
         if error.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST as i32) {

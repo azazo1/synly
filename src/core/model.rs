@@ -2,10 +2,10 @@ use crate::config::{
     ClipboardConfig, DiscoveryConfig, RuntimeConfig, SynlyConfig, TransferConfig,
     TrustedDeviceConfig, UiConfig,
 };
-use crate::runtime_control::InteractionRequest;
-use crate::protocol::{CapabilityEpoch, RuntimeCapabilities};
-use crate::settings::{AudioMode, ClipboardMode};
 use crate::input::InputMode;
+use crate::protocol::{CapabilityEpoch, RuntimeCapabilities};
+use crate::runtime_control::InteractionRequest;
+use crate::settings::{AudioMode, ClipboardMode};
 use std::path::PathBuf;
 use uuid::Uuid;
 

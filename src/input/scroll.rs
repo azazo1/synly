@@ -111,7 +111,10 @@ fn rounded_i32(value: f64) -> i32 {
 mod tests {
     use super::*;
 
-    fn transformer(native_macos_to_windows: bool, native_windows_to_macos: bool) -> ScrollTransformer {
+    fn transformer(
+        native_macos_to_windows: bool,
+        native_windows_to_macos: bool,
+    ) -> ScrollTransformer {
         ScrollTransformer::new(native_macos_to_windows, native_windows_to_macos)
     }
 

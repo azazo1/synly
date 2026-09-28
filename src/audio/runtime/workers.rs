@@ -14,10 +14,18 @@ pub(super) struct Workers {
 
 impl Workers {
     pub fn new(stop: CancellationToken) -> Self {
-        Self { stop, tasks: JoinSet::new(), queues: Vec::new() }
+        Self {
+            stop,
+            tasks: JoinSet::new(),
+            queues: Vec::new(),
+        }
     }
 
-    pub fn queue<T: Send + 'static>(&mut self, name: &'static str, capacity: usize) -> Arc<FrameQueue<T>> {
+    pub fn queue<T: Send + 'static>(
+        &mut self,
+        name: &'static str,
+        capacity: usize,
+    ) -> Arc<FrameQueue<T>> {
         let queue = Arc::new(FrameQueue::new(name, capacity));
         self.queues.push(Arc::clone(&queue) as Arc<dyn StopQueue>);
         queue
@@ -88,7 +96,12 @@ mod tests {
             Ok(())
         });
         workers.spawn(async { anyhow::bail!("测试失败") });
-        assert!(tokio::time::timeout(Duration::from_secs(1), workers.finish()).await.unwrap().is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), workers.finish())
+                .await
+                .unwrap()
+                .is_err()
+        );
         assert!(stop.is_cancelled());
         assert!(stopped.load(Ordering::Acquire));
     }
@@ -103,7 +116,12 @@ mod tests {
             Ok(())
         });
         workers.spawn_blocking(|| panic!("测试工作线程 panic"));
-        assert!(tokio::time::timeout(Duration::from_secs(1), workers.finish()).await.unwrap().is_err());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), workers.finish())
+                .await
+                .unwrap()
+                .is_err()
+        );
         assert!(stop.is_cancelled());
     }
 
@@ -117,6 +135,9 @@ mod tests {
             Ok(())
         });
         stop.cancel();
-        tokio::time::timeout(Duration::from_secs(1), workers.finish()).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), workers.finish())
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

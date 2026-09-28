@@ -30,7 +30,9 @@ pub(crate) enum ServiceResponse {
     Err(String),
 }
 
-pub(crate) fn read_request(pipe: &mut super::super::agent::pipe::NativePipe) -> Result<ServiceRequest> {
+pub(crate) fn read_request(
+    pipe: &mut super::super::agent::pipe::NativePipe,
+) -> Result<ServiceRequest> {
     super::super::agent::protocol::read_packet(pipe, SERVICE_REQUEST_TIMEOUT)
         .context("读取 Synly 输入服务请求失败")
 }
@@ -51,7 +53,9 @@ pub(crate) fn write_response(
         .context("写入 Synly 输入服务响应失败")
 }
 
-pub(crate) fn read_response(pipe: &mut super::super::agent::pipe::NativePipe) -> Result<ServiceResponse> {
+pub(crate) fn read_response(
+    pipe: &mut super::super::agent::pipe::NativePipe,
+) -> Result<ServiceResponse> {
     super::super::agent::protocol::read_packet(pipe, SERVICE_RESPONSE_TIMEOUT)
         .context("读取 Synly 输入服务响应失败")
 }

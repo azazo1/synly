@@ -83,7 +83,11 @@ impl CursorCaptureTracker {
             let dy = point.y.saturating_sub(previous.y);
             self.last_point = Some(self.anchor);
             if dx == 0 && dy == 0 {
-                return CursorMove::Relayed { dx, dy, bogus: false };
+                return CursorMove::Relayed {
+                    dx,
+                    dy,
+                    bogus: false,
+                };
             }
             let bogus = self.is_bogus_motion(dx, dy);
             return CursorMove::Relayed { dx, dy, bogus };
@@ -104,19 +108,13 @@ impl CursorCaptureTracker {
     fn is_bogus_motion(&self, dx: i32, dy: i32) -> bool {
         let bounds = virtual_bounds(&self.layout.displays);
         (dx < 0
-            && dx
-                .saturating_neg()
-                .saturating_add(BOGUS_MOTION_MARGIN)
+            && dx.saturating_neg().saturating_add(BOGUS_MOTION_MARGIN)
                 > self.anchor.x - bounds.left)
-            || (dx > 0
-                && dx.saturating_add(BOGUS_MOTION_MARGIN) > bounds.right - self.anchor.x)
+            || (dx > 0 && dx.saturating_add(BOGUS_MOTION_MARGIN) > bounds.right - self.anchor.x)
             || (dy < 0
-                && dy
-                    .saturating_neg()
-                    .saturating_add(BOGUS_MOTION_MARGIN)
+                && dy.saturating_neg().saturating_add(BOGUS_MOTION_MARGIN)
                     > self.anchor.y - bounds.top)
-            || (dy > 0
-                && dy.saturating_add(BOGUS_MOTION_MARGIN) > bounds.bottom - self.anchor.y)
+            || (dy > 0 && dy.saturating_add(BOGUS_MOTION_MARGIN) > bounds.bottom - self.anchor.y)
     }
 }
 
@@ -124,15 +122,22 @@ pub(super) fn select_capture_anchor(
     primary: Option<DisplayRect>,
     displays: &[DisplayRect],
 ) -> Option<Point> {
-    primary.or_else(|| displays.first().copied()).map(|display| Point {
-        x: display.x.saturating_add(display.width / 2),
-        y: display.y.saturating_add(display.height / 2),
-    })
+    primary
+        .or_else(|| displays.first().copied())
+        .map(|display| Point {
+            x: display.x.saturating_add(display.width / 2),
+            y: display.y.saturating_add(display.height / 2),
+        })
 }
 
 fn virtual_bounds(displays: &[DisplayRect]) -> Rect {
     let Some(first) = displays.first().copied() else {
-        return Rect { left: 0, top: 0, right: 1, bottom: 1 };
+        return Rect {
+            left: 0,
+            top: 0,
+            right: 1,
+            bottom: 1,
+        };
     };
     displays.iter().skip(1).fold(
         Rect {
@@ -191,7 +196,11 @@ mod tests {
         let mut tracker = CursorCaptureTracker::new(layout(), Point { x: 50, y: 50 }, None);
         assert_eq!(
             tracker.handle_move(CapturePhase::Relaying, Point { x: 57, y: 44 }),
-            CursorMove::Relayed { dx: 7, dy: -6, bogus: false }
+            CursorMove::Relayed {
+                dx: 7,
+                dy: -6,
+                bogus: false
+            }
         );
     }
 
@@ -211,15 +220,29 @@ mod tests {
         let mut tracker = CursorCaptureTracker::new(layout(), Point { x: 50, y: 50 }, None);
         assert_eq!(
             tracker.handle_move(CapturePhase::Relaying, Point { x: 0, y: 50 }),
-            CursorMove::Relayed { dx: -50, dy: 0, bogus: true }
+            CursorMove::Relayed {
+                dx: -50,
+                dy: 0,
+                bogus: true
+            }
         );
     }
 
     #[test]
     fn primary_display_is_preferred_for_capture_anchor() {
         let displays = [
-            DisplayRect { x: -1280, y: 200, width: 1280, height: 1024 },
-            DisplayRect { x: 0, y: 0, width: 1920, height: 1080 },
+            DisplayRect {
+                x: -1280,
+                y: 200,
+                width: 1280,
+                height: 1024,
+            },
+            DisplayRect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
         ];
         assert_eq!(
             select_capture_anchor(Some(displays[1]), &displays),

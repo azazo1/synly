@@ -20,9 +20,16 @@ pub(super) async fn run(
     stream: StreamParams,
 ) -> Result<()> {
     let playback_stream = stream.clone();
-    run_with_output(socket, stop, master_secret, direction, expected_peer_ip, stream, move || {
-        open_output(&PlaybackConfig::default(), &playback_stream)
-    }).await
+    run_with_output(
+        socket,
+        stop,
+        master_secret,
+        direction,
+        expected_peer_ip,
+        stream,
+        move || open_output(&PlaybackConfig::default(), &playback_stream),
+    )
+    .await
 }
 
 pub(super) async fn run_with_output(
@@ -44,7 +51,14 @@ pub(super) async fn run_with_output(
     workers.spawn_blocking(move || {
         super::render::run(open, decode_queue, decode_stop, &stream).map_err(Into::into)
     });
-    workers.spawn(receive_packets(socket, packets, stop, decryptor, expected_peer_ip, depacketizer));
+    workers.spawn(receive_packets(
+        socket,
+        packets,
+        stop,
+        decryptor,
+        expected_peer_ip,
+        depacketizer,
+    ));
     let result = workers.finish().await;
     tracing::info!(success = result.is_ok(), "音频接收链路已停止");
     result
@@ -74,12 +88,17 @@ pub(super) async fn receive_packets(
             Err(_) => depacketizer.receive_timeout(),
             Ok(Err(error)) => return Err(error).context("接收音频 UDP 失败"),
             Ok(Ok((packet_len, remote_addr))) => {
-                if remote_addr.ip() != expected_peer_ip || bound_peer.is_some_and(|peer| peer != remote_addr) {
+                if remote_addr.ip() != expected_peer_ip
+                    || bound_peer.is_some_and(|peer| peer != remote_addr)
+                {
                     continue;
                 }
                 let packet = match decryptor.decrypt(&read_buffer[..packet_len]) {
                     Ok(packet) => packet,
-                    Err(_) => { invalid += 1; continue; }
+                    Err(_) => {
+                        invalid += 1;
+                        continue;
+                    }
                 };
                 let ready = match depacketizer.push_datagram(&packet) {
                     Ok(ready) => ready,
@@ -98,7 +117,9 @@ pub(super) async fn receive_packets(
             }
         };
         for frame in ready {
-            if !packets.push(frame) { return Ok(()); }
+            if !packets.push(frame) {
+                return Ok(());
+            }
         }
     }
     tracing::debug!(received, invalid, "音频 UDP 接收统计");

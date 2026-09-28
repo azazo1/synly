@@ -1,3 +1,4 @@
+use super::super::super::{CaptureContext, InputBackend, MotionAccumulator};
 use super::pipe::{NativePipe, PipeDirection};
 use super::protocol::{
     AgentRequest, AgentResponse, AgentToGuiPacket, GuiToAgentPacket, is_timeout_error, read_packet,
@@ -7,7 +8,6 @@ use super::security::{
     current_process_is_system, process_session_id, validate_parent_process, validate_pipe_server,
 };
 use super::{AGENT_HEARTBEAT_TIMEOUT, CONNECT_TIMEOUT, REQUEST_DELIVERY_TIMEOUT};
-use super::super::super::{CaptureContext, InputBackend, MotionAccumulator};
 use crate::input::{Hotkey, InputMode, Point};
 use anyhow::{Context, Result, anyhow, bail};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -200,16 +200,12 @@ fn agent_command_owner(
     startup: std::sync::mpsc::SyncSender<Result<(), String>>,
     alive: Arc<AtomicBool>,
 ) -> Result<()> {
-    let mut pipe = NativePipe::connect_client(
-        &pipe_name,
-        PipeDirection::ServerToClient,
-        CONNECT_TIMEOUT,
-    )?;
+    let mut pipe =
+        NativePipe::connect_client(&pipe_name, PipeDirection::ServerToClient, CONNECT_TIMEOUT)?;
     validate_pipe_server(&pipe, parent_pid)?;
     let ack: GuiToAgentPacket = read_packet(&mut pipe, CONNECT_TIMEOUT)?;
     let startup_result = (|| -> Result<()> {
-        let GuiToAgentPacket::HelloAck { session_id } = ack
-        else {
+        let GuiToAgentPacket::HelloAck { session_id } = ack else {
             bail!("Windows input agent received an invalid handshake response");
         };
         let expected_session_id = process_session_id(parent_pid)?;
@@ -222,7 +218,12 @@ fn agent_command_owner(
         Ok(())
     })();
     startup
-        .send(startup_result.as_ref().map(|_| ()).map_err(|error| format!("{error:#}")))
+        .send(
+            startup_result
+                .as_ref()
+                .map(|_| ())
+                .map_err(|error| format!("{error:#}")),
+        )
         .map_err(|_| anyhow!("Windows input agent event owner stopped during startup"))?;
     startup_result?;
 
@@ -255,11 +256,8 @@ fn agent_event_owner(
     ready: std::sync::mpsc::SyncSender<Result<(), String>>,
     alive: Arc<AtomicBool>,
 ) -> Result<()> {
-    let mut pipe = NativePipe::connect_client(
-        &pipe_name,
-        PipeDirection::ClientToServer,
-        CONNECT_TIMEOUT,
-    )?;
+    let mut pipe =
+        NativePipe::connect_client(&pipe_name, PipeDirection::ClientToServer, CONNECT_TIMEOUT)?;
     validate_pipe_server(&pipe, parent_pid)?;
     let agent_path = std::env::current_exe().context("failed to locate input agent executable")?;
     write_packet(
@@ -347,8 +345,7 @@ pub async fn run_agent(
 fn agent_completion_packet(id: u64, response: Result<AgentResponse>) -> AgentToGuiPacket {
     AgentToGuiPacket::Response {
         id,
-        response: response
-            .unwrap_or_else(|error| AgentResponse::Error(format!("{error:#}"))),
+        response: response.unwrap_or_else(|error| AgentResponse::Error(format!("{error:#}"))),
     }
 }
 
@@ -506,8 +503,7 @@ async fn handle_agent_request(
                 outgoing,
             )?);
             let layout = agent_backend(runtime)?.layout()?;
-            let secure_desktop =
-                !super::super::desktop::current_input_desktop_is_default();
+            let secure_desktop = !super::super::desktop::current_input_desktop_is_default();
             let primary = if secure_desktop {
                 agent_backend(runtime)?.secure_desktop_state().1
             } else {
@@ -526,9 +522,9 @@ async fn handle_agent_request(
             Ok(AgentResponse::Ok)
         }
         AgentRequest::Health => Ok(AgentResponse::Pong),
-        AgentRequest::CursorPosition => {
-            Ok(AgentResponse::Point(agent_backend(runtime)?.cursor_position()?))
-        }
+        AgentRequest::CursorPosition => Ok(AgentResponse::Point(
+            agent_backend(runtime)?.cursor_position()?,
+        )),
         AgentRequest::Snapshot => Ok(AgentResponse::Snapshot(agent_backend(runtime)?.snapshot())),
         AgentRequest::RefreshPressedState => Ok(AgentResponse::Snapshot(
             agent_backend(runtime)?.refresh_pressed_state()?,

@@ -1,9 +1,7 @@
 use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
-#[derive(
-    Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, ValueEnum, PartialOrd, Ord,
-)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, ValueEnum, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum FileSyncMode {
     Off,
@@ -107,7 +105,6 @@ impl InitialSyncMode {
             InitialSyncMode::Other => "对端目录",
         }
     }
-
 }
 
 impl FileSyncMode {

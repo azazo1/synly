@@ -1,9 +1,9 @@
 use super::{DesktopLayout, DisplayRect, Hotkey, InputMode, KeySnapshot, ModifierMask, Point};
 use anyhow::{Result, bail};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use tokio::sync::mpsc;
-use serde::{Deserialize, Serialize};
 
 #[cfg(target_os = "macos")]
 pub(super) mod macos;
@@ -116,26 +116,14 @@ pub fn foreground_cursor_captured() -> bool {
 pub struct MotionAccumulator {
     dx: AtomicI32,
     dy: AtomicI32,
-    #[cfg(any(
-        windows,
-        test,
-        all(target_os = "macos", feature = "input-screen-mock")
-    ))]
+    #[cfg(any(windows, test, all(target_os = "macos", feature = "input-screen-mock")))]
     observed_dx: AtomicI32,
-    #[cfg(any(
-        windows,
-        test,
-        all(target_os = "macos", feature = "input-screen-mock")
-    ))]
+    #[cfg(any(windows, test, all(target_os = "macos", feature = "input-screen-mock")))]
     observed_dy: AtomicI32,
     position: AtomicU64,
     position_valid: AtomicBool,
     position_updated: AtomicBool,
-    #[cfg(any(
-        windows,
-        test,
-        all(target_os = "macos", feature = "input-screen-mock")
-    ))]
+    #[cfg(any(windows, test, all(target_os = "macos", feature = "input-screen-mock")))]
     observed_position_updated: AtomicBool,
 }
 
@@ -144,11 +132,7 @@ impl MotionAccumulator {
     pub fn add(&self, dx: i32, dy: i32) {
         self.dx.fetch_add(dx, Ordering::Relaxed);
         self.dy.fetch_add(dy, Ordering::Relaxed);
-        #[cfg(any(
-            windows,
-            test,
-            all(target_os = "macos", feature = "input-screen-mock")
-        ))]
+        #[cfg(any(windows, test, all(target_os = "macos", feature = "input-screen-mock")))]
         {
             self.observed_dx.fetch_add(dx, Ordering::Relaxed);
             self.observed_dy.fetch_add(dy, Ordering::Relaxed);
@@ -160,12 +144,9 @@ impl MotionAccumulator {
         self.position.store(pack_point(position), Ordering::Relaxed);
         self.position_valid.store(true, Ordering::Release);
         self.position_updated.store(true, Ordering::Release);
-        #[cfg(any(
-            windows,
-            test,
-            all(target_os = "macos", feature = "input-screen-mock")
-        ))]
-        self.observed_position_updated.store(true, Ordering::Release);
+        #[cfg(any(windows, test, all(target_os = "macos", feature = "input-screen-mock")))]
+        self.observed_position_updated
+            .store(true, Ordering::Release);
         self.add(dx, dy);
     }
 
@@ -177,14 +158,15 @@ impl MotionAccumulator {
             .position_valid
             .load(Ordering::Acquire)
             .then(|| unpack_point(self.position.load(Ordering::Relaxed)));
-        MotionSample { dx, dy, position, position_updated }
+        MotionSample {
+            dx,
+            dy,
+            position,
+            position_updated,
+        }
     }
 
-    #[cfg(any(
-        windows,
-        test,
-        all(target_os = "macos", feature = "input-screen-mock")
-    ))]
+    #[cfg(any(windows, test, all(target_os = "macos", feature = "input-screen-mock")))]
     pub fn take_observed(&self) -> MotionSample {
         let position_updated = self.observed_position_updated.swap(false, Ordering::AcqRel);
         let position = self

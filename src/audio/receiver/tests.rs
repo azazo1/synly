@@ -38,7 +38,10 @@ fn delivers_in_order_without_waiting_for_parity_and_ignores_duplicates() {
     queue.add_packet(audio(0)).unwrap();
     for sequence in 4..8 {
         queue.add_packet(audio(sequence)).unwrap();
-        assert_eq!(drain(&mut queue), vec![QueuedAudioFrame::Encoded(vec![sequence as u8; 8])]);
+        assert_eq!(
+            drain(&mut queue),
+            vec![QueuedAudioFrame::Encoded(vec![sequence as u8; 8])]
+        );
         queue.add_packet(audio(sequence)).unwrap();
         assert!(drain(&mut queue).is_empty());
     }
@@ -51,11 +54,15 @@ fn restores_every_pair_of_lost_data_or_parity_shards() {
         sender.push_encoded_frame(&[sequence; 8]).unwrap();
     }
     let mut datagrams = Vec::new();
-    let expected: Vec<_> = (4..8).map(|sequence| {
-        let payload: Vec<u8> = (0..251).map(|index| (index * 37 + sequence) as u8).collect();
-        datagrams.extend(sender.push_encoded_frame(&payload).unwrap());
-        QueuedAudioFrame::Encoded(payload)
-    }).collect();
+    let expected: Vec<_> = (4..8)
+        .map(|sequence| {
+            let payload: Vec<u8> = (0..251)
+                .map(|index| (index * 37 + sequence) as u8)
+                .collect();
+            datagrams.extend(sender.push_encoded_frame(&payload).unwrap());
+            QueuedAudioFrame::Encoded(payload)
+        })
+        .collect();
     assert_eq!(datagrams.len(), 6);
     for first_missing in 0..6 {
         for second_missing in first_missing + 1..6 {
@@ -69,7 +76,10 @@ fn restores_every_pair_of_lost_data_or_parity_shards() {
                     recovered.extend(receiver.push_datagram(&datagrams[index].bytes).unwrap());
                 }
             }
-            assert_eq!(recovered, expected, "missing {first_missing}, {second_missing}");
+            assert_eq!(
+                recovered, expected,
+                "missing {first_missing}, {second_missing}"
+            );
         }
     }
 }
@@ -84,10 +94,13 @@ fn late_packet_enables_reordering_grace_before_being_discarded() {
     queue.add_packet(audio(12)).unwrap();
     assert!(drain(&mut queue).is_empty());
     queue.add_packet(audio(8)).unwrap();
-    assert_eq!(drain(&mut queue), vec![
-        QueuedAudioFrame::Encoded(vec![8; 8]),
-        QueuedAudioFrame::Encoded(vec![9; 8]),
-    ]);
+    assert_eq!(
+        drain(&mut queue),
+        vec![
+            QueuedAudioFrame::Encoded(vec![8; 8]),
+            QueuedAudioFrame::Encoded(vec![9; 8]),
+        ]
+    );
     assert_eq!(queue.stats.packet_count_fec_failed, 0);
 }
 
@@ -96,13 +109,16 @@ fn unrecoverable_block_produces_plc_then_advances_to_next_block() {
     let mut queue = synchronized_queue();
     queue.add_packet(audio(9)).unwrap();
     queue.add_packet(audio(12)).unwrap();
-    assert_eq!(drain(&mut queue), vec![
-        QueuedAudioFrame::Missing,
-        QueuedAudioFrame::Encoded(vec![9; 8]),
-        QueuedAudioFrame::Missing,
-        QueuedAudioFrame::Missing,
-        QueuedAudioFrame::Encoded(vec![12; 8]),
-    ]);
+    assert_eq!(
+        drain(&mut queue),
+        vec![
+            QueuedAudioFrame::Missing,
+            QueuedAudioFrame::Encoded(vec![9; 8]),
+            QueuedAudioFrame::Missing,
+            QueuedAudioFrame::Missing,
+            QueuedAudioFrame::Encoded(vec![12; 8]),
+        ]
+    );
     assert_eq!(queue.stats.packet_count_fec_failed, 1);
 }
 
@@ -135,17 +151,20 @@ fn one_timeout_drains_expired_blocks_across_a_completely_lost_block() {
     }
     let mut receiver = AudioDepacketizer::new(5, 0);
     receiver.queue = queue;
-    assert_eq!(receiver.receive_timeout(), vec![
-        QueuedAudioFrame::Missing,
-        QueuedAudioFrame::Encoded(vec![9; 8]),
-        QueuedAudioFrame::Missing,
-        QueuedAudioFrame::Missing,
-        QueuedAudioFrame::Missing,
-        QueuedAudioFrame::Encoded(vec![17; 8]),
-        QueuedAudioFrame::Missing,
-        QueuedAudioFrame::Missing,
-        QueuedAudioFrame::Encoded(vec![20; 8]),
-    ]);
+    assert_eq!(
+        receiver.receive_timeout(),
+        vec![
+            QueuedAudioFrame::Missing,
+            QueuedAudioFrame::Encoded(vec![9; 8]),
+            QueuedAudioFrame::Missing,
+            QueuedAudioFrame::Missing,
+            QueuedAudioFrame::Missing,
+            QueuedAudioFrame::Encoded(vec![17; 8]),
+            QueuedAudioFrame::Missing,
+            QueuedAudioFrame::Missing,
+            QueuedAudioFrame::Encoded(vec![20; 8]),
+        ]
+    );
     assert_eq!(receiver.queue.stats.packet_count_fec_failed, 2);
 }
 
@@ -153,7 +172,10 @@ fn one_timeout_drains_expired_blocks_across_a_completely_lost_block() {
 fn entirely_lost_block_resynchronizes_without_synthetic_backlog() {
     let mut queue = synchronized_queue();
     queue.add_packet(audio(16)).unwrap();
-    assert_eq!(drain(&mut queue), vec![QueuedAudioFrame::Encoded(vec![16; 8])]);
+    assert_eq!(
+        drain(&mut queue),
+        vec![QueuedAudioFrame::Encoded(vec![16; 8])]
+    );
     assert!(!queue.received_oos_data);
 }
 
@@ -163,7 +185,10 @@ fn startup_at_sequence_wrap_does_not_restart_synchronization() {
     queue.add_packet(audio(65532)).unwrap();
     for sequence in 0..4 {
         queue.add_packet(audio(sequence)).unwrap();
-        assert_eq!(drain(&mut queue), vec![QueuedAudioFrame::Encoded(vec![sequence as u8; 8])]);
+        assert_eq!(
+            drain(&mut queue),
+            vec![QueuedAudioFrame::Encoded(vec![sequence as u8; 8])]
+        );
     }
     assert!(!queue.synchronizing);
 }
@@ -190,7 +215,10 @@ fn startup_drop_discards_parity_and_timeout_ends_only_started_window() {
         }
     }
     let packet = sender.push_encoded_frame(&[16; 8]).unwrap();
-    assert_eq!(receiver.push_datagram(&packet[0].bytes).unwrap(), vec![QueuedAudioFrame::Encoded(vec![16; 8])]);
+    assert_eq!(
+        receiver.push_datagram(&packet[0].bytes).unwrap(),
+        vec![QueuedAudioFrame::Encoded(vec![16; 8])]
+    );
 }
 
 #[test]
@@ -203,7 +231,9 @@ fn rejects_mismatched_block_identity_without_poisoning_valid_shards() {
             match field {
                 0 => rtp.timestamp += 1,
                 1 => rtp.ssrc += 1,
-                _ => { payload.pop(); }
+                _ => {
+                    payload.pop();
+                }
             }
         }
         assert!(queue.add_packet(packet).is_err());
@@ -214,7 +244,9 @@ fn rejects_mismatched_block_identity_without_poisoning_valid_shards() {
 
 #[test]
 fn rejects_invalid_rtp_headers_and_empty_payloads() {
-    let ParsedPacket::Audio { rtp, payload } = audio(4) else { unreachable!() };
+    let ParsedPacket::Audio { rtp, payload } = audio(4) else {
+        unreachable!()
+    };
     let packet = write_audio_packet(rtp, &payload);
     for flags in [0, 0x40, 0x81, 0x90, 0xa0] {
         let mut invalid = packet.clone();

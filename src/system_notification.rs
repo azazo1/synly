@@ -64,10 +64,13 @@ impl SystemNotifier {
                 .pending
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            state.pending.remove(&peer.device_id).is_some_and(|pending| {
-                pending.cancelled.store(true, Ordering::Release);
-                pending.disconnected_at.elapsed() < DISCONNECT_NOTIFICATION_DELAY
-            })
+            state
+                .pending
+                .remove(&peer.device_id)
+                .is_some_and(|pending| {
+                    pending.cancelled.store(true, Ordering::Release);
+                    pending.disconnected_at.elapsed() < DISCONNECT_NOTIFICATION_DELAY
+                })
         };
         if !suppressed {
             show_session_notification(ConnectionEvent::Connected, peer);
@@ -128,10 +131,7 @@ impl SystemNotifier {
                     }
                 };
                 if should_show {
-                    show_session_notification(
-                        ConnectionEvent::Disconnected,
-                        &peer_for_thread,
-                    );
+                    show_session_notification(ConnectionEvent::Disconnected, &peer_for_thread);
                 }
             })
         {
@@ -219,17 +219,11 @@ fn show_session_notification(event: ConnectionEvent, peer: &NotificationPeer) {
     }
 }
 
-fn notification_text(
-    event: ConnectionEvent,
-    peer: &NotificationPeer,
-) -> (&'static str, String) {
+fn notification_text(event: ConnectionEvent, peer: &NotificationPeer) -> (&'static str, String) {
     match event {
         ConnectionEvent::Connected => (
             "Synly 已连接",
-            format!(
-                "已连接到 {} ({})",
-                peer.display_name, peer.short_device_id
-            ),
+            format!("已连接到 {} ({})", peer.display_name, peer.short_device_id),
         ),
         ConnectionEvent::Disconnected => (
             "Synly 已断开",

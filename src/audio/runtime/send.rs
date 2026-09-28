@@ -21,7 +21,8 @@ pub(super) async fn run(
     let capture_stream = stream.clone();
     run_with_input(socket, stop, master_secret, direction, stream, move || {
         open_input(&CaptureConfig::default(), &capture_stream)
-    }).await
+    })
+    .await
 }
 
 pub(super) async fn run_with_input(
@@ -45,8 +46,16 @@ pub(super) async fn run_with_input(
     let encode_queue = Arc::clone(&packets);
     let encode_stop = stop.clone();
     let encode_stream = stream.clone();
-    workers.spawn_blocking(move || encode_frames(samples, encode_queue, encode_stop, &encode_stream));
-    workers.spawn(send_packets(socket, packets, stop, master_secret, direction, stream.packet_duration_ms));
+    workers
+        .spawn_blocking(move || encode_frames(samples, encode_queue, encode_stop, &encode_stream));
+    workers.spawn(send_packets(
+        socket,
+        packets,
+        stop,
+        master_secret,
+        direction,
+        stream.packet_duration_ms,
+    ));
     let result = workers.finish().await;
     tracing::info!(success = result.is_ok(), "音频发送链路已停止");
     result
@@ -60,11 +69,19 @@ fn encode_frames(
 ) -> Result<()> {
     let mut encoder = OpusEncoder::new(stream.opus_config(), stream.bitrate)?;
     let mut encoded = vec![0u8; 1400];
-    tracing::info!(bitrate = stream.bitrate, frame_ms = stream.packet_duration_ms, "Opus 编码任务已启动");
+    tracing::info!(
+        bitrate = stream.bitrate,
+        frame_ms = stream.packet_duration_ms,
+        "Opus 编码任务已启动"
+    );
     while let Some(frame) = samples.pop_blocking() {
-        if stop.is_cancelled() { break; }
+        if stop.is_cancelled() {
+            break;
+        }
         let size = encoder.encode_float(&frame, &mut encoded)?;
-        if !packets.push(encoded[..size].to_vec()) { break; }
+        if !packets.push(encoded[..size].to_vec()) {
+            break;
+        }
     }
     Ok(())
 }
@@ -82,7 +99,9 @@ async fn send_packets(
     tracing::info!(local_addr = %socket.local_addr()?, remote_addr = %socket.peer_addr()?, "音频 UDP 发送端已连接");
     let mut sent = 0u64;
     while let Some(packet) = packets.pop().await {
-        if stop.is_cancelled() { break; }
+        if stop.is_cancelled() {
+            break;
+        }
         for datagram in packetizer.push_encoded_frame(&packet)? {
             let encrypted = encryptor.encrypt(&datagram.bytes)?;
             tokio::select! {

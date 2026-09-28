@@ -4,8 +4,8 @@ use std::net::SocketAddr;
 use std::str::FromStr;
 use std::time::Duration;
 use synly::input::receiver_mock::{
-    ControllerMockOptions, InteractiveControllerOptions, ReceiverMockOptions,
-    run_controller_mock, run_controller_mock_interactive, run_receiver_mock,
+    ControllerMockOptions, InteractiveControllerOptions, ReceiverMockOptions, run_controller_mock,
+    run_controller_mock_interactive, run_receiver_mock,
 };
 use synly::input::{CursorMode, Hotkey, ScreenEdge};
 

@@ -20,17 +20,24 @@ fn playback(frame_ms: u32) -> SharedSampleRing {
         budget.frame_samples,
         budget.playback_watermark,
         "测试播放队列已关闭",
-    ).unwrap()
+    )
+    .unwrap()
 }
 
 #[test]
 fn playback_restart_is_reported_to_runtime_instead_of_reopening_in_place() {
-    for result in [Ok(ThreadRunState::Restart), Err(Error::Backend("模拟 WASAPI 失败".into()))] {
+    for result in [
+        Ok(ThreadRunState::Restart),
+        Err(Error::Backend("模拟 WASAPI 失败".into())),
+    ] {
         let ring = playback(5);
         finish_playback_stream(result, &ring);
         assert!(ring.lock_state().unwrap().closed);
         assert!(ring.lock_state().unwrap().error.is_some());
-        assert!(ring.write_blocking(&vec![0.0; ring.frame_samples], Duration::ZERO).is_err());
+        assert!(
+            ring.write_blocking(&vec![0.0; ring.frame_samples], Duration::ZERO)
+                .is_err()
+        );
     }
     let ring = playback(5);
     finish_playback_stream(Ok(ThreadRunState::Stop), &ring);
@@ -42,10 +49,16 @@ fn playback_restart_is_reported_to_runtime_instead_of_reopening_in_place() {
 fn budgets_preserve_five_and_sixty_millisecond_frames() {
     let short = QueueBudget::from_stream(&params(5)).unwrap();
     assert_eq!((short.frame_samples, short.capture_samples), (480, 2880));
-    assert_eq!((short.playback_watermark, short.playback_samples), (4800, 5280));
+    assert_eq!(
+        (short.playback_watermark, short.playback_samples),
+        (4800, 5280)
+    );
     let long = QueueBudget::from_stream(&params(60)).unwrap();
     assert_eq!((long.frame_samples, long.capture_samples), (5760, 5760));
-    assert_eq!((long.playback_watermark, long.playback_samples), (4800, 10560));
+    assert_eq!(
+        (long.playback_watermark, long.playback_samples),
+        (4800, 10560)
+    );
 }
 
 #[test]
@@ -74,7 +87,10 @@ fn fifty_millisecond_watermark_accepts_one_whole_negotiated_frame() {
         ring.write_silence_overwrite(ring.playback_watermark);
         let frame = vec![1.0; ring.frame_samples];
         ring.write_blocking(&frame, Duration::ZERO).unwrap();
-        assert_eq!(ring.lock_state().unwrap().len, ring.playback_watermark + ring.frame_samples);
+        assert_eq!(
+            ring.lock_state().unwrap().len,
+            ring.playback_watermark + ring.frame_samples
+        );
         assert!(ring.write_blocking(&frame, Duration::ZERO).is_err());
     }
 }
@@ -82,33 +98,47 @@ fn fifty_millisecond_watermark_accepts_one_whole_negotiated_frame() {
 #[test]
 fn sixty_millisecond_backlog_blocks_even_when_capacity_is_available() {
     let ring = SharedSampleRing::new(12_000, 2, 5760, 4800, "test").unwrap();
-    ring.write_blocking(&vec![1.0; 5760], Duration::ZERO).unwrap();
+    ring.write_blocking(&vec![1.0; 5760], Duration::ZERO)
+        .unwrap();
     // 故意使用更大容量, 验证不能仅凭剩余空间绕过 50 ms 软件水位.
     ring.read_partial_zero_fill(&mut vec![0.0; 958]);
     assert_eq!(ring.lock_state().unwrap().len, 4802);
     assert!(ring.lock_state().unwrap().available() >= 5760);
-    assert!(ring.write_blocking(&vec![2.0; 5760], Duration::ZERO).is_err());
+    assert!(
+        ring.write_blocking(&vec![2.0; 5760], Duration::ZERO)
+            .is_err()
+    );
     ring.read_partial_zero_fill(&mut [0.0; 2]);
-    ring.write_blocking(&vec![3.0; 5760], Duration::ZERO).unwrap();
+    ring.write_blocking(&vec![3.0; 5760], Duration::ZERO)
+        .unwrap();
 }
 
 #[test]
 fn submission_size_is_checked_even_while_recovering() {
     let ring = playback(5);
     for size in [0, 1, 2, 479, 481, 960] {
-        assert!(ring.write_blocking(&vec![0.0; size], Duration::ZERO).is_err());
+        assert!(
+            ring.write_blocking(&vec![0.0; size], Duration::ZERO)
+                .is_err()
+        );
     }
     ring.begin_recovery().unwrap();
     assert!(ring.write_blocking(&[0.0; 2], Duration::ZERO).is_err());
-    ring.write_blocking(&vec![0.0; 480], Duration::ZERO).unwrap();
+    ring.write_blocking(&vec![0.0; 480], Duration::ZERO)
+        .unwrap();
 }
 
-fn start_waiting_writer(ring: &Arc<SharedSampleRing>) -> (JoinHandle<Result<()>>, mpsc::Receiver<Duration>) {
+fn start_waiting_writer(
+    ring: &Arc<SharedSampleRing>,
+) -> (JoinHandle<Result<()>>, mpsc::Receiver<Duration>) {
     let (tx, rx) = mpsc::channel();
     ring.lock_state().unwrap().writer_wait_hook = Some(tx);
     let writer_ring = Arc::clone(ring);
     let writer = thread::spawn(move || {
-        writer_ring.write_blocking(&vec![2.0; writer_ring.frame_samples], Duration::from_secs(10))
+        writer_ring.write_blocking(
+            &vec![2.0; writer_ring.frame_samples],
+            Duration::from_secs(10),
+        )
     });
     (writer, rx)
 }
@@ -199,25 +229,36 @@ fn silence_overflow_and_malformed_input_preserve_alignment() {
 fn sixty_millisecond_capture_preserves_six_device_packets_and_remainder() {
     let budget = QueueBudget::from_stream(&params(60)).unwrap();
     let ring = SharedSampleRing::new(
-        budget.capture_samples, budget.channels, budget.frame_samples,
-        budget.capture_samples, "test",
-    ).unwrap();
+        budget.capture_samples,
+        budget.channels,
+        budget.frame_samples,
+        budget.capture_samples,
+        "test",
+    )
+    .unwrap();
     ring.configure_capture_packet(512, 48_000).unwrap();
     assert_eq!(ring.lock_state().unwrap().buffer.len(), (2880 + 512) * 2);
     let mut frame = vec![0.0; budget.frame_samples];
     for packet_index in 0..6 {
         let packet: Vec<f32> = (packet_index * 1024..(packet_index + 1) * 1024)
-            .map(|sample| sample as f32).collect();
+            .map(|sample| sample as f32)
+            .collect();
         ring.write_overwrite(&packet);
         if packet_index < 5 {
             assert!(!ring.read_exact(&mut frame, Duration::ZERO).unwrap());
         }
     }
     assert!(ring.read_exact(&mut frame, Duration::ZERO).unwrap());
-    assert_eq!(frame, (0..5760).map(|sample| sample as f32).collect::<Vec<_>>());
+    assert_eq!(
+        frame,
+        (0..5760).map(|sample| sample as f32).collect::<Vec<_>>()
+    );
     let mut remainder = vec![0.0; (3072 - 2880) * 2];
     assert!(ring.read_exact(&mut remainder, Duration::ZERO).unwrap());
-    assert_eq!(remainder, (5760..6144).map(|sample| sample as f32).collect::<Vec<_>>());
+    assert_eq!(
+        remainder,
+        (5760..6144).map(|sample| sample as f32).collect::<Vec<_>>()
+    );
     let state = ring.lock_state().unwrap();
     assert_eq!(state.len, 0);
     assert_eq!(state.dropped_samples, 0);
@@ -227,9 +268,13 @@ fn sixty_millisecond_capture_preserves_six_device_packets_and_remainder() {
 fn capture_resize_accounts_for_packets_larger_than_negotiated_frame() {
     let budget = QueueBudget::from_stream(&params(5)).unwrap();
     let ring = SharedSampleRing::new(
-        budget.capture_samples, budget.channels, budget.frame_samples,
-        budget.capture_samples, "test",
-    ).unwrap();
+        budget.capture_samples,
+        budget.channels,
+        budget.frame_samples,
+        budget.capture_samples,
+        "test",
+    )
+    .unwrap();
     ring.configure_capture_packet(16, 48_000).unwrap();
     assert_eq!(ring.lock_state().unwrap().buffer.len(), 2880);
     ring.configure_capture_packet(4096, 48_000).unwrap();

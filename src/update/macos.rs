@@ -69,9 +69,14 @@ pub fn cleanup_stale() {
     if let Ok(entries) = fs::read_dir(&update_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            let name = path.file_name().and_then(|value| value.to_str()).unwrap_or("");
+            let name = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("");
             if name.starts_with("mount-") {
-                let _ = Command::new("hdiutil").args(["detach", &path.to_string_lossy()]).status();
+                let _ = Command::new("hdiutil")
+                    .args(["detach", &path.to_string_lossy()])
+                    .status();
                 let _ = fs::remove_dir_all(&path);
             }
         }
@@ -174,8 +179,7 @@ trap - EXIT
 cleanup_mount
 open "$bundle" >/dev/null 2>&1 || true
 echo "[apply-update] completed"
-"#
-        ,
+"#,
         pid = pid,
         bundle = shell_quote(bundle),
         dmg = shell_quote(dmg),

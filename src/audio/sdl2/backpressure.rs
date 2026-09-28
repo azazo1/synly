@@ -35,10 +35,16 @@ mod tests {
                 let boundary = (50 / ms + 1) as usize * bytes;
                 for initial in [boundary - channels * 4, boundary] {
                     let delays = Cell::new(0);
-                    wait_for_space(bytes, ms,
+                    wait_for_space(
+                        bytes,
+                        ms,
                         || Ok(if delays.get() >= 3 { 0 } else { initial }),
-                        |duration| { assert_eq!(duration, Duration::from_millis(1)); delays.set(delays.get() + 1); },
-                    ).unwrap();
+                        |duration| {
+                            assert_eq!(duration, Duration::from_millis(1));
+                            delays.set(delays.get() + 1);
+                        },
+                    )
+                    .unwrap();
                     assert_eq!(delays.get(), if initial < boundary { 0 } else { 3 });
                 }
             }
@@ -49,10 +55,19 @@ mod tests {
     fn exhausted_poll_budget_still_permits_queueing() {
         let polls = Cell::new(0);
         let delays = Cell::new(0);
-        wait_for_space(1920, 5,
-            || { polls.set(polls.get() + 1); Ok(1920 * 11) },
-            |duration| { assert_eq!(duration, Duration::from_millis(1)); delays.set(delays.get() + 1); },
-        ).unwrap();
+        wait_for_space(
+            1920,
+            5,
+            || {
+                polls.set(polls.get() + 1);
+                Ok(1920 * 11)
+            },
+            |duration| {
+                assert_eq!(duration, Duration::from_millis(1));
+                delays.set(delays.get() + 1);
+            },
+        )
+        .unwrap();
         assert_eq!(polls.get(), 100);
         assert_eq!(delays.get(), 100);
     }
@@ -61,10 +76,16 @@ mod tests {
     fn stopped_device_fails_only_when_observed_during_polling() {
         for stop_at in [0, 2, 99, 100] {
             let delays = Cell::new(0);
-            let result = wait_for_space(1920, 5,
-                || if delays.get() >= stop_at {
-                    Err(Error::Backend("模拟设备停止".into()))
-                } else { Ok(1920 * 11) },
+            let result = wait_for_space(
+                1920,
+                5,
+                || {
+                    if delays.get() >= stop_at {
+                        Err(Error::Backend("模拟设备停止".into()))
+                    } else {
+                        Ok(1920 * 11)
+                    }
+                },
                 |_| delays.set(delays.get() + 1),
             );
             assert_eq!(result.is_ok(), stop_at == 100);

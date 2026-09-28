@@ -46,8 +46,8 @@ fn parse_unit(raw: &str) -> Result<u128> {
         | "terabytes" | "tebibyte" | "tebibytes" => Ok(TIB),
         "p" | "pb" | "pib" | "pbyte" | "pbytes" | "pibyte" | "pibytes" | "petabyte"
         | "petabytes" | "pebibyte" | "pebibytes" => Ok(PIB),
-        "e" | "eb" | "eib" | "ebyte" | "ebytes" | "eibyte" | "eibytes" | "exabyte"
-        | "exabytes" | "exbibyte" | "exbibytes" => Ok(EIB),
+        "e" | "eb" | "eib" | "ebyte" | "ebytes" | "eibyte" | "eibytes" | "exabyte" | "exabytes"
+        | "exbibyte" | "exbibytes" => Ok(EIB),
         _ => bail!("字节大小单位无法识别: {raw}"),
     }
 }
@@ -151,7 +151,10 @@ mod tests {
         assert_eq!(parse_human_bytes("1KB").unwrap(), 1024);
         assert_eq!(parse_human_bytes("1KiB").unwrap(), 1024);
         assert_eq!(parse_human_bytes("2 GB").unwrap(), 2 * 1024 * 1024 * 1024);
-        assert_eq!(parse_human_bytes("3TiB").unwrap(), 3 * 1024 * 1024 * 1024 * 1024);
+        assert_eq!(
+            parse_human_bytes("3TiB").unwrap(),
+            3 * 1024 * 1024 * 1024 * 1024
+        );
     }
 
     #[test]
@@ -163,7 +166,14 @@ mod tests {
 
     #[test]
     fn rejects_invalid_input() {
-        for value in ["", "MiB", "1.2.3 MiB", "-1 KiB", "1 banana", "999999999999999999999 EiB"] {
+        for value in [
+            "",
+            "MiB",
+            "1.2.3 MiB",
+            "-1 KiB",
+            "1 banana",
+            "999999999999999999999 EiB",
+        ] {
             assert!(parse_human_bytes(value).is_err(), "{value} should fail");
         }
     }

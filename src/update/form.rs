@@ -20,8 +20,7 @@ pub const APP_EXECUTABLE: &str = "synly";
 
 /// Windows 安装器在 HKCU 下登记的卸载项 AppId, 必须与 `scripts/installer-windows.iss` 一致.
 #[cfg(windows)]
-pub const WINDOWS_UNINSTALL_KEY: &str =
-    r"Software\Microsoft\Windows\CurrentVersion\Uninstall\{B354AB28-E96A-4AF4-9988-253DA25F421F}_is1";
+pub const WINDOWS_UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\{B354AB28-E96A-4AF4-9988-253DA25F421F}_is1";
 
 /// 安装版落在程序目录里的清单文件, 用于运行期确认当前程序确实由安装器安装.
 #[cfg(not(any(windows, target_os = "macos")))]
@@ -137,7 +136,8 @@ fn uninstall_entry_exists() -> bool {
         .chain(std::iter::once(0))
         .collect();
     let mut handle = std::ptr::null_mut();
-    let status = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_READ, &mut handle) };
+    let status =
+        unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_READ, &mut handle) };
     if status != 0 {
         return false;
     }

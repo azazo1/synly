@@ -3,14 +3,13 @@ use crate::config::{
     TransferConfig, UiConfig,
 };
 use crate::core::{AppCommand, AppSettings, AppSnapshot, AppSupervisor};
-use crate::update::{self, UpdateHandle, UpdatePhase, UpdateSnapshot};
 use crate::input::{CursorMode, InputMode, InputPlatform, ScreenEdge};
 use crate::runtime_control::{InteractionRequest, InteractionResponse};
 use crate::runtime_options::normalize_pin;
 use crate::settings::{
-    AudioMode, ClipboardMode, ConnectionPreference, FileSyncMode, InitialSyncMode,
-    LogLevel,
+    AudioMode, ClipboardMode, ConnectionPreference, FileSyncMode, InitialSyncMode, LogLevel,
 };
+use crate::update::{self, UpdateHandle, UpdatePhase, UpdateSnapshot};
 use anyhow::{Context, Result};
 use slint::{CloseRequestResponse, ComponentHandle, LogicalSize, ModelRc, VecModel};
 use std::path::PathBuf;
@@ -19,9 +18,9 @@ use std::time::Duration;
 use synly_core::size::{format_human_bytes, parse_human_bytes};
 use uuid::Uuid;
 
+mod macos_dock;
 mod single_instance;
 mod tray;
-mod macos_dock;
 
 slint::include_modules!();
 
@@ -59,7 +58,9 @@ pub fn run(config: SynlyConfig, force_start: bool) -> Result<()> {
     window.set_about_version(crate::BUILD_VERSION.into());
     window.set_current_version(crate::BUILD_VERSION.into());
     window.set_macos_dock_setting_visible(cfg!(target_os = "macos"));
-    window.window().set_size(restored_window_size(&config.gui_state));
+    window
+        .window()
+        .set_size(restored_window_size(&config.gui_state));
     let _single_instance_guard =
         single_instance::SingleInstanceGuard::start(listener, window.as_weak())?;
     macos_dock::set_follow_window(config.ui.hide_dock_when_hidden);
@@ -69,15 +70,14 @@ pub fn run(config: SynlyConfig, force_start: bool) -> Result<()> {
         crate::BUILD_VERSION.to_string(),
         config.update.clone(),
         Arc::new(move |update_config| {
-            send_command(&persist_commands, AppCommand::SaveUpdateConfig(update_config));
+            send_command(
+                &persist_commands,
+                AppCommand::SaveUpdateConfig(update_config),
+            );
         }),
     )?;
     let tray = tray::TrayController::new(&window, &handle, update.clone(), crate::BUILD_VERSION);
-    apply_settings_to_window(
-        &window,
-        &config.runtime,
-        &AppSettings::from_config(&config),
-    );
+    apply_settings_to_window(&window, &config.runtime, &AppSettings::from_config(&config));
     apply_snapshot(&window, &handle.snapshots().borrow(), None);
     apply_update_snapshot(&window, &update.snapshot());
     #[cfg(target_os = "macos")]
@@ -114,7 +114,13 @@ pub fn run(config: SynlyConfig, force_start: bool) -> Result<()> {
         tray.state_sink(),
     );
     spawn_log_presenter(&runtime, &window);
-    spawn_update_presenter(&runtime, &window, update.subscribe(), tray.state_sink(), handle.commands());
+    spawn_update_presenter(
+        &runtime,
+        &window,
+        update.subscribe(),
+        tray.state_sink(),
+        handle.commands(),
+    );
     spawn_ctrl_c_handler(&runtime, handle.commands());
     #[cfg(target_os = "macos")]
     {
@@ -126,26 +132,25 @@ pub fn run(config: SynlyConfig, force_start: bool) -> Result<()> {
     }
 
     tray.start();
-    let _hide_dock_on_start =
-        if !config.gui_state.first_run_completed || !config.ui.start_hidden {
-            show_main_window(&window).context("failed to show Slint window")?;
-            None
-        } else {
-            macos_dock::note_hidden();
-            let window = window.as_weak();
-            let follow_dock = config.ui.hide_dock_when_hidden;
-            let timer = slint::Timer::default();
-            timer.start(slint::TimerMode::SingleShot, Duration::ZERO, move || {
-                guard_callback("start_hidden_dock", || {
-                    if window.upgrade().is_some() {
-                        tracing::info!("启动时隐藏主窗口, 按设置更新 Dock 可见性");
-                        macos_dock::set_follow_window(follow_dock);
-                        macos_dock::set_dock_visible(false);
-                    }
-                })
-            });
-            Some(timer)
-        };
+    let _hide_dock_on_start = if !config.gui_state.first_run_completed || !config.ui.start_hidden {
+        show_main_window(&window).context("failed to show Slint window")?;
+        None
+    } else {
+        macos_dock::note_hidden();
+        let window = window.as_weak();
+        let follow_dock = config.ui.hide_dock_when_hidden;
+        let timer = slint::Timer::default();
+        timer.start(slint::TimerMode::SingleShot, Duration::ZERO, move || {
+            guard_callback("start_hidden_dock", || {
+                if window.upgrade().is_some() {
+                    tracing::info!("启动时隐藏主窗口, 按设置更新 Dock 可见性");
+                    macos_dock::set_follow_window(follow_dock);
+                    macos_dock::set_dock_visible(false);
+                }
+            })
+        });
+        Some(timer)
+    };
 
     slint::run_event_loop_until_quit().context("Slint event loop failed")?;
     save_window_state(&window, &handle.commands());
@@ -282,9 +287,11 @@ fn wire_window_callbacks(
 
     let commands = handle.commands();
     window.on_disconnect_session(move |device_id| {
-        guard_callback("disconnect_session", || match Uuid::parse_str(device_id.as_str()) {
-            Ok(device_id) => send_command(&commands, AppCommand::DisconnectPeer(device_id)),
-            Err(error) => tracing::warn!(error = %error, "忽略无效的会话设备 ID"),
+        guard_callback("disconnect_session", || {
+            match Uuid::parse_str(device_id.as_str()) {
+                Ok(device_id) => send_command(&commands, AppCommand::DisconnectPeer(device_id)),
+                Err(error) => tracing::warn!(error = %error, "忽略无效的会话设备 ID"),
+            }
         })
     });
 
@@ -292,7 +299,9 @@ fn wire_window_callbacks(
     window.on_switch_active_session(move |device_id| {
         guard_callback("switch_active_session", || {
             match Uuid::parse_str(device_id.as_str()) {
-                Ok(device_id) => send_command(&commands, AppCommand::SwitchActiveSession(device_id)),
+                Ok(device_id) => {
+                    send_command(&commands, AppCommand::SwitchActiveSession(device_id))
+                }
                 Err(error) => tracing::warn!(error = %error, "忽略无效的活跃会话设备 ID"),
             }
         })
@@ -414,7 +423,10 @@ fn wire_window_callbacks(
     let commands = handle.commands();
     window.on_set_audio_layout(move |index| {
         guard_callback("set_audio_layout", || {
-            send_command(&commands, AppCommand::SetAudioLayout(audio_layout_from_index(index)))
+            send_command(
+                &commands,
+                AppCommand::SetAudioLayout(audio_layout_from_index(index)),
+            )
         })
     });
 
@@ -454,9 +466,11 @@ fn wire_window_callbacks(
 
     let commands = handle.commands();
     window.on_revoke_trust(move |device_id| {
-        guard_callback("revoke_trust", || match Uuid::parse_str(device_id.as_str()) {
-            Ok(device_id) => send_command(&commands, AppCommand::RevokeTrust(device_id)),
-            Err(error) => tracing::warn!(error = %error, "忽略无效的可信设备 ID"),
+        guard_callback("revoke_trust", || {
+            match Uuid::parse_str(device_id.as_str()) {
+                Ok(device_id) => send_command(&commands, AppCommand::RevokeTrust(device_id)),
+                Err(error) => tracing::warn!(error = %error, "忽略无效的可信设备 ID"),
+            }
         })
     });
 
@@ -550,14 +564,10 @@ fn wire_update_callbacks(
     });
 
     let update_handle = update.clone();
-    window.on_check_update(move || {
-        guard_callback("check_update", || update_handle.check(true))
-    });
+    window.on_check_update(move || guard_callback("check_update", || update_handle.check(true)));
 
     let update_handle = update.clone();
-    window.on_start_update(move || {
-        guard_callback("start_update", || update_handle.download())
-    });
+    window.on_start_update(move || guard_callback("start_update", || update_handle.download()));
 
     let update_handle = update.clone();
     window.on_cancel_update(move || {
@@ -565,9 +575,7 @@ fn wire_update_callbacks(
     });
 
     let update_handle = update.clone();
-    window.on_skip_update(move || {
-        guard_callback("skip_update", || update_handle.skip_current())
-    });
+    window.on_skip_update(move || guard_callback("skip_update", || update_handle.skip_current()));
 
     let update_handle = update.clone();
     let commands = handle.commands();
@@ -598,7 +606,9 @@ fn wire_update_callbacks(
 
     let update_handle = update.clone();
     window.on_auto_check_changed(move |enabled| {
-        guard_callback("auto_check_changed", || update_handle.set_auto_check(enabled))
+        guard_callback("auto_check_changed", || {
+            update_handle.set_auto_check(enabled)
+        })
     });
 }
 
@@ -658,7 +668,8 @@ fn apply_update_snapshot(window: &AppWindow, snapshot: &UpdateSnapshot) {
             | UpdatePhase::HandedOff
     ));
     window.set_update_show_download(snapshot.phase == UpdatePhase::Available && !handed_off);
-    window.set_update_show_cancel(snapshot.phase == UpdatePhase::Downloading && snapshot.cancellable);
+    window
+        .set_update_show_cancel(snapshot.phase == UpdatePhase::Downloading && snapshot.cancellable);
     window.set_update_show_skip(snapshot.phase == UpdatePhase::Available);
     window.set_update_show_restart(snapshot.phase == UpdatePhase::ReadyToRestart);
     window.set_update_show_retry(matches!(
@@ -701,9 +712,7 @@ fn update_status_text(snapshot: &UpdateSnapshot) -> String {
                 "正在安装更新...".to_string()
             }
         }
-        UpdatePhase::ReadyToRestart => {
-            "更新已就绪, 点击后会运行安装程序并退出当前进程".to_string()
-        }
+        UpdatePhase::ReadyToRestart => "更新已就绪, 点击后会运行安装程序并退出当前进程".to_string(),
         UpdatePhase::Applying => "正在运行安装程序...".to_string(),
         UpdatePhase::HandedOff => "正在退出并运行安装程序, 请勿手动关闭进程".to_string(),
         UpdatePhase::DmgOpened => "已打开安装镜像, 请拖拽安装后重启".to_string(),
@@ -735,10 +744,7 @@ fn update_progress_text(snapshot: &UpdateSnapshot) -> String {
 static QUITTING_FOR_UPDATE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-fn wire_close_to_tray(
-    window: &AppWindow,
-    handle: &crate::core::AppSupervisorHandle,
-) {
+fn wire_close_to_tray(window: &AppWindow, handle: &crate::core::AppSupervisorHandle) {
     let weak = window.as_weak();
     let commands = handle.commands();
     window.window().on_close_requested(move || {
@@ -786,17 +792,17 @@ fn spawn_snapshot_presenter(
             }
             let snapshot = snapshots.borrow().clone();
             tray_state.apply_snapshot(&snapshot);
-            let settings_changed = runtime_form_fields_changed(
-                &previous_runtime,
-                &snapshot.desired,
-            ) || snapshot.settings != previous_settings;
+            let settings_changed =
+                runtime_form_fields_changed(&previous_runtime, &snapshot.desired)
+                    || snapshot.settings != previous_settings;
             previous_runtime = snapshot.desired.clone();
             previous_settings = snapshot.settings.clone();
             let interaction_id = snapshot
                 .interaction
                 .as_ref()
                 .map(|interaction| interaction.request.request_id());
-            let new_interaction = interaction_id.is_some() && interaction_id != previous_interaction;
+            let new_interaction =
+                interaction_id.is_some() && interaction_id != previous_interaction;
             previous_interaction = interaction_id;
             let interaction = Arc::clone(&current_interaction);
             let window_weak = window.clone();
@@ -831,11 +837,7 @@ fn spawn_snapshot_presenter(
                         );
                     }
                     if settings_changed {
-                        apply_settings_to_window(
-                            &window,
-                            &snapshot.desired,
-                            &snapshot.settings,
-                        );
+                        apply_settings_to_window(&window, &snapshot.desired, &snapshot.settings);
                     }
                 })
             })
@@ -858,8 +860,7 @@ fn interaction_notification_text(request: &InteractionRequest) -> (String, Strin
             format!("{remote_label} 正在配对, bootstrap {bootstrap_short}"),
         ),
         InteractionRequest::EnterPin {
-            bootstrap_short,
-            ..
+            bootstrap_short, ..
         } => (
             "Synly 需要输入 PIN".to_string(),
             format!("请核对 bootstrap {bootstrap_short} 并输入 PIN"),
@@ -1160,9 +1161,7 @@ fn apply_interaction(
         } => {
             window.set_interaction_kind(3);
             window.set_interaction_title("确认长期信任".into());
-            window.set_interaction_detail(
-                format!("信任 {display_name} ({device_id})").into(),
-            );
+            window.set_interaction_detail(format!("信任 {display_name} ({device_id})").into());
             window.set_interaction_art("".into());
             window.set_interaction_pin("".into());
         }
@@ -1170,11 +1169,7 @@ fn apply_interaction(
     }
 }
 
-fn apply_settings_to_window(
-    window: &AppWindow,
-    runtime: &RuntimeConfig,
-    settings: &AppSettings,
-) {
+fn apply_settings_to_window(window: &AppWindow, runtime: &RuntimeConfig, settings: &AppSettings) {
     window.set_settings_error_text("".into());
     window.set_connection_index(match runtime.connection {
         Some(ConnectionPreference::Join) => 1,
@@ -1191,7 +1186,13 @@ fn apply_settings_to_window(
             .join("\n")
             .into(),
     );
-    window.set_port_text(runtime.port.map(|port| port.to_string()).unwrap_or_default().into());
+    window.set_port_text(
+        runtime
+            .port
+            .map(|port| port.to_string())
+            .unwrap_or_default()
+            .into(),
+    );
     window.set_file_mode_index(file_mode_index(runtime.file_sync_mode));
     window.set_initial_index(matches!(runtime.initial, Some(InitialSyncMode::Other)) as i32);
     window.set_sync_delete(runtime.sync_delete);
@@ -1222,9 +1223,8 @@ fn apply_settings_to_window(
     window.set_trust_device(runtime.trust_device);
     window.set_trusted_only(runtime.trusted_only);
     window.set_device_name(settings.device_name.clone().into());
-    window.set_clipboard_max_file_text(
-        format_human_bytes(settings.clipboard.max_file_bytes).into(),
-    );
+    window
+        .set_clipboard_max_file_text(format_human_bytes(settings.clipboard.max_file_bytes).into());
     window.set_clipboard_max_cache_text(
         settings
             .clipboard
@@ -1242,12 +1242,9 @@ fn apply_settings_to_window(
             .unwrap_or_default()
             .into(),
     );
-    window.set_transfer_meta_text(
-        format_human_bytes(settings.transfer.max_meta_bytes).into(),
-    );
-    window.set_transfer_frame_text(
-        format_human_bytes(settings.transfer.max_frame_data_bytes).into(),
-    );
+    window.set_transfer_meta_text(format_human_bytes(settings.transfer.max_meta_bytes).into());
+    window
+        .set_transfer_frame_text(format_human_bytes(settings.transfer.max_frame_data_bytes).into());
     window.set_transfer_clipboard_text(
         format_human_bytes(settings.transfer.max_clipboard_bytes).into(),
     );
@@ -1345,8 +1342,7 @@ fn settings_from_window(
             cursor_mode: cursor_mode_from_index(window.get_cursor_mode_index()),
         },
         interval_secs: window.get_interval_secs().max(1) as u64,
-        max_folder_depth: (window.get_max_depth() >= 0)
-            .then_some(window.get_max_depth() as usize),
+        max_folder_depth: (window.get_max_depth() >= 0).then_some(window.get_max_depth() as usize),
         accept: window.get_accept_untrusted(),
         trust_device: window.get_trust_device(),
         trusted_only: window.get_trusted_only(),
@@ -1419,18 +1415,9 @@ fn settings_from_window(
     Ok((runtime, settings, session_pin))
 }
 
-fn save_window_state(
-    window: &AppWindow,
-    commands: &tokio::sync::mpsc::Sender<AppCommand>,
-) {
+fn save_window_state(window: &AppWindow, commands: &tokio::sync::mpsc::Sender<AppCommand>) {
     let (width, height) = logical_window_size(window);
-    send_command(
-        commands,
-        AppCommand::SaveWindowState {
-            width,
-            height,
-        },
-    );
+    send_command(commands, AppCommand::SaveWindowState { width, height });
 }
 
 fn restored_window_size(gui_state: &GuiState) -> LogicalSize {

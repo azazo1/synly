@@ -1,6 +1,6 @@
 use crate::app::{
-    notification_peer, run_sync_session, run_with_session_notifications, AuthenticatedSession,
-    SyncSessionOptions,
+    AuthenticatedSession, SyncSessionOptions, notification_peer, run_sync_session,
+    run_with_session_notifications,
 };
 use crate::host::clipboard_hub::ClipboardHubHandle;
 use crate::host::{HostEvent, SessionCapabilityProfile, runtime_options_for_profile};
@@ -117,7 +117,10 @@ pub(crate) fn spawn_host_session(
             Ok(()) => tracing::info!(%device_id, "同步会话已结束"),
             Err(error) => tracing::warn!(%device_id, error = %error, "同步会话中断"),
         }
-        let _ = events.send(HostEvent::SessionFinished { device_id, instance });
+        let _ = events.send(HostEvent::SessionFinished {
+            device_id,
+            instance,
+        });
     });
     HostSessionTask { instance, task }
 }

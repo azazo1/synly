@@ -7,25 +7,24 @@ mod mapping;
     feature = "input-screen-mock"
 ))]
 pub mod mock;
-#[cfg(all(target_os = "macos", feature = "input-macos-trackpad-debug"))]
-pub mod trackpad_debug;
-#[cfg(feature = "input-receiver-mock")]
-pub mod receiver_mock;
 mod platform;
 mod protocol;
+#[cfg(feature = "input-receiver-mock")]
+pub mod receiver_mock;
 mod runtime;
 mod scroll;
-#[cfg(windows)]
-pub use platform::windows as windows_agent;
+#[cfg(all(target_os = "macos", feature = "input-macos-trackpad-debug"))]
+pub mod trackpad_debug;
 #[cfg(target_os = "macos")]
 pub use platform::macos::permissions::{
     is_accessibility_trusted, request_accessibility, watch_accessibility_change,
 };
+#[cfg(windows)]
+pub use platform::windows as windows_agent;
 
 pub use channel::{
     InputChannelOffer, InputChannelRole, InputHostChannel, read_preamble as read_input_preamble,
 };
-pub use synly_core::input::InputMode;
 pub use geometry::{DesktopLayout, DisplayRect, Point, ScreenEdge};
 pub use hotkey::{Hotkey, ModifierMask};
 pub use mapping::{InputPlatform, KeyMappingConfig, validate_key_mapping};
@@ -34,6 +33,7 @@ pub use runtime::{
     CursorMode, InputRuntimeOptions, InputSessionContext, InputSocketConnection, InputSocketInbox,
     run_input_session,
 };
+pub use synly_core::input::InputMode;
 
 use anyhow::Result;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,17 +76,14 @@ pub use platform::windows::init_agent_tracing as init_windows_agent_tracing;
 
 #[cfg(windows)]
 pub use platform::windows::{
-    service_installed as windows_input_service_installed,
-    service_running as windows_input_service_running,
-    uninstall_via_uac as request_windows_input_service_uninstall_via_uac,
-    restart_via_uac as request_windows_input_service_restart_via_uac,
+    init_tracing as init_windows_service_tracing, install as install_windows_input_service,
     mark_install_attempted as mark_windows_input_service_install_attempted,
-    init_tracing as init_windows_service_tracing,
-    install as install_windows_input_service,
     restart as restart_windows_input_service,
+    restart_via_uac as request_windows_input_service_restart_via_uac,
+    run_service as run_windows_input_service, service_installed as windows_input_service_installed,
+    service_running as windows_input_service_running, status as windows_input_service_status,
     uninstall as uninstall_windows_input_service,
-    status as windows_input_service_status,
-    run_service as run_windows_input_service,
+    uninstall_via_uac as request_windows_input_service_uninstall_via_uac,
 };
 
 #[cfg(windows)]

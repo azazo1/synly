@@ -1,6 +1,4 @@
-use super::{
-    AppWindow, guard_callback, save_window_state, send_command, show_main_window,
-};
+use super::{AppWindow, guard_callback, save_window_state, send_command, show_main_window};
 use crate::core::{AppCommand, AppSnapshot, AppSupervisorHandle};
 use crate::input::InputMode;
 use crate::settings::{AudioMode, ClipboardMode};
@@ -81,13 +79,8 @@ impl<T: Copy + PartialEq> ModeGroup<T> {
         let submenu = Submenu::new(title, true);
         let mut items = Vec::with_capacity(modes.len());
         for (mode, key, label) in modes {
-            let item = CheckMenuItem::with_id(
-                format!("{id_prefix}.{key}"),
-                *label,
-                true,
-                false,
-                None,
-            );
+            let item =
+                CheckMenuItem::with_id(format!("{id_prefix}.{key}"), *label, true, false, None);
             submenu
                 .append(&item)
                 .with_context(|| format!("无法创建托盘菜单项 {title}/{label}"))?;
@@ -141,7 +134,8 @@ impl TrayController {
         version: &str,
     ) -> Self {
         let snapshots = handle.snapshots();
-        let state = TrayState::from_snapshot(&snapshots.borrow(), version, update.snapshot().auto_check);
+        let state =
+            TrayState::from_snapshot(&snapshots.borrow(), version, update.snapshot().auto_check);
         let shared_state = Arc::new(Mutex::new(state));
         Self {
             inner: Rc::new(RefCell::new(ControllerInner {
@@ -158,11 +152,10 @@ impl TrayController {
 
     pub fn start(&self) {
         let inner = Rc::downgrade(&self.inner);
-        self.start_timer.start(
-            TimerMode::SingleShot,
-            Duration::ZERO,
-            move || guard_callback("tray_start", || start_native_tray(inner.clone())),
-        );
+        self.start_timer
+            .start(TimerMode::SingleShot, Duration::ZERO, move || {
+                guard_callback("tray_start", || start_native_tray(inner.clone()))
+            });
     }
 
     pub fn state_sink(&self) -> TrayStateSink {
@@ -268,11 +261,9 @@ impl NativeTray {
             .context("无法创建系统托盘图标")?;
 
         let poll_timer = Timer::default();
-        poll_timer.start(
-            TimerMode::Repeated,
-            Duration::from_millis(80),
-            move || poll_events(&inner),
-        );
+        poll_timer.start(TimerMode::Repeated, Duration::from_millis(80), move || {
+            poll_events(&inner)
+        });
 
         let mut tray = Self {
             tray_icon,
@@ -327,7 +318,9 @@ impl NativeTray {
 }
 
 fn start_native_tray(inner: Weak<RefCell<ControllerInner>>) {
-    let Some(controller) = inner.upgrade() else { return };
+    let Some(controller) = inner.upgrade() else {
+        return;
+    };
     if let Err(error) = initialize_platform() {
         tracing::error!(error = %error, "系统托盘平台初始化失败");
         return;
@@ -472,11 +465,9 @@ fn make_template_icon() -> Result<Icon> {
     for y in 0..SIZE {
         for x in 0..SIZE {
             let upper_shaft = (4..=21).contains(&x) && (8..=12).contains(&y);
-            let upper_head = (18..=27).contains(&x)
-                && (y as i32 - 10).abs() * 2 <= (27 - x) as i32;
+            let upper_head = (18..=27).contains(&x) && (y as i32 - 10).abs() * 2 <= (27 - x) as i32;
             let lower_shaft = (10..=27).contains(&x) && (20..=24).contains(&y);
-            let lower_head = (4..=13).contains(&x)
-                && (y as i32 - 22).abs() * 2 <= (x - 4) as i32;
+            let lower_head = (4..=13).contains(&x) && (y as i32 - 22).abs() * 2 <= (x - 4) as i32;
             if upper_shaft || upper_head || lower_shaft || lower_head {
                 let offset = ((y * SIZE + x) * 4) as usize;
                 rgba[offset] = 66;

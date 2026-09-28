@@ -34,7 +34,9 @@ impl OpusMultistreamConfig {
             || !(0..=self.streams).contains(&self.coupled_streams)
             || self.streams + self.coupled_streams > self.channel_count
         {
-            return Err(Error::InvalidConfig("Opus streams 与 coupled_streams 超出声道范围"));
+            return Err(Error::InvalidConfig(
+                "Opus streams 与 coupled_streams 超出声道范围",
+            ));
         }
         let coded_channels = self.streams + self.coupled_streams;
         if self.mapping[..self.channel_count as usize]
@@ -44,10 +46,13 @@ impl OpusMultistreamConfig {
             return Err(Error::InvalidConfig("Opus mapping 引用了不存在的编码声道"));
         }
         // 以 2.5 ms 为单位比较, 避免整数毫秒截断短帧.
-        if ![1, 2, 4, 8, 16, 24].iter().any(|&units| {
-            self.samples_per_frame == self.sample_rate / 400 * units
-        }) {
-            return Err(Error::InvalidConfig("Opus 帧时长必须为 2.5, 5, 10, 20, 40 或 60 ms"));
+        if ![1, 2, 4, 8, 16, 24]
+            .iter()
+            .any(|&units| self.samples_per_frame == self.sample_rate / 400 * units)
+        {
+            return Err(Error::InvalidConfig(
+                "Opus 帧时长必须为 2.5, 5, 10, 20, 40 或 60 ms",
+            ));
         }
         Ok(())
     }
@@ -101,8 +106,8 @@ impl OpusEncoder {
             return Err(Error::Codec(opus_error(err)));
         }
 
-        let inner = NonNull::new(inner)
-            .ok_or_else(|| Error::Codec("Opus 编码器创建返回空指针".into()))?;
+        let inner =
+            NonNull::new(inner).ok_or_else(|| Error::Codec("Opus 编码器创建返回空指针".into()))?;
         // ctl 失败也必须通过 Drop 释放已经创建的编码器.
         let encoder = Self { inner, config };
 
@@ -167,8 +172,8 @@ impl OpusDecoder {
         if err != 0 {
             return Err(Error::Codec(opus_error(err)));
         }
-        let inner = NonNull::new(inner)
-            .ok_or_else(|| Error::Codec("Opus 解码器创建返回空指针".into()))?;
+        let inner =
+            NonNull::new(inner).ok_or_else(|| Error::Codec("Opus 解码器创建返回空指针".into()))?;
         Ok(Self { inner, config })
     }
 

@@ -345,11 +345,7 @@ struct WindowsBackend {
 impl WindowsBackend {
     /// 主显示器矩形, 用于安全桌面期间的光标钳制; 未知时返回 None.
     fn primary_rect(&self) -> Option<DisplayRect> {
-        self.state
-            .primary
-            .lock()
-            .ok()
-            .and_then(|primary| *primary)
+        self.state.primary.lock().ok().and_then(|primary| *primary)
     }
 }
 
@@ -385,9 +381,8 @@ pub(super) fn start(context: CaptureContext) -> Result<Arc<dyn InputBackend>> {
 }
 
 fn run_message_loop(state: Arc<WindowsState>, ready: std::sync::mpsc::SyncSender<Result<()>>) {
-    let previous_dpi_context = unsafe {
-        SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
-    };
+    let previous_dpi_context =
+        unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
     if previous_dpi_context == 0 {
         tracing::warn!("Windows 输入线程无法启用 per-monitor DPI awareness");
     }
@@ -535,7 +530,12 @@ fn create_cursor_hider(thread_id: u32) -> Result<CursorHider> {
         }
         bail!("无法创建 Windows 光标隐藏窗口");
     }
-    Ok(CursorHider { window, cursor, instance, class_name })
+    Ok(CursorHider {
+        window,
+        cursor,
+        instance,
+        class_name,
+    })
 }
 
 fn create_blank_cursor(instance: HInstance) -> Result<HCursor> {
@@ -599,7 +599,11 @@ unsafe extern "system" fn cursor_hider_window_proc(
     unsafe { DefWindowProcW(window, message, w_param, l_param) }
 }
 
-unsafe extern "system" fn keyboard_callback(code: i32, w_param: WParam, l_param: LParam) -> LResult {
+unsafe extern "system" fn keyboard_callback(
+    code: i32,
+    w_param: WParam,
+    l_param: LParam,
+) -> LResult {
     if code < HC_ACTION {
         return unsafe { CallNextHookEx(0, code, w_param, l_param) };
     }
@@ -636,7 +640,12 @@ unsafe extern "system" fn keyboard_callback(code: i32, w_param: WParam, l_param:
         phase == CapturePhase::Relaying || context.keyboard_capture.load(Ordering::Acquire);
     let suppressing = phase.suppresses_local_input();
     if capturing {
-        context.context.emit_reliable(NativeEvent::Key { usage, modifiers, down, repeat });
+        context.context.emit_reliable(NativeEvent::Key {
+            usage,
+            modifiers,
+            down,
+            repeat,
+        });
     }
     if suppressing && !usage_is_modifier(usage) {
         return 1;
@@ -667,10 +676,14 @@ unsafe extern "system" fn mouse_callback(code: i32, w_param: WParam, l_param: LP
     let mut posted = true;
     match w_param as u32 {
         WM_MOUSEMOVE => {
-            posted = post_thread_point(thread_id, WM_SYNLY_MOUSE_MOVE, Point {
-                x: event.pt.x,
-                y: event.pt.y,
-            });
+            posted = post_thread_point(
+                thread_id,
+                WM_SYNLY_MOUSE_MOVE,
+                Point {
+                    x: event.pt.x,
+                    y: event.pt.y,
+                },
+            );
         }
         WM_LBUTTONDOWN | WM_LBUTTONUP | WM_RBUTTONDOWN | WM_RBUTTONUP | WM_MBUTTONDOWN
         | WM_MBUTTONUP | WM_XBUTTONDOWN | WM_XBUTTONUP => {
@@ -833,7 +846,9 @@ fn handle_mouse_move(state: &WindowsState, point: Point) {
 fn handle_mouse_button(state: &WindowsState, button: u8, down: bool) {
     update_set(&state.physical_buttons, button, down);
     if capture_phase(state) == CapturePhase::Relaying {
-        state.context.emit_reliable(NativeEvent::Button { button, down });
+        state
+            .context
+            .emit_reliable(NativeEvent::Button { button, down });
     }
 }
 
@@ -853,14 +868,8 @@ fn handle_pre_warp(state: &WindowsState, target: Point) {
     }
     let mut pending = Msg::default();
     let matched = loop {
-        let result = unsafe {
-            GetMessageW(
-                &mut pending,
-                0,
-                WM_SYNLY_MOUSE_MOVE,
-                WM_SYNLY_POST_WARP,
-            )
-        };
+        let result =
+            unsafe { GetMessageW(&mut pending, 0, WM_SYNLY_MOUSE_MOVE, WM_SYNLY_POST_WARP) };
         if result <= 0 {
             break false;
         }
@@ -878,7 +887,9 @@ fn handle_pre_warp(state: &WindowsState, target: Point) {
 
 fn fail_capture(state: &WindowsState, message: String) {
     state.context.failed.store(true, Ordering::Release);
-    state.context.emit_reliable(NativeEvent::Failed(message.clone()));
+    state
+        .context
+        .emit_reliable(NativeEvent::Failed(message.clone()));
     tracing::error!(error = %message, "Windows 光标捕获失败");
 }
 
@@ -916,9 +927,23 @@ impl InputBackend for WindowsBackend {
 
     fn snapshot(&self) -> KeySnapshot {
         KeySnapshot {
-            usages: self.state.physical_pressed.lock().unwrap().iter().copied().collect(),
+            usages: self
+                .state
+                .physical_pressed
+                .lock()
+                .unwrap()
+                .iter()
+                .copied()
+                .collect(),
             modifiers: current_modifiers(),
-            buttons: self.state.physical_buttons.lock().unwrap().iter().copied().collect(),
+            buttons: self
+                .state
+                .physical_buttons
+                .lock()
+                .unwrap()
+                .iter()
+                .copied()
+                .collect(),
         }
     }
 
@@ -957,7 +982,13 @@ impl InputBackend for WindowsBackend {
         Ok(())
     }
 
-    fn inject_key(&self, usage: u16, _modifiers: ModifierMask, down: bool, _repeat: bool) -> Result<()> {
+    fn inject_key(
+        &self,
+        usage: u16,
+        _modifiers: ModifierMask,
+        down: bool,
+        _repeat: bool,
+    ) -> Result<()> {
         let (scan, extended) = hid_to_windows_scan(usage)
             .with_context(|| format!("Windows 不支持 USB HID usage 0x{usage:04x}"))?;
         let mut flags = KEYEVENTF_SCANCODE;
@@ -974,10 +1005,38 @@ impl InputBackend for WindowsBackend {
 
     fn inject_button(&self, button: u8, down: bool) -> Result<()> {
         let (flags, data) = match button {
-            1 => (if down { MOUSEEVENTF_LEFTDOWN } else { MOUSEEVENTF_LEFTUP }, 0),
-            2 => (if down { MOUSEEVENTF_MIDDLEDOWN } else { MOUSEEVENTF_MIDDLEUP }, 0),
-            3 => (if down { MOUSEEVENTF_RIGHTDOWN } else { MOUSEEVENTF_RIGHTUP }, 0),
-            4 | 5 => (if down { MOUSEEVENTF_XDOWN } else { MOUSEEVENTF_XUP }, if button == 4 { 1 } else { 2 }),
+            1 => (
+                if down {
+                    MOUSEEVENTF_LEFTDOWN
+                } else {
+                    MOUSEEVENTF_LEFTUP
+                },
+                0,
+            ),
+            2 => (
+                if down {
+                    MOUSEEVENTF_MIDDLEDOWN
+                } else {
+                    MOUSEEVENTF_MIDDLEUP
+                },
+                0,
+            ),
+            3 => (
+                if down {
+                    MOUSEEVENTF_RIGHTDOWN
+                } else {
+                    MOUSEEVENTF_RIGHTUP
+                },
+                0,
+            ),
+            4 | 5 => (
+                if down {
+                    MOUSEEVENTF_XDOWN
+                } else {
+                    MOUSEEVENTF_XUP
+                },
+                if button == 4 { 1 } else { 2 },
+            ),
             _ => return Ok(()),
         };
         send_mouse(0, 0, data, flags)?;
@@ -992,8 +1051,12 @@ impl InputBackend for WindowsBackend {
             && let Some(primary) = *self.state.primary.lock().unwrap()
         {
             bounded = Point {
-                x: bounded.x.clamp(primary.x, primary.right().saturating_sub(1)),
-                y: bounded.y.clamp(primary.y, primary.bottom().saturating_sub(1)),
+                x: bounded
+                    .x
+                    .clamp(primary.x, primary.right().saturating_sub(1)),
+                y: bounded
+                    .y
+                    .clamp(primary.y, primary.bottom().saturating_sub(1)),
             };
         }
         if bounded != point {
@@ -1043,9 +1106,8 @@ impl InputBackend for WindowsBackend {
 }
 
 fn with_per_monitor_dpi<T>(operation: impl FnOnce() -> T) -> T {
-    let previous = unsafe {
-        SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
-    };
+    let previous =
+        unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
     let result = operation();
     if previous != 0 {
         unsafe { SetThreadDpiAwarenessContext(previous) };
@@ -1087,8 +1149,7 @@ fn send_warp_message(window: HWnd, point: Point) -> bool {
 
 fn sync_cursor_capture(state: &WindowsState, active: bool) -> bool {
     let phase = capture_phase(state);
-    if (active && phase == CapturePhase::Relaying)
-        || (!active && phase == CapturePhase::Observing)
+    if (active && phase == CapturePhase::Relaying) || (!active && phase == CapturePhase::Observing)
     {
         return true;
     }
@@ -1097,7 +1158,9 @@ fn sync_cursor_capture(state: &WindowsState, active: bool) -> bool {
         return false;
     }
     let succeeded = if active {
-        state.capture_phase.store(CapturePhase::Arming as u8, Ordering::Release);
+        state
+            .capture_phase
+            .store(CapturePhase::Arming as u8, Ordering::Release);
         let anchor = state
             .cursor
             .lock()
@@ -1105,7 +1168,9 @@ fn sync_cursor_capture(state: &WindowsState, active: bool) -> bool {
             .as_ref()
             .map(CursorCaptureTracker::anchor);
         let Some(anchor) = anchor else {
-            state.capture_phase.store(CapturePhase::Observing as u8, Ordering::Release);
+            state
+                .capture_phase
+                .store(CapturePhase::Observing as u8, Ordering::Release);
             return false;
         };
         let visibility_ok = set_cursor_visibility(false);
@@ -1125,7 +1190,9 @@ fn sync_cursor_capture(state: &WindowsState, active: bool) -> bool {
         if position_ok {
             state.cursor_hidden.store(true, Ordering::Release);
             state.context.capture_active.store(true, Ordering::Release);
-            state.capture_phase.store(CapturePhase::Relaying as u8, Ordering::Release);
+            state
+                .capture_phase
+                .store(CapturePhase::Relaying as u8, Ordering::Release);
             true
         } else {
             unsafe {
@@ -1142,11 +1209,15 @@ fn sync_cursor_capture(state: &WindowsState, active: bool) -> bool {
             let _ = set_cursor_visibility(true);
             state.cursor_hidden.store(false, Ordering::Release);
             state.context.capture_active.store(false, Ordering::Release);
-            state.capture_phase.store(CapturePhase::Observing as u8, Ordering::Release);
+            state
+                .capture_phase
+                .store(CapturePhase::Observing as u8, Ordering::Release);
             false
         }
     } else {
-        state.capture_phase.store(CapturePhase::Disarming as u8, Ordering::Release);
+        state
+            .capture_phase
+            .store(CapturePhase::Disarming as u8, Ordering::Release);
         let visibility_ok = set_cursor_visibility(true);
         let window_ok = unsafe {
             SetWindowPos(
@@ -1162,12 +1233,16 @@ fn sync_cursor_capture(state: &WindowsState, active: bool) -> bool {
         if visibility_ok && window_ok {
             state.cursor_hidden.store(false, Ordering::Release);
             state.context.capture_active.store(false, Ordering::Release);
-            state.capture_phase.store(CapturePhase::Observing as u8, Ordering::Release);
+            state
+                .capture_phase
+                .store(CapturePhase::Observing as u8, Ordering::Release);
             true
         } else {
             state.cursor_hidden.store(true, Ordering::Release);
             state.context.capture_active.store(true, Ordering::Release);
-            state.capture_phase.store(CapturePhase::Relaying as u8, Ordering::Release);
+            state
+                .capture_phase
+                .store(CapturePhase::Relaying as u8, Ordering::Release);
             false
         }
     };
@@ -1190,9 +1265,7 @@ fn warp_cursor_in_message_thread(state: &WindowsState, target: Point) -> bool {
         return false;
     }
     let moved = set_cursor_position_verified(target);
-    let marker_posted = unsafe {
-        PostThreadMessageW(thread_id, WM_SYNLY_POST_WARP, 0, 0)
-    } != 0;
+    let marker_posted = unsafe { PostThreadMessageW(thread_id, WM_SYNLY_POST_WARP, 0, 0) } != 0;
     if marker_posted {
         handle_pre_warp(state, target);
     }
@@ -1216,7 +1289,10 @@ fn read_cursor_position() -> Result<Point> {
     if unsafe { GetCursorPos(&mut point) } == 0 {
         bail!("无法读取 Windows 光标位置");
     }
-    Ok(Point { x: point.x, y: point.y })
+    Ok(Point {
+        x: point.x,
+        y: point.y,
+    })
 }
 
 fn set_cursor_visibility(visible: bool) -> bool {
@@ -1275,17 +1351,25 @@ fn collect_display_snapshot() -> Result<(DesktopLayout, Point, Option<DisplayRec
         let width = unsafe { GetSystemMetrics(SM_CXVIRTUALSCREEN) };
         let height = unsafe { GetSystemMetrics(SM_CYVIRTUALSCREEN) };
         displays.push(MonitorDisplay {
-            rect: DisplayRect { x, y, width, height },
+            rect: DisplayRect {
+                x,
+                y,
+                width,
+                height,
+            },
             primary: true,
         });
     }
-    let rects = displays.iter().map(|display| display.rect).collect::<Vec<_>>();
+    let rects = displays
+        .iter()
+        .map(|display| display.rect)
+        .collect::<Vec<_>>();
     let primary = displays
         .iter()
         .find(|display| display.primary)
         .map(|display| display.rect);
-    let anchor = select_capture_anchor(primary, &rects)
-        .context("Windows 显示器布局缺少光标捕获锚点")?;
+    let anchor =
+        select_capture_anchor(primary, &rects).context("Windows 显示器布局缺少光标捕获锚点")?;
     Ok((DesktopLayout::new(rects)?, anchor, primary))
 }
 
@@ -1293,9 +1377,7 @@ fn refresh_display_layout(state: &WindowsState) -> Result<()> {
     let (layout, anchor, primary) = collect_display_snapshot()?;
     let changed = {
         let mut cursor = state.cursor.lock().unwrap();
-        let cursor = cursor
-            .as_mut()
-            .context("Windows 光标捕获状态尚未初始化")?;
+        let cursor = cursor.as_mut().context("Windows 光标捕获状态尚未初始化")?;
         cursor.update_layout(layout.clone(), anchor)
     };
     *state.layout.lock().unwrap() = Some(layout.clone());
@@ -1315,10 +1397,18 @@ fn refresh_display_layout(state: &WindowsState) -> Result<()> {
 
 fn current_modifiers() -> ModifierMask {
     let mut bits = 0u8;
-    if key_down(VK_CONTROL) { bits |= ModifierMask::CTRL.bits(); }
-    if key_down(VK_MENU) { bits |= ModifierMask::ALT.bits(); }
-    if key_down(VK_SHIFT) { bits |= ModifierMask::SHIFT.bits(); }
-    if key_down(VK_LWIN) || key_down(VK_RWIN) { bits |= ModifierMask::META.bits(); }
+    if key_down(VK_CONTROL) {
+        bits |= ModifierMask::CTRL.bits();
+    }
+    if key_down(VK_MENU) {
+        bits |= ModifierMask::ALT.bits();
+    }
+    if key_down(VK_SHIFT) {
+        bits |= ModifierMask::SHIFT.bits();
+    }
+    if key_down(VK_LWIN) || key_down(VK_RWIN) {
+        bits |= ModifierMask::META.bits();
+    }
     ModifierMask::from_bits(bits)
 }
 
@@ -1540,7 +1630,13 @@ fn vk_to_hid(vk: u16) -> u16 {
         0x28 => 0x51,
         0x70..=0x7b => 0x3a + (vk - 0x70),
         0x7c..=0x87 => 0x68 + (vk - 0x7c),
-        0x30..=0x39 => if vk == 0x30 { 0x27 } else { 0x1e + (vk - 0x31) },
+        0x30..=0x39 => {
+            if vk == 0x30 {
+                0x27
+            } else {
+                0x1e + (vk - 0x31)
+            }
+        }
         0x41..=0x5a => 0x04 + (vk - 0x41),
         0xa2 => 0xe0,
         0xa0 => 0xe1,
@@ -1651,8 +1747,8 @@ fn hid_to_windows_scan(usage: u16) -> Option<(u16, bool)> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::allow_native_fallback;
     use super::super::super::ScrollSource;
+    use super::super::allow_native_fallback;
     use super::{
         MOUSEEVENTF_FROMTOUCH, MOUSEEVENTF_MASK, WM_SYNLY_MOUSE_TRACKPAD_WHEEL,
         WM_SYNLY_MOUSE_WHEEL, hid_to_windows_scan, scroll_source_from_extra_info, vk_to_hid,
@@ -1695,7 +1791,10 @@ mod tests {
 
     #[test]
     fn wheel_message_maps_source_to_message_id() {
-        assert_eq!(wheel_message(ScrollSource::MouseWheel), WM_SYNLY_MOUSE_WHEEL);
+        assert_eq!(
+            wheel_message(ScrollSource::MouseWheel),
+            WM_SYNLY_MOUSE_WHEEL
+        );
         assert_eq!(
             wheel_message(ScrollSource::Trackpad),
             WM_SYNLY_MOUSE_TRACKPAD_WHEEL,

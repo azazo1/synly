@@ -1,18 +1,16 @@
-use super::{ServiceStatus, status};
+use super::super::agent::pipe::{NativePipe, PipeDirection};
+use super::super::agent::security::wide;
 use super::protocol::{
     SERVICE_CONNECT_TIMEOUT, SERVICE_PIPE_NAME, ServiceRequest, ServiceResponse, read_response,
     write_request,
 };
-use super::super::agent::pipe::{NativePipe, PipeDirection};
-use super::super::agent::security::wide;
+use super::{ServiceStatus, status};
 use anyhow::{Context, Result, bail};
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, Ordering};
 use windows_sys::Win32::Foundation::{CloseHandle, ERROR_CANCELLED, WAIT_OBJECT_0};
 use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
-use windows_sys::Win32::UI::Shell::{
-    SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
-};
+use windows_sys::Win32::UI::Shell::{SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW};
 use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
 const ELEVATED_ACTION_TIMEOUT_MS: u32 = 30_000;

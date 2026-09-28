@@ -1,21 +1,25 @@
 // 仅显式运行的物理设备诊断, 不保存或回放捕获数据.
-use super::config::{CaptureConfig, CodecConfig, PlaybackConfig};
 use super::capture::CaptureStatus;
+use super::config::{CaptureConfig, CodecConfig, PlaybackConfig};
 use std::time::{Duration, Instant};
 
 fn tone_frame(stream: &super::config::StreamParams, frame_index: usize) -> Vec<f32> {
-    (0..stream.samples_per_frame()).map(|index| {
-        let sample = frame_index * stream.frame_size() + index / usize::from(stream.channels);
-        let position = sample as f32 / stream.sample_rate as f32;
-        let fade = (position / 0.02).min(1.0) * ((1.0 - position) / 0.02).clamp(0.0, 1.0);
-        (position * 440.0 * std::f32::consts::TAU).sin() * 0.02 * fade
-    }).collect()
+    (0..stream.samples_per_frame())
+        .map(|index| {
+            let sample = frame_index * stream.frame_size() + index / usize::from(stream.channels);
+            let position = sample as f32 / stream.sample_rate as f32;
+            let fade = (position / 0.02).min(1.0) * ((1.0 - position) / 0.02).clamp(0.0, 1.0);
+            (position * 440.0 * std::f32::consts::TAU).sin() * 0.02 * fade
+        })
+        .collect()
 }
 
 #[test]
 fn diagnostic_tone_has_no_frame_boundary_phase_reset() {
     let stream = CodecConfig::default().stream_params().unwrap();
-    let pcm: Vec<f32> = (0..200).flat_map(|index| tone_frame(&stream, index)).collect();
+    let pcm: Vec<f32> = (0..200)
+        .flat_map(|index| tone_frame(&stream, index))
+        .collect();
     assert_eq!(pcm.len(), 48000 * 2);
     assert_eq!(pcm[0], 0.0);
     assert!(pcm[pcm.len() - 1].abs() < 0.00001);
@@ -42,11 +46,16 @@ fn play_diagnostic_tone() {
         for frame_index in 0..200 {
             let pcm = tone_frame(&stream, frame_index);
             let started = Instant::now();
-            output.submit_frame(&pcm, Duration::from_millis(200)).unwrap();
+            output
+                .submit_frame(&pcm, Duration::from_millis(200))
+                .unwrap();
             longest_submit = longest_submit.max(started.elapsed());
         }
-        eprintln!("供帧完成: elapsed_ms={}, longest_submit_us={}",
-            playback_started.elapsed().as_millis(), longest_submit.as_micros());
+        eprintln!(
+            "供帧完成: elapsed_ms={}, longest_submit_us={}",
+            playback_started.elapsed().as_millis(),
+            longest_submit.as_micros()
+        );
         std::thread::sleep(Duration::from_millis(300));
     }
 }
@@ -54,9 +63,15 @@ fn play_diagnostic_tone() {
 #[test]
 #[ignore = "仅播放真实声卡提示音, 必须经用户允许后单独运行"]
 fn local_playback_only() {
-    assert_eq!(std::env::var("SYNLY_AUDIO_HARDWARE_TEST").as_deref(), Ok("1"));
+    assert_eq!(
+        std::env::var("SYNLY_AUDIO_HARDWARE_TEST").as_deref(),
+        Ok("1")
+    );
     let _diagnostic_log = tracing::subscriber::set_default(
-        tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).with_writer(std::io::stderr).finish(),
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(std::io::stderr)
+            .finish(),
     );
     eprintln!("纯播放诊断: 不采集声音, 不建立网络连接");
     play_diagnostic_tone();
@@ -66,9 +81,15 @@ fn local_playback_only() {
 #[test]
 #[ignore = "访问真实声卡并播放提示音, 必须经用户允许后单独运行"]
 fn local_capture_and_playback() {
-    assert_eq!(std::env::var("SYNLY_AUDIO_HARDWARE_TEST").as_deref(), Ok("1"));
+    assert_eq!(
+        std::env::var("SYNLY_AUDIO_HARDWARE_TEST").as_deref(),
+        Ok("1")
+    );
     let _diagnostic_log = tracing::subscriber::set_default(
-        tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).with_writer(std::io::stderr).finish(),
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(std::io::stderr)
+            .finish(),
     );
     let stream = CodecConfig::default().stream_params().unwrap();
     eprintln!("[1/2] 播放诊断");
@@ -77,10 +98,16 @@ fn local_capture_and_playback() {
     let mut input = None;
     for attempt in 1..=3 {
         match super::platform::open_input(&CaptureConfig::default(), &stream) {
-            Ok(device) => { input = Some(device); break; }
+            Ok(device) => {
+                input = Some(device);
+                break;
+            }
             Err(error) => {
                 eprintln!("采集初始化第 {attempt}/3 次失败: {error}");
-                if !matches!(error, super::error::Error::Backend(_) | super::error::Error::Io(_)) {
+                if !matches!(
+                    error,
+                    super::error::Error::Backend(_) | super::error::Error::Io(_)
+                ) {
                     panic!("不可重试的采集错误: {error}");
                 }
                 if attempt < 3 {
@@ -98,7 +125,10 @@ fn local_capture_and_playback() {
     let mut peak = 0.0f32;
     let mut reported_second = 0;
     while started.elapsed() < Duration::from_secs(5) {
-        match input.read_frame(&mut pcm, Duration::from_millis(200)).unwrap() {
+        match input
+            .read_frame(&mut pcm, Duration::from_millis(200))
+            .unwrap()
+        {
             CaptureStatus::Ok => {
                 frames += 1;
                 for value in &pcm {
@@ -116,5 +146,7 @@ fn local_capture_and_playback() {
     }
     drop(input);
     assert!(frames > 0, "未收到系统音频帧");
-    eprintln!("真实设备测试结束: frames={frames}, timeouts={timeouts}, peak={peak:.6}. 非零峰值和听感需结合实际播放源确认");
+    eprintln!(
+        "真实设备测试结束: frames={frames}, timeouts={timeouts}, peak={peak:.6}. 非零峰值和听感需结合实际播放源确认"
+    );
 }

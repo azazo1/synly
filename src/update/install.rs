@@ -9,9 +9,9 @@ use super::form;
 use super::form::DistributionForm;
 use super::pending::{self, Handoff};
 use super::state::InstallOutcome;
-use anyhow::{Context, Result};
 #[cfg(not(target_os = "macos"))]
 use anyhow::bail;
+use anyhow::{Context, Result};
 use std::fs;
 use std::path::Path;
 #[cfg(not(any(windows, target_os = "macos")))]
@@ -62,12 +62,7 @@ pub fn apply_installer(archive: &Path, version: &str) -> Result<InstallOutcome> 
 }
 
 /// 交接前写下本次落地记录, 供下次启动判断结果.
-fn write_pending(
-    archive: &Path,
-    version: &str,
-    update_dir: &Path,
-    log_path: &Path,
-) -> Result<()> {
+fn write_pending(archive: &Path, version: &str, update_dir: &Path, log_path: &Path) -> Result<()> {
     let package = archive
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -106,9 +101,7 @@ fn handoff_portable(archive: &Path) -> Result<InstallOutcome> {
     #[cfg(not(target_os = "macos"))]
     {
         tracing::warn!("当前程序不在安装位置, 无法就地升级");
-        bail!(
-            "当前程序不在安装位置, 自动更新无法替换程序文件. 请从 Release 页下载安装包重新安装."
-        );
+        bail!("当前程序不在安装位置, 自动更新无法替换程序文件. 请从 Release 页下载安装包重新安装.");
     }
 }
 
@@ -144,12 +137,7 @@ fn handoff_windows(archive: &Path, log_path: &Path, update_dir: &Path) -> Result
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
-fn handoff_linux(
-    archive: &Path,
-    version: &str,
-    update_dir: &Path,
-    log_path: &Path,
-) -> Result<()> {
+fn handoff_linux(archive: &Path, version: &str, update_dir: &Path, log_path: &Path) -> Result<()> {
     let staging = update_dir.join(format!("staging-{}", version.trim_start_matches('v')));
     if staging.exists() {
         fs::remove_dir_all(&staging)

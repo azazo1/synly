@@ -145,9 +145,14 @@ mod tests {
 
     #[test]
     fn parses_pending_record_fields() {
-        let record = parse("version=v1.2.3\nform=installer\npackage=synly-1.2.3-windows-x86_64-setup.exe\ntime_unix=42\nlog=C:\\tmp\\apply.log\n");
+        let record = parse(
+            "version=v1.2.3\nform=installer\npackage=synly-1.2.3-windows-x86_64-setup.exe\ntime_unix=42\nlog=C:\\tmp\\apply.log\n",
+        );
         assert_eq!(record.version.as_deref(), Some("v1.2.3"));
-        assert_eq!(record.log_path.as_deref(), Some(Path::new(r"C:\tmp\apply.log")));
+        assert_eq!(
+            record.log_path.as_deref(),
+            Some(Path::new(r"C:\tmp\apply.log"))
+        );
     }
 
     #[test]

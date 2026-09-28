@@ -78,10 +78,7 @@ impl ClipboardSync {
         &self,
         tx: mpsc::UnboundedSender<ClipboardPayload>,
     ) -> Result<ClipboardWatcherHandle> {
-        let handler = LocalClipboardHandler::new(
-            tx,
-            Arc::clone(&self.options),
-        )?;
+        let handler = LocalClipboardHandler::new(tx, Arc::clone(&self.options))?;
         let mut watcher: ClipboardWatcherContext<LocalClipboardHandler> =
             ClipboardWatcherContext::new().map_err(clipboard_error)?;
         let shutdown = watcher.add_handler(handler).get_shutdown_channel();
@@ -120,8 +117,7 @@ impl ClipboardSync {
 
         tokio::task::spawn_blocking(move || -> Result<()> {
             let mut warnings = Vec::new();
-            let payload =
-                sanitize_remote_payload(payload, options.max_file_bytes, &mut warnings);
+            let payload = sanitize_remote_payload(payload, options.max_file_bytes, &mut warnings);
             emit_warnings(&warnings);
 
             if payload.is_empty() {
@@ -227,11 +223,7 @@ impl LocalClipboardHandler {
         options: Arc<Mutex<ClipboardRuntimeOptions>>,
     ) -> Result<Self> {
         let ctx = ClipboardContext::new().map_err(clipboard_error)?;
-        Ok(Self {
-            ctx,
-            tx,
-            options,
-        })
+        Ok(Self { ctx, tx, options })
     }
 }
 

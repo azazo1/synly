@@ -41,7 +41,10 @@ pub fn open_output(config: &PlaybackConfig, stream: &StreamParams) -> Result<Box
     {
         windows::open_output(config, stream)
     }
-    #[cfg(all(not(feature = "sdl2-audio"), not(any(target_os = "macos", target_os = "windows"))))]
+    #[cfg(all(
+        not(feature = "sdl2-audio"),
+        not(any(target_os = "macos", target_os = "windows"))
+    ))]
     {
         unsupported::open_output(config, stream)
     }
@@ -57,10 +60,20 @@ mod tests {
     fn malformed_endpoint_selection_fails_before_device_startup() {
         let stream = CodecConfig::default().stream_params().unwrap();
         for id in ["", "设备\0后缀"] {
-            let capture = CaptureConfig { device_name: Some(id.into()) };
-            let playback = PlaybackConfig { device_name: Some(id.into()) };
-            assert!(matches!(open_input(&capture, &stream), Err(Error::InvalidConfig(_))));
-            assert!(matches!(open_output(&playback, &stream), Err(Error::InvalidConfig(_))));
+            let capture = CaptureConfig {
+                device_name: Some(id.into()),
+            };
+            let playback = PlaybackConfig {
+                device_name: Some(id.into()),
+            };
+            assert!(matches!(
+                open_input(&capture, &stream),
+                Err(Error::InvalidConfig(_))
+            ));
+            assert!(matches!(
+                open_output(&playback, &stream),
+                Err(Error::InvalidConfig(_))
+            ));
         }
     }
 
@@ -68,9 +81,19 @@ mod tests {
     #[test]
     fn unsupported_device_selection_is_not_a_retryable_device_outage() {
         let stream = CodecConfig::default().stream_params().unwrap();
-        let capture = CaptureConfig { device_name: Some("测试指定设备".into()) };
-        let playback = PlaybackConfig { device_name: Some("测试指定设备".into()) };
-        assert!(matches!(open_input(&capture, &stream), Err(Error::UnsupportedPlatform(_))));
-        assert!(matches!(open_output(&playback, &stream), Err(Error::UnsupportedPlatform(_))));
+        let capture = CaptureConfig {
+            device_name: Some("测试指定设备".into()),
+        };
+        let playback = PlaybackConfig {
+            device_name: Some("测试指定设备".into()),
+        };
+        assert!(matches!(
+            open_input(&capture, &stream),
+            Err(Error::UnsupportedPlatform(_))
+        ));
+        assert!(matches!(
+            open_output(&playback, &stream),
+            Err(Error::UnsupportedPlatform(_))
+        ));
     }
 }

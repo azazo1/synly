@@ -200,18 +200,20 @@ impl ClipboardHub {
         let (event_tx, event_rx) = mpsc::channel(INGEST_CAPACITY);
         let (local_tx, local_rx) = mpsc::unbounded_channel();
         let handle = ClipboardHubHandle { tx: event_tx };
-        let task = tokio::spawn(HubTask {
-            sink,
-            events: event_rx,
-            local_tx: local_tx.clone(),
-            local_rx,
-            watcher: None,
-            subscribers: HashMap::new(),
-            policy: HubPolicy::default(),
-            next_allowed: Instant::now(),
-            pending: None,
-        }
-        .run());
+        let task = tokio::spawn(
+            HubTask {
+                sink,
+                events: event_rx,
+                local_tx: local_tx.clone(),
+                local_rx,
+                watcher: None,
+                subscribers: HashMap::new(),
+                policy: HubPolicy::default(),
+                next_allowed: Instant::now(),
+                pending: None,
+            }
+            .run(),
+        );
         Self { handle, task }
     }
 
@@ -479,18 +481,20 @@ mod tests {
         let (event_tx, event_rx) = mpsc::channel(INGEST_CAPACITY);
         let (local_tx, local_rx) = mpsc::unbounded_channel();
         let handle = ClipboardHubHandle { tx: event_tx };
-        let task = tokio::spawn(HubTask {
-            sink,
-            events: event_rx,
-            local_tx,
-            local_rx,
-            watcher: None,
-            subscribers: HashMap::new(),
-            policy: HubPolicy::default(),
-            next_allowed: Instant::now(),
-            pending: None,
-        }
-        .run());
+        let task = tokio::spawn(
+            HubTask {
+                sink,
+                events: event_rx,
+                local_tx,
+                local_rx,
+                watcher: None,
+                subscribers: HashMap::new(),
+                policy: HubPolicy::default(),
+                next_allowed: Instant::now(),
+                pending: None,
+            }
+            .run(),
+        );
         (handle, task)
     }
 
@@ -658,11 +662,7 @@ mod tests {
             Err(DropReason::RateLimited)
         );
         assert_eq!(
-            policy.accept(
-                SourceKey::Local,
-                &text_payload("rate-extra"),
-                now
-            ),
+            policy.accept(SourceKey::Local, &text_payload("rate-extra"), now),
             Ok(())
         );
     }

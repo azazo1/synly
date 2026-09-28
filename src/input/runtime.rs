@@ -14,10 +14,10 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
-use tokio::net::TcpStream;
 use tokio::io::AsyncWriteExt;
-use tokio::sync::mpsc;
+use tokio::net::TcpStream;
 use tokio::sync::Mutex;
+use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::{self, Instant, MissedTickBehavior};
 use tokio_rustls::TlsStream;
@@ -134,53 +134,48 @@ pub async fn run_input_session(
         platform::start_with_filter(options.mode, options.hotkey, filter_app_events)?;
     tracing::info!(role = ?local_role, "输入同步运行时已启动");
     match context {
-        InputSessionContext::Host {
-            channel,
-            sockets,
-        } => {
-            loop {
-                let connection = sockets
-                    .recv()
-                    .await
-                    .context("输入辅助连接等待期间主会话已结束")?;
-                match time::timeout(
-                    AUTH_TIMEOUT,
-                    channel.accept_after_preamble(
-                        connection.socket,
-                        connection.session_id,
-                        &master_secret,
-                    ),
-                )
+        InputSessionContext::Host { channel, sockets } => loop {
+            let connection = sockets
+                .recv()
                 .await
-                {
-                    Ok(Ok(stream)) => {
-                        if let Err(err) = run_established(
-                            stream,
-                            local_role,
-                            &options,
-                            &mut platform,
-                            input_activity.clone(),
-                        )
-                        .await
-                        {
-                            cleanup_platform(&platform);
-                            if platform_is_terminal(&platform) {
-                                return Err(err);
-                            }
-                            tracing::warn!(error = %err, "输入辅助连接已断开, 等待重连");
+                .context("输入辅助连接等待期间主会话已结束")?;
+            match time::timeout(
+                AUTH_TIMEOUT,
+                channel.accept_after_preamble(
+                    connection.socket,
+                    connection.session_id,
+                    &master_secret,
+                ),
+            )
+            .await
+            {
+                Ok(Ok(stream)) => {
+                    if let Err(err) = run_established(
+                        stream,
+                        local_role,
+                        &options,
+                        &mut platform,
+                        input_activity.clone(),
+                    )
+                    .await
+                    {
+                        cleanup_platform(&platform);
+                        if platform_is_terminal(&platform) {
+                            return Err(err);
                         }
-                    }
-                    Ok(Err(err)) => {
-                        cleanup_platform(&platform);
-                        tracing::warn!(error = %err, "输入辅助连接认证失败");
-                    }
-                    Err(_) => {
-                        cleanup_platform(&platform);
-                        tracing::warn!("输入辅助连接认证超时");
+                        tracing::warn!(error = %err, "输入辅助连接已断开, 等待重连");
                     }
                 }
+                Ok(Err(err)) => {
+                    cleanup_platform(&platform);
+                    tracing::warn!(error = %err, "输入辅助连接认证失败");
+                }
+                Err(_) => {
+                    cleanup_platform(&platform);
+                    tracing::warn!("输入辅助连接认证超时");
+                }
             }
-        }
+        },
         InputSessionContext::Client { offer, remote_addr } => {
             let mut delay = RECONNECT_MIN;
             loop {
@@ -212,7 +207,10 @@ pub async fn run_input_session(
                     tracing::warn!(error = %err, retry_secs = delay.as_secs(), "输入辅助连接将在退避后重连");
                     time::sleep(delay).await;
                     delay = Duration::from_secs(
-                        delay.as_secs().saturating_mul(2).min(RECONNECT_MAX.as_secs()),
+                        delay
+                            .as_secs()
+                            .saturating_mul(2)
+                            .min(RECONNECT_MAX.as_secs()),
                     );
                 }
             }
@@ -275,17 +273,19 @@ async fn run_established(
     let _reader_abort = AbortOnDrop(reader_task.abort_handle());
 
     let session = match local_role {
-        LocalInputRole::Send => run_sender_with_activity(
-            &mut incoming,
-            &tx,
-            platform,
-            local_layout,
-            options.edge,
-            remote_platform,
-            options,
-            input_activity,
-        )
-        .await,
+        LocalInputRole::Send => {
+            run_sender_with_activity(
+                &mut incoming,
+                &tx,
+                platform,
+                local_layout,
+                options.edge,
+                remote_platform,
+                options,
+                input_activity,
+            )
+            .await
+        }
         LocalInputRole::Receive => {
             run_receiver(
                 &mut incoming,
@@ -388,7 +388,10 @@ pub(super) struct IncomingMotion {
 
 impl IncomingMotion {
     pub(super) fn push(&self, generation: u64, dx: i32, dy: i32) {
-        let mut pending = self.pending.lock().unwrap_or_else(|error| error.into_inner());
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         match pending.as_mut() {
             Some(motion) if motion.generation == generation => {
                 motion.dx = motion.dx.saturating_add(dx);
@@ -565,11 +568,7 @@ pub(super) async fn run_sender_with_activity(
     input_activity: Option<Arc<AtomicBool>>,
 ) -> Result<()> {
     let local_platform = InputPlatform::current();
-    let mut key_mapper = KeyMapper::new(
-        &options.key_mapping,
-        local_platform,
-        remote_platform,
-    )?;
+    let mut key_mapper = KeyMapper::new(&options.key_mapping, local_platform, remote_platform)?;
     let mut control =
         SenderControl::new(platform, local_layout.clone(), source_edge, input_activity);
     let mut last_heartbeat = Instant::now();
@@ -586,11 +585,10 @@ pub(super) async fn run_sender_with_activity(
     let mut press_blocked = false;
     let mut secure_desktop = false;
     let mut secure_input = false;
-    let scroll_transformer =
-        ScrollTransformer::new(
-            options.native_scroll_macos_to_windows,
-            options.native_scroll_windows_to_macos,
-        );
+    let scroll_transformer = ScrollTransformer::new(
+        options.native_scroll_macos_to_windows,
+        options.native_scroll_windows_to_macos,
+    );
 
     tracing::info!(
         edge = ?source_edge,
@@ -996,12 +994,7 @@ impl SenderRecoveryGuard {
         let Some(edge_position) = edge_position.or(self.edge_position.take()) else {
             return;
         };
-        let _ = restore_sender(
-            &*self.backend,
-            &self.layout,
-            self.edge,
-            edge_position,
-        );
+        let _ = restore_sender(&*self.backend, &self.layout, self.edge, edge_position);
     }
 }
 
@@ -1028,10 +1021,13 @@ fn sender_return_now(
     edge_position: f32,
     control: &mut SenderControl,
 ) -> Result<()> {
-    enqueue_message(tx, InputMessage::Return {
-        generation: control.generation,
-        edge_position,
-    })?;
+    enqueue_message(
+        tx,
+        InputMessage::Return {
+            generation: control.generation,
+            edge_position,
+        },
+    )?;
     deactivate_sender(platform, layout, edge, edge_position)?;
     control.recovery.disarm();
     control.deactivate();
@@ -1067,11 +1063,9 @@ fn restore_sender(
 }
 
 fn enqueue_message(tx: &mpsc::Sender<InputMessage>, message: InputMessage) -> Result<()> {
-    tx.try_send(message).map_err(|err| {
-        match err {
-            TrySendError::Full(_) => anyhow::anyhow!("输入辅助发送队列已满"),
-            TrySendError::Closed(_) => anyhow::anyhow!("输入辅助发送队列已关闭"),
-        }
+    tx.try_send(message).map_err(|err| match err {
+        TrySendError::Full(_) => anyhow::anyhow!("输入辅助发送队列已满"),
+        TrySendError::Closed(_) => anyhow::anyhow!("输入辅助发送队列已关闭"),
     })
 }
 
@@ -1476,8 +1470,8 @@ fn apply_snapshot(backend: &dyn platform::InputBackend, snapshot: &KeySnapshot) 
 #[cfg(test)]
 mod tests {
     use super::{
-        ACTIVATION_TIMEOUT, AbortOnDrop, EDGE_INSET, HEARTBEAT_TIMEOUT, ReceiverMotion,
-        IncomingMotion, PressedState, SenderRecoveryGuard, describe_pressed, enqueue_message,
+        ACTIVATION_TIMEOUT, AbortOnDrop, EDGE_INSET, HEARTBEAT_TIMEOUT, IncomingMotion,
+        PressedState, ReceiverMotion, SenderRecoveryGuard, describe_pressed, enqueue_message,
         receiver_motion, run_receiver, run_sender, sender_activation_edge_position,
         sender_heartbeat_timeout, spawn_input_reader,
     };
@@ -1491,8 +1485,8 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
-    use tokio::sync::mpsc;
     use tokio::io::AsyncWriteExt;
+    use tokio::sync::mpsc;
     use tokio::time::{Duration, sleep, timeout};
 
     #[derive(Default)]
@@ -1512,7 +1506,12 @@ mod tests {
         }
 
         fn layout(&self) -> Result<DesktopLayout> {
-            DesktopLayout::new(vec![DisplayRect { x: 0, y: 0, width: 100, height: 100 }])
+            DesktopLayout::new(vec![DisplayRect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            }])
         }
 
         fn cursor_position(&self) -> Result<Point> {
@@ -1546,7 +1545,13 @@ mod tests {
             Ok(())
         }
 
-        fn inject_key(&self, _usage: u16, _modifiers: ModifierMask, _down: bool, _repeat: bool) -> Result<()> {
+        fn inject_key(
+            &self,
+            _usage: u16,
+            _modifiers: ModifierMask,
+            _down: bool,
+            _repeat: bool,
+        ) -> Result<()> {
             Ok(())
         }
 
@@ -1588,7 +1593,10 @@ mod tests {
         assert!(!*backend.capture.lock().unwrap());
         assert_eq!(
             *backend.warped.lock().unwrap(),
-            Some(Point { x: 100 - EDGE_INSET - 1, y: 50 })
+            Some(Point {
+                x: 100 - EDGE_INSET - 1,
+                y: 50
+            })
         );
         assert_eq!(
             *backend.recovery_actions.lock().unwrap(),
@@ -1637,8 +1645,11 @@ mod tests {
     #[tokio::test]
     async fn input_writer_queue_rejects_overflow_without_waiting() {
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        enqueue_message(&tx, crate::input::protocol::InputMessage::Heartbeat { generation: 1 })
-            .unwrap();
+        enqueue_message(
+            &tx,
+            crate::input::protocol::InputMessage::Heartbeat { generation: 1 },
+        )
+        .unwrap();
         assert!(
             enqueue_message(
                 &tx,
@@ -1680,10 +1691,7 @@ mod tests {
         });
         let edge_position = timeout(Duration::from_secs(1), async {
             loop {
-                if let InputMessage::Activate {
-                    edge_position,
-                    ..
-                } =
+                if let InputMessage::Activate { edge_position, .. } =
                     messages.recv().await.expect("sender 不应提前停止")
                 {
                     break edge_position;
@@ -2147,9 +2155,10 @@ mod tests {
         let edge_position = timeout(Duration::from_secs(1), async {
             loop {
                 match messages.recv().await {
-                    Some(InputMessage::ReturnRequest { generation: 7, edge_position }) => {
-                        break edge_position
-                    }
+                    Some(InputMessage::ReturnRequest {
+                        generation: 7,
+                        edge_position,
+                    }) => break edge_position,
                     Some(InputMessage::Return { .. }) => panic!("接收端不应自行返回"),
                     Some(_) => {}
                     None => panic!("接收端不应提前停止"),
@@ -2643,9 +2652,7 @@ mod tests {
             .unwrap();
         timeout(Duration::from_secs(1), async {
             loop {
-                if !*backend.capture.lock().unwrap()
-                    && backend.warped.lock().unwrap().is_some()
-                {
+                if !*backend.capture.lock().unwrap() && backend.warped.lock().unwrap().is_some() {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -2716,13 +2723,19 @@ mod tests {
             buttons: vec![1],
         });
         events_tx
-            .send(NativeEvent::Button { button: 1, down: true })
+            .send(NativeEvent::Button {
+                button: 1,
+                down: true,
+            })
             .await
             .unwrap();
         timeout(Duration::from_secs(1), async {
             loop {
-                if let InputMessage::Button { button: 1, down: true, .. } =
-                    messages.recv().await.expect("sender 不应提前停止")
+                if let InputMessage::Button {
+                    button: 1,
+                    down: true,
+                    ..
+                } = messages.recv().await.expect("sender 不应提前停止")
                 {
                     break;
                 }
@@ -2753,7 +2766,10 @@ mod tests {
         // 松开按钮: 应批准返回并恢复本机.
         *backend.pressed.lock().unwrap() = None;
         events_tx
-            .send(NativeEvent::Button { button: 1, down: false })
+            .send(NativeEvent::Button {
+                button: 1,
+                down: false,
+            })
             .await
             .unwrap();
         let edge_position = timeout(Duration::from_secs(1), async {
@@ -2826,7 +2842,11 @@ mod tests {
             for _ in 0..400 {
                 write_message(
                     &mut writer,
-                    &InputMessage::Motion { generation: 5, dx: 1, dy: -1 },
+                    &InputMessage::Motion {
+                        generation: 5,
+                        dx: 1,
+                        dy: -1,
+                    },
                 )
                 .await
                 .unwrap();
@@ -2837,16 +2857,24 @@ mod tests {
         });
 
         assert!(matches!(
-            timeout(Duration::from_secs(1), incoming.recv()).await.unwrap(),
+            timeout(Duration::from_secs(1), incoming.recv())
+                .await
+                .unwrap(),
             Some(Ok(InputMessage::Activate { generation: 5, .. }))
         ));
         assert!(matches!(
-            timeout(Duration::from_secs(1), incoming.recv()).await.unwrap(),
+            timeout(Duration::from_secs(1), incoming.recv())
+                .await
+                .unwrap(),
             Some(Ok(InputMessage::Heartbeat { generation: 5 }))
         ));
         assert_eq!(
             motion.take(),
-            Some(super::CoalescedMotion { generation: 5, dx: 400, dy: -400 })
+            Some(super::CoalescedMotion {
+                generation: 5,
+                dx: 400,
+                dy: -400
+            })
         );
 
         write_task.await.unwrap();
@@ -2861,13 +2889,21 @@ mod tests {
         let write_task = tokio::spawn(async move {
             write_message(
                 &mut writer,
-                &InputMessage::Motion { generation: 3, dx: 7, dy: -2 },
+                &InputMessage::Motion {
+                    generation: 3,
+                    dx: 7,
+                    dy: -2,
+                },
             )
             .await
             .unwrap();
             write_message(
                 &mut writer,
-                &InputMessage::Button { generation: 3, button: 1, down: true },
+                &InputMessage::Button {
+                    generation: 3,
+                    button: 1,
+                    down: true,
+                },
             )
             .await
             .unwrap();
@@ -2879,7 +2915,11 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .unwrap(),
-            InputMessage::Motion { generation: 3, dx: 7, dy: -2 }
+            InputMessage::Motion {
+                generation: 3,
+                dx: 7,
+                dy: -2
+            }
         );
         assert_eq!(
             timeout(Duration::from_secs(1), incoming.recv())
@@ -2887,7 +2927,11 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .unwrap(),
-            InputMessage::Button { generation: 3, button: 1, down: true }
+            InputMessage::Button {
+                generation: 3,
+                button: 1,
+                down: true
+            }
         );
         assert_eq!(motion.take(), None);
 
@@ -2905,13 +2949,7 @@ mod tests {
             height: 100,
         }])
         .unwrap();
-        let first = receiver_motion(
-            &layout,
-            ScreenEdge::Left,
-            Point { x: 8, y: 40 },
-            30,
-            5,
-        );
+        let first = receiver_motion(&layout, ScreenEdge::Left, Point { x: 8, y: 40 }, 30, 5);
         assert_eq!(first, ReceiverMotion::Move(Point { x: 38, y: 45 }));
         let ReceiverMotion::Move(point) = first else {
             panic!("第一次移动不应返回本机");

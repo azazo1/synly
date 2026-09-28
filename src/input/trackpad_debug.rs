@@ -140,23 +140,12 @@ impl DebugState {
     fn observe(&mut self, event_type: CGEventType, event: CGEventRef) {
         self.count(event_type);
         match event_type {
-            EVENT_MOUSE_MOVED
-            | EVENT_LEFT_DRAGGED
-            | EVENT_RIGHT_DRAGGED
-            | EVENT_OTHER_DRAGGED => {
-                self.motion_x += unsafe {
-                    CGEventGetIntegerValueField(event, FIELD_MOUSE_DELTA_X)
-                };
-                self.motion_y += unsafe {
-                    CGEventGetIntegerValueField(event, FIELD_MOUSE_DELTA_Y)
-                };
+            EVENT_MOUSE_MOVED | EVENT_LEFT_DRAGGED | EVENT_RIGHT_DRAGGED | EVENT_OTHER_DRAGGED => {
+                self.motion_x += unsafe { CGEventGetIntegerValueField(event, FIELD_MOUSE_DELTA_X) };
+                self.motion_y += unsafe { CGEventGetIntegerValueField(event, FIELD_MOUSE_DELTA_Y) };
             }
-            EVENT_LEFT_DOWN
-            | EVENT_LEFT_UP
-            | EVENT_RIGHT_DOWN
-            | EVENT_RIGHT_UP
-            | EVENT_OTHER_DOWN
-            | EVENT_OTHER_UP => {
+            EVENT_LEFT_DOWN | EVENT_LEFT_UP | EVENT_RIGHT_DOWN | EVENT_RIGHT_UP
+            | EVENT_OTHER_DOWN | EVENT_OTHER_UP => {
                 let button = unsafe { CGEventGetIntegerValueField(event, FIELD_MOUSE_BUTTON) };
                 self.emit(LogRecord::Event(format!(
                     "pointer button: type={event_type}, button={button}"
@@ -165,13 +154,11 @@ impl DebugState {
             EVENT_SCROLL => {
                 let x = unsafe { CGEventGetIntegerValueField(event, FIELD_SCROLL_DELTA_X) };
                 let y = unsafe { CGEventGetIntegerValueField(event, FIELD_SCROLL_DELTA_Y) };
-                let continuous = unsafe {
-                    CGEventGetIntegerValueField(event, FIELD_SCROLL_IS_CONTINUOUS)
-                };
+                let continuous =
+                    unsafe { CGEventGetIntegerValueField(event, FIELD_SCROLL_IS_CONTINUOUS) };
                 let phase = unsafe { CGEventGetIntegerValueField(event, FIELD_SCROLL_PHASE) };
-                let momentum = unsafe {
-                    CGEventGetIntegerValueField(event, FIELD_SCROLL_MOMENTUM_PHASE)
-                };
+                let momentum =
+                    unsafe { CGEventGetIntegerValueField(event, FIELD_SCROLL_MOMENTUM_PHASE) };
                 self.emit(LogRecord::Event(format!(
                     "scroll: x={x}, y={y}, continuous={continuous}, phase={phase}, momentum={momentum}"
                 )));
@@ -238,16 +225,7 @@ pub fn run_trackpad_debug() -> Result<()> {
         .context("无法启动 trackpad 诊断日志线程")?;
     let mut state = DebugState::new(log_tx);
     let user_info = (&mut state as *mut DebugState).cast::<c_void>();
-    let tap = unsafe {
-        CGEventTapCreate(
-            0,
-            0,
-            0,
-            ALL_EVENT_MASK,
-            Some(event_callback),
-            user_info,
-        )
-    };
+    let tap = unsafe { CGEventTapCreate(0, 0, 0, ALL_EVENT_MASK, Some(event_callback), user_info) };
     if tap.is_null() {
         bail!("无法创建全事件 Quartz event tap, 请检查辅助功能和输入监控权限")
     }
@@ -263,9 +241,7 @@ pub fn run_trackpad_debug() -> Result<()> {
         CFRunLoopAddSource(state.run_loop, source, kCFRunLoopCommonModes);
         CGEventTapEnable(tap, true);
     }
-    tracing::info!(
-        "trackpad 全事件捕获已启动, 所有输入将被阻止, 按任意键结束测试"
-    );
+    tracing::info!("trackpad 全事件捕获已启动, 所有输入将被阻止, 按任意键结束测试");
     unsafe { CFRunLoopRun() };
     unsafe {
         CGEventTapEnable(tap, false);
@@ -306,7 +282,10 @@ unsafe extern "C" fn event_callback(
 }
 
 fn is_keyboard_event(event_type: CGEventType) -> bool {
-    matches!(event_type, EVENT_KEY_DOWN | EVENT_KEY_UP | EVENT_FLAGS_CHANGED)
+    matches!(
+        event_type,
+        EVENT_KEY_DOWN | EVENT_KEY_UP | EVENT_FLAGS_CHANGED
+    )
 }
 
 fn nonzero_fields(event: CGEventRef) -> String {

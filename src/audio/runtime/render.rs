@@ -1,11 +1,11 @@
-use super::queue::FrameQueue;
 use super::AUDIO_IO_TIMEOUT;
+use super::queue::FrameQueue;
+use super::sdl_policy;
 use crate::audio::codec::OpusDecoder;
 use crate::audio::config::StreamParams;
 use crate::audio::error::{Error, Result};
 use crate::audio::playback::AudioOutput;
 use crate::audio::receiver::QueuedAudioFrame;
-use super::sdl_policy;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
@@ -37,19 +37,29 @@ fn run_with_retry_delay(
     let mut recovering = false;
     let mut attempts = 0u64;
     loop {
-        if stop.is_cancelled() { return Ok(()); }
+        if stop.is_cancelled() {
+            return Ok(());
+        }
         let started = Instant::now();
         attempts = attempts.saturating_add(1);
         let result = match open() {
             Ok(output) => {
                 let opened = Instant::now();
-                if stop.is_cancelled() { return Ok(()); }
+                if stop.is_cancelled() {
+                    return Ok(());
+                }
                 if recovering {
                     let elapsed = opened.duration_since(started);
-                    tracing::info!(attempts, elapsed_ms = elapsed.as_millis(), "播放设备重建成功, 开始恢复丢帧窗口");
+                    tracing::info!(
+                        attempts,
+                        elapsed_ms = elapsed.as_millis(),
+                        "播放设备重建成功, 开始恢复丢帧窗口"
+                    );
                     // Moonlight audio.cpp:245-249 用初始化耗时作为恢复后的丢帧时长.
                     // 同时清掉重建期间的有界积压, 不重启 UDP/AEAD/RTP 状态.
-                    if !packets.discard_until(opened + elapsed) || stop.is_cancelled() { return Ok(()); }
+                    if !packets.discard_until(opened + elapsed) || stop.is_cancelled() {
+                        return Ok(());
+                    }
                     tracing::info!("播放恢复丢帧窗口结束");
                 }
                 // 每次设备重建都新建 Opus 解码器. 函数返回前先释放旧设备和解码器.
@@ -57,7 +67,9 @@ fn run_with_retry_delay(
             }
             Err(error) => Err(error),
         };
-        if stop.is_cancelled() { return Ok(()); }
+        if stop.is_cancelled() {
+            return Ok(());
+        }
         match result {
             Ok(()) => return Ok(()),
             Err(error) if recoverable(&error) => {
@@ -68,7 +80,9 @@ fn run_with_retry_delay(
         recovering = true;
         // 用单调时间替代上游每 200 个样本重试, 各种帧时长和断流时均为 1 秒.
         // 监督器取消时关闭队列, 同时唤醒没有网络输入的重试等待.
-        if !packets.discard_until(Instant::now() + retry_delay) { return Ok(()); }
+        if !packets.discard_until(Instant::now() + retry_delay) {
+            return Ok(());
+        }
     }
 }
 
@@ -81,9 +95,14 @@ pub(super) fn decode_frames(
     let mut decoder = OpusDecoder::new(stream.opus_config())?;
     let mut buffer = vec![0.0; stream.samples_per_frame()];
     let mut skipped = 0u64;
-    tracing::info!(frame_ms = stream.packet_duration_ms, "音频解码播放任务已启动");
+    tracing::info!(
+        frame_ms = stream.packet_duration_ms,
+        "音频解码播放任务已启动"
+    );
     while let Some(frame) = packets.pop_blocking() {
-        if stop.is_cancelled() { break; }
+        if stop.is_cancelled() {
+            break;
+        }
         let packet = match &frame {
             QueuedAudioFrame::Encoded(packet) => Some(packet.as_slice()),
             QueuedAudioFrame::Missing => None,
@@ -101,7 +120,9 @@ pub(super) fn decode_frames(
             skipped += 1;
             continue;
         }
-        if stop.is_cancelled() { break; }
+        if stop.is_cancelled() {
+            break;
+        }
         output.submit_frame(&buffer[..decoded], AUDIO_IO_TIMEOUT)?;
     }
     tracing::debug!(skipped_frames = skipped, "音频解码播放统计");

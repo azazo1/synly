@@ -7,11 +7,11 @@ use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::sync::Arc;
+pub use synly_core::input::InputChannelOffer;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector, TlsStream};
 use uuid::Uuid;
-pub use synly_core::input::InputChannelOffer;
 
 pub const INPUT_PREAMBLE_MAGIC: &[u8; 12] = b"SYNLY-INPUT\0";
 pub const INPUT_AUX_VERSION: u16 = 1;
@@ -144,9 +144,7 @@ pub async fn connect(
         .with_no_client_auth();
     config.alpn_protocols = vec![INPUT_ALPN.to_vec()];
     let connector = TlsConnector::from(Arc::new(config));
-    let stream = connector
-        .connect(input_server_name()?, socket)
-        .await?;
+    let stream = connector.connect(input_server_name()?, socket).await?;
     let exporter = export_client(&stream, offer.session_id)?;
     let mut stream: TlsStream<TcpStream> = stream.into();
     write_message(
@@ -169,13 +167,7 @@ pub async fn connect(
     if role != InputChannelRole::Host {
         bail!("输入辅助连接服务端角色不正确");
     }
-    verify_proof(
-        master_secret,
-        offer.session_id,
-        role,
-        &exporter,
-        &proof,
-    )?;
+    verify_proof(master_secret, offer.session_id, role, &exporter, &proof)?;
     Ok(stream)
 }
 
@@ -290,8 +282,24 @@ mod tests {
         let session = Uuid::new_v4();
         let exporter = [2u8; 32];
         let proof = make_proof(&secret, session, InputChannelRole::Client, &exporter).unwrap();
-        verify_proof(&secret, session, InputChannelRole::Client, &exporter, &proof).unwrap();
-        assert!(verify_proof(&[3u8; 32], session, InputChannelRole::Client, &exporter, &proof).is_err());
+        verify_proof(
+            &secret,
+            session,
+            InputChannelRole::Client,
+            &exporter,
+            &proof,
+        )
+        .unwrap();
+        assert!(
+            verify_proof(
+                &[3u8; 32],
+                session,
+                InputChannelRole::Client,
+                &exporter,
+                &proof
+            )
+            .is_err()
+        );
         assert!(verify_proof(&secret, session, InputChannelRole::Host, &exporter, &proof).is_err());
     }
 

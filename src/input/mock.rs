@@ -35,9 +35,7 @@ impl Default for ScreenMockOptions {
     fn default() -> Self {
         Self {
             edge: ScreenEdge::Right,
-            hotkey: Hotkey::DEFAULT
-                .parse()
-                .expect("默认紧急热键必须有效"),
+            hotkey: Hotkey::DEFAULT.parse().expect("默认紧急热键必须有效"),
             width: 1280,
             height: 720,
         }
@@ -109,8 +107,7 @@ pub fn run_screen_mock(options: ScreenMockOptions) -> Result<()> {
         match MockSettings::from_window(&window) {
             Ok(settings) => {
                 window.set_source_edge(settings.edge.as_arg().into());
-                window
-                    .set_virtual_aspect_ratio(settings.width as f32 / settings.height as f32);
+                window.set_virtual_aspect_ratio(settings.width as f32 / settings.height as f32);
                 let _ = settings_tx.send(settings);
             }
             Err(error) => {
@@ -903,8 +900,14 @@ mod tests {
 
     #[test]
     fn grid_offset_uses_small_step_and_wraps_phase() {
-        assert_eq!(grid_pixels_per_wheel_unit(InputPlatform::Macos), GRID_SCROLL_STEP);
-        assert_eq!(grid_pixels_per_wheel_unit(InputPlatform::Windows), GRID_SCROLL_STEP);
+        assert_eq!(
+            grid_pixels_per_wheel_unit(InputPlatform::Macos),
+            GRID_SCROLL_STEP
+        );
+        assert_eq!(
+            grid_pixels_per_wheel_unit(InputPlatform::Windows),
+            GRID_SCROLL_STEP
+        );
         assert_eq!(grid_phase(-60.0), 132.0);
         assert_eq!(grid_phase(48.0), 48.0);
         assert_eq!(grid_phase(250.0), 58.0);

@@ -16,11 +16,17 @@ impl DeviceConfig {
     }
 
     pub fn identity_public_key(&self) -> Result<&str> {
-        non_empty_key(&self.identity_public_key, "device identity public key is missing")
+        non_empty_key(
+            &self.identity_public_key,
+            "device identity public key is missing",
+        )
     }
 
     pub fn identity_private_key(&self) -> Result<&str> {
-        non_empty_key(&self.identity_private_key, "device identity private key is missing")
+        non_empty_key(
+            &self.identity_private_key,
+            "device identity private key is missing",
+        )
     }
 }
 

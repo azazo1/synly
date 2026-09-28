@@ -170,9 +170,10 @@ fn emit_fake_dist_cfg() {
 
 fn env_flag_enabled(key: &str) -> bool {
     match env::var(key) {
-        Ok(value) => {
-            !matches!(value.trim().to_ascii_lowercase().as_str(), "" | "0" | "false" | "no" | "off")
-        }
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "no" | "off"
+        ),
         Err(_) => false,
     }
 }

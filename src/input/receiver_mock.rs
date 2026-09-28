@@ -230,10 +230,8 @@ pub async fn run_controller_mock(options: ControllerMockOptions) -> Result<()> {
     }
     let mut channel = open_controller_channel(options.address).await?;
     let generation = Arc::new(AtomicU64::new(1));
-    let heartbeat_task = spawn_controller_heartbeat(
-        channel.outgoing.clone(),
-        Arc::clone(&generation),
-    );
+    let heartbeat_task =
+        spawn_controller_heartbeat(channel.outgoing.clone(), Arc::clone(&generation));
     let started = Instant::now();
 
     send_input(
@@ -260,10 +258,13 @@ pub async fn run_controller_mock(options: ControllerMockOptions) -> Result<()> {
         "真实被控端已确认第一次接管"
     );
     send_full_input_sequence(&channel.outgoing, &options, 1).await?;
-    send_input(&channel.outgoing, InputMessage::Deactivate {
-        generation: 1,
-        edge_position: None,
-    })
+    send_input(
+        &channel.outgoing,
+        InputMessage::Deactivate {
+            generation: 1,
+            edge_position: None,
+        },
+    )
     .await?;
 
     generation.store(2, Ordering::Release);
@@ -290,15 +291,14 @@ pub async fn run_controller_mock(options: ControllerMockOptions) -> Result<()> {
         pressure_steps = second_pressure_steps,
         "真实被控端已确认重新接管"
     );
+    send_input(&channel.outgoing, motion_message(options.edge, 2, 4)).await?;
     send_input(
         &channel.outgoing,
-        motion_message(options.edge, 2, 4),
+        InputMessage::Deactivate {
+            generation: 2,
+            edge_position: None,
+        },
     )
-    .await?;
-    send_input(&channel.outgoing, InputMessage::Deactivate {
-        generation: 2,
-        edge_position: None,
-    })
     .await?;
     time::sleep(FINISH_DELAY).await;
 
@@ -328,10 +328,8 @@ pub async fn run_controller_mock_interactive(options: InteractiveControllerOptio
     platform.backend.set_keyboard_capture(true)?;
     let mut channel = open_controller_channel(options.address).await?;
     let generation = Arc::new(AtomicU64::new(1));
-    let heartbeat_task = spawn_controller_heartbeat(
-        channel.outgoing.clone(),
-        Arc::clone(&generation),
-    );
+    let heartbeat_task =
+        spawn_controller_heartbeat(channel.outgoing.clone(), Arc::clone(&generation));
     let mut active = true;
     send_input(
         &channel.outgoing,
@@ -348,10 +346,13 @@ pub async fn run_controller_mock_interactive(options: InteractiveControllerOptio
     // 等待被控端确认接管, 期间若立即请求返回则批准并等待方向键重新接管.
     time::timeout(CONFIRM_TIMEOUT, async {
         loop {
-            match channel.incoming.recv().await.context("被控端读取任务已停止")?? {
-                MockFrame::Input(InputMessage::Heartbeat {
-                    generation: 1,
-                }) => break,
+            match channel
+                .incoming
+                .recv()
+                .await
+                .context("被控端读取任务已停止")??
+            {
+                MockFrame::Input(InputMessage::Heartbeat { generation: 1 }) => break,
                 MockFrame::Input(InputMessage::ReturnRequest {
                     generation: 1,
                     edge_position,
@@ -492,10 +493,7 @@ pub async fn run_controller_mock_interactive(options: InteractiveControllerOptio
     let _ = channel.reader_task.await;
     let _ = platform.backend.set_keyboard_capture(false);
     let _ = platform.backend.release_all();
-    tracing::info!(
-        elapsed_ms = started.elapsed().as_millis(),
-        "交互控制已结束"
-    );
+    tracing::info!(elapsed_ms = started.elapsed().as_millis(), "交互控制已结束");
     result
 }
 
@@ -530,11 +528,7 @@ async fn send_full_input_sequence(
     generation: u64,
 ) -> Result<()> {
     for step in 0..options.motion_steps {
-        send_input(
-            outgoing,
-            motion_message(options.edge, generation, 4),
-        )
-        .await?;
+        send_input(outgoing, motion_message(options.edge, generation, 4)).await?;
         time::sleep(options.step_delay).await;
         if (step + 1) % 500 == 0 {
             tracing::info!(
@@ -605,11 +599,7 @@ async fn send_full_input_sequence(
 
 fn motion_message(edge: ScreenEdge, generation: u64, distance: i32) -> InputMessage {
     let (dx, dy) = inward_motion(edge, distance);
-    InputMessage::Motion {
-        generation,
-        dx,
-        dy,
-    }
+    InputMessage::Motion { generation, dx, dy }
 }
 
 fn inward_motion(edge: ScreenEdge, distance: i32) -> (i32, i32) {
@@ -629,10 +619,7 @@ fn empty_snapshot() -> KeySnapshot {
     }
 }
 
-async fn send_input(
-    outgoing: &mpsc::Sender<MockFrame>,
-    message: InputMessage,
-) -> Result<()> {
+async fn send_input(outgoing: &mpsc::Sender<MockFrame>, message: InputMessage) -> Result<()> {
     outgoing
         .send(MockFrame::Input(message))
         .await
@@ -809,8 +796,8 @@ mod tests {
         DIRECTION_DOWN_USAGE, DIRECTION_LEFT_USAGE, DIRECTION_RIGHT_USAGE, DIRECTION_UP_USAGE,
         ESC_USAGE, MockFrame, direction_motion, inward_motion, read_mock_frame, write_mock_frame,
     };
-    use crate::input::protocol::InputMessage;
     use crate::input::ScreenEdge;
+    use crate::input::protocol::InputMessage;
     use tokio::io::duplex;
 
     #[test]
@@ -823,22 +810,10 @@ mod tests {
 
     #[test]
     fn direction_motion_maps_arrow_keys_to_relative_deltas() {
-        assert_eq!(
-            direction_motion(DIRECTION_UP_USAGE, 4),
-            Some((0, -4))
-        );
-        assert_eq!(
-            direction_motion(DIRECTION_DOWN_USAGE, 4),
-            Some((0, 4))
-        );
-        assert_eq!(
-            direction_motion(DIRECTION_LEFT_USAGE, 4),
-            Some((-4, 0))
-        );
-        assert_eq!(
-            direction_motion(DIRECTION_RIGHT_USAGE, 4),
-            Some((4, 0))
-        );
+        assert_eq!(direction_motion(DIRECTION_UP_USAGE, 4), Some((0, -4)));
+        assert_eq!(direction_motion(DIRECTION_DOWN_USAGE, 4), Some((0, 4)));
+        assert_eq!(direction_motion(DIRECTION_LEFT_USAGE, 4), Some((-4, 0)));
+        assert_eq!(direction_motion(DIRECTION_RIGHT_USAGE, 4), Some((4, 0)));
         assert_eq!(direction_motion(ESC_USAGE, 4), None);
         assert_eq!(direction_motion(0x04, 4), None);
     }
@@ -862,7 +837,10 @@ mod tests {
             read_mock_frame(&mut reader).await.unwrap(),
             MockFrame::Input(InputMessage::Heartbeat { generation: 7 })
         );
-        assert_eq!(read_mock_frame(&mut reader).await.unwrap(), MockFrame::Finish);
+        assert_eq!(
+            read_mock_frame(&mut reader).await.unwrap(),
+            MockFrame::Finish
+        );
         task.await.unwrap();
     }
 }

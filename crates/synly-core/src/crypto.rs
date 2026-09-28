@@ -1238,8 +1238,8 @@ mod tests {
         ControlMessage, DeviceIdentity, PROTOCOL_VERSION, PairAuthMethod, PairRequestPayload,
         SessionAgreement,
     };
-    use crate::workspace::WorkspaceSummary;
     use crate::settings::{AudioMode, ClipboardMode, FileSyncMode, InitialSyncMode};
+    use crate::workspace::WorkspaceSummary;
     use ring::rand::SystemRandom;
     use ring::signature::KeyPair;
     use uuid::Uuid;

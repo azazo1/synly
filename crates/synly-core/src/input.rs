@@ -45,4 +45,3 @@ pub struct InputChannelOffer {
     pub session_id: Uuid,
     pub certificate_der: Vec<u8>,
 }
-

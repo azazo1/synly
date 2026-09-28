@@ -12,7 +12,10 @@ pub struct ReconnectPolicy {
 
 impl ReconnectPolicy {
     pub fn new(base_delay: Duration, max_delay: Duration) -> Self {
-        Self { base_delay, max_delay }
+        Self {
+            base_delay,
+            max_delay,
+        }
     }
 }
 
@@ -151,8 +154,7 @@ mod tests {
     #[tokio::test]
     async fn terminal_verdict_returns_error_immediately() {
         let mut attempt = FixedAttempt(AttemptVerdict::Terminal(anyhow::anyhow!("配对终止")));
-        let result =
-            run_auto_reconnect(policy(), CancellationToken::new(), &mut attempt).await;
+        let result = run_auto_reconnect(policy(), CancellationToken::new(), &mut attempt).await;
         let message = format!("{:#}", result.unwrap_err());
         assert!(message.contains("配对终止"));
     }
@@ -182,8 +184,7 @@ mod tests {
     async fn retry_immediately_skips_backoff() {
         let mut attempt = ImmediateAttempt { calls: 0 };
         let started = std::time::Instant::now();
-        let result =
-            run_auto_reconnect(policy(), CancellationToken::new(), &mut attempt).await;
+        let result = run_auto_reconnect(policy(), CancellationToken::new(), &mut attempt).await;
 
         assert!(result.is_err());
         assert_eq!(attempt.calls, 4);

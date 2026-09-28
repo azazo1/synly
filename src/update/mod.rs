@@ -84,7 +84,10 @@ impl UpdateHandle {
 
     pub fn check(&self, manual: bool) {
         let mut inner = self.lock();
-        if matches!(inner.snapshot.phase, UpdatePhase::Checking | UpdatePhase::Downloading) {
+        if matches!(
+            inner.snapshot.phase,
+            UpdatePhase::Checking | UpdatePhase::Downloading
+        ) {
             return;
         }
         if let Some(task) = inner.check_task.take() {
@@ -204,7 +207,9 @@ impl UpdateHandle {
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
-        self.inner.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     async fn run_check(&self, manual: bool) {
@@ -347,16 +352,18 @@ impl UpdateHandle {
             inner.ready_package = Some(final_path.clone());
             inner.snapshot.phase = Phase::ReadyToRestart;
             inner.snapshot.cancellable = false;
-            inner.snapshot.apply_message = "新版本已下载, 点击重启并更新后由安装程序完成替换".to_string();
+            inner.snapshot.apply_message =
+                "新版本已下载, 点击重启并更新后由安装程序完成替换".to_string();
             tracing::info!(package = %final_path.display(), "更新包已就绪, 等待用户重启安装");
         });
     }
 
     /// 把安装包交接给平台安装器, 成功后本进程随即退出.
     async fn run_apply(&self, package: PathBuf, version: String) {
-        let result = tokio::task::spawn_blocking(move || install::apply_installer(&package, &version))
-            .await
-            .unwrap_or_else(|error| Err(anyhow::anyhow!("安装任务异常终止: {error}")));
+        let result =
+            tokio::task::spawn_blocking(move || install::apply_installer(&package, &version))
+                .await
+                .unwrap_or_else(|error| Err(anyhow::anyhow!("安装任务异常终止: {error}")));
         let mut inner = self.lock();
         if inner.snapshot.phase != Phase::Applying {
             return;
@@ -365,7 +372,8 @@ impl UpdateHandle {
             Ok(InstallOutcome::HandedOff) => {
                 inner.snapshot.phase = Phase::HandedOff;
                 inner.snapshot.cancellable = false;
-                inner.snapshot.apply_message = "正在退出并运行安装程序, 请勿手动关闭进程".to_string();
+                inner.snapshot.apply_message =
+                    "正在退出并运行安装程序, 请勿手动关闭进程".to_string();
                 inner.publish();
                 tracing::info!("已交接安装程序, 准备退出");
             }
@@ -406,7 +414,9 @@ impl UpdateHandle {
         if !check::is_newer(&current, &version) {
             return;
         }
-        let Some(name) = package.file_name().map(|value| value.to_string_lossy().into_owned())
+        let Some(name) = package
+            .file_name()
+            .map(|value| value.to_string_lossy().into_owned())
         else {
             return;
         };

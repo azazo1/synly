@@ -1,6 +1,8 @@
-use super::pipe::NativePipe;
 use super::super::super::NativeEvent;
-use crate::input::{DesktopLayout, DisplayRect, Hotkey, InputMode, KeySnapshot, ModifierMask, Point};
+use super::pipe::NativePipe;
+use crate::input::{
+    DesktopLayout, DisplayRect, Hotkey, InputMode, KeySnapshot, ModifierMask, Point,
+};
 use anyhow::{Context, Result, bail};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -29,10 +31,19 @@ pub(super) enum AgentRequest {
         down: bool,
         repeat: bool,
     },
-    InjectButton { button: u8, down: bool },
+    InjectButton {
+        button: u8,
+        down: bool,
+    },
     InjectCursor(Point),
-    InjectMotion { dx: i32, dy: i32 },
-    InjectWheel { x: i32, y: i32 },
+    InjectMotion {
+        dx: i32,
+        dy: i32,
+    },
+    InjectWheel {
+        x: i32,
+        y: i32,
+    },
     ReleaseAll,
 }
 
@@ -77,13 +88,8 @@ pub(super) enum AgentResponse {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) enum GuiToAgentPacket {
-    HelloAck {
-        session_id: u32,
-    },
-    Request {
-        id: u64,
-        request: AgentRequest,
-    },
+    HelloAck { session_id: u32 },
+    Request { id: u64, request: AgentRequest },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -130,15 +136,12 @@ impl AgentToGuiPacket {
     }
 }
 
-pub(crate) fn write_packet<P>(
-    pipe: &mut NativePipe,
-    packet: &P,
-    timeout: Duration,
-) -> Result<()>
+pub(crate) fn write_packet<P>(pipe: &mut NativePipe, packet: &P, timeout: Duration) -> Result<()>
 where
     P: Serialize,
 {
-    let bytes = bincode::serialize(packet).context("failed to encode Windows input agent packet")?;
+    let bytes =
+        bincode::serialize(packet).context("failed to encode Windows input agent packet")?;
     if bytes.is_empty() || bytes.len() > IPC_MAX_FRAME {
         bail!("Windows input agent packet length is invalid");
     }
@@ -165,8 +168,7 @@ where
         bail!("Windows input agent packet read timed out");
     }
     pipe.read_exact(&mut bytes, remaining)?;
-    bincode::deserialize(&bytes)
-        .context("failed to decode Windows input agent packet")
+    bincode::deserialize(&bytes).context("failed to decode Windows input agent packet")
 }
 
 pub(crate) fn is_timeout_error(error: &anyhow::Error) -> bool {

@@ -1,5 +1,5 @@
-use super::*;
 use super::super::workers::Workers;
+use super::*;
 use crate::audio::codec::OpusEncoder;
 use crate::audio::config::CodecConfig;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -12,13 +12,17 @@ struct ProbeOutput {
 }
 
 impl Drop for ProbeOutput {
-    fn drop(&mut self) { self.destroyed.fetch_add(1, Ordering::SeqCst); }
+    fn drop(&mut self) {
+        self.destroyed.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 impl AudioOutput for ProbeOutput {
     fn submit_frame(&mut self, pcm: &[f32], _timeout: Duration) -> Result<()> {
         self.submitted.fetch_add(1, Ordering::SeqCst);
-        if self.fail { return Err(Error::Backend("模拟设备失效".into())); }
+        if self.fail {
+            return Err(Error::Backend("模拟设备失效".into()));
+        }
         // 恢复后的首个包是 PLC, 新解码器应输出静音. 旧包或旧解码器不能泄漏过来.
         assert!(pcm.iter().all(|sample| *sample == 0.0));
         self.stop.cancel();
@@ -29,14 +33,18 @@ impl AudioOutput for ProbeOutput {
 async fn exercise_recovery(initial_failure: bool) {
     let stream = CodecConfig::default().stream_params().unwrap();
     let mut encoder = OpusEncoder::new(stream.opus_config(), stream.bitrate).unwrap();
-    let input: Vec<_> = (0..stream.samples_per_frame()).map(|i| (i as f32 * 0.15).sin() * 0.5).collect();
+    let input: Vec<_> = (0..stream.samples_per_frame())
+        .map(|i| (i as f32 * 0.15).sin() * 0.5)
+        .collect();
     let mut packet = vec![0; 1400];
     let len = encoder.encode_float(&input, &mut packet).unwrap();
     packet.truncate(len);
     let stop = CancellationToken::new();
     let mut workers = Workers::new(stop.clone());
     let queue = workers.queue("recovery-test", 30);
-    if !initial_failure { queue.push(QueuedAudioFrame::Encoded(packet.clone())); }
+    if !initial_failure {
+        queue.push(QueuedAudioFrame::Encoded(packet.clone()));
+    }
     let opened = Arc::new(AtomicUsize::new(0));
     let submitted = Arc::new(AtomicUsize::new(0));
     let destroyed = Arc::new(AtomicUsize::new(0));
@@ -48,22 +56,38 @@ async fn exercise_recovery(initial_failure: bool) {
     let (ready, mut ready_rx) = tokio::sync::mpsc::unbounded_channel();
     let open = move || -> Result<Box<dyn AudioOutput>> {
         let attempt = factory_opened.fetch_add(1, Ordering::SeqCst);
-        if initial_failure && attempt == 0 { return Err(Error::Backend("模拟初始无设备".into())); }
+        if initial_failure && attempt == 0 {
+            return Err(Error::Backend("模拟初始无设备".into()));
+        }
         assert!(attempt <= 1);
         if attempt == 1 {
-            assert_eq!(factory_destroyed.load(Ordering::SeqCst), usize::from(!initial_failure));
+            assert_eq!(
+                factory_destroyed.load(Ordering::SeqCst),
+                usize::from(!initial_failure)
+            );
             // 模拟在设备重建期间到达的旧网络音频.
             assert!(factory_queue.push(QueuedAudioFrame::Encoded(packet.clone())));
             ready.send(()).unwrap();
         }
         Ok(Box::new(ProbeOutput {
             fail: !initial_failure && attempt == 0,
-            stop: factory_stop.clone(), submitted: Arc::clone(&factory_submitted), destroyed: Arc::clone(&factory_destroyed),
+            stop: factory_stop.clone(),
+            submitted: Arc::clone(&factory_submitted),
+            destroyed: Arc::clone(&factory_destroyed),
         }))
     };
     let worker_queue = Arc::clone(&queue);
     let worker_stop = stop.clone();
-    workers.spawn_blocking(move || run_with_retry_delay(open, worker_queue, worker_stop, &stream, Duration::from_millis(20)).map_err(Into::into));
+    workers.spawn_blocking(move || {
+        run_with_retry_delay(
+            open,
+            worker_queue,
+            worker_stop,
+            &stream,
+            Duration::from_millis(20),
+        )
+        .map_err(Into::into)
+    });
     let task = tokio::spawn(workers.finish());
     let outcome = tokio::time::timeout(Duration::from_secs(3), async {
         ready_rx.recv().await.unwrap();
@@ -72,13 +96,24 @@ async fn exercise_recovery(initial_failure: bool) {
             queue.push(QueuedAudioFrame::Missing);
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-    }).await;
+    })
+    .await;
     stop.cancel();
-    tokio::time::timeout(Duration::from_secs(2), task).await.unwrap().unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     assert!(outcome.is_ok());
     assert_eq!(opened.load(Ordering::SeqCst), 2);
-    assert_eq!(submitted.load(Ordering::SeqCst), if initial_failure { 1 } else { 2 });
-    assert_eq!(destroyed.load(Ordering::SeqCst), if initial_failure { 1 } else { 2 });
+    assert_eq!(
+        submitted.load(Ordering::SeqCst),
+        if initial_failure { 1 } else { 2 }
+    );
+    assert_eq!(
+        destroyed.load(Ordering::SeqCst),
+        if initial_failure { 1 } else { 2 }
+    );
     assert!(queue.dropped() >= 1);
 }
 
@@ -102,15 +137,30 @@ async fn no_network_retry_wait_is_cancelled_without_reopening() {
     let attempts_worker = Arc::clone(&attempts);
     let (entered, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
     let worker_stop = stop.clone();
-    workers.spawn_blocking(move || run(move || {
-        attempts_worker.fetch_add(1, Ordering::SeqCst);
-        entered.send(()).unwrap();
-        Err(Error::Backend("无播放设备".into()))
-    }, queue, worker_stop, &stream).map_err(Into::into));
+    workers.spawn_blocking(move || {
+        run(
+            move || {
+                attempts_worker.fetch_add(1, Ordering::SeqCst);
+                entered.send(()).unwrap();
+                Err(Error::Backend("无播放设备".into()))
+            },
+            queue,
+            worker_stop,
+            &stream,
+        )
+        .map_err(Into::into)
+    });
     let task = tokio::spawn(workers.finish());
-    tokio::time::timeout(Duration::from_secs(2), entered_rx.recv()).await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(2), entered_rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
     stop.cancel();
-    tokio::time::timeout(Duration::from_millis(500), task).await.unwrap().unwrap().unwrap();
+    tokio::time::timeout(Duration::from_millis(500), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     assert_eq!(attempts.load(Ordering::SeqCst), 1);
 }
 
@@ -129,18 +179,37 @@ async fn cancellation_during_open_releases_the_new_device_without_submission() {
     let worker_destroyed = Arc::clone(&destroyed);
     let cancel = stop.clone();
     let mut entered = Some(entered);
-    workers.spawn_blocking(move || run(move || {
-        entered.take().unwrap().send(()).unwrap();
-        release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        Ok(Box::new(ProbeOutput { fail: false, stop: worker_stop.clone(),
-            submitted: Arc::clone(&worker_submitted), destroyed: Arc::clone(&worker_destroyed) }))
-    }, queue, stop, &stream).map_err(Into::into));
+    workers.spawn_blocking(move || {
+        run(
+            move || {
+                entered.take().unwrap().send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                Ok(Box::new(ProbeOutput {
+                    fail: false,
+                    stop: worker_stop.clone(),
+                    submitted: Arc::clone(&worker_submitted),
+                    destroyed: Arc::clone(&worker_destroyed),
+                }))
+            },
+            queue,
+            stop,
+            &stream,
+        )
+        .map_err(Into::into)
+    });
     let task = tokio::spawn(workers.finish());
-    tokio::time::timeout(Duration::from_secs(2), entered_rx).await.unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(2), entered_rx)
+        .await
+        .unwrap()
+        .unwrap();
     // 通过监督器的队列关闭路径取消, 不假定系统设备打开 API 可以被强行中断.
     cancel.cancel();
     release.send(()).unwrap();
-    tokio::time::timeout(Duration::from_secs(2), task).await.unwrap().unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     assert_eq!(destroyed.load(Ordering::SeqCst), 1);
     assert_eq!(submitted.load(Ordering::SeqCst), 0);
 }
@@ -153,16 +222,34 @@ async fn retries_are_time_based_even_without_audio_packets() {
     let stop = CancellationToken::new();
     let worker_stop = stop.clone();
     let (attempt, mut attempts) = tokio::sync::mpsc::unbounded_channel();
-    let task = tokio::task::spawn_blocking(move || run_with_retry_delay(move || {
-        attempt.send(Instant::now()).unwrap();
-        Err(Error::Backend("设备尚未连接".into()))
-    }, queue, worker_stop, &stream, Duration::from_millis(30)));
+    let task = tokio::task::spawn_blocking(move || {
+        run_with_retry_delay(
+            move || {
+                attempt.send(Instant::now()).unwrap();
+                Err(Error::Backend("设备尚未连接".into()))
+            },
+            queue,
+            worker_stop,
+            &stream,
+            Duration::from_millis(30),
+        )
+    });
     // 直接运行的测试也遵守监督器关闭队列以唤醒等待的契约.
-    let first = tokio::time::timeout(Duration::from_secs(2), attempts.recv()).await.unwrap().unwrap();
-    let second = tokio::time::timeout(Duration::from_secs(2), attempts.recv()).await.unwrap().unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(2), attempts.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let second = tokio::time::timeout(Duration::from_secs(2), attempts.recv())
+        .await
+        .unwrap()
+        .unwrap();
     stop.cancel();
     super::super::queue::StopQueue::close(&*closer);
-    tokio::time::timeout(Duration::from_secs(2), task).await.unwrap().unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     assert!(second.duration_since(first) >= Duration::from_millis(30));
 }
 
@@ -173,7 +260,9 @@ struct NetworkOutput {
 
 impl AudioOutput for NetworkOutput {
     fn submit_frame(&mut self, pcm: &[f32], _timeout: Duration) -> Result<()> {
-        if self.fail { return Err(Error::Backend("模拟网络播放期间设备失效".into())); }
+        if self.fail {
+            return Err(Error::Backend("模拟网络播放期间设备失效".into()));
+        }
         assert!(!pcm.is_empty() && pcm.iter().all(|value| value.is_finite()));
         self.stop.cancel();
         Ok(())
@@ -182,55 +271,95 @@ impl AudioOutput for NetworkOutput {
 
 #[tokio::test]
 async fn udp_reception_survives_blocked_device_recreation() {
-    use super::super::{AudioChannelDirection, crypto::{AudioEncryptor, AudioDecryptor}, receive};
+    use super::super::{
+        AudioChannelDirection,
+        crypto::{AudioDecryptor, AudioEncryptor},
+        receive,
+    };
+    use crate::audio::protocol::{RTP_PAYLOAD_TYPE_AUDIO, RtpHeader, write_audio_packet};
     use crate::audio::receiver::AudioDepacketizer;
-    use crate::audio::protocol::{write_audio_packet, RtpHeader, RTP_PAYLOAD_TYPE_AUDIO};
-    use tokio::net::UdpSocket;
     use std::net::{IpAddr, Ipv4Addr};
+    use tokio::net::UdpSocket;
 
     let stream = CodecConfig::default().stream_params().unwrap();
     let mut encoder = OpusEncoder::new(stream.opus_config(), stream.bitrate).unwrap();
     let mut payload = vec![0; 1400];
-    let length = encoder.encode_float(&vec![0.0; stream.samples_per_frame()], &mut payload).unwrap();
+    let length = encoder
+        .encode_float(&vec![0.0; stream.samples_per_frame()], &mut payload)
+        .unwrap();
     payload.truncate(length);
     let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let sender = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    sender.connect(receiver.local_addr().unwrap()).await.unwrap();
+    sender
+        .connect(receiver.local_addr().unwrap())
+        .await
+        .unwrap();
     let stop = CancellationToken::new();
     let mut workers = Workers::new(stop.clone());
     let queue = workers.queue("network-recovery", 30);
-    workers.spawn(receive::receive_packets(receiver, Arc::clone(&queue), stop.clone(),
+    workers.spawn(receive::receive_packets(
+        receiver,
+        Arc::clone(&queue),
+        stop.clone(),
         AudioDecryptor::new([7; 32], AudioChannelDirection::HostToClient).unwrap(),
-        IpAddr::V4(Ipv4Addr::LOCALHOST), AudioDepacketizer::new(5, 0)));
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        AudioDepacketizer::new(5, 0),
+    ));
     let worker_queue = Arc::clone(&queue);
     let worker_stop = stop.clone();
     let factory_stop = stop.clone();
     let (opening, mut opening_rx) = tokio::sync::mpsc::unbounded_channel();
     let (release, release_rx) = std::sync::mpsc::channel();
     let mut count = 0;
-    workers.spawn_blocking(move || run_with_retry_delay(move || {
-        count += 1;
-        assert!(count <= 2);
-        if count == 2 {
-            opening.send(()).unwrap();
-            release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        }
-        Ok(Box::new(NetworkOutput { fail: count == 1, stop: factory_stop.clone() }))
-    }, worker_queue, worker_stop, &stream, Duration::from_millis(10)).map_err(Into::into));
+    workers.spawn_blocking(move || {
+        run_with_retry_delay(
+            move || {
+                count += 1;
+                assert!(count <= 2);
+                if count == 2 {
+                    opening.send(()).unwrap();
+                    release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                }
+                Ok(Box::new(NetworkOutput {
+                    fail: count == 1,
+                    stop: factory_stop.clone(),
+                }))
+            },
+            worker_queue,
+            worker_stop,
+            &stream,
+            Duration::from_millis(10),
+        )
+        .map_err(Into::into)
+    });
     let task = tokio::spawn(workers.finish());
     let mut cipher = AudioEncryptor::new([7; 32], AudioChannelDirection::HostToClient).unwrap();
     let mut encrypt_frame = |sequence_number: u16| {
-        let rtp = write_audio_packet(RtpHeader { packet_type: RTP_PAYLOAD_TYPE_AUDIO, sequence_number,
-            timestamp: u32::from(sequence_number) * 5, ssrc: 7 }, &payload);
+        let rtp = write_audio_packet(
+            RtpHeader {
+                packet_type: RTP_PAYLOAD_TYPE_AUDIO,
+                sequence_number,
+                timestamp: u32::from(sequence_number) * 5,
+                ssrc: 7,
+            },
+            &payload,
+        );
         cipher.encrypt(&rtp).unwrap()
     };
     let preparation = tokio::time::timeout(Duration::from_secs(2), async {
         // 首块为 RTP 同步, 第二块触发播放错误和设备重建.
-        for sequence in 0..5 { sender.send(&encrypt_frame(sequence)).await.unwrap(); }
+        for sequence in 0..5 {
+            sender.send(&encrypt_frame(sequence)).await.unwrap();
+        }
         opening_rx.recv().await.unwrap();
-        for sequence in 5..70 { sender.send(&encrypt_frame(sequence)).await.unwrap(); }
-        while queue.dropped() < 30 { tokio::task::yield_now().await; }
-    }).await;
+        for sequence in 5..70 {
+            sender.send(&encrypt_frame(sequence)).await.unwrap();
+        }
+        while queue.dropped() < 30 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
     // 无论断言是否成功, 都先释放设备打开替身, 防止测试留下阻塞线程.
     release.send(()).unwrap();
     let completion = if preparation.is_ok() {
@@ -241,10 +370,17 @@ async fn udp_reception_survives_blocked_device_recreation() {
                 sequence += 1;
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
-        }).await
-    } else { preparation };
+        })
+        .await
+    } else {
+        preparation
+    };
     stop.cancel();
-    tokio::time::timeout(Duration::from_secs(2), task).await.unwrap().unwrap().unwrap();
+    tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     assert!(completion.is_ok());
     assert!(queue.dropped() >= 30);
 }
@@ -254,11 +390,17 @@ fn fatal_backend_state_stops_before_waiting_for_network_or_reopening() {
     let stream = CodecConfig::default().stream_params().unwrap();
     let packets = Arc::new(FrameQueue::new("render-fatal", 30));
     let mut attempts = 0;
-    let result = run_with_retry_delay(|| {
-        attempts += 1;
-        assert_eq!(attempts, 1);
-        Err(Error::BackendFatal("回调上下文已隔离".into()))
-    }, packets, CancellationToken::new(), &stream, Duration::from_millis(1));
+    let result = run_with_retry_delay(
+        || {
+            attempts += 1;
+            assert_eq!(attempts, 1);
+            Err(Error::BackendFatal("回调上下文已隔离".into()))
+        },
+        packets,
+        CancellationToken::new(),
+        &stream,
+        Duration::from_millis(1),
+    );
     assert!(matches!(result, Err(Error::BackendFatal(_))));
     assert_eq!(attempts, 1);
 }
@@ -267,9 +409,13 @@ fn fatal_backend_state_stops_before_waiting_for_network_or_reopening() {
 fn only_backend_and_io_errors_are_recoverable() {
     assert!(recoverable(&Error::Backend("设备离线".into())));
     assert!(recoverable(&Error::Io(std::io::Error::other("设备错误"))));
-    for error in [Error::InvalidConfig("无效参数"), Error::Codec("解码错误".into()),
-                  Error::Protocol("协议错误".into()), Error::UnsupportedPlatform("不支持的平台"),
-                  Error::BackendFatal("原生回调无法安全销毁".into())] {
+    for error in [
+        Error::InvalidConfig("无效参数"),
+        Error::Codec("解码错误".into()),
+        Error::Protocol("协议错误".into()),
+        Error::UnsupportedPlatform("不支持的平台"),
+        Error::BackendFatal("原生回调无法安全销毁".into()),
+    ] {
         assert!(!recoverable(&error));
     }
 }

@@ -2,8 +2,10 @@ use super::*;
 
 fn pair() -> (AudioEncryptor, AudioDecryptor) {
     let secret = derive_channel_secret([7; 32], [9; 32]).unwrap();
-    (AudioEncryptor::new(secret, AudioChannelDirection::HostToClient).unwrap(),
-     AudioDecryptor::new(secret, AudioChannelDirection::HostToClient).unwrap())
+    (
+        AudioEncryptor::new(secret, AudioChannelDirection::HostToClient).unwrap(),
+        AudioDecryptor::new(secret, AudioChannelDirection::HostToClient).unwrap(),
+    )
 }
 
 #[test]
@@ -20,7 +22,9 @@ fn authenticated_packets_preserve_payload_and_reject_duplicate_counters() {
 #[test]
 fn window_accepts_sixty_three_packets_of_reordering_but_not_sixty_four() {
     let (mut sender, mut receiver) = pair();
-    let packets: Vec<_> = (0..130).map(|value| sender.encrypt(&[value]).unwrap()).collect();
+    let packets: Vec<_> = (0..130)
+        .map(|value| sender.encrypt(&[value]).unwrap())
+        .collect();
     assert_eq!(receiver.decrypt(&packets[64]).unwrap(), [64]);
     assert_eq!(receiver.decrypt(&packets[1]).unwrap(), [1]);
     assert!(receiver.decrypt(&packets[0]).is_err());
@@ -58,19 +62,26 @@ fn fresh_channels_and_directions_have_distinct_keys() {
     let first_secret = derive_channel_secret([1; 32], [2; 32]).unwrap();
     let second_secret = derive_channel_secret([1; 32], [3; 32]).unwrap();
     assert_ne!(first_secret, second_secret);
-    assert_ne!(first_secret, derive_channel_secret([2; 32], [2; 32]).unwrap());
-    let mut old_sender = AudioEncryptor::new(first_secret, AudioChannelDirection::HostToClient).unwrap();
+    assert_ne!(
+        first_secret,
+        derive_channel_secret([2; 32], [2; 32]).unwrap()
+    );
+    let mut old_sender =
+        AudioEncryptor::new(first_secret, AudioChannelDirection::HostToClient).unwrap();
     let old_packet = old_sender.encrypt(b"same-payload").unwrap();
-    let mut sender = AudioEncryptor::new(second_secret, AudioChannelDirection::HostToClient).unwrap();
+    let mut sender =
+        AudioEncryptor::new(second_secret, AudioChannelDirection::HostToClient).unwrap();
     let packet = sender.encrypt(b"same-payload").unwrap();
     // 两次计数器都从 0 开始, 比较不含计数器的实际密文.
     assert_eq!(&packet[..8], &old_packet[..8]);
     assert_ne!(&packet[8..], &old_packet[8..]);
-    let mut receiver = AudioDecryptor::new(second_secret, AudioChannelDirection::HostToClient).unwrap();
+    let mut receiver =
+        AudioDecryptor::new(second_secret, AudioChannelDirection::HostToClient).unwrap();
     assert!(receiver.decrypt(&old_packet).is_err());
     assert!(receiver.highest_counter.is_none());
     assert_eq!(receiver.decrypt(&packet).unwrap(), b"same-payload");
-    let mut opposite = AudioDecryptor::new(second_secret, AudioChannelDirection::ClientToHost).unwrap();
+    let mut opposite =
+        AudioDecryptor::new(second_secret, AudioChannelDirection::ClientToHost).unwrap();
     assert!(opposite.decrypt(&packet).is_err());
 }
 

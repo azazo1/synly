@@ -55,10 +55,7 @@ impl DisplayRect {
     }
 
     pub fn contains(self, point: Point) -> bool {
-        point.x >= self.x
-            && point.x < self.right()
-            && point.y >= self.y
-            && point.y < self.bottom()
+        point.x >= self.x && point.x < self.right() && point.y >= self.y && point.y < self.bottom()
     }
 }
 
@@ -96,18 +93,10 @@ impl DesktopLayout {
             };
             on_span
                 && match edge {
-                    ScreenEdge::Left => {
-                        point.x < segment.boundary.saturating_add(zone_size)
-                    }
-                    ScreenEdge::Right => {
-                        point.x >= segment.boundary.saturating_sub(zone_size)
-                    }
-                    ScreenEdge::Top => {
-                        point.y < segment.boundary.saturating_add(zone_size)
-                    }
-                    ScreenEdge::Bottom => {
-                        point.y >= segment.boundary.saturating_sub(zone_size)
-                    }
+                    ScreenEdge::Left => point.x < segment.boundary.saturating_add(zone_size),
+                    ScreenEdge::Right => point.x >= segment.boundary.saturating_sub(zone_size),
+                    ScreenEdge::Top => point.y < segment.boundary.saturating_add(zone_size),
+                    ScreenEdge::Bottom => point.y >= segment.boundary.saturating_sub(zone_size),
                 }
         })
     }
@@ -143,14 +132,16 @@ impl DesktopLayout {
             ScreenEdge::Left | ScreenEdge::Right => point.y,
             ScreenEdge::Top | ScreenEdge::Bottom => point.x,
         };
-        let display_boundary = self.displays.iter().find(|display| display.contains(point)).map(
-            |display| match edge {
+        let display_boundary = self
+            .displays
+            .iter()
+            .find(|display| display.contains(point))
+            .map(|display| match edge {
                 ScreenEdge::Left => display.x,
                 ScreenEdge::Right => display.right(),
                 ScreenEdge::Top => display.y,
                 ScreenEdge::Bottom => display.bottom(),
-            },
-        );
+            });
         let total = segments
             .iter()
             .map(|segment| segment.end - segment.start)
@@ -297,20 +288,54 @@ impl DesktopLayout {
         let mut segments = Vec::new();
         for display in &self.displays {
             let (start, end, boundary, outside) = match edge {
-                ScreenEdge::Left => (display.y, display.bottom(), display.x, Point { x: display.x - 1, y: 0 }),
-                ScreenEdge::Right => (display.y, display.bottom(), display.right(), Point { x: display.right(), y: 0 }),
-                ScreenEdge::Top => (display.x, display.right(), display.y, Point { x: 0, y: display.y - 1 }),
-                ScreenEdge::Bottom => (display.x, display.right(), display.bottom(), Point { x: 0, y: display.bottom() }),
+                ScreenEdge::Left => (
+                    display.y,
+                    display.bottom(),
+                    display.x,
+                    Point {
+                        x: display.x - 1,
+                        y: 0,
+                    },
+                ),
+                ScreenEdge::Right => (
+                    display.y,
+                    display.bottom(),
+                    display.right(),
+                    Point {
+                        x: display.right(),
+                        y: 0,
+                    },
+                ),
+                ScreenEdge::Top => (
+                    display.x,
+                    display.right(),
+                    display.y,
+                    Point {
+                        x: 0,
+                        y: display.y - 1,
+                    },
+                ),
+                ScreenEdge::Bottom => (
+                    display.x,
+                    display.right(),
+                    display.bottom(),
+                    Point {
+                        x: 0,
+                        y: display.bottom(),
+                    },
+                ),
             };
             let mut blocked = Vec::new();
             for candidate in &self.displays {
                 let candidate_contains_boundary = match edge {
                     ScreenEdge::Left | ScreenEdge::Right => {
-                        candidate.x <= outside.x && outside.x < candidate.right()
+                        candidate.x <= outside.x
+                            && outside.x < candidate.right()
                             && candidate.x != display.x
                     }
                     ScreenEdge::Top | ScreenEdge::Bottom => {
-                        candidate.y <= outside.y && outside.y < candidate.bottom()
+                        candidate.y <= outside.y
+                            && outside.y < candidate.bottom()
                             && candidate.y != display.y
                     }
                 };
@@ -322,7 +347,9 @@ impl DesktopLayout {
                     ScreenEdge::Top | ScreenEdge::Bottom => display.x.max(candidate.x),
                 };
                 let overlap_end = match edge {
-                    ScreenEdge::Left | ScreenEdge::Right => display.bottom().min(candidate.bottom()),
+                    ScreenEdge::Left | ScreenEdge::Right => {
+                        display.bottom().min(candidate.bottom())
+                    }
                     ScreenEdge::Top | ScreenEdge::Bottom => display.right().min(candidate.right()),
                 };
                 if overlap_start < overlap_end {
@@ -333,12 +360,20 @@ impl DesktopLayout {
             let mut cursor = start;
             for (blocked_start, blocked_end) in blocked {
                 if cursor < blocked_start {
-                    segments.push(EdgeSegment { start: cursor, end: blocked_start, boundary });
+                    segments.push(EdgeSegment {
+                        start: cursor,
+                        end: blocked_start,
+                        boundary,
+                    });
                 }
                 cursor = cursor.max(blocked_end);
             }
             if cursor < end {
-                segments.push(EdgeSegment { start: cursor, end, boundary });
+                segments.push(EdgeSegment {
+                    start: cursor,
+                    end,
+                    boundary,
+                });
             }
         }
         segments.sort_by_key(|segment| (segment.start, segment.end, segment.boundary));
@@ -393,8 +428,18 @@ mod tests {
 
     fn layout() -> DesktopLayout {
         DesktopLayout::new(vec![
-            DisplayRect { x: 0, y: 0, width: 1920, height: 1080 },
-            DisplayRect { x: 1920, y: 200, width: 1280, height: 1024 },
+            DisplayRect {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+            DisplayRect {
+                x: 1920,
+                y: 200,
+                width: 1280,
+                height: 1024,
+            },
         ])
         .unwrap()
     }
@@ -402,38 +447,34 @@ mod tests {
     #[test]
     fn jump_zone_uses_the_outermost_pixel_without_an_outward_delta() {
         let layout = layout();
-        assert!(layout.is_jump_zone_point(
-            ScreenEdge::Right,
-            Point { x: 3199, y: 500 },
-            1,
-        ));
-        assert!(!layout.is_jump_zone_point(
-            ScreenEdge::Right,
-            Point { x: 3198, y: 500 },
-            1,
-        ));
-        assert!(layout.is_jump_zone_point(
-            ScreenEdge::Right,
-            Point { x: 3200, y: 500 },
-            1,
-        ));
-        assert!(!layout.is_jump_zone_point(
-            ScreenEdge::Right,
-            Point { x: 1919, y: 500 },
-            1,
-        ));
+        assert!(layout.is_jump_zone_point(ScreenEdge::Right, Point { x: 3199, y: 500 }, 1,));
+        assert!(!layout.is_jump_zone_point(ScreenEdge::Right, Point { x: 3198, y: 500 }, 1,));
+        assert!(layout.is_jump_zone_point(ScreenEdge::Right, Point { x: 3200, y: 500 }, 1,));
+        assert!(!layout.is_jump_zone_point(ScreenEdge::Right, Point { x: 1919, y: 500 }, 1,));
     }
 
     #[test]
     fn edge_mapping_handles_negative_coordinates() {
-        let layout = DesktopLayout::new(vec![DisplayRect { x: -1200, y: -400, width: 1200, height: 900 }]).unwrap();
+        let layout = DesktopLayout::new(vec![DisplayRect {
+            x: -1200,
+            y: -400,
+            width: 1200,
+            height: 900,
+        }])
+        .unwrap();
         let point = layout.point_inside_edge(ScreenEdge::Right, 0.5, 8);
         assert_eq!(point, Point { x: -9, y: 50 });
     }
 
     #[test]
     fn edge_position_maps_interior_point_along_the_edge() {
-        let layout = DesktopLayout::new(vec![DisplayRect { x: 0, y: 0, width: 100, height: 100 }]).unwrap();
+        let layout = DesktopLayout::new(vec![DisplayRect {
+            x: 0,
+            y: 0,
+            width: 100,
+            height: 100,
+        }])
+        .unwrap();
         assert_eq!(
             layout.edge_position(ScreenEdge::Right, Point { x: 50, y: 25 }),
             0.25
@@ -443,8 +484,18 @@ mod tests {
             0.75
         );
         let parallel = DesktopLayout::new(vec![
-            DisplayRect { x: 0, y: 0, width: 100, height: 100 },
-            DisplayRect { x: 200, y: 0, width: 100, height: 100 },
+            DisplayRect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            },
+            DisplayRect {
+                x: 200,
+                y: 0,
+                width: 100,
+                height: 100,
+            },
         ])
         .unwrap();
         assert_eq!(
@@ -456,8 +507,18 @@ mod tests {
     #[test]
     fn edge_mapping_uses_real_segments_in_irregular_layout() {
         let layout = DesktopLayout::new(vec![
-            DisplayRect { x: 0, y: 0, width: 100, height: 100 },
-            DisplayRect { x: 200, y: 50, width: 100, height: 100 },
+            DisplayRect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            },
+            DisplayRect {
+                x: 200,
+                y: 50,
+                width: 100,
+                height: 100,
+            },
         ])
         .unwrap();
         assert_eq!(
@@ -469,8 +530,18 @@ mod tests {
     #[test]
     fn edge_normalization_distinguishes_parallel_exposed_segments() {
         let layout = DesktopLayout::new(vec![
-            DisplayRect { x: 0, y: 0, width: 100, height: 100 },
-            DisplayRect { x: 200, y: 0, width: 100, height: 100 },
+            DisplayRect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            },
+            DisplayRect {
+                x: 200,
+                y: 0,
+                width: 100,
+                height: 100,
+            },
         ])
         .unwrap();
         assert_eq!(
@@ -478,21 +549,11 @@ mod tests {
             0.75
         );
         assert_eq!(
-            layout.crossed_outer_edge_position(
-                ScreenEdge::Right,
-                Point { x: 291, y: 50 },
-                4,
-                0,
-            ),
+            layout.crossed_outer_edge_position(ScreenEdge::Right, Point { x: 291, y: 50 }, 4, 0,),
             None,
         );
         assert_eq!(
-            layout.crossed_outer_edge_position(
-                ScreenEdge::Right,
-                Point { x: 291, y: 50 },
-                12,
-                0,
-            ),
+            layout.crossed_outer_edge_position(ScreenEdge::Right, Point { x: 291, y: 50 }, 12, 0,),
             Some(0.75),
         );
     }
@@ -519,8 +580,18 @@ mod tests {
     #[test]
     fn receiver_motion_is_clamped_to_real_displays() {
         let layout = DesktopLayout::new(vec![
-            DisplayRect { x: 0, y: 0, width: 100, height: 100 },
-            DisplayRect { x: 200, y: 0, width: 100, height: 100 },
+            DisplayRect {
+                x: 0,
+                y: 0,
+                width: 100,
+                height: 100,
+            },
+            DisplayRect {
+                x: 200,
+                y: 0,
+                width: 100,
+                height: 100,
+            },
         ])
         .unwrap();
         assert_eq!(
@@ -532,8 +603,18 @@ mod tests {
     #[test]
     fn cursor_bounds_preserve_real_multi_display_coordinates() {
         let layout = DesktopLayout::new(vec![
-            DisplayRect { x: -1920, y: 180, width: 1920, height: 1080 },
-            DisplayRect { x: 0, y: 0, width: 2560, height: 1440 },
+            DisplayRect {
+                x: -1920,
+                y: 180,
+                width: 1920,
+                height: 1080,
+            },
+            DisplayRect {
+                x: 0,
+                y: 0,
+                width: 2560,
+                height: 1440,
+            },
         ])
         .unwrap();
         assert_eq!(

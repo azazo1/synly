@@ -5,7 +5,7 @@ use crate::discovery::{self, DiscoveredPeer};
 use crate::input::InputMode;
 use crate::protocol::{
     ClipboardPayload, ControlMessage, DeviceIdentity, Frame, FrameReader, FrameWriter,
-    PairAuthMethod, PairRequestPayload, PROTOCOL_VERSION, RuntimeCapabilities, SessionAgreement,
+    PROTOCOL_VERSION, PairAuthMethod, PairRequestPayload, RuntimeCapabilities, SessionAgreement,
     TransferLimits,
 };
 use crate::reconnect::{self, AttemptVerdict, ReconnectPolicy};
@@ -13,8 +13,8 @@ use crate::settings::{AudioMode, ClipboardMode, FileSyncMode};
 use crate::workspace::WorkspaceSummary;
 use anyhow::{Context, Result, anyhow, bail};
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
@@ -191,7 +191,15 @@ pub fn start_client(
     let worker_finished = Arc::clone(&handle.finished);
     let worker_shutdown = Arc::clone(&handle.shutdown);
     tokio::spawn(async move {
-        run_client_loop(config, target, listener, command_rx, worker_state, cancellation).await;
+        run_client_loop(
+            config,
+            target,
+            listener,
+            command_rx,
+            worker_state,
+            cancellation,
+        )
+        .await;
         worker_finished.store(true, Ordering::Release);
         worker_shutdown.notify_waiters();
     });
@@ -234,9 +242,8 @@ struct ClientReconnectAttempt<'a> {
 impl reconnect::ReconnectAttempt for ClientReconnectAttempt<'_> {
     fn attempt(
         &mut self,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = reconnect::AttemptVerdict> + Send + '_>,
-    > {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = reconnect::AttemptVerdict> + Send + '_>>
+    {
         Box::pin(attempt_connect_once(
             self.config,
             self.target,
@@ -358,7 +365,11 @@ fn prioritize_connected_address(target: &mut ClientTarget, socket: &TcpStream) {
         return;
     };
     let address = *remote.ip();
-    if let Some(index) = target.addresses.iter().position(|candidate| *candidate == address) {
+    if let Some(index) = target
+        .addresses
+        .iter()
+        .position(|candidate| *candidate == address)
+    {
         target.addresses.swap(0, index);
     } else {
         target.addresses.insert(0, address);
@@ -401,7 +412,9 @@ async fn refresh_target_addresses(
 }
 
 fn rediscovered_peer(peers: &[DiscoveredPeer], device_id: Uuid) -> Option<&DiscoveredPeer> {
-    peers.iter().find(|peer| Uuid::parse_str(&peer.device_id).ok() == Some(device_id))
+    peers
+        .iter()
+        .find(|peer| Uuid::parse_str(&peer.device_id).ok() == Some(device_id))
 }
 
 fn trusted_device_for_target<'a>(
@@ -723,36 +736,36 @@ async fn connect_bootstrap_inner(
     };
     let (remote, remote_workspace, agreement, clipboard_agreement, server_trusts_client) =
         match &reply {
-        ControlMessage::PairDecision {
-            accepted,
-            message,
-            server,
-            workspace,
-            agreement,
-            clipboard_agreement,
-            auth_method,
-            server_trusts_client,
-            ..
-        } => {
-            if *auth_method != PairAuthMethod::Pin {
-                bail!("配对决策使用了非 PIN 认证方式");
+            ControlMessage::PairDecision {
+                accepted,
+                message,
+                server,
+                workspace,
+                agreement,
+                clipboard_agreement,
+                auth_method,
+                server_trusts_client,
+                ..
+            } => {
+                if *auth_method != PairAuthMethod::Pin {
+                    bail!("配对决策使用了非 PIN 认证方式");
+                }
+                crypto::verify_device_identity_material(server)?;
+                crypto::verify_pair_decision(&reply, &exporter, &request_id, &pin)?;
+                if !accepted {
+                    bail!("{}", message);
+                }
+                (
+                    server.clone(),
+                    workspace.clone(),
+                    agreement.clone(),
+                    clipboard_agreement.clone(),
+                    *server_trusts_client,
+                )
             }
-            crypto::verify_device_identity_material(server)?;
-            crypto::verify_pair_decision(&reply, &exporter, &request_id, &pin)?;
-            if !accepted {
-                bail!("{}", message);
-            }
-            (
-                server.clone(),
-                workspace.clone(),
-                agreement.clone(),
-                clipboard_agreement.clone(),
-                *server_trusts_client,
-            )
-        }
-        ControlMessage::Error { message } => bail!("{}", message),
-        other => bail!("意外的配对响应: {other:?}"),
-    };
+            ControlMessage::Error { message } => bail!("{}", message),
+            other => bail!("意外的配对响应: {other:?}"),
+        };
 
     if server_trusts_client
         && !config
@@ -1009,7 +1022,11 @@ async fn run_session(
     Ok(())
 }
 
-async fn writer_loop<W>(writer: W, mut rx: mpsc::Receiver<Frame>, transfer_limits: TransferLimits) -> Result<()>
+async fn writer_loop<W>(
+    writer: W,
+    mut rx: mpsc::Receiver<Frame>,
+    transfer_limits: TransferLimits,
+) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {

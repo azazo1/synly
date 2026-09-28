@@ -1,6 +1,6 @@
-use crate::protocol::{CapabilityEpoch, RuntimeCapabilities};
 use crate::clipboard::ClipboardRuntimeOptions;
 use crate::input::InputRuntimeOptions;
+use crate::protocol::{CapabilityEpoch, RuntimeCapabilities};
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;

@@ -1,7 +1,7 @@
-use crate::workspace::{ManifestSnapshot, WorkspaceSummary};
 use crate::input::InputChannelOffer;
 use crate::input::InputMode;
 use crate::settings::{AudioMode, ClipboardMode};
+use crate::workspace::{ManifestSnapshot, WorkspaceSummary};
 use anyhow::{Context, Result, bail};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -661,12 +661,25 @@ mod tests {
 
     #[test]
     fn audio_offer_roundtrip_requires_the_full_channel_identifier() {
-        let epoch = super::CapabilityEpoch { host_generation: 8, client_generation: 3 };
-        let offer = ControlMessage::AudioUdpReady { epoch, port: 48000, layout: super::AudioLayout::Surround51, channel_id: [0xa7; 32] };
+        let epoch = super::CapabilityEpoch {
+            host_generation: 8,
+            client_generation: 3,
+        };
+        let offer = ControlMessage::AudioUdpReady {
+            epoch,
+            port: 48000,
+            layout: super::AudioLayout::Surround51,
+            channel_id: [0xa7; 32],
+        };
         let bytes = encode_payload(&offer).unwrap();
         let decoded: ControlMessage = decode_payload(&bytes, "音频控制帧解码失败").unwrap();
         match decoded {
-            ControlMessage::AudioUdpReady { epoch: actual, port, layout, channel_id } => {
+            ControlMessage::AudioUdpReady {
+                epoch: actual,
+                port,
+                layout,
+                channel_id,
+            } => {
                 assert_eq!(actual, epoch);
                 assert_eq!(port, 48000);
                 assert_eq!(layout, super::AudioLayout::Surround51);
@@ -675,12 +688,24 @@ mod tests {
             _ => panic!("音频通道控制帧类型不符"),
         }
         let mut legacy_layout = serde_json::to_value(&offer).unwrap();
-        legacy_layout["audio_udp_ready"].as_object_mut().unwrap().remove("layout");
+        legacy_layout["audio_udp_ready"]
+            .as_object_mut()
+            .unwrap()
+            .remove("layout");
         let legacy: ControlMessage = serde_json::from_value(legacy_layout).unwrap();
-        assert!(matches!(legacy, ControlMessage::AudioUdpReady { layout: super::AudioLayout::Stereo, .. }));
+        assert!(matches!(
+            legacy,
+            ControlMessage::AudioUdpReady {
+                layout: super::AudioLayout::Stereo,
+                ..
+            }
+        ));
         // 不为缺失随机标识的旧控制帧填充默认值.
         let mut missing_id = serde_json::to_value(&offer).unwrap();
-        missing_id["audio_udp_ready"].as_object_mut().unwrap().remove("channel_id");
+        missing_id["audio_udp_ready"]
+            .as_object_mut()
+            .unwrap()
+            .remove("channel_id");
         assert!(serde_json::from_value::<ControlMessage>(missing_id).is_err());
     }
 

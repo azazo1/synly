@@ -1,8 +1,8 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod app;
-mod autostart;
 mod audio;
+mod autostart;
 mod cli;
 mod clipboard;
 mod config;
@@ -17,11 +17,11 @@ mod protocol;
 mod reconnect;
 mod runtime_control;
 mod runtime_options;
-mod settings;
 mod session;
+mod settings;
+mod sync;
 mod system_notification;
 mod tracing_utils;
-mod sync;
 mod update;
 
 #[cfg(windows)]

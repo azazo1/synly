@@ -139,9 +139,7 @@ fn load_or_create_in_dir(dir: &Path) -> Result<SynlyConfig> {
         migrations::migrate_trusted_devices,
     )?;
     let main_missing = existing_main.is_none();
-    let main_migrated = existing_main
-        .as_ref()
-        .is_some_and(|loaded| loaded.migrated);
+    let main_migrated = existing_main.as_ref().is_some_and(|loaded| loaded.migrated);
     let identity_missing = existing_identity.is_none();
     let identity_migrated = existing_identity
         .as_ref()
@@ -189,11 +187,7 @@ fn load_or_create_in_dir(dir: &Path) -> Result<SynlyConfig> {
         .map(|loaded| loaded.value.into_runtime())
         .or(legacy_gui_state)
         .unwrap_or_default();
-    let config = main.into_runtime(
-        identity.clone(),
-        trusted.devices.clone(),
-        gui_state,
-    );
+    let config = main.into_runtime(identity.clone(), trusted.devices.clone(), gui_state);
 
     fs::create_dir_all(dir)
         .with_context(|| format!("failed to create config dir {}", dir.display()))?;
@@ -389,8 +383,8 @@ fn read_optional_toml<T: DeserializeOwned>(
     let Some(raw) = read_optional_raw(path)? else {
         return Ok(None);
     };
-    let migration = migrate(&raw)
-        .with_context(|| format!("failed to migrate config at {}", path.display()))?;
+    let migration =
+        migrate(&raw).with_context(|| format!("failed to migrate config at {}", path.display()))?;
     let value = migration
         .document
         .try_into()
@@ -415,7 +409,11 @@ fn validate_main_config(config: &SynlyConfig) -> Result<()> {
         anyhow::bail!("device name cannot be empty");
     }
     crate::input::validate_key_mapping(&config.runtime.input.key_mapping)?;
-    config.runtime.input.hotkey.parse::<crate::input::Hotkey>()?;
+    config
+        .runtime
+        .input
+        .hotkey
+        .parse::<crate::input::Hotkey>()?;
     Ok(())
 }
 
@@ -432,16 +430,25 @@ fn validate_trusted_devices(devices: &[TrustedDeviceConfig]) -> Result<()> {
     let mut ids = std::collections::BTreeSet::new();
     for device in devices {
         if !ids.insert(device.device_id) {
-            anyhow::bail!("trusted devices contain duplicate device ID {}", device.device_id);
+            anyhow::bail!(
+                "trusted devices contain duplicate device ID {}",
+                device.device_id
+            );
         }
         if device.device_name.trim().is_empty() {
             anyhow::bail!("trusted device {} has an empty name", device.device_id);
         }
         if device.public_key.trim().is_empty() {
-            anyhow::bail!("trusted device {} has an empty public key", device.device_id);
+            anyhow::bail!(
+                "trusted device {} has an empty public key",
+                device.device_id
+            );
         }
         if device.tls_root_certificate.trim().is_empty() {
-            anyhow::bail!("trusted device {} has an empty TLS root certificate", device.device_id);
+            anyhow::bail!(
+                "trusted device {} has an empty TLS root certificate",
+                device.device_id
+            );
         }
     }
     Ok(())
@@ -456,7 +463,9 @@ fn write_toml_atomic<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let pretty = toml::to_string_pretty(value).context("failed to serialize config")?;
     let temp = parent.join(format!(
         ".{}.{}.tmp",
-        path.file_name().and_then(|name| name.to_str()).unwrap_or("synly"),
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("synly"),
         Uuid::new_v4()
     ));
     let result = (|| -> Result<()> {
@@ -528,10 +537,16 @@ fn detect_device_name(device_id: Uuid) -> String {
     if let Ok(user) = std::env::var("USER").or_else(|_| std::env::var("USERNAME")) {
         let trimmed = user.trim();
         if !trimmed.is_empty() {
-            return format!("{trimmed}-{}", device_id.to_string().chars().take(8).collect::<String>());
+            return format!(
+                "{trimmed}-{}",
+                device_id.to_string().chars().take(8).collect::<String>()
+            );
         }
     }
-    format!("synly-{}", device_id.to_string().chars().take(8).collect::<String>())
+    format!(
+        "synly-{}",
+        device_id.to_string().chars().take(8).collect::<String>()
+    )
 }
 
 #[cfg(test)]
@@ -558,18 +573,26 @@ mod tests {
         assert_eq!(reloaded.device.device_id, config.device.device_id);
         assert_eq!(reloaded.runtime, config.runtime);
         assert_eq!(reloaded.gui_state, config.gui_state);
-        assert!(fs::read_to_string(dir.join(CONFIG_FILE_NAME))
-            .unwrap()
-            .contains("version = 4"));
-        assert!(fs::read_to_string(dir.join(GUI_STATE_FILE_NAME))
-            .unwrap()
-            .contains("version = 1"));
-        assert!(fs::read_to_string(dir.join(IDENTITY_FILE_NAME))
-            .unwrap()
-            .contains("version = 1"));
-        assert!(fs::read_to_string(dir.join(TRUSTED_DEVICES_FILE_NAME))
-            .unwrap()
-            .contains("version = 1"));
+        assert!(
+            fs::read_to_string(dir.join(CONFIG_FILE_NAME))
+                .unwrap()
+                .contains("version = 4")
+        );
+        assert!(
+            fs::read_to_string(dir.join(GUI_STATE_FILE_NAME))
+                .unwrap()
+                .contains("version = 1")
+        );
+        assert!(
+            fs::read_to_string(dir.join(IDENTITY_FILE_NAME))
+                .unwrap()
+                .contains("version = 1")
+        );
+        assert!(
+            fs::read_to_string(dir.join(TRUSTED_DEVICES_FILE_NAME))
+                .unwrap()
+                .contains("version = 1")
+        );
         cleanup_dir(&dir);
     }
 
@@ -587,7 +610,10 @@ mod tests {
             .get_mut("ui")
             .and_then(toml::Value::as_table_mut)
             .unwrap();
-        ui.insert("first_run_completed".to_string(), toml::Value::Boolean(true));
+        ui.insert(
+            "first_run_completed".to_string(),
+            toml::Value::Boolean(true),
+        );
         ui.insert("window_width".to_string(), toml::Value::Integer(900));
         ui.insert("window_height".to_string(), toml::Value::Integer(600));
         fs::write(
@@ -619,7 +645,12 @@ mod tests {
         let main: toml::Value =
             toml::from_str(&fs::read_to_string(dir.join(CONFIG_FILE_NAME)).unwrap()).unwrap();
         assert_eq!(main["version"].as_integer(), Some(4));
-        assert!(!main["ui"].as_table().unwrap().contains_key("first_run_completed"));
+        assert!(
+            !main["ui"]
+                .as_table()
+                .unwrap()
+                .contains_key("first_run_completed")
+        );
         assert!(!main["ui"].as_table().unwrap().contains_key("window_width"));
         assert!(!main["ui"].as_table().unwrap().contains_key("window_height"));
         let gui_state: GuiStateFile =
@@ -648,7 +679,10 @@ mod tests {
         let gui_after = fs::read_to_string(dir.join(GUI_STATE_FILE_NAME)).unwrap();
         let reloaded = load_or_create_in_dir(&dir).unwrap();
         assert_eq!(reloaded.gui_state, migrated.gui_state);
-        assert_eq!(fs::read_to_string(dir.join(CONFIG_FILE_NAME)).unwrap(), main_after);
+        assert_eq!(
+            fs::read_to_string(dir.join(CONFIG_FILE_NAME)).unwrap(),
+            main_after
+        );
         assert_eq!(
             fs::read_to_string(dir.join(GUI_STATE_FILE_NAME)).unwrap(),
             gui_after
@@ -668,7 +702,10 @@ mod tests {
             .get_mut("ui")
             .and_then(toml::Value::as_table_mut)
             .unwrap();
-        ui.insert("first_run_completed".to_string(), toml::Value::Boolean(false));
+        ui.insert(
+            "first_run_completed".to_string(),
+            toml::Value::Boolean(false),
+        );
         ui.insert("window_width".to_string(), toml::Value::Integer(900));
         ui.insert("window_height".to_string(), toml::Value::Integer(600));
         fs::write(
@@ -719,11 +756,7 @@ mod tests {
         let mut config = load_or_create_in_dir(&dir).unwrap();
         assert!(!config.runtime.input.block_switch_on_press);
         config.runtime.input.block_switch_on_press = true;
-        write_toml_atomic(
-            &dir.join(CONFIG_FILE_NAME),
-            &MainConfigFile::from(&config),
-        )
-        .unwrap();
+        write_toml_atomic(&dir.join(CONFIG_FILE_NAME), &MainConfigFile::from(&config)).unwrap();
         let path = dir.join(CONFIG_FILE_NAME);
         let text = fs::read_to_string(&path).unwrap();
         assert!(text.contains("block_switch_on_press = true"));
@@ -744,11 +777,7 @@ mod tests {
         let mut config = load_or_create_in_dir(&dir).unwrap();
         assert!(config.runtime.input.filter_app_events);
         config.runtime.input.filter_app_events = false;
-        write_toml_atomic(
-            &dir.join(CONFIG_FILE_NAME),
-            &MainConfigFile::from(&config),
-        )
-        .unwrap();
+        write_toml_atomic(&dir.join(CONFIG_FILE_NAME), &MainConfigFile::from(&config)).unwrap();
         let reloaded = load_or_create_in_dir(&dir).unwrap();
         assert!(!reloaded.runtime.input.filter_app_events);
         cleanup_dir(&dir);
@@ -798,8 +827,14 @@ mod tests {
         let trusted = fs::read_to_string(dir.join(TRUSTED_DEVICES_FILE_NAME)).unwrap();
         config.device.device_name = "renamed".to_string();
         write_toml_atomic(&dir.join(CONFIG_FILE_NAME), &MainConfigFile::from(&config)).unwrap();
-        assert_eq!(fs::read_to_string(dir.join(IDENTITY_FILE_NAME)).unwrap(), identity);
-        assert_eq!(fs::read_to_string(dir.join(TRUSTED_DEVICES_FILE_NAME)).unwrap(), trusted);
+        assert_eq!(
+            fs::read_to_string(dir.join(IDENTITY_FILE_NAME)).unwrap(),
+            identity
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join(TRUSTED_DEVICES_FILE_NAME)).unwrap(),
+            trusted
+        );
 
         let settings = fs::read_to_string(dir.join(CONFIG_FILE_NAME)).unwrap();
         config.trusted_devices.push(TrustedDeviceConfig {
@@ -819,8 +854,14 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(fs::read_to_string(dir.join(CONFIG_FILE_NAME)).unwrap(), settings);
-        assert_eq!(fs::read_to_string(dir.join(IDENTITY_FILE_NAME)).unwrap(), identity);
+        assert_eq!(
+            fs::read_to_string(dir.join(CONFIG_FILE_NAME)).unwrap(),
+            settings
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join(IDENTITY_FILE_NAME)).unwrap(),
+            identity
+        );
         cleanup_dir(&dir);
     }
 
@@ -830,11 +871,7 @@ mod tests {
         let mut config = load_or_create_in_dir(&dir).unwrap();
         let preferred = Uuid::new_v4();
         config.preferred_active = Some(preferred);
-        write_toml_atomic(
-            &dir.join(CONFIG_FILE_NAME),
-            &MainConfigFile::from(&config),
-        )
-        .unwrap();
+        write_toml_atomic(&dir.join(CONFIG_FILE_NAME), &MainConfigFile::from(&config)).unwrap();
         let reloaded = load_or_create_in_dir(&dir).unwrap();
         assert_eq!(reloaded.preferred_active, Some(preferred));
         cleanup_dir(&dir);
@@ -844,7 +881,11 @@ mod tests {
     fn audio_layout_survives_atomic_save_and_reload() {
         let dir = unique_test_dir("audio-layout");
         let mut config = load_or_create_in_dir(&dir).unwrap();
-        for layout in [AudioLayout::Surround51, AudioLayout::Surround71, AudioLayout::Stereo] {
+        for layout in [
+            AudioLayout::Surround51,
+            AudioLayout::Surround71,
+            AudioLayout::Stereo,
+        ] {
             config.runtime.audio_layout = layout;
             write_toml_atomic(&dir.join(CONFIG_FILE_NAME), &MainConfigFile::from(&config)).unwrap();
             let reloaded = load_or_create_in_dir(&dir).unwrap();
@@ -859,19 +900,40 @@ mod tests {
     fn absent_audio_layout_defaults_but_invalid_values_are_not_silently_replaced() {
         let main = MainConfigFile::new(Uuid::new_v4());
         let mut document = toml::Value::try_from(&main).unwrap();
-        document["runtime"].as_table_mut().unwrap().remove("audio_layout");
+        document["runtime"]
+            .as_table_mut()
+            .unwrap()
+            .remove("audio_layout");
         let parsed: MainConfigFile = document.clone().try_into().unwrap();
-        assert_eq!(parsed.runtime.into_runtime(parsed.input).audio_layout, AudioLayout::Stereo);
-        for invalid in [toml::Value::String("surround91".into()), toml::Value::Integer(6)] {
-            document["runtime"].as_table_mut().unwrap().insert("audio_layout".into(), invalid);
+        assert_eq!(
+            parsed.runtime.into_runtime(parsed.input).audio_layout,
+            AudioLayout::Stereo
+        );
+        for invalid in [
+            toml::Value::String("surround91".into()),
+            toml::Value::Integer(6),
+        ] {
+            document["runtime"]
+                .as_table_mut()
+                .unwrap()
+                .insert("audio_layout".into(), invalid);
             assert!(document.clone().try_into::<MainConfigFile>().is_err());
         }
         // 明确锁定文件格式的枚举值, 防止改名造成已保存的声道设置无法读回.
-        for (name, layout) in [("stereo", AudioLayout::Stereo),
-            ("surround51", AudioLayout::Surround51), ("surround71", AudioLayout::Surround71)] {
-            document["runtime"].as_table_mut().unwrap().insert("audio_layout".into(), name.into());
+        for (name, layout) in [
+            ("stereo", AudioLayout::Stereo),
+            ("surround51", AudioLayout::Surround51),
+            ("surround71", AudioLayout::Surround71),
+        ] {
+            document["runtime"]
+                .as_table_mut()
+                .unwrap()
+                .insert("audio_layout".into(), name.into());
             let parsed: MainConfigFile = document.clone().try_into().unwrap();
-            assert_eq!(parsed.runtime.into_runtime(parsed.input).audio_layout, layout);
+            assert_eq!(
+                parsed.runtime.into_runtime(parsed.input).audio_layout,
+                layout
+            );
         }
     }
 
@@ -908,7 +970,10 @@ mod tests {
     fn example_main_config_is_valid() {
         let config: MainConfigFile =
             toml::from_str(include_str!("../../config.toml.example")).unwrap();
-        assert_eq!(config.input.key_mapping, crate::input::KeyMappingConfig::default());
+        assert_eq!(
+            config.input.key_mapping,
+            crate::input::KeyMappingConfig::default()
+        );
         assert!(!config.input.elevate_on_start);
         assert!(!config.input.block_switch_on_press);
         assert!(!config.input.native_scroll_macos_to_windows);

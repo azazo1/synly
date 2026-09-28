@@ -6,11 +6,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::fmt::MakeWriter;
-use tracing_subscriber::reload;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::Registry;
+use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::reload;
 use tracing_subscriber::util::SubscriberInitExt;
 
 /// 配置尚未加载时使用的日志等级, 保证启动早期的失败也能落盘.
@@ -187,7 +187,14 @@ fn prune_old_logs(path: &Path) {
                 candidate
                     .file_name()
                     .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with(stem) && name != path.file_name().and_then(|value| value.to_str()).unwrap_or_default())
+                    .is_some_and(|name| {
+                        name.starts_with(stem)
+                            && name
+                                != path
+                                    .file_name()
+                                    .and_then(|value| value.to_str())
+                                    .unwrap_or_default()
+                    })
             })
             .collect::<Vec<_>>(),
         Err(_) => return,

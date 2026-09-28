@@ -1381,11 +1381,8 @@ mod tests {
         );
         assert!(lines.iter().any(|line| line.contains("文件同步: 关闭")));
 
-        let summary = workspace.session_summary(
-            ClipboardMode::Both,
-            AudioMode::Off,
-            InputMode::Off,
-        );
+        let summary =
+            workspace.session_summary(ClipboardMode::Both, AudioMode::Off, InputMode::Off);
         assert!(!summary.file_sync_enabled());
         let remote_lines = summary.summary_lines();
         assert!(

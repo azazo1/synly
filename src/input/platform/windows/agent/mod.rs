@@ -7,9 +7,9 @@ mod tracing;
 
 use std::time::Duration;
 
+pub(in crate::input) use client::{elevation_requested, is_ready, start_client};
 pub use client::{request_elevation, request_elevation_for_auto_recovery};
 pub use server::run_agent;
-pub(in crate::input) use client::{elevation_requested, is_ready, start_client};
 pub(super) use tracing::init as init_tracing;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);

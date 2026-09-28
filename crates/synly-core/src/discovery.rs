@@ -3,7 +3,7 @@ use crate::input::InputMode;
 use crate::settings::{AudioMode, ClipboardMode, FileSyncMode};
 use anyhow::{Context, Result, anyhow, bail};
 use if_addrs::{IfAddr, get_if_addrs};
-use lnd::{AnnounceHandle, AnnounceSpec, DiscoveryFilter, DiscoveredNode, LndClient};
+use lnd::{AnnounceHandle, AnnounceSpec, DiscoveredNode, DiscoveryFilter, LndClient};
 use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr};
@@ -272,9 +272,7 @@ pub async fn advertise(
                 .initial_error
                 .as_ref()
                 .expect("LND 初始错误已经过分支判断");
-            let message = format!(
-                "mDNS 与 LND 注册均失败; mDNS: {mdns_err:#}; LND: {lnd_err:#}"
-            );
+            let message = format!("mDNS 与 LND 注册均失败; mDNS: {mdns_err:#}; LND: {lnd_err:#}");
             if let Err(err) = lnd.handle.stop().await {
                 tracing::warn!(error = %err, "清理失败的 LND 注册任务失败");
             }
@@ -309,15 +307,12 @@ pub fn validate_config(discovery: &DiscoveryConfig) -> Result<()> {
     Ok(())
 }
 
-pub async fn browse(
-    timeout: Duration,
-    discovery: &DiscoveryConfig,
-) -> Result<Vec<DiscoveredPeer>> {
+pub async fn browse(timeout: Duration, discovery: &DiscoveryConfig) -> Result<Vec<DiscoveredPeer>> {
     let mdns_cancelled = Arc::new(AtomicBool::new(false));
     let _mdns_cancellation = BrowseCancellation(Arc::clone(&mdns_cancelled));
-    let mdns_task = discovery.mdns_enabled.then(|| {
-        tokio::task::spawn_blocking(move || browse_mdns(timeout, &mdns_cancelled))
-    });
+    let mdns_task = discovery
+        .mdns_enabled
+        .then(|| tokio::task::spawn_blocking(move || browse_mdns(timeout, &mdns_cancelled)));
     let lnd_config = discovery.lnd.clone();
     let lnd_task = async move {
         match lnd_config.as_ref() {
@@ -325,21 +320,22 @@ pub async fn browse(
             None => None,
         }
     };
-    let (mdns_result, lnd_result) = tokio::join!(async move {
-        match mdns_task {
-            Some(task) => Some(
-                task.await
-                    .map_err(|err| anyhow!("mDNS discovery task failed: {err}"))
-                    .and_then(|result| result),
-            ),
-            None => None,
-        }
-    }, lnd_task);
+    let (mdns_result, lnd_result) = tokio::join!(
+        async move {
+            match mdns_task {
+                Some(task) => Some(
+                    task.await
+                        .map_err(|err| anyhow!("mDNS discovery task failed: {err}"))
+                        .and_then(|result| result),
+                ),
+                None => None,
+            }
+        },
+        lnd_task
+    );
 
     match (mdns_result, lnd_result) {
-        (Some(mdns_result), Some(lnd_result)) => {
-            combine_browse_results(mdns_result, lnd_result)
-        }
+        (Some(mdns_result), Some(lnd_result)) => combine_browse_results(mdns_result, lnd_result),
         (Some(mdns_result), None) => mdns_result,
         (None, Some(lnd_result)) => lnd_result,
         (None, None) => Ok(Vec::new()),
@@ -587,13 +583,8 @@ fn build_lnd_announce_spec(
         advertisement.instance_name.as_deref(),
         &advertisement.device.device_name,
     );
-    let mut spec = AnnounceSpec::new(
-        node_id,
-        LND_SERVICE_TYPE,
-        display_name,
-        advertisement.port,
-    )
-    .with_metadata(advertisement_metadata(advertisement));
+    let mut spec = AnnounceSpec::new(node_id, LND_SERVICE_TYPE, display_name, advertisement.port)
+        .with_metadata(advertisement_metadata(advertisement));
     if let Some(domain) = normalized.discovery_domain {
         spec = spec.with_discovery_domain(domain);
     }
@@ -697,23 +688,21 @@ async fn browse_lnd(config: &LndDiscoveryConfig, timeout: Duration) -> Result<Ve
     if !scopes.is_empty() {
         filter = filter.with_reachability_scopes(scopes);
     }
-    let nodes = client.list(filter).await.context("LND list request failed")?;
+    let nodes = client
+        .list(filter)
+        .await
+        .context("LND list request failed")?;
     Ok(discovered_peers_from_lnd(nodes))
 }
 
-fn build_lnd_client(
-    config: &LndDiscoveryConfig,
-    timeout: Option<Duration>,
-) -> Result<LndClient> {
+fn build_lnd_client(config: &LndDiscoveryConfig, timeout: Option<Duration>) -> Result<LndClient> {
     let normalized = normalize_lnd_config(config)?;
-    let mut builder = LndClient::builder(normalized.server_url)
-        .bearer_token(normalized.bearer_token);
+    let mut builder =
+        LndClient::builder(normalized.server_url).bearer_token(normalized.bearer_token);
     if let Some(timeout) = timeout {
         builder = builder.timeout(timeout);
     }
-    builder
-        .build()
-        .context("failed to build LND client")
+    builder.build().context("failed to build LND client")
 }
 
 fn normalize_lnd_config(config: &LndDiscoveryConfig) -> Result<LndDiscoveryConfig> {
@@ -1003,10 +992,9 @@ pub fn format_display_name(instance_name: Option<&str>, device_name: &str) -> St
 mod tests {
     use super::{
         Advertisement, BrowseCancellation, DiscoveryCache, DiscoverySource, LND_SERVICE_TYPE,
-        LND_STALE_AFTER, LocalIpv4Interface,
-        build_lnd_announce_spec, combine_browse_results, discovered_peer_from_lnd,
-        discovered_peers_from_lnd, group_peer_addresses_for_interfaces, merge_peers,
-        normalize_lnd_config, should_report_lnd_failure,
+        LND_STALE_AFTER, LocalIpv4Interface, build_lnd_announce_spec, combine_browse_results,
+        discovered_peer_from_lnd, discovered_peers_from_lnd, group_peer_addresses_for_interfaces,
+        merge_peers, normalize_lnd_config, should_report_lnd_failure,
     };
     use crate::device::{DeviceConfig, LndDiscoveryConfig};
     use crate::input::InputMode;
@@ -1117,10 +1105,7 @@ mod tests {
                 Ipv4Addr::new(192, 168, 110, 138),
             ]
         );
-        assert_eq!(
-            groups.fallback,
-            vec![Ipv4Addr::new(192, 168, 137, 1)]
-        );
+        assert_eq!(groups.fallback, vec![Ipv4Addr::new(192, 168, 137, 1)]);
     }
 
     #[test]

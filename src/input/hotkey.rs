@@ -73,9 +73,7 @@ impl FromStr for Hotkey {
                 "ctrl" | "control" => Some(ModifierMask::CTRL),
                 "alt" | "option" => Some(ModifierMask::ALT),
                 "shift" => Some(ModifierMask::SHIFT),
-                "meta" | "cmd" | "command" | "win" | "super" => {
-                    Some(ModifierMask::META)
-                }
+                "meta" | "cmd" | "command" | "win" | "super" => Some(ModifierMask::META),
                 _ => None,
             };
             if let Some(modifier) = modifier {
@@ -151,9 +149,9 @@ fn parse_named_key(value: &str) -> Result<u16> {
         "down" => 0x51,
         "up" => 0x52,
         name if name.starts_with('f') => {
-            let number = name[1..].parse::<u16>().map_err(|_| {
-                anyhow::anyhow!("不支持的热键主键 `{value}`")
-            })?;
+            let number = name[1..]
+                .parse::<u16>()
+                .map_err(|_| anyhow::anyhow!("不支持的热键主键 `{value}`"))?;
             if !(1..=24).contains(&number) {
                 bail!("功能键范围必须是 F1 到 F24");
             }

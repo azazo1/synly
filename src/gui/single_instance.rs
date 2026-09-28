@@ -43,7 +43,9 @@ impl SingleInstance {
                     activate_existing(address)?;
                     return Ok(Self::ActivatedExisting);
                 }
-                Err(error) => return Err(error).context("failed to create single instance listener"),
+                Err(error) => {
+                    return Err(error).context("failed to create single instance listener");
+                }
             }
         }
         bail!("single instance lock is busy")
@@ -89,8 +91,9 @@ fn probe_existing(address: SocketAddrV4) -> bool {
 }
 
 fn activate_existing(address: SocketAddrV4) -> Result<()> {
-    let mut stream = TcpStream::connect_timeout(&address.into(), Duration::from_secs(1))
-        .context("single instance port is occupied but the existing Synly process did not respond")?;
+    let mut stream = TcpStream::connect_timeout(&address.into(), Duration::from_secs(1)).context(
+        "single instance port is occupied but the existing Synly process did not respond",
+    )?;
     stream.set_read_timeout(Some(Duration::from_secs(1)))?;
     stream.set_write_timeout(Some(Duration::from_secs(1)))?;
     let args = std::env::args().skip(1).collect::<Vec<_>>().join("\0");

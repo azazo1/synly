@@ -6,16 +6,18 @@ static CHANGE_CALLBACK: OnceLock<Mutex<Option<ChangeCallback>>> = OnceLock::new(
 unsafe extern "C" {
     fn synly_permissions_is_accessibility_trusted() -> bool;
     fn synly_permissions_request_accessibility();
-    fn synly_permissions_set_change_handler(
-        handler: Option<unsafe extern "C" fn(bool)>,
-    );
+    fn synly_permissions_set_change_handler(handler: Option<unsafe extern "C" fn(bool)>);
     fn synly_foreground_cursor_captured() -> bool;
 }
 
 unsafe extern "C" fn accessibility_change_received(trusted: bool) {
-    let Some(slot) = CHANGE_CALLBACK.get() else { return };
+    let Some(slot) = CHANGE_CALLBACK.get() else {
+        return;
+    };
     let Ok(guard) = slot.lock() else { return };
-    let Some(callback) = guard.as_ref() else { return };
+    let Some(callback) = guard.as_ref() else {
+        return;
+    };
     callback(trusted);
 }
 

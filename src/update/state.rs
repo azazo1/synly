@@ -80,7 +80,9 @@ impl UpdateSnapshot {
 
     pub fn progress(&self) -> f32 {
         match (self.received_bytes, self.total_bytes) {
-            (received, Some(total)) if total > 0 => (received as f32 / total as f32).clamp(0.0, 1.0),
+            (received, Some(total)) if total > 0 => {
+                (received as f32 / total as f32).clamp(0.0, 1.0)
+            }
             _ => 0.0,
         }
     }

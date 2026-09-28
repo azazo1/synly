@@ -95,10 +95,8 @@ enum InternalEvent {
 impl AppSupervisor {
     pub fn new(mut config: SynlyConfig, force_start: bool) -> (Self, AppSupervisorHandle) {
         config.runtime.normalize_file_sync_options();
-        let mut snapshot = AppSnapshot::idle(
-            config.runtime.clone(),
-            AppSettings::from_config(&config),
-        );
+        let mut snapshot =
+            AppSnapshot::idle(config.runtime.clone(), AppSettings::from_config(&config));
         snapshot.trusted_devices = config.trusted_devices.clone();
         #[cfg(windows)]
         {
@@ -184,18 +182,14 @@ impl AppSupervisor {
                 settings.device_name = settings.device_name.trim().to_string();
                 let mut candidate = self.config.clone();
                 apply_settings_to_config(&mut candidate, &runtime, &settings);
-                if let Err(error) = validate_settings(&candidate)
-                    .and_then(|_| {
-                        runtime_options_from_config(&candidate, session_pin.clone(), false)
-                            .map(|_| ())
-                    })
-                {
+                if let Err(error) = validate_settings(&candidate).and_then(|_| {
+                    runtime_options_from_config(&candidate, session_pin.clone(), false).map(|_| ())
+                }) {
                     self.set_error(error.to_string());
                     self.publish();
                     return false;
                 }
-                if settings.ui.launch_at_login
-                    != self.snapshot.settings.ui.launch_at_login
+                if settings.ui.launch_at_login != self.snapshot.settings.ui.launch_at_login
                     && let Err(error) = crate::autostart::apply(settings.ui.launch_at_login)
                 {
                     self.set_error(format!("无法更新登录启动设置: {error:#}"));
@@ -240,8 +234,7 @@ impl AppSupervisor {
                     self.update_tuning();
                     if self.session.is_some() {
                         let mut applied = self.snapshot.desired.clone();
-                        if capability_change
-                            && let Some(previous) = self.snapshot.applied.as_ref()
+                        if capability_change && let Some(previous) = self.snapshot.applied.as_ref()
                         {
                             applied.clipboard_mode = previous.clipboard_mode;
                             applied.audio_mode = previous.audio_mode;
@@ -251,9 +244,12 @@ impl AppSupervisor {
                             applied.audio_layout = previous.audio_layout;
                         }
                         self.snapshot.applied = Some(applied);
-                        self.snapshot.pending = (capability_change || audio_layout_pending(
-                            self.snapshot.applied.as_ref(), &self.snapshot.desired,
-                        )).then(|| self.snapshot.desired.clone());
+                        self.snapshot.pending = (capability_change
+                            || audio_layout_pending(
+                                self.snapshot.applied.as_ref(),
+                                &self.snapshot.desired,
+                            ))
+                        .then(|| self.snapshot.desired.clone());
                     }
                     self.publish();
                 }
@@ -315,7 +311,8 @@ impl AppSupervisor {
                         self.start_session().await;
                     } else {
                         self.snapshot.pending = audio_layout_pending(
-                            self.snapshot.applied.as_ref(), &self.snapshot.desired,
+                            self.snapshot.applied.as_ref(),
+                            &self.snapshot.desired,
                         )
                         .then(|| self.snapshot.desired.clone());
                         tracing::info!(?layout, "音频接收布局已保存, 连接时生效");
@@ -353,7 +350,10 @@ impl AppSupervisor {
                         .send(RuntimeCommand::SwitchActiveSession(device_id));
                 }
             }
-            AppCommand::RespondInteraction { request_id, response } => {
+            AppCommand::RespondInteraction {
+                request_id,
+                response,
+            } => {
                 if let Some(sender) = self.pending_responses.remove(&request_id) {
                     let _ = sender.send(response);
                 }
@@ -377,9 +377,7 @@ impl AppSupervisor {
                         self.config.preferred_active = None;
                         self.save_settings();
                     }
-                    if was_preferred
-                        && let Some(session) = &self.session
-                    {
+                    if was_preferred && let Some(session) = &self.session {
                         let _ = session.commands.send(RuntimeCommand::ClearPreferredActive);
                     }
                     if self
@@ -628,8 +626,10 @@ impl AppSupervisor {
                         && local.input_mode == self.snapshot.desired.input.mode
                     {
                         self.snapshot.pending = audio_layout_pending(
-                            self.snapshot.applied.as_ref(), &self.snapshot.desired,
-                        ).then(|| self.snapshot.desired.clone());
+                            self.snapshot.applied.as_ref(),
+                            &self.snapshot.desired,
+                        )
+                        .then(|| self.snapshot.desired.clone());
                     }
                 }
                 self.sync_active_flags();
@@ -646,14 +646,21 @@ impl AppSupervisor {
             .iter()
             .find(|session| session.active)
             .map(|session| session.device_id)
-            .or_else(|| self.snapshot.sessions.first().map(|session| session.device_id))
+            .or_else(|| {
+                self.snapshot
+                    .sessions
+                    .first()
+                    .map(|session| session.device_id)
+            })
     }
 
     fn sync_active_flags(&mut self) {
         let active = match self.snapshot.desired.connection {
-            Some(ConnectionPreference::Join) => {
-                self.snapshot.sessions.first().map(|session| session.device_id)
-            }
+            Some(ConnectionPreference::Join) => self
+                .snapshot
+                .sessions
+                .first()
+                .map(|session| session.device_id),
             _ => self.runtime_active_session,
         };
         for session in &mut self.snapshot.sessions {
@@ -683,8 +690,7 @@ impl AppSupervisor {
         let request_id = envelope.request.request_id();
         if matches!(envelope.request, InteractionRequest::Clear { .. }) {
             if let Some(pending) = self.snapshot.interaction.as_ref() {
-                self.pending_responses
-                    .remove(&pending.request.request_id());
+                self.pending_responses.remove(&pending.request.request_id());
             }
             self.snapshot.interaction = None;
             self.restore_lifecycle_after_interaction();
@@ -729,18 +735,15 @@ impl AppSupervisor {
         if self.session.is_some() {
             return;
         }
-        let mut options = match runtime_options_from_config(
-            &self.config,
-            self.session_pin.clone(),
-            false,
-        ) {
-            Ok(options) => options,
-            Err(error) => {
-                self.set_error(error.to_string());
-                self.publish();
-                return;
-            }
-        };
+        let mut options =
+            match runtime_options_from_config(&self.config, self.session_pin.clone(), false) {
+                Ok(options) => options,
+                Err(error) => {
+                    self.set_error(error.to_string());
+                    self.publish();
+                    return;
+                }
+            };
         let capabilities = self.current_capabilities();
         let tuning = tuning_from_options(&options, self.input_backend_generation);
         let (control, control_handle) = RuntimeControl::new(capabilities, tuning);
@@ -754,8 +757,7 @@ impl AppSupervisor {
         if options.connection == ConnectionPreference::Join {
             let query = options.pairing.peer_query.clone();
             if let Some(query) = query.as_deref()
-                && let Some(peer) =
-                    crate::app::known_peer_for_query(&self.discovered_peers, query)
+                && let Some(peer) = crate::app::known_peer_for_query(&self.discovered_peers, query)
             {
                 tracing::info!(
                     peer = %peer.display_name(),
@@ -790,10 +792,7 @@ impl AppSupervisor {
             let result = crate::app::run(session_config, options, commands_rx)
                 .await
                 .map_err(|error| format!("{error:#}"));
-            let _ = internal.send(InternalEvent::SessionFinished {
-                session_id,
-                result,
-            });
+            let _ = internal.send(InternalEvent::SessionFinished { session_id, result });
         });
         self.session = Some(SessionHandle {
             id: session_id,
@@ -854,7 +853,9 @@ impl AppSupervisor {
             return;
         }
         if let Some(session) = &self.session {
-            let _ = session.commands.send(RuntimeCommand::DisconnectPeer(device_id));
+            let _ = session
+                .commands
+                .send(RuntimeCommand::DisconnectPeer(device_id));
         }
     }
 
@@ -879,10 +880,7 @@ impl AppSupervisor {
         };
         match runtime_options_from_config(&self.config, self.session_pin.clone(), false) {
             Ok(options) => {
-                let _ = tuning.send(tuning_from_options(
-                    &options,
-                    self.input_backend_generation,
-                ));
+                let _ = tuning.send(tuning_from_options(&options, self.input_backend_generation));
             }
             Err(error) => self.set_error(error.to_string()),
         }
@@ -1055,10 +1053,7 @@ fn validate_settings(config: &SynlyConfig) -> Result<()> {
     discovery::validate_config(&config.discovery)
 }
 
-fn tuning_from_options(
-    options: &RuntimeOptions,
-    input_backend_generation: u64,
-) -> RuntimeTuning {
+fn tuning_from_options(options: &RuntimeOptions, input_backend_generation: u64) -> RuntimeTuning {
     let mut tuning = options.control.tuning().borrow().clone();
     tuning.input_backend_generation = input_backend_generation;
     tuning
@@ -1079,10 +1074,7 @@ fn audio_layout_pending(applied: Option<&RuntimeConfig>, desired: &RuntimeConfig
     applied.is_some_and(|applied| applied.audio_layout != desired.audio_layout)
 }
 
-fn capability_fields_changed(
-    applied: Option<&RuntimeConfig>,
-    desired: &RuntimeConfig,
-) -> bool {
+fn capability_fields_changed(applied: Option<&RuntimeConfig>, desired: &RuntimeConfig) -> bool {
     applied.is_some_and(|applied| {
         applied.clipboard_mode != desired.clipboard_mode
             || applied.audio_mode != desired.audio_mode
@@ -1205,7 +1197,8 @@ mod tests {
         supervisor.snapshot.desired.audio_layout = AudioLayout::Surround71;
         supervisor.snapshot.pending = Some(supervisor.snapshot.desired.clone());
         let peer = crate::runtime_control::RuntimePeerSummary {
-            device_id: Uuid::new_v4(), display_name: "peer".into(),
+            device_id: Uuid::new_v4(),
+            display_name: "peer".into(),
         };
         supervisor.handle_runtime_event(RuntimeEvent::Connected(peer.clone()));
         let capabilities = RuntimeCapabilities {
@@ -1214,13 +1207,24 @@ mod tests {
             input_mode: supervisor.snapshot.desired.input.mode,
         };
         let event = || RuntimeEvent::Capabilities {
-            peer: peer.clone(), local: capabilities, remote: capabilities,
-            epoch: CapabilityEpoch { host_generation: 1, client_generation: 1 },
+            peer: peer.clone(),
+            local: capabilities,
+            remote: capabilities,
+            epoch: CapabilityEpoch {
+                host_generation: 1,
+                client_generation: 1,
+            },
             acknowledged: true,
         };
         supervisor.handle_runtime_event(event());
-        assert_eq!(supervisor.snapshot.applied.as_ref().unwrap().audio_layout, AudioLayout::Stereo);
-        assert_eq!(supervisor.snapshot.pending.as_ref().unwrap().audio_layout, AudioLayout::Surround71);
+        assert_eq!(
+            supervisor.snapshot.applied.as_ref().unwrap().audio_layout,
+            AudioLayout::Stereo
+        );
+        assert_eq!(
+            supervisor.snapshot.pending.as_ref().unwrap().audio_layout,
+            AudioLayout::Surround71
+        );
         // 模拟新连接已从 desired 构造, 随后的 ACK 才能清除布局待生效状态.
         supervisor.snapshot.applied = Some(supervisor.snapshot.desired.clone());
         supervisor.handle_runtime_event(event());
@@ -1239,7 +1243,10 @@ mod tests {
 
         assert_eq!(supervisor.snapshot.sessions.len(), 1);
         assert_eq!(supervisor.snapshot.sessions[0].device_id, peer.device_id);
-        assert_eq!(supervisor.snapshot.sessions[0].display_name, peer.display_name);
+        assert_eq!(
+            supervisor.snapshot.sessions[0].display_name,
+            peer.display_name
+        );
     }
 
     #[test]

@@ -19,13 +19,13 @@ use crate::protocol::{
 use crate::runtime_control::{RuntimeCommand, RuntimeEvent, RuntimeLifecycle, RuntimePeerSummary};
 use crate::runtime_options::RuntimeOptions;
 use crate::settings::AudioMode;
-use crate::system_notification::SystemNotifier;
 use crate::sync::WorkspaceSpec;
+use crate::system_notification::SystemNotifier;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, Mutex, Semaphore};
+use tokio::sync::{Mutex, Semaphore, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::{self, MissedTickBehavior};
 use tokio_util::sync::CancellationToken;
@@ -125,10 +125,7 @@ pub(crate) async fn run_host_runtime(
     mut commands: mpsc::UnboundedReceiver<RuntimeCommand>,
 ) -> Result<()> {
     let device = config.device.clone();
-    let notifier = SystemNotifier::new(
-        options.control.tuning(),
-        options.control.input_activity(),
-    );
+    let notifier = SystemNotifier::new(options.control.tuning(), options.control.input_activity());
     let shutdown = options.control.shutdown().clone();
     let mut runtime_capabilities = options.control.capabilities();
     let mut runtime_tuning = options.control.tuning();

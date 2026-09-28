@@ -11,7 +11,10 @@ pub(super) struct MmcssTask {
 
 impl MmcssTask {
     pub(super) fn register() -> Option<Self> {
-        let task = Self::register_with(AvSetMmThreadCharacteristicsW, AvRevertMmThreadCharacteristics);
+        let task = Self::register_with(
+            AvSetMmThreadCharacteristicsW,
+            AvRevertMmThreadCharacteristics,
+        );
         if task.is_none() {
             tracing::warn!(error = %std::io::Error::last_os_error(), "注册 Pro Audio MMCSS 失败, 继续使用普通线程优先级");
         }

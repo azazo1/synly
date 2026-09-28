@@ -1,18 +1,18 @@
 mod capture;
+#[cfg(test)]
+mod channel_tests;
 mod crypto;
 mod queue;
 mod receive;
 mod render;
 mod sdl_policy;
 mod send;
-mod workers;
 #[cfg(test)]
 mod tests;
-#[cfg(test)]
-mod channel_tests;
+mod workers;
 
-use anyhow::{Context, Result};
 use crate::audio::config::CodecConfig;
+use anyhow::{Context, Result};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 use tokio::net::UdpSocket;
@@ -44,8 +44,11 @@ pub struct AudioTaskHandle {
 impl AudioTaskHandle {
     pub async fn stop(mut self) -> Result<()> {
         self.stop.cancel();
-        self.task.take().context("音频任务句柄丢失")?
-            .await.context("音频监督任务异常退出")?
+        self.task
+            .take()
+            .context("音频任务句柄丢失")?
+            .await
+            .context("音频监督任务异常退出")?
     }
 }
 
@@ -67,8 +70,22 @@ pub fn bind_and_spawn_receiver_with_config(
     let local_port = socket.local_addr()?.port();
     let stop = CancellationToken::new();
     let task_stop = stop.clone();
-    let task = tokio::spawn(receive::run(socket, task_stop, channel_secret, direction, expected_peer_ip, stream));
-    Ok((AudioTaskHandle { stop, task: Some(task) }, local_port, channel_id))
+    let task = tokio::spawn(receive::run(
+        socket,
+        task_stop,
+        channel_secret,
+        direction,
+        expected_peer_ip,
+        stream,
+    ));
+    Ok((
+        AudioTaskHandle {
+            stop,
+            task: Some(task),
+        },
+        local_port,
+        channel_id,
+    ))
 }
 
 pub fn spawn_sender_with_config(
@@ -84,13 +101,22 @@ pub fn spawn_sender_with_config(
     let stop = CancellationToken::new();
     let task_stop = stop.clone();
     let task = tokio::spawn(async move {
-        socket.connect(remote_addr).await.context("连接音频 UDP 接收端失败")?;
+        socket
+            .connect(remote_addr)
+            .await
+            .context("连接音频 UDP 接收端失败")?;
         send::run(socket, task_stop, channel_secret, direction, stream).await
     });
-    Ok(AudioTaskHandle { stop, task: Some(task) })
+    Ok(AudioTaskHandle {
+        stop,
+        task: Some(task),
+    })
 }
 
-fn prepare_receiver(master_secret: [u8; 32], peer: IpAddr) -> Result<(UdpSocket, [u8; 32], [u8; 32])> {
+fn prepare_receiver(
+    master_secret: [u8; 32],
+    peer: IpAddr,
+) -> Result<(UdpSocket, [u8; 32], [u8; 32])> {
     let mut channel_id = [0; 32];
     ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut channel_id)
         .map_err(|_| anyhow::anyhow!("生成音频通道随机标识失败"))?;
@@ -104,8 +130,10 @@ fn bind_socket(peer: IpAddr) -> Result<UdpSocket> {
         IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
     };
     // 同步入口仅绑定端口, 所有网络收发都交给 Tokio 非阻塞驱动.
-    let socket = std::net::UdpSocket::bind(SocketAddr::new(address, 0))
-        .context("绑定音频 UDP 端口失败")?;
-    socket.set_nonblocking(true).context("设置音频 UDP 非阻塞模式失败")?;
+    let socket =
+        std::net::UdpSocket::bind(SocketAddr::new(address, 0)).context("绑定音频 UDP 端口失败")?;
+    socket
+        .set_nonblocking(true)
+        .context("设置音频 UDP 非阻塞模式失败")?;
     UdpSocket::from_std(socket).context("注册音频 UDP 异步驱动失败")
 }

@@ -14,12 +14,12 @@ mod budget;
 mod diagnostics;
 mod endpoint;
 mod format;
+#[cfg(test)]
+mod queue_tests;
 mod scheduling;
 mod stream;
 #[cfg(test)]
 mod tests;
-#[cfg(test)]
-mod queue_tests;
 
 use budget::{MAX_PLAYBACK_WAIT, QueueBudget};
 use diagnostics::CaptureDiagnostics;
@@ -284,7 +284,9 @@ fn capture_thread_main(
     loop {
         match CaptureThreadContext::start(spec, &endpoint) {
             Ok(context) => {
-                if let Err(err) = ring.configure_capture_packet(context.buffer_frames, spec.sample_rate) {
+                if let Err(err) =
+                    ring.configure_capture_packet(context.buffer_frames, spec.sample_rate)
+                {
                     let message = err.to_string();
                     if !ready_sent {
                         let _ = ready_tx.send(Err(message.clone()));
@@ -309,7 +311,10 @@ fn capture_thread_main(
                     Ok(ThreadRunState::Restart) => {
                         match ring.begin_recovery() {
                             Ok(discarded_samples) => {
-                                tracing::info!(discarded_samples, "Windows 音频设备需要重建, 清空队列并暂停接收音频");
+                                tracing::info!(
+                                    discarded_samples,
+                                    "Windows 音频设备需要重建, 清空队列并暂停接收音频"
+                                );
                             }
                             Err(err) => {
                                 ring.close(Some(err.to_string()));
@@ -558,7 +563,12 @@ fn capture_loop(
     let mut last_endpoint_check =
         Instant::now() - Duration::from_millis(u64::from(DEVICE_REBIND_POLL_MS));
     loop {
-        if endpoint::should_rebind(endpoint_id, &mut last_endpoint_check, Instant::now(), current_default_render_endpoint_id) {
+        if endpoint::should_rebind(
+            endpoint_id,
+            &mut last_endpoint_check,
+            Instant::now(),
+            current_default_render_endpoint_id,
+        ) {
             return Ok(ThreadRunState::Restart);
         }
 
@@ -685,7 +695,12 @@ fn playback_loop(
     let mut last_endpoint_check =
         Instant::now() - Duration::from_millis(u64::from(DEVICE_REBIND_POLL_MS));
     loop {
-        if endpoint::should_rebind(endpoint_id, &mut last_endpoint_check, Instant::now(), current_default_render_endpoint_id) {
+        if endpoint::should_rebind(
+            endpoint_id,
+            &mut last_endpoint_check,
+            Instant::now(),
+            current_default_render_endpoint_id,
+        ) {
             return Ok(ThreadRunState::Restart);
         }
 
@@ -755,14 +770,19 @@ impl SharedSampleRing {
         playback_watermark: usize,
         closed_message: &'static str,
     ) -> Result<Self> {
-        if channels == 0 || frame_samples == 0 || capacity < frame_samples
-            || !capacity.is_multiple_of(channels) || !frame_samples.is_multiple_of(channels)
-            || !playback_watermark.is_multiple_of(channels) || playback_watermark > capacity
+        if channels == 0
+            || frame_samples == 0
+            || capacity < frame_samples
+            || !capacity.is_multiple_of(channels)
+            || !frame_samples.is_multiple_of(channels)
+            || !playback_watermark.is_multiple_of(channels)
+            || playback_watermark > capacity
         {
             return Err(Error::Backend("Windows 音频队列边界无效".into()));
         }
         let mut buffer = Vec::new();
-        buffer.try_reserve_exact(capacity)
+        buffer
+            .try_reserve_exact(capacity)
             .map_err(|err| Error::Backend(format!("分配 Windows 音频队列失败: {err}")))?;
         buffer.resize(capacity, 0.0);
         Ok(Self {
@@ -794,15 +814,21 @@ impl SharedSampleRing {
         if buffer_frames == 0 || sample_rate == 0 {
             return Err(Error::Backend("Windows 捕获设备包或采样率无效".into()));
         }
-        let packet_samples = usize::try_from(buffer_frames).ok()
+        let packet_samples = usize::try_from(buffer_frames)
+            .ok()
             .and_then(|frames| frames.checked_mul(self.channels))
             .ok_or_else(|| Error::Backend("Windows 捕获设备包样本数溢出".into()))?;
-        let floor_frames = usize::try_from(sample_rate).ok()
+        let floor_frames = usize::try_from(sample_rate)
+            .ok()
             .and_then(|rate| rate.checked_mul(30))
             .ok_or_else(|| Error::Backend("Windows 捕获时间预算溢出".into()))?;
-        let floor_samples = floor_frames.div_ceil(1000).checked_mul(self.channels)
+        let floor_samples = floor_frames
+            .div_ceil(1000)
+            .checked_mul(self.channels)
             .ok_or_else(|| Error::Backend("Windows 捕获时间预算样本数溢出".into()))?;
-        let capacity = self.frame_samples.checked_add(packet_samples)
+        let capacity = self
+            .frame_samples
+            .checked_add(packet_samples)
             .ok_or_else(|| Error::Backend("Windows 捕获拼帧容量溢出".into()))?
             .max(floor_samples);
         let mut state = self.lock_state()?;
@@ -811,7 +837,8 @@ impl SharedSampleRing {
         }
         // 分配成功后才替换旧状态, 不改变恢复标志或流代次.
         let mut buffer = Vec::new();
-        buffer.try_reserve_exact(capacity)
+        buffer
+            .try_reserve_exact(capacity)
             .map_err(|err| Error::Backend(format!("分配 Windows 捕获拼帧队列失败: {err}")))?;
         buffer.resize(capacity, 0.0);
         let discarded = state.len;
@@ -822,7 +849,11 @@ impl SharedSampleRing {
         state.len = 0;
         self.readable.notify_all();
         self.writable.notify_all();
-        tracing::debug!(capacity, packet_samples, "已按设备最大单包调整 Windows 捕获队列");
+        tracing::debug!(
+            capacity,
+            packet_samples,
+            "已按设备最大单包调整 Windows 捕获队列"
+        );
         Ok(())
     }
 
@@ -833,7 +864,9 @@ impl SharedSampleRing {
             return Err(self.closed_error(&state));
         }
         if !out.len().is_multiple_of(self.channels) || out.len() > state.buffer.len() {
-            return Err(Error::Backend("Windows 捕获读取未按声道帧对齐或超出容量".into()));
+            return Err(Error::Backend(
+                "Windows 捕获读取未按声道帧对齐或超出容量".into(),
+            ));
         }
         while state.len < out.len() && !state.closed {
             let now = Instant::now();
@@ -1065,9 +1098,9 @@ struct RingState {
 
 impl RingState {
     fn record_drop(&mut self, samples: usize) {
-        self.dropped_samples = self.dropped_samples.saturating_add(
-            u64::try_from(samples).unwrap_or(u64::MAX),
-        );
+        self.dropped_samples = self
+            .dropped_samples
+            .saturating_add(u64::try_from(samples).unwrap_or(u64::MAX));
     }
 
     fn accepts_write(&self, generation: u64) -> bool {
@@ -1120,7 +1153,10 @@ struct ActivatedAudioClient {
 fn activate_audio_client(selection: &EndpointSelection) -> Result<ActivatedAudioClient> {
     let device = get_render_endpoint(selection)?;
     let endpoint_id = get_device_id(device.as_ptr())?;
-    tracing::info!(follows_default = selection.follows_default(), "已选择 Windows 音频 endpoint");
+    tracing::info!(
+        follows_default = selection.follows_default(),
+        "已选择 Windows 音频 endpoint"
+    );
 
     let mut audio_client = ptr::null_mut();
     unsafe {

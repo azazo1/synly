@@ -98,8 +98,7 @@ where
     }
     let mut bytes = vec![0u8; len];
     reader.read_exact(&mut bytes).await?;
-    bincode::deserialize(&bytes)
-        .context("无法解码输入消息")
+    bincode::deserialize(&bytes).context("无法解码输入消息")
 }
 
 #[cfg(test)]
@@ -111,7 +110,11 @@ mod tests {
     #[tokio::test]
     async fn input_messages_roundtrip() {
         let (mut left, mut right) = duplex(4096);
-        let message = InputMessage::Motion { generation: 7, dx: -12, dy: 34 };
+        let message = InputMessage::Motion {
+            generation: 7,
+            dx: -12,
+            dy: 34,
+        };
         let expected = message.clone();
         let write = tokio::spawn(async move { write_message(&mut left, &message).await });
         let actual = read_message(&mut right).await.unwrap();

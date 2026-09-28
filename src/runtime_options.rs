@@ -195,13 +195,13 @@ fn workspace_from_config(runtime: &RuntimeConfig) -> Result<WorkspaceSpec> {
             WorkspaceSpec::for_receive(expand_single_path(paths, "receive")?)?
         }
         FileSyncMode::Both => WorkspaceSpec::for_both(expand_single_path(paths, "both")?)?
-            .with_initial_sync(Some(initial.context(
-                "file_sync_mode = both 时必须配置 initial = this 或 other",
-            )?)),
+            .with_initial_sync(Some(
+                initial.context("file_sync_mode = both 时必须配置 initial = this 或 other")?,
+            )),
         FileSyncMode::Auto => WorkspaceSpec::for_auto(expand_single_path(paths, "auto")?)?
-            .with_initial_sync(Some(initial.context(
-                "file_sync_mode = auto 时必须配置 initial = this 或 other",
-            )?)),
+            .with_initial_sync(Some(
+                initial.context("file_sync_mode = auto 时必须配置 initial = this 或 other")?,
+            )),
     };
     Ok(workspace.with_max_folder_depth(runtime.max_folder_depth))
 }
@@ -258,8 +258,8 @@ mod tests {
         config.runtime.trust_device = true;
         config.runtime.trusted_only = true;
 
-        let options = runtime_options_from_config(&config, Some("123456".to_string()), false)
-            .unwrap();
+        let options =
+            runtime_options_from_config(&config, Some("123456".to_string()), false).unwrap();
 
         assert_eq!(options.connection, ConnectionPreference::Join);
         assert_eq!(options.instance_name.as_deref(), Some("worker-a"));

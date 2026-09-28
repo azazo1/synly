@@ -2,13 +2,18 @@ use super::{
     AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, Error, Handle, IAudioClient,
     Result, WasapiSpec, check_hresult,
 };
+use super::{
+    CoTaskMemFree, WaveFormatEx,
+    format::{EXTENSIBLE, WaveFormatExtensible},
+};
 use std::ptr;
-use super::{CoTaskMemFree, WaveFormatEx, format::{EXTENSIBLE, WaveFormatExtensible}};
 
 struct MixFormat(*mut WaveFormatEx);
 impl Drop for MixFormat {
     fn drop(&mut self) {
-        unsafe { CoTaskMemFree(self.0.cast()); }
+        unsafe {
+            CoTaskMemFree(self.0.cast());
+        }
     }
 }
 
@@ -16,9 +21,14 @@ fn device_format(client: *mut IAudioClient, spec: WasapiSpec) -> Result<WaveForm
     let mut format = spec.wave_format()?;
     let mut mix = MixFormat(ptr::null_mut());
     unsafe {
-        check_hresult(((*(*client).lp_vtbl).get_mix_format)(client, &mut mix.0), "IAudioClient::GetMixFormat")?;
+        check_hresult(
+            ((*(*client).lp_vtbl).get_mix_format)(client, &mut mix.0),
+            "IAudioClient::GetMixFormat",
+        )?;
         if mix.0.is_null() {
-            return Err(Error::Backend("IAudioClient::GetMixFormat 返回空接口".into()));
+            return Err(Error::Backend(
+                "IAudioClient::GetMixFormat 返回空接口".into(),
+            ));
         }
         apply_mix_format(&mut format, mix.0);
     }
@@ -29,9 +39,14 @@ fn device_format(client: *mut IAudioClient, spec: WasapiSpec) -> Result<WaveForm
 unsafe fn apply_mix_format(format: &mut WaveFormatExtensible, mix: *const WaveFormatEx) {
     let header = unsafe { mix.read_unaligned() };
     if header.w_format_tag == EXTENSIBLE && header.cb_size >= 22 {
-        let mask = unsafe { ptr::addr_of!((*mix.cast::<WaveFormatExtensible>()).channel_mask).read_unaligned() };
+        let mask = unsafe {
+            ptr::addr_of!((*mix.cast::<WaveFormatExtensible>()).channel_mask).read_unaligned()
+        };
         if !format.prefer_native_mask(header.n_channels, mask) {
-            tracing::debug!(native_mask = mask, "保留标准声道布局, 由 Windows 音频引擎转换");
+            tracing::debug!(
+                native_mask = mask,
+                "保留标准声道布局, 由 Windows 音频引擎转换"
+            );
         }
     }
 }
@@ -55,16 +70,33 @@ pub(super) fn initialize_shared_client(
     unsafe {
         let vtbl = &*(*client).lp_vtbl;
         check_hresult(
-            (vtbl.initialize)(client, AUDCLNT_SHAREMODE_SHARED, flags, 0, 0, &format.format, ptr::null()),
+            (vtbl.initialize)(
+                client,
+                AUDCLNT_SHAREMODE_SHARED,
+                flags,
+                0,
+                0,
+                &format.format,
+                ptr::null(),
+            ),
             "IAudioClient::Initialize(shared event)",
         )?;
-        check_hresult((vtbl.set_event_handle)(client, event), "IAudioClient::SetEventHandle")?;
-        check_hresult((vtbl.get_buffer_size)(client, &mut buffer_frames), "IAudioClient::GetBufferSize")?;
+        check_hresult(
+            (vtbl.set_event_handle)(client, event),
+            "IAudioClient::SetEventHandle",
+        )?;
+        check_hresult(
+            (vtbl.get_buffer_size)(client, &mut buffer_frames),
+            "IAudioClient::GetBufferSize",
+        )?;
         check_hresult(
             (vtbl.get_device_period)(client, &mut period_hns, ptr::null_mut()),
             "IAudioClient::GetDevicePeriod",
         )?;
-        check_hresult((vtbl.get_stream_latency)(client, &mut latency_hns), "IAudioClient::GetStreamLatency")?;
+        check_hresult(
+            (vtbl.get_stream_latency)(client, &mut latency_hns),
+            "IAudioClient::GetStreamLatency",
+        )?;
     }
     if buffer_frames == 0 || period_hns <= 0 || latency_hns < 0 {
         return Err(Error::Backend(format!(

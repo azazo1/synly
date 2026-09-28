@@ -71,7 +71,10 @@ impl<T> FrameQueue<T> {
             if let Some(item) = state.items.pop_front() {
                 return Some(item);
             }
-            state = self.available.wait(state).unwrap_or_else(|error| error.into_inner());
+            state = self
+                .available
+                .wait(state)
+                .unwrap_or_else(|error| error.into_inner());
         }
     }
 
@@ -99,10 +102,16 @@ impl<T> FrameQueue<T> {
         loop {
             state.dropped = state.dropped.saturating_add(state.items.len() as u64);
             state.items.clear();
-            if state.closed { return false; }
+            if state.closed {
+                return false;
+            }
             let now = std::time::Instant::now();
-            if now >= deadline { return true; }
-            let (next, _) = self.available.wait_timeout(state, deadline - now)
+            if now >= deadline {
+                return true;
+            }
+            let (next, _) = self
+                .available
+                .wait_timeout(state, deadline - now)
                 .unwrap_or_else(|error| error.into_inner());
             state = next;
         }
@@ -165,7 +174,13 @@ mod tests {
         let consumer = tokio::spawn(async move { consumer_queue.pop().await });
         tokio::task::yield_now().await;
         queue.close();
-        assert_eq!(tokio::time::timeout(Duration::from_secs(1), consumer).await.unwrap().unwrap(), None);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), consumer)
+                .await
+                .unwrap()
+                .unwrap(),
+            None
+        );
         assert!(!queue.push(1));
         let queue = FrameQueue::new("pending", 30);
         queue.push(1);
@@ -191,7 +206,12 @@ mod tests {
         let started = std::time::Instant::now();
         let deadline = started + Duration::from_millis(30);
         let waiting = tokio::task::spawn_blocking(move || queue.discard_until(deadline));
-        assert!(tokio::time::timeout(Duration::from_secs(2), waiting).await.unwrap().unwrap());
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), waiting)
+                .await
+                .unwrap()
+                .unwrap()
+        );
         assert!(started.elapsed() >= Duration::from_millis(30));
     }
 
@@ -199,9 +219,16 @@ mod tests {
     async fn closing_interrupts_a_long_recovery_drop_window() {
         let queue = Arc::new(FrameQueue::<u8>::new("recovery", 30));
         let worker_queue = Arc::clone(&queue);
-        let waiting = tokio::task::spawn_blocking(move || worker_queue.discard_until(std::time::Instant::now() + Duration::from_secs(60)));
+        let waiting = tokio::task::spawn_blocking(move || {
+            worker_queue.discard_until(std::time::Instant::now() + Duration::from_secs(60))
+        });
         queue.close();
-        assert!(!tokio::time::timeout(Duration::from_millis(500), waiting).await.unwrap().unwrap());
+        assert!(
+            !tokio::time::timeout(Duration::from_millis(500), waiting)
+                .await
+                .unwrap()
+                .unwrap()
+        );
     }
 
     #[tokio::test]
@@ -210,6 +237,12 @@ mod tests {
         let consumer_queue = Arc::clone(&queue);
         let consumer = tokio::task::spawn_blocking(move || consumer_queue.pop_blocking());
         queue.close();
-        assert_eq!(tokio::time::timeout(Duration::from_secs(1), consumer).await.unwrap().unwrap(), None);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), consumer)
+                .await
+                .unwrap()
+                .unwrap(),
+            None
+        );
     }
 }

@@ -84,8 +84,7 @@ const FLAG_META: u64 = 1 << 20;
 const EVENT_TAG: i64 = 0x5359_4e4c_5949_4e50;
 const CG_EVENT_SOURCE_COMBINED_SESSION_STATE: i32 = 0;
 const CG_EVENT_SOURCE_HID_SYSTEM_STATE: i32 = 1;
-const CAPTURE_MAINTENANCE_INTERVAL: std::time::Duration =
-    std::time::Duration::from_millis(250);
+const CAPTURE_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
@@ -94,7 +93,14 @@ unsafe extern "C" {
         place: u32,
         options: u32,
         events_of_interest: u64,
-        callback: Option<unsafe extern "C" fn(CGEventTapProxy, CGEventType, CGEventRef, *mut c_void) -> CGEventRef>,
+        callback: Option<
+            unsafe extern "C" fn(
+                CGEventTapProxy,
+                CGEventType,
+                CGEventRef,
+                *mut c_void,
+            ) -> CGEventRef,
+        >,
         user_info: *mut c_void,
     ) -> CFMachPortRef;
     fn CGEventTapEnable(tap: CFMachPortRef, enable: bool);
@@ -122,7 +128,11 @@ unsafe extern "C" {
         wheel2: i32,
     ) -> CGEventRef;
     fn CGEventPost(tap: u32, event: CGEventRef);
-    fn CGGetActiveDisplayList(max_displays: u32, displays: *mut CGDirectDisplayID, count: *mut u32) -> i32;
+    fn CGGetActiveDisplayList(
+        max_displays: u32,
+        displays: *mut CGDirectDisplayID,
+        count: *mut u32,
+    ) -> i32;
     fn CGDisplayBounds(display: CGDirectDisplayID) -> CGRect;
     fn CGMainDisplayID() -> CGDirectDisplayID;
     fn CGDisplayHideCursor(display: CGDirectDisplayID) -> i32;
@@ -271,7 +281,9 @@ fn run_event_tap(state: Arc<MacState>, ready: std::sync::mpsc::SyncSender<Result
             CFRelease(tap);
             drop(Arc::from_raw(context.cast::<MacState>()));
         }
-        let _ = ready.send(Err(anyhow::anyhow!("无法创建 Quartz event tap run loop source")));
+        let _ = ready.send(Err(anyhow::anyhow!(
+            "无法创建 Quartz event tap run loop source"
+        )));
         return;
     }
     unsafe {
@@ -322,12 +334,9 @@ unsafe extern "C" fn event_callback(
 
     let active = state.context.capture_active.load(Ordering::Acquire);
     if state.context.filter_app_events {
-        let source_pid = unsafe {
-            CGEventGetIntegerValueField(event, FIELD_SOURCE_UNIX_PROCESS_ID)
-        };
-        let source_state = unsafe {
-            CGEventGetIntegerValueField(event, FIELD_SOURCE_STATE_ID)
-        };
+        let source_pid =
+            unsafe { CGEventGetIntegerValueField(event, FIELD_SOURCE_UNIX_PROCESS_ID) };
+        let source_state = unsafe { CGEventGetIntegerValueField(event, FIELD_SOURCE_STATE_ID) };
         if source_pid != 0 || source_state != HID_SOURCE_STATE_ID {
             return if active { ptr::null_mut() } else { event };
         }
@@ -360,21 +369,23 @@ unsafe extern "C" fn event_callback(
         }
         EVENT_LEFT_DOWN | EVENT_LEFT_UP | EVENT_RIGHT_DOWN | EVENT_RIGHT_UP | EVENT_OTHER_DOWN
         | EVENT_OTHER_UP => {
-            let raw_button = unsafe { CGEventGetIntegerValueField(event, FIELD_MOUSE_BUTTON) } as u8;
+            let raw_button =
+                unsafe { CGEventGetIntegerValueField(event, FIELD_MOUSE_BUTTON) } as u8;
             let button = match raw_button {
                 0 => 1,
                 1 => 3,
                 2 => 2,
                 value => value.saturating_add(1),
             };
-            let down = matches!(event_type, EVENT_LEFT_DOWN | EVENT_RIGHT_DOWN | EVENT_OTHER_DOWN);
+            let down = matches!(
+                event_type,
+                EVENT_LEFT_DOWN | EVENT_RIGHT_DOWN | EVENT_OTHER_DOWN
+            );
             update_set(&state.physical_buttons, button, down);
-            state.context.emit_reliable(NativeEvent::Button { button, down });
-            if active {
-                ptr::null_mut()
-            } else {
-                event
-            }
+            state
+                .context
+                .emit_reliable(NativeEvent::Button { button, down });
+            if active { ptr::null_mut() } else { event }
         }
         EVENT_SCROLL => {
             let x = unsafe { CGEventGetIntegerValueField(event, FIELD_SCROLL_DELTA_X) } as i32;
@@ -383,23 +394,25 @@ unsafe extern "C" fn event_callback(
                 CGEventGetIntegerValueField(event, FIELD_SCROLL_IS_CONTINUOUS)
             });
             if active {
-                state.context.emit_reliable(NativeEvent::Wheel { x, y, source });
+                state
+                    .context
+                    .emit_reliable(NativeEvent::Wheel { x, y, source });
                 ptr::null_mut()
             } else {
                 event
             }
         }
         EVENT_GESTURE | EVENT_DOCK_SWIPE | EVENT_NAVIGATION_SWIPE => {
-            if suppress_local_gesture(event_type, active) { ptr::null_mut() } else { event }
+            if suppress_local_gesture(event_type, active) {
+                ptr::null_mut()
+            } else {
+                event
+            }
         }
         EVENT_KEY_DOWN | EVENT_KEY_UP | EVENT_FLAGS_CHANGED => {
             let keycode = unsafe { CGEventGetIntegerValueField(event, FIELD_KEY_CODE) } as u16;
             let Some(usage) = mac_keycode_to_hid(keycode) else {
-                tracing::debug!(
-                    keycode,
-                    event_type,
-                    "macOS event tap 收到未映射按键"
-                );
+                tracing::debug!(keycode, event_type, "macOS event tap 收到未映射按键");
                 return if active { ptr::null_mut() } else { event };
             };
             let flags = unsafe { CGEventGetFlags(event) };
@@ -418,8 +431,7 @@ unsafe extern "C" fn event_callback(
                 }
                 return ptr::null_mut();
             }
-            let listening =
-                active || state.keyboard_capture.load(Ordering::Acquire);
+            let listening = active || state.keyboard_capture.load(Ordering::Acquire);
             if listening && event_type == EVENT_FLAGS_CHANGED && usage_is_modifier(usage) {
                 state.context.emit_reliable(NativeEvent::Key {
                     usage,
@@ -493,7 +505,12 @@ fn refresh_mac_pressed_state(state: &MacState) {
 
     let mut os_buttons = BTreeSet::new();
     for button in 1..=3u8 {
-        if unsafe { CGEventSourceButtonState(CG_EVENT_SOURCE_COMBINED_SESSION_STATE, mac_mouse_button(button)) } {
+        if unsafe {
+            CGEventSourceButtonState(
+                CG_EVENT_SOURCE_COMBINED_SESSION_STATE,
+                mac_mouse_button(button),
+            )
+        } {
             os_buttons.insert(button);
         }
     }
@@ -527,12 +544,14 @@ fn enable_background_cursor_updates() {
         return;
     }
     let connection = unsafe { _CGSDefaultConnection() };
-    let result = unsafe {
-        CGSSetConnectionProperty(connection, connection, property, kCFBooleanTrue)
-    };
+    let result =
+        unsafe { CGSSetConnectionProperty(connection, connection, property, kCFBooleanTrue) };
     unsafe { CFRelease(property) };
     if result != 0 {
-        tracing::warn!(error_code = result, "设置 macOS 后台光标属性失败, 光标隐藏可能不稳定");
+        tracing::warn!(
+            error_code = result,
+            "设置 macOS 后台光标属性失败, 光标隐藏可能不稳定"
+        );
     } else {
         tracing::debug!("已设置 macOS 后台光标属性");
     }
@@ -576,7 +595,8 @@ impl InputBackend for MacBackend {
     fn secure_input_state(&self) -> bool {
         let active = unsafe { IsSecureEventInputEnabled() };
         let was_active = self.state.secure_input.swap(active, Ordering::AcqRel);
-        if !active && was_active
+        if !active
+            && was_active
             && let Some(tap) = *self.state.tap.lock().unwrap()
         {
             unsafe { CGEventTapEnable(tap as CFMachPortRef, true) };
@@ -618,7 +638,10 @@ impl InputBackend for MacBackend {
         }
         let point = unsafe { CGEventGetLocation(event) };
         unsafe { CFRelease(event) };
-        Ok(Point { x: point.x.round() as i32, y: point.y.round() as i32 })
+        Ok(Point {
+            x: point.x.round() as i32,
+            y: point.y.round() as i32,
+        })
     }
 
     fn snapshot(&self) -> KeySnapshot {
@@ -629,8 +652,19 @@ impl InputBackend for MacBackend {
                 current_modifiers(&pressed),
             )
         };
-        let buttons = self.state.physical_buttons.lock().unwrap().iter().copied().collect();
-        KeySnapshot { usages, modifiers, buttons }
+        let buttons = self
+            .state
+            .physical_buttons
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .collect();
+        KeySnapshot {
+            usages,
+            modifiers,
+            buttons,
+        }
     }
 
     fn refresh_pressed_state(&self) -> Result<KeySnapshot> {
@@ -639,7 +673,11 @@ impl InputBackend for MacBackend {
     }
 
     fn set_capture(&self, active: bool) -> Result<()> {
-        let previous = self.state.context.capture_active.swap(active, Ordering::AcqRel);
+        let previous = self
+            .state
+            .context
+            .capture_active
+            .swap(active, Ordering::AcqRel);
         if previous == active {
             if !active {
                 *self.state.capture_maintenance.lock().unwrap() = None;
@@ -661,7 +699,11 @@ impl InputBackend for MacBackend {
             let recouple_result = unsafe { CGAssociateMouseAndMouseCursorPosition(true) };
             unsafe { CGSetLocalEventsSuppressionInterval(0.0001) };
             let decouple_result = unsafe { CGAssociateMouseAndMouseCursorPosition(false) };
-            if recouple_result != 0 { recouple_result } else { decouple_result }
+            if recouple_result != 0 {
+                recouple_result
+            } else {
+                decouple_result
+            }
         } else {
             unsafe { CGSetLocalEventsSuppressionInterval(0.0) };
             unsafe { CGAssociateMouseAndMouseCursorPosition(true) }
@@ -690,7 +732,11 @@ impl InputBackend for MacBackend {
             let handle = std::thread::Builder::new()
                 .name("synly-macos-capture-maintain".to_string())
                 .spawn(move || {
-                    while maintenance_state.context.capture_active.load(Ordering::Acquire) {
+                    while maintenance_state
+                        .context
+                        .capture_active
+                        .load(Ordering::Acquire)
+                    {
                         reassert_macos_capture(&maintenance_state);
                         std::thread::sleep(CAPTURE_MAINTENANCE_INTERVAL);
                     }
@@ -717,7 +763,12 @@ impl InputBackend for MacBackend {
     }
 
     fn warp_cursor(&self, point: Point) -> Result<()> {
-        let result = unsafe { CGWarpMouseCursorPosition(CGPoint { x: point.x as f64, y: point.y as f64 }) };
+        let result = unsafe {
+            CGWarpMouseCursorPosition(CGPoint {
+                x: point.x as f64,
+                y: point.y as f64,
+            })
+        };
         if result != 0 {
             bail!("移动 macOS 光标失败, 错误码 {result}");
         }
@@ -758,7 +809,10 @@ impl InputBackend for MacBackend {
             CGEventCreateMouseEvent(
                 ptr::null(),
                 event_type,
-                CGPoint { x: point.x as f64, y: point.y as f64 },
+                CGPoint {
+                    x: point.x as f64,
+                    y: point.y as f64,
+                },
                 mouse_button,
             )
         };
@@ -786,7 +840,10 @@ impl InputBackend for MacBackend {
             CGEventCreateMouseEvent(
                 ptr::null(),
                 event_type,
-                CGPoint { x: point.x as f64, y: point.y as f64 },
+                CGPoint {
+                    x: point.x as f64,
+                    y: point.y as f64,
+                },
                 mouse_button,
             )
         };
@@ -825,7 +882,10 @@ impl InputBackend for MacBackend {
             CGEventCreateMouseEvent(
                 ptr::null(),
                 EVENT_MOUSE_MOVED,
-                CGPoint { x: point.x as f64, y: point.y as f64 },
+                CGPoint {
+                    x: point.x as f64,
+                    y: point.y as f64,
+                },
                 0,
             )
         };
@@ -876,19 +936,35 @@ fn post_event(event: CGEventRef, flags: u64) -> Result<()> {
 
 fn modifiers_from_flags(flags: u64) -> ModifierMask {
     let mut bits = 0u8;
-    if flags & FLAG_CONTROL != 0 { bits |= ModifierMask::CTRL.bits(); }
-    if flags & FLAG_ALT != 0 { bits |= ModifierMask::ALT.bits(); }
-    if flags & FLAG_SHIFT != 0 { bits |= ModifierMask::SHIFT.bits(); }
-    if flags & FLAG_META != 0 { bits |= ModifierMask::META.bits(); }
+    if flags & FLAG_CONTROL != 0 {
+        bits |= ModifierMask::CTRL.bits();
+    }
+    if flags & FLAG_ALT != 0 {
+        bits |= ModifierMask::ALT.bits();
+    }
+    if flags & FLAG_SHIFT != 0 {
+        bits |= ModifierMask::SHIFT.bits();
+    }
+    if flags & FLAG_META != 0 {
+        bits |= ModifierMask::META.bits();
+    }
     ModifierMask::from_bits(bits)
 }
 
 fn flags_from_modifiers(modifiers: ModifierMask) -> u64 {
     let mut flags = 0;
-    if modifiers.contains(ModifierMask::CTRL) { flags |= FLAG_CONTROL; }
-    if modifiers.contains(ModifierMask::ALT) { flags |= FLAG_ALT; }
-    if modifiers.contains(ModifierMask::SHIFT) { flags |= FLAG_SHIFT; }
-    if modifiers.contains(ModifierMask::META) { flags |= FLAG_META; }
+    if modifiers.contains(ModifierMask::CTRL) {
+        flags |= FLAG_CONTROL;
+    }
+    if modifiers.contains(ModifierMask::ALT) {
+        flags |= FLAG_ALT;
+    }
+    if modifiers.contains(ModifierMask::SHIFT) {
+        flags |= FLAG_SHIFT;
+    }
+    if modifiers.contains(ModifierMask::META) {
+        flags |= FLAG_META;
+    }
     flags
 }
 
@@ -904,32 +980,118 @@ fn modifier_usage_is_down(usage: u16, flags: u64) -> bool {
 
 fn current_modifiers(keys: &BTreeSet<u16>) -> ModifierMask {
     let mut bits = 0;
-    if keys.contains(&0xe0) || keys.contains(&0xe4) { bits |= ModifierMask::CTRL.bits(); }
-    if keys.contains(&0xe1) || keys.contains(&0xe5) { bits |= ModifierMask::SHIFT.bits(); }
-    if keys.contains(&0xe2) || keys.contains(&0xe6) { bits |= ModifierMask::ALT.bits(); }
-    if keys.contains(&0xe3) || keys.contains(&0xe7) { bits |= ModifierMask::META.bits(); }
+    if keys.contains(&0xe0) || keys.contains(&0xe4) {
+        bits |= ModifierMask::CTRL.bits();
+    }
+    if keys.contains(&0xe1) || keys.contains(&0xe5) {
+        bits |= ModifierMask::SHIFT.bits();
+    }
+    if keys.contains(&0xe2) || keys.contains(&0xe6) {
+        bits |= ModifierMask::ALT.bits();
+    }
+    if keys.contains(&0xe3) || keys.contains(&0xe7) {
+        bits |= ModifierMask::META.bits();
+    }
     ModifierMask::from_bits(bits)
 }
 
 fn mac_keycode_to_hid(code: u16) -> Option<u16> {
     Some(match code {
-        0 => 0x04, 11 => 0x05, 8 => 0x06, 2 => 0x07, 14 => 0x08, 3 => 0x09,
-        5 => 0x0a, 4 => 0x0b, 34 => 0x0c, 38 => 0x0d, 40 => 0x0e, 37 => 0x0f,
-        46 => 0x10, 45 => 0x11, 31 => 0x12, 35 => 0x13, 12 => 0x14, 15 => 0x15,
-        1 => 0x16, 17 => 0x17, 32 => 0x18, 9 => 0x19, 13 => 0x1a, 7 => 0x1b,
-        16 => 0x1c, 6 => 0x1d, 18 => 0x1e, 19 => 0x1f, 20 => 0x20, 21 => 0x21,
-        23 => 0x22, 22 => 0x23, 26 => 0x24, 28 => 0x25, 25 => 0x26, 29 => 0x27,
-        36 => 0x28, 53 => 0x29, 51 => 0x2a, 48 => 0x2b, 49 => 0x2c, 50 => 0x35, 24 => 0x2e,
-        27 => 0x2d, 33 => 0x2f, 30 => 0x30, 42 => 0x31, 41 => 0x33, 39 => 0x34,
-        43 => 0x36, 47 => 0x37, 44 => 0x38, 57 => 0x39, 122 => 0x3a, 120 => 0x3b,
-        99 => 0x3c, 118 => 0x3d, 96 => 0x3e, 97 => 0x3f, 98 => 0x40, 100 => 0x41,
-        101 => 0x42, 109 => 0x43, 103 => 0x44, 111 => 0x45, 105 => 0x68, 107 => 0x69,
-        113 => 0x6a, 106 => 0x6b, 64 => 0x6c, 79 => 0x6d, 80 => 0x6e, 90 => 0x6f,
-        87 => 0x70, 86 => 0x71, 89 => 0x72, 91 => 0x73,
-        114 => 0x49, 115 => 0x4a, 116 => 0x4b, 117 => 0x4c, 119 => 0x4d,
-        121 => 0x4e, 124 => 0x4f, 123 => 0x50, 125 => 0x51, 126 => 0x52,
-        59 => 0xe0, 56 => 0xe1, 58 => 0xe2, 55 => 0xe3, 62 => 0xe4, 60 => 0xe5,
-        61 => 0xe6, 54 => 0xe7,
+        0 => 0x04,
+        11 => 0x05,
+        8 => 0x06,
+        2 => 0x07,
+        14 => 0x08,
+        3 => 0x09,
+        5 => 0x0a,
+        4 => 0x0b,
+        34 => 0x0c,
+        38 => 0x0d,
+        40 => 0x0e,
+        37 => 0x0f,
+        46 => 0x10,
+        45 => 0x11,
+        31 => 0x12,
+        35 => 0x13,
+        12 => 0x14,
+        15 => 0x15,
+        1 => 0x16,
+        17 => 0x17,
+        32 => 0x18,
+        9 => 0x19,
+        13 => 0x1a,
+        7 => 0x1b,
+        16 => 0x1c,
+        6 => 0x1d,
+        18 => 0x1e,
+        19 => 0x1f,
+        20 => 0x20,
+        21 => 0x21,
+        23 => 0x22,
+        22 => 0x23,
+        26 => 0x24,
+        28 => 0x25,
+        25 => 0x26,
+        29 => 0x27,
+        36 => 0x28,
+        53 => 0x29,
+        51 => 0x2a,
+        48 => 0x2b,
+        49 => 0x2c,
+        50 => 0x35,
+        24 => 0x2e,
+        27 => 0x2d,
+        33 => 0x2f,
+        30 => 0x30,
+        42 => 0x31,
+        41 => 0x33,
+        39 => 0x34,
+        43 => 0x36,
+        47 => 0x37,
+        44 => 0x38,
+        57 => 0x39,
+        122 => 0x3a,
+        120 => 0x3b,
+        99 => 0x3c,
+        118 => 0x3d,
+        96 => 0x3e,
+        97 => 0x3f,
+        98 => 0x40,
+        100 => 0x41,
+        101 => 0x42,
+        109 => 0x43,
+        103 => 0x44,
+        111 => 0x45,
+        105 => 0x68,
+        107 => 0x69,
+        113 => 0x6a,
+        106 => 0x6b,
+        64 => 0x6c,
+        79 => 0x6d,
+        80 => 0x6e,
+        90 => 0x6f,
+        87 => 0x70,
+        86 => 0x71,
+        89 => 0x72,
+        91 => 0x73,
+        114 => 0x49,
+        115 => 0x4a,
+        116 => 0x4b,
+        117 => 0x4c,
+        119 => 0x4d,
+        121 => 0x4e,
+        124 => 0x4f,
+        123 => 0x50,
+        125 => 0x51,
+        126 => 0x52,
+        59 => 0xe0,
+        56 => 0xe1,
+        58 => 0xe2,
+        55 => 0xe3,
+        62 => 0xe4,
+        60 => 0xe5,
+        61 => 0xe6,
+        54 => 0xe7,
         _ => return None,
     })
 }

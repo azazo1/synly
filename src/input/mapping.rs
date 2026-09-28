@@ -100,12 +100,7 @@ impl KeyMapper {
         }
     }
 
-    pub fn map_key(
-        &mut self,
-        usage: u16,
-        down: bool,
-        repeat: bool,
-    ) -> Option<MappedKey> {
+    pub fn map_key(&mut self, usage: u16, down: bool, repeat: bool) -> Option<MappedKey> {
         if repeat {
             let target = self
                 .pressed_sources
@@ -166,16 +161,8 @@ impl KeyMapper {
 }
 
 pub fn validate_key_mapping(config: &KeyMappingConfig) -> Result<()> {
-    compile_direction(
-        config,
-        InputPlatform::Macos,
-        InputPlatform::Windows,
-    )?;
-    compile_direction(
-        config,
-        InputPlatform::Windows,
-        InputPlatform::Macos,
-    )?;
+    compile_direction(config, InputPlatform::Macos, InputPlatform::Windows)?;
+    compile_direction(config, InputPlatform::Windows, InputPlatform::Macos)?;
     Ok(())
 }
 
@@ -224,7 +211,9 @@ fn parse_common_key_name(name: &str) -> Option<u16> {
             return Some(0x27);
         }
     }
-    if let Some(number) = name.strip_prefix('f').and_then(|value| value.parse::<u16>().ok())
+    if let Some(number) = name
+        .strip_prefix('f')
+        .and_then(|value| value.parse::<u16>().ok())
         && (1..=24).contains(&number)
     {
         return Some(if number <= 12 {
@@ -269,16 +258,12 @@ fn parse_modifier_name(platform: InputPlatform, name: &str) -> Option<u16> {
     Some(match (platform, name) {
         (_, "left_ctrl") => 0xe0,
         (_, "left_shift") => 0xe1,
-        (InputPlatform::Macos, "left_option")
-        | (InputPlatform::Windows, "left_alt") => 0xe2,
-        (InputPlatform::Macos, "left_command")
-        | (InputPlatform::Windows, "left_win") => 0xe3,
+        (InputPlatform::Macos, "left_option") | (InputPlatform::Windows, "left_alt") => 0xe2,
+        (InputPlatform::Macos, "left_command") | (InputPlatform::Windows, "left_win") => 0xe3,
         (_, "right_ctrl") => 0xe4,
         (_, "right_shift") => 0xe5,
-        (InputPlatform::Macos, "right_option")
-        | (InputPlatform::Windows, "right_alt") => 0xe6,
-        (InputPlatform::Macos, "right_command")
-        | (InputPlatform::Windows, "right_win") => 0xe7,
+        (InputPlatform::Macos, "right_option") | (InputPlatform::Windows, "right_alt") => 0xe6,
+        (InputPlatform::Macos, "right_command") | (InputPlatform::Windows, "right_win") => 0xe7,
         _ => return None,
     })
 }
@@ -317,12 +302,8 @@ mod tests {
     #[test]
     fn default_mapping_swaps_option_win_and_command_alt() {
         let config = KeyMappingConfig::default();
-        let mut mac = KeyMapper::new(
-            &config,
-            InputPlatform::Macos,
-            InputPlatform::Windows,
-        )
-        .unwrap();
+        let mut mac =
+            KeyMapper::new(&config, InputPlatform::Macos, InputPlatform::Windows).unwrap();
         let mapped = mac.map_snapshot(&KeySnapshot {
             usages: vec![0xe2, 0xe3],
             modifiers: ModifierMask::from_bits(
@@ -336,12 +317,8 @@ mod tests {
             ModifierMask::from_bits(ModifierMask::ALT.bits() | ModifierMask::META.bits())
         );
 
-        let mut windows = KeyMapper::new(
-            &config,
-            InputPlatform::Windows,
-            InputPlatform::Macos,
-        )
-        .unwrap();
+        let mut windows =
+            KeyMapper::new(&config, InputPlatform::Windows, InputPlatform::Macos).unwrap();
         assert_eq!(windows.map_key(0xe3, true, false).unwrap().usage, 0xe2);
         assert_eq!(windows.map_key(0xe3, false, false).unwrap().usage, 0xe2);
         assert_eq!(windows.map_key(0xe2, true, false).unwrap().usage, 0xe3);
@@ -350,12 +327,8 @@ mod tests {
     #[test]
     fn same_platform_keeps_native_usages() {
         let config = KeyMappingConfig::default();
-        let mut mapper = KeyMapper::new(
-            &config,
-            InputPlatform::Macos,
-            InputPlatform::Macos,
-        )
-        .unwrap();
+        let mut mapper =
+            KeyMapper::new(&config, InputPlatform::Macos, InputPlatform::Macos).unwrap();
         assert_eq!(mapper.map_key(0xe3, true, false).unwrap().usage, 0xe3);
     }
 
@@ -366,12 +339,8 @@ mod tests {
         config
             .macos_to_windows
             .insert("a".to_string(), "b".to_string());
-        let mut mapper = KeyMapper::new(
-            &config,
-            InputPlatform::Macos,
-            InputPlatform::Windows,
-        )
-        .unwrap();
+        let mut mapper =
+            KeyMapper::new(&config, InputPlatform::Macos, InputPlatform::Windows).unwrap();
         assert_eq!(mapper.map_key(0x04, true, false).unwrap().usage, 0x05);
         assert!(mapper.map_key(0x05, true, false).is_none());
         assert!(mapper.map_key(0x04, false, false).is_none());
@@ -413,12 +382,8 @@ mod tests {
             .insert("c".to_string(), "b".to_string());
         assert!(validate_key_mapping(&config).is_ok());
 
-        let mut mapper = KeyMapper::new(
-            &config,
-            InputPlatform::Macos,
-            InputPlatform::Windows,
-        )
-        .unwrap();
+        let mut mapper =
+            KeyMapper::new(&config, InputPlatform::Macos, InputPlatform::Windows).unwrap();
         // 先按下的来源键发出目标键, 第二个来源键在目标已按下时被压制.
         assert_eq!(mapper.map_key(0x04, true, false).unwrap().usage, 0x05);
         assert!(mapper.map_key(0x06, true, false).is_none());
@@ -437,12 +402,8 @@ mod tests {
     #[test]
     fn mapped_modifiers_follow_press_and_release_state() {
         let config = KeyMappingConfig::default();
-        let mut mapper = KeyMapper::new(
-            &config,
-            InputPlatform::Macos,
-            InputPlatform::Windows,
-        )
-        .unwrap();
+        let mut mapper =
+            KeyMapper::new(&config, InputPlatform::Macos, InputPlatform::Windows).unwrap();
         let down = mapper.map_key(0xe3, true, false).unwrap();
         assert_eq!(down.usage, 0xe2);
         assert_eq!(down.modifiers, ModifierMask::ALT);
