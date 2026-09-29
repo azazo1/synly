@@ -9,6 +9,7 @@ import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
@@ -18,6 +19,8 @@ import com.azazo1.synly.MainActivity
 import com.azazo1.synly.R
 import com.azazo1.synly.core.SynlyEngine
 import com.azazo1.synly.core.SynlyLog
+import java.net.Inet4Address
+import java.net.NetworkInterface
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -25,6 +28,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import uniffi.synly_core.FfiClientState
 
 class ClipboardSyncService : android.app.Service() {
@@ -33,7 +37,24 @@ class ClipboardSyncService : android.app.Service() {
         private const val CHANNEL_ID = "synly_sync"
         private const val NOTIFICATION_ID = 1
         private const val NOTIFICATION_REFRESH_INTERVAL_MS = 60_000L
-        private const val CELLULAR_EXIT_DELAY_MS = 30_000L
+        private const val WIFI_LOST_EXIT_DELAY_MS = 30_000L
+
+        // 蜂窝数据 (含 464xlat) 与隧道的接口名, 这些不算可用的局域网.
+        private val NON_LOCAL_INTERFACE_PREFIXES = listOf(
+            "rmnet",
+            "ccmni",
+            "pdp",
+            "wwan",
+            "clat",
+            "v4-",
+            "tun",
+            "sit",
+            "ip6tnl",
+            "dummy",
+        )
+
+        // 热点等共享模式的接口名, 没有客户端接入时可能尚未配置 IPv4 地址.
+        private val AP_INTERFACE_PREFIXES = listOf("ap", "softap", "swlan", "wlan1")
 
         fun start(context: Context) {
             ContextCompat.startForegroundService(
@@ -52,7 +73,7 @@ class ClipboardSyncService : android.app.Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var notificationJob: Job? = null
     private var notificationRefreshJob: Job? = null
-    private var cellularExitJob: Job? = null
+    private var wifiExitJob: Job? = null
     private var connectivityManager: ConnectivityManager? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var lastNotificationState: FfiClientState? = null
@@ -73,7 +94,7 @@ class ClipboardSyncService : android.app.Service() {
             buildNotification(currentUi.state, currentUi.connectedDevice, currentUi.targetLabel),
         )
         acquireMulticastLock()
-        monitorDefaultNetwork()
+        monitorWifiAvailability()
         if (notificationJob == null) {
             notificationJob = scope.launch {
                 SynlyEngine.uiState.collect { ui ->
@@ -98,7 +119,7 @@ class ClipboardSyncService : android.app.Service() {
 
     override fun onDestroy() {
         stopForeground(STOP_FOREGROUND_REMOVE)
-        stopMonitoringDefaultNetwork()
+        stopMonitoringWifi()
         releaseMulticastLock()
         notificationJob?.cancel()
         notificationJob = null
@@ -193,78 +214,105 @@ class ClipboardSyncService : android.app.Service() {
         )
     }
 
-    private fun monitorDefaultNetwork() {
+    private fun monitorWifiAvailability() {
         if (networkCallback != null) return
         val manager = getSystemService(ConnectivityManager::class.java) ?: return
         connectivityManager = manager
         val callback = object : ConnectivityManager.NetworkCallback() {
-            override fun onCapabilitiesChanged(
-                network: Network,
-                networkCapabilities: NetworkCapabilities,
-            ) {
-                scope.launch { evaluateDefaultNetwork(networkCapabilities) }
+            override fun onAvailable(network: Network) {
+                scope.launch { evaluateWifiAvailability() }
             }
 
             override fun onLost(network: Network) {
-                scope.launch { refreshDefaultNetwork() }
+                scope.launch { evaluateWifiAvailability() }
             }
         }
-        runCatching {
-            manager.registerDefaultNetworkCallback(callback)
-            networkCallback = callback
-            refreshDefaultNetwork()
-        }.onFailure {
-            connectivityManager = null
-            SynlyLog.w(TAG, "注册默认网络监听失败", it)
-        }
+        val request = NetworkRequest.Builder()
+            .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+            .build()
+        runCatching { manager.registerNetworkCallback(request, callback) }
+            .onSuccess {
+                networkCallback = callback
+                scope.launch { evaluateWifiAvailability() }
+            }
+            .onFailure {
+                connectivityManager = null
+                SynlyLog.w(TAG, "注册 Wi-Fi 网络监听失败", it)
+            }
     }
 
-    private fun refreshDefaultNetwork() {
-        val manager = connectivityManager ?: return
-        val capabilities = manager.activeNetwork?.let(manager::getNetworkCapabilities)
-        evaluateDefaultNetwork(capabilities)
-    }
-
-    private fun evaluateDefaultNetwork(capabilities: NetworkCapabilities?) {
-        if (capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true) {
-            scheduleCellularExit()
+    private suspend fun evaluateWifiAvailability() {
+        // 监听不可用时无法判断 Wi-Fi 状态, 保持后台同步而不是误判退出.
+        if (networkCallback == null) return
+        if (hasWifiSideNetwork()) {
+            cancelWifiExit()
         } else {
-            cancelCellularExit()
+            scheduleWifiExit()
         }
     }
 
-    private fun scheduleCellularExit() {
-        if (cellularExitJob != null) return
-        SynlyLog.i(TAG, "检测到移动数据, ${CELLULAR_EXIT_DELAY_MS / 1000} 秒后停止后台同步")
-        cellularExitJob = scope.launch {
-            delay(CELLULAR_EXIT_DELAY_MS)
-            if (isDefaultNetworkCellular()) {
-                SynlyLog.i(TAG, "移动数据持续存在, 停止后台同步服务")
-                cellularExitJob = null
-                stopSelf()
+    private fun scheduleWifiExit() {
+        if (wifiExitJob != null) return
+        SynlyLog.i(TAG, "没有 Wi-Fi 与热点, ${WIFI_LOST_EXIT_DELAY_MS / 1000} 秒后停止后台同步")
+        wifiExitJob = scope.launch {
+            delay(WIFI_LOST_EXIT_DELAY_MS)
+            wifiExitJob = null
+            if (hasWifiSideNetwork()) {
+                SynlyLog.i(TAG, "已在限期内恢复 Wi-Fi 或热点, 继续后台同步")
             } else {
-                cellularExitJob = null
+                SynlyLog.i(TAG, "仍没有 Wi-Fi 与热点, 停止后台同步服务")
+                stopSelf()
             }
         }
     }
 
-    private fun cancelCellularExit() {
-        cellularExitJob?.let {
+    private fun cancelWifiExit() {
+        wifiExitJob?.let {
             it.cancel()
-            cellularExitJob = null
-            SynlyLog.i(TAG, "默认网络已恢复为非移动数据, 取消自动退出")
+            wifiExitJob = null
+            SynlyLog.i(TAG, "已有 Wi-Fi 或热点, 取消自动退出")
         }
     }
 
-    private fun isDefaultNetworkCellular(): Boolean {
+    // Wi-Fi 连接与热点都能承载局域网同步, 其中热点不会以 TRANSPORT_WIFI 网络的形式出现,
+    // 所以再按本机接口判断一次.
+    private suspend fun hasWifiSideNetwork(): Boolean {
         val manager = connectivityManager ?: return false
-        val capabilities = manager.activeNetwork?.let(manager::getNetworkCapabilities)
-        return capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) == true
+        val wifiNetwork = manager.allNetworks.any { network ->
+            manager.getNetworkCapabilities(network)
+                ?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true
+        }
+        return wifiNetwork || hasLocalInterface()
     }
 
-    private fun stopMonitoringDefaultNetwork() {
-        cellularExitJob?.cancel()
-        cellularExitJob = null
+    private suspend fun hasLocalInterface(): Boolean = withContext(Dispatchers.IO) {
+        val interfaces = runCatching { NetworkInterface.getNetworkInterfaces() }.getOrNull()
+            ?: return@withContext false
+        while (interfaces.hasMoreElements()) {
+            if (hasLocalAddress(interfaces.nextElement())) return@withContext true
+        }
+        false
+    }
+
+    private fun hasLocalAddress(networkInterface: NetworkInterface): Boolean {
+        val name = networkInterface.name ?: return false
+        val active = runCatching {
+            networkInterface.isUp && !networkInterface.isLoopback
+        }.getOrDefault(false)
+        if (!active) return false
+        if (NON_LOCAL_INTERFACE_PREFIXES.any { name.startsWith(it) }) return false
+        if (AP_INTERFACE_PREFIXES.any { name.startsWith(it) }) return true
+        val addresses = runCatching { networkInterface.inetAddresses }.getOrNull() ?: return false
+        while (addresses.hasMoreElements()) {
+            val address = addresses.nextElement()
+            if (address is Inet4Address && !address.isLoopbackAddress) return true
+        }
+        return false
+    }
+
+    private fun stopMonitoringWifi() {
+        wifiExitJob?.cancel()
+        wifiExitJob = null
         val manager = connectivityManager
         val callback = networkCallback
         if (manager != null && callback != null) {
