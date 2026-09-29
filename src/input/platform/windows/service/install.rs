@@ -206,15 +206,28 @@ pub fn restart() -> Result<()> {
         return Err(error).context("打开 Synly 输入服务失败");
     }
     let service = ServiceHandle(service);
-    if matches!(query_current_state(service.0)?, ServiceStatus::Running) {
+    let was_running = matches!(query_current_state(service.0)?, ServiceStatus::Running);
+    if was_running {
         stop_service(service.0)?;
     }
-    let started = unsafe { StartServiceW(service.0, 0, std::ptr::null()) };
-    if started == 0 {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let started = unsafe { StartServiceW(service.0, 0, std::ptr::null()) };
+        if started != 0 {
+            break;
+        }
         let error = std::io::Error::last_os_error();
         if error.raw_os_error() != Some(ERROR_SERVICE_ALREADY_RUNNING as i32) {
             return Err(error).context("启动 Synly 输入服务失败");
         }
+        if !was_running {
+            break;
+        }
+        // 服务报告已停止时旧进程可能还没退净, 不能把仍在运行的旧映像当成重启成功.
+        if Instant::now() >= deadline {
+            bail!("等待旧 Synly 输入服务退出超时");
+        }
+        std::thread::sleep(Duration::from_millis(500));
     }
     mark_service_seen_installed();
     tracing::info!("Synly 输入服务已重启");

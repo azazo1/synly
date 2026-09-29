@@ -40,10 +40,6 @@ pub fn run(config: SynlyConfig, force_start: bool) -> Result<()> {
         single_instance::SingleInstance::Primary(listener) => listener,
         single_instance::SingleInstance::ActivatedExisting => return Ok(()),
     };
-    #[cfg(windows)]
-    if config.runtime.input.elevate_on_start {
-        crate::windows_input_agent::request_startup_elevation()?;
-    }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)
         .enable_all()
@@ -151,6 +147,12 @@ pub fn run(config: SynlyConfig, force_start: bool) -> Result<()> {
         });
         Some(timer)
     };
+
+    #[cfg(windows)]
+    if config.runtime.input.elevate_on_start {
+        tracing::info!("配置要求启动 Windows 输入管理员代理, 将在后台申请授权");
+        send_command(&handle.commands(), AppCommand::RequestInputElevation);
+    }
 
     slint::run_event_loop_until_quit().context("Slint event loop failed")?;
     save_window_state(&window, &handle.commands());

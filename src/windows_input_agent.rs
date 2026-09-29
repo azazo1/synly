@@ -27,9 +27,13 @@ fn ensure_input_service_current() {
             tracing::info!("输入服务已跟随更新重启");
             report_backup_cleanup();
         }
-        Ok(false) => tracing::warn!("用户取消了输入服务重启, 继续沿用当前服务"),
+        Ok(false) => {
+            SERVICE_ALIGNED.store(false, Ordering::Release);
+            tracing::warn!("用户取消了输入服务重启, 下次手动授权时可重试");
+        }
         Err(error) => {
-            tracing::warn!(error = %format!("{error:#}"), "重启输入服务失败, 继续沿用当前服务")
+            SERVICE_ALIGNED.store(false, Ordering::Release);
+            tracing::warn!(error = %format!("{error:#}"), "重启输入服务失败, 下次手动授权时可重试")
         }
     }
 }

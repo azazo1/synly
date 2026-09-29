@@ -61,6 +61,8 @@ pub struct AppSupervisor {
     pending_responses: HashMap<Uuid, oneshot::Sender<crate::runtime_control::InteractionResponse>>,
     runtime_active_session: Option<Uuid>,
     input_permission_monitor: Option<JoinHandle<()>>,
+    #[cfg(windows)]
+    input_elevation_pending: bool,
     discovered_peers: Vec<DiscoveredPeer>,
 }
 
@@ -80,6 +82,8 @@ enum InternalEvent {
     },
     #[cfg_attr(not(windows), allow(dead_code))]
     InputElevation(bool),
+    #[cfg(windows)]
+    InputElevationRequest(std::result::Result<(), String>),
     #[cfg_attr(not(windows), allow(dead_code))]
     RefreshInputServiceStatus,
     Runtime {
@@ -122,6 +126,8 @@ impl AppSupervisor {
                 pending_responses: HashMap::new(),
                 runtime_active_session: None,
                 input_permission_monitor: None,
+                #[cfg(windows)]
+                input_elevation_pending: false,
                 discovered_peers: Vec::new(),
             },
             AppSupervisorHandle {
@@ -394,15 +400,15 @@ impl AppSupervisor {
             AppCommand::RequestInputElevation => {
                 #[cfg(windows)]
                 {
-                    match crate::windows_input_agent::request_elevation() {
-                        Ok(()) => {
-                            self.snapshot.input_elevation_ready = true;
-                            self.restart_input_backend_if_active();
-                        }
-                        Err(error) => self.set_error(error.to_string()),
+                    if !self.input_elevation_pending {
+                        self.input_elevation_pending = true;
+                        let internal = self.internal_tx.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let result = crate::windows_input_agent::request_elevation()
+                                .map_err(|error| format!("{error:#}"));
+                            let _ = internal.send(InternalEvent::InputElevationRequest(result));
+                        });
                     }
-                    self.refresh_input_service_status();
-                    self.publish();
                 }
                 #[cfg(target_os = "macos")]
                 {
@@ -496,6 +502,22 @@ impl AppSupervisor {
                 }
                 self.snapshot.input_elevation_ready = ready;
                 self.restart_input_backend_if_active();
+                self.publish();
+            }
+            #[cfg(windows)]
+            InternalEvent::InputElevationRequest(result) => {
+                self.input_elevation_pending = false;
+                match result {
+                    Ok(()) => {
+                        self.snapshot.input_elevation_ready = true;
+                        self.restart_input_backend_if_active();
+                    }
+                    Err(error) => {
+                        tracing::error!(error, "Windows 输入管理员代理启动失败");
+                        self.set_error(error);
+                    }
+                }
+                self.refresh_input_service_status();
                 self.publish();
             }
             InternalEvent::RefreshInputServiceStatus => {
