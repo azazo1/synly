@@ -562,6 +562,10 @@ async fn handle_agent_request(
             agent_backend(runtime)?.inject_wheel(x, y)?;
             Ok(AgentResponse::Ok)
         }
+        AgentRequest::InjectPreciseWheel { x, y } => {
+            agent_backend(runtime)?.inject_precise_wheel(x, y)?;
+            Ok(AgentResponse::Ok)
+        }
         AgentRequest::ReleaseAll => {
             agent_backend(runtime)?.release_all()?;
             Ok(AgentResponse::Ok)

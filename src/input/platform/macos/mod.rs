@@ -71,6 +71,9 @@ const FIELD_MOUSE_DELTA_Y: u32 = 5;
 const FIELD_SCROLL_DELTA_Y: u32 = 11;
 const FIELD_SCROLL_DELTA_X: u32 = 12;
 const FIELD_SCROLL_IS_CONTINUOUS: u32 = 88;
+// kCGScrollWheelEventPointDeltaAxis1/2: 像素级滚动增量, 触控板连续滚动时有效.
+const FIELD_SCROLL_POINT_DELTA_Y: u32 = 96;
+const FIELD_SCROLL_POINT_DELTA_X: u32 = 97;
 const FIELD_KEY_AUTOREPEAT: u32 = 8;
 const FIELD_KEY_CODE: u32 = 9;
 const FIELD_SOURCE_UNIX_PROCESS_ID: u32 = 41;
@@ -394,9 +397,18 @@ unsafe extern "C" fn event_callback(
                 CGEventGetIntegerValueField(event, FIELD_SCROLL_IS_CONTINUOUS)
             });
             if active {
-                state
-                    .context
-                    .emit_reliable(NativeEvent::Wheel { x, y, source });
+                let pixels = (source == ScrollSource::Trackpad).then(|| unsafe {
+                    (
+                        CGEventGetIntegerValueField(event, FIELD_SCROLL_POINT_DELTA_X) as i32,
+                        CGEventGetIntegerValueField(event, FIELD_SCROLL_POINT_DELTA_Y) as i32,
+                    )
+                });
+                state.context.emit_reliable(NativeEvent::Wheel {
+                    x,
+                    y,
+                    source,
+                    pixels,
+                });
                 ptr::null_mut()
             } else {
                 event

@@ -483,6 +483,14 @@ async fn run_mock_peer(
                         grid_offset.add_wheel(x, y, remote_platform);
                         last_event = format!("滚轮 x={x}, y={y}");
                     }
+                    InputMessage::PreciseWheel {
+                        generation: incoming_generation,
+                        x,
+                        y,
+                    } if active && incoming_generation == generation => {
+                        grid_offset.add_precise_wheel(x, y, remote_platform);
+                        last_event = format!("高精度滚轮 x={x}, y={y}");
+                    }
                     InputMessage::Heartbeat { .. } => {}
                     InputMessage::SecureDesktop { active } => {
                         last_event = if active {
@@ -500,7 +508,8 @@ async fn run_mock_peer(
                     | InputMessage::Key { .. }
                     | InputMessage::Button { .. }
                     | InputMessage::Motion { .. }
-                    | InputMessage::Wheel { .. } => {}
+                    | InputMessage::Wheel { .. }
+                    | InputMessage::PreciseWheel { .. } => {}
                 }
             }
             _ = heartbeat.tick() => {
@@ -670,6 +679,13 @@ impl GridOffset {
         let (delta_x, delta_y) = wheel_to_grid_delta(x, y, remote_platform);
         self.x += delta_x;
         self.y += delta_y;
+    }
+
+    /// 高精度滚轮以 120 为一格.
+    fn add_precise_wheel(&mut self, x: i32, y: i32, remote_platform: InputPlatform) {
+        let scale = grid_pixels_per_wheel_unit(remote_platform) / 120.0;
+        self.x += x as f32 * scale;
+        self.y += y as f32 * scale;
     }
 }
 

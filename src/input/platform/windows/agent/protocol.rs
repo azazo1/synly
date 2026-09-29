@@ -44,6 +44,10 @@ pub(super) enum AgentRequest {
         x: i32,
         y: i32,
     },
+    InjectPreciseWheel {
+        x: i32,
+        y: i32,
+    },
     ReleaseAll,
 }
 
@@ -63,12 +67,16 @@ impl AgentRequest {
             Self::InjectCursor(_) => "InjectCursor",
             Self::InjectMotion { .. } => "InjectMotion",
             Self::InjectWheel { .. } => "InjectWheel",
+            Self::InjectPreciseWheel { .. } => "InjectPreciseWheel",
             Self::ReleaseAll => "ReleaseAll",
         }
     }
 
     pub(super) fn requires_cursor_ordering(&self) -> bool {
-        matches!(self, Self::InjectButton { .. } | Self::InjectWheel { .. })
+        matches!(
+            self,
+            Self::InjectButton { .. } | Self::InjectWheel { .. } | Self::InjectPreciseWheel { .. }
+        )
     }
 }
 

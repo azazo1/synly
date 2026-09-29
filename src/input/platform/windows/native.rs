@@ -858,6 +858,7 @@ fn handle_mouse_wheel(state: &WindowsState, delta: Point, source: ScrollSource) 
             x: delta.x,
             y: delta.y,
             source,
+            pixels: None,
         });
     }
 }
@@ -1088,6 +1089,17 @@ impl InputBackend for WindowsBackend {
                 x.saturating_mul(WHEEL_DELTA) as u32,
                 MOUSEEVENTF_HWHEEL,
             )?;
+        }
+        Ok(())
+    }
+
+    fn inject_precise_wheel(&self, x: i32, y: i32) -> Result<()> {
+        // mouseData 是有符号值按 DWORD 传递, 非 120 整数倍即高精度滚动.
+        if y != 0 {
+            send_mouse(0, 0, y as u32, MOUSEEVENTF_WHEEL)?;
+        }
+        if x != 0 {
+            send_mouse(0, 0, x as u32, MOUSEEVENTF_HWHEEL)?;
         }
         Ok(())
     }

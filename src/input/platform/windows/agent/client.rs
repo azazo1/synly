@@ -577,6 +577,11 @@ impl InputBackend for AgentBackend {
         Ok(())
     }
 
+    fn inject_precise_wheel(&self, x: i32, y: i32) -> Result<()> {
+        self.request(AgentRequest::InjectPreciseWheel { x, y })?;
+        Ok(())
+    }
+
     fn release_all(&self) -> Result<()> {
         self.request(AgentRequest::ReleaseAll)?;
         Ok(())

@@ -30,6 +30,8 @@ pub enum NativeEvent {
         x: i32,
         y: i32,
         source: ScrollSource,
+        /// 触控板像素级增量 (x, y), 仅 macOS 连续滚动提供, 用于高精度滚动转发.
+        pixels: Option<(i32, i32)>,
     },
     Emergency,
     SecureDesktop {
@@ -91,6 +93,10 @@ pub trait InputBackend: Send + Sync {
         bail!("相对光标注入在当前平台不可用")
     }
     fn inject_wheel(&self, x: i32, y: i32) -> Result<()>;
+    /// 按 Windows 高精度滚轮单位注入, 120 为一格, 允许非整格值.
+    fn inject_precise_wheel(&self, _x: i32, _y: i32) -> Result<()> {
+        bail!("高精度滚轮注入在当前平台不可用")
+    }
     fn release_all(&self) -> Result<()>;
 }
 

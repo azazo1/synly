@@ -68,6 +68,13 @@ pub enum InputMessage {
     SecureDesktop {
         active: bool,
     },
+    /// Windows 高精度滚轮, 单位与 mouseData 相同 (120 为一格), 用于转发 macOS 触控板像素滚动.
+    /// 放在末尾避免改变已有变体的 bincode 编号.
+    PreciseWheel {
+        generation: u64,
+        x: i32,
+        y: i32,
+    },
 }
 
 pub async fn write_message<W>(writer: &mut W, message: &InputMessage) -> Result<()>

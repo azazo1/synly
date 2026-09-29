@@ -2,7 +2,7 @@ use super::channel::{InputChannelOffer, InputHostChannel};
 use super::mapping::KeyMapper;
 use super::platform::{self, NativeEvent};
 use super::protocol::{InputMessage, read_message, write_message};
-use super::scroll::ScrollTransformer;
+use super::scroll::{PreciseWheelConverter, ScrollTransformer};
 use super::{
     DisplayRect, Hotkey, InputMode, InputPlatform, KeyMappingConfig, KeySnapshot, LocalInputRole,
     ScreenEdge,
@@ -589,6 +589,7 @@ pub(super) async fn run_sender_with_activity(
         options.native_scroll_macos_to_windows,
         options.native_scroll_windows_to_macos,
     );
+    let mut precise_wheel = PreciseWheelConverter::default();
 
     tracing::info!(
         edge = ?source_edge,
@@ -710,21 +711,41 @@ pub(super) async fn run_sender_with_activity(
                             )?;
                         }
                     }
-                    NativeEvent::Wheel { x, y, source } if control.active => {
-                        let (x, y) = scroll_transformer.transform(
-                            x,
-                            y,
-                            source,
-                            local_platform,
-                            remote_platform,
-                            options.reverse_mouse_wheel,
-                            options.reverse_trackpad,
-                        );
-                        enqueue_message(tx, InputMessage::Wheel {
-                            generation: control.generation,
-                            x,
-                            y,
-                        })?;
+                    NativeEvent::Wheel { x, y, source, pixels } if control.active => {
+                        let transform = |x, y| {
+                            scroll_transformer.transform(
+                                x,
+                                y,
+                                source,
+                                local_platform,
+                                remote_platform,
+                                options.reverse_mouse_wheel,
+                                options.reverse_trackpad,
+                            )
+                        };
+                        // macOS 触控板 -> Windows: 转发像素级增量为高精度滚轮, 其余保持按行/格.
+                        let precise = pixels.filter(|_| {
+                            local_platform == InputPlatform::Macos
+                                && remote_platform == InputPlatform::Windows
+                        });
+                        if let Some((pixel_x, pixel_y)) = precise {
+                            let (pixel_x, pixel_y) = transform(pixel_x, pixel_y);
+                            let (x, y) = precise_wheel.convert(pixel_x, pixel_y);
+                            if x != 0 || y != 0 {
+                                enqueue_message(tx, InputMessage::PreciseWheel {
+                                    generation: control.generation,
+                                    x,
+                                    y,
+                                })?;
+                            }
+                        } else {
+                            let (x, y) = transform(x, y);
+                            enqueue_message(tx, InputMessage::Wheel {
+                                generation: control.generation,
+                                x,
+                                y,
+                            })?;
+                        }
                     }
                     NativeEvent::ReliableQueueOverflow => {
                         if control.active {
@@ -1287,6 +1308,10 @@ pub(super) async fn run_receiver(
                     InputMessage::Wheel { generation: incoming_generation, x, y }
                         if active && incoming_generation == generation => {
                             platform.backend.inject_wheel(x, y)?;
+                    }
+                    InputMessage::PreciseWheel { generation: incoming_generation, x, y }
+                        if active && incoming_generation == generation => {
+                            platform.backend.inject_precise_wheel(x, y)?;
                     }
                     InputMessage::Motion { generation: incoming_generation, dx, dy }
                         if active && incoming_generation == generation => {
