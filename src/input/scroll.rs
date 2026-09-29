@@ -76,9 +76,9 @@ impl ScrollTransformer {
     }
 }
 
-/// Chromium 在 Windows 上一格 (120) 约滚动 100 逻辑像素, 按 120/100 = 6/5 换算 macOS 像素增量,
-/// 使浏览器内滚动距离与 macOS 本机接近. 用整数分子分母避免浮点累计误差.
-const WHEEL_UNITS_NUMERATOR: i64 = 6;
+/// 以 Chromium 在 Windows 上一格 (120) 约滚动 100 逻辑像素为基准 (6/5), 实测偏慢, 再乘 1.5 倍,
+/// 即约 67 像素一格 (9/5). 用整数分子分母避免浮点累计误差.
+const WHEEL_UNITS_NUMERATOR: i64 = 9;
 const WHEEL_UNITS_DENOMINATOR: i64 = 5;
 
 /// 把 macOS 触控板像素增量换算为 Windows 高精度滚轮单位, 保留余量避免慢速滚动丢失.
@@ -270,18 +270,18 @@ mod tests {
     #[test]
     fn precise_wheel_keeps_fraction_across_slow_events() {
         let mut converter = PreciseWheelConverter::default();
-        // 每次 1 像素 = 1.2 单位, 5 次后累计 6 单位, 不应因取整丢失.
+        // 每次 1 像素 = 1.8 单位, 5 次后累计 9 单位, 不应因取整丢失.
         let total: i32 = (0..5).map(|_| converter.convert(0, 1).1).sum();
-        assert_eq!(total, 6);
+        assert_eq!(total, 9);
         let total: i32 = (0..5).map(|_| converter.convert(0, -1).1).sum();
-        assert_eq!(total, -6);
+        assert_eq!(total, -9);
     }
 
     #[test]
     fn precise_wheel_drops_remainder_on_direction_change() {
         let mut converter = PreciseWheelConverter::default();
         assert_eq!(converter.convert(0, 1), (0, 1));
-        // 残留 0.2, 反向时应清零, 反向第一下完整生效.
+        // 残留 0.8, 反向时应清零, 反向第一下完整生效.
         assert_eq!(converter.convert(0, -1), (0, -1));
     }
 
