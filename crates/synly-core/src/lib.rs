@@ -15,4 +15,3 @@ pub mod protocol;
 pub mod reconnect;
 pub mod settings;
 pub mod size;
-pub mod workspace;

@@ -6,7 +6,6 @@ use crate::input::InputMode;
 use crate::protocol::{CapabilityEpoch, RuntimeCapabilities};
 use crate::runtime_control::InteractionRequest;
 use crate::settings::{AudioMode, ClipboardMode};
-use std::path::PathBuf;
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -48,7 +47,6 @@ pub struct DiscoveredPeerView {
     pub protocol_version: u16,
     pub compatible: bool,
     pub trusted: bool,
-    pub file_mode: String,
     pub clipboard_mode: String,
     pub audio_mode: String,
     pub input_mode: String,
@@ -165,7 +163,6 @@ pub enum AppCommand {
     SetAudioMode(AudioMode),
     SetAudioLayout(crate::audio::AudioLayout),
     SetInputMode(InputMode),
-    SelectPaths(Vec<PathBuf>),
     Disconnect,
     DisconnectPeer(Uuid),
     SwitchActiveSession(Uuid),

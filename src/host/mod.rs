@@ -19,7 +19,6 @@ use crate::protocol::{
 use crate::runtime_control::{RuntimeCommand, RuntimeEvent, RuntimeLifecycle, RuntimePeerSummary};
 use crate::runtime_options::RuntimeOptions;
 use crate::settings::AudioMode;
-use crate::sync::WorkspaceSpec;
 use crate::system_notification::SystemNotifier;
 use anyhow::{Context, Result};
 use std::collections::HashMap;
@@ -34,7 +33,7 @@ use uuid::Uuid;
 const MAX_HOST_SESSIONS: usize = 8;
 const PROMOTION_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
-/// 会话能力档位: 全量会话承载文件/音频/输入, 仅剪贴板会话只同步剪贴板.
+/// 会话能力档位: 全量会话承载剪贴板/音频/输入, 仅剪贴板会话只同步剪贴板.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SessionCapabilityProfile {
     Full,
@@ -71,7 +70,6 @@ pub(crate) fn runtime_options_for_profile(
 ) -> RuntimeOptions {
     let mut filtered = options.clone();
     if profile == SessionCapabilityProfile::ClipboardOnly {
-        filtered.workspace = WorkspaceSpec::for_off();
         filtered.audio_mode = AudioMode::Off;
         filtered.input_mode = input::InputMode::Off;
     }
@@ -148,7 +146,6 @@ pub(crate) async fn run_host_runtime(
         protocol_version: PROTOCOL_VERSION,
         port,
         device: device.clone(),
-        file_sync_mode: options.file_sync_mode,
         clipboard_mode: initial_capabilities.clipboard_mode,
         audio_mode: initial_capabilities.audio_mode,
         input_mode: initial_capabilities.input_mode,

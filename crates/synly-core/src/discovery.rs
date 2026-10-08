@@ -1,6 +1,6 @@
 use crate::device::{DeviceConfig, DiscoveryConfig, LndDiscoveryConfig};
 use crate::input::InputMode;
-use crate::settings::{AudioMode, ClipboardMode, FileSyncMode};
+use crate::settings::{AudioMode, ClipboardMode};
 use anyhow::{Context, Result, anyhow, bail};
 use if_addrs::{IfAddr, get_if_addrs};
 use lnd::{AnnounceHandle, AnnounceSpec, DiscoveredNode, DiscoveryFilter, LndClient};
@@ -27,7 +27,6 @@ pub struct Advertisement {
     pub protocol_version: u16,
     pub port: u16,
     pub device: DeviceConfig,
-    pub file_sync_mode: FileSyncMode,
     pub clipboard_mode: ClipboardMode,
     pub audio_mode: AudioMode,
     pub input_mode: InputMode,
@@ -96,7 +95,6 @@ pub struct DiscoveredPeer {
     pub instance_name: Option<String>,
     pub device_id: String,
     pub protocol_version: u16,
-    pub file_sync_mode: FileSyncMode,
     pub clipboard_mode: ClipboardMode,
     pub audio_mode: AudioMode,
     pub input_mode: InputMode,
@@ -118,10 +116,9 @@ impl DiscoveredPeer {
             .collect::<Vec<_>>()
             .join(", ");
         format!(
-            "{} ({})  文件:{}  剪贴板:{}  音频:{}  输入:{}  来源:{}  {}",
+            "{} ({})  剪贴板:{}  音频:{}  输入:{}  来源:{}  {}",
             self.display_name(),
             &self.device_id[..8.min(self.device_id.len())],
-            self.file_sync_mode.label(),
             self.clipboard_mode.label(),
             self.audio_mode.label(),
             self.input_mode.label(),
@@ -606,10 +603,6 @@ fn advertisement_metadata(advertisement: &Advertisement) -> BTreeMap<String, Str
             advertisement.protocol_version.to_string(),
         ),
         (
-            "fs_mode".to_string(),
-            advertisement.file_sync_mode.as_wire().to_string(),
-        ),
-        (
             "clipboard_mode".to_string(),
             advertisement.clipboard_mode.as_wire().to_string(),
         ),
@@ -738,9 +731,6 @@ fn normalize_lnd_config(config: &LndDiscoveryConfig) -> Result<LndDiscoveryConfi
 }
 
 fn discovered_peer_from_mdns(info: &mdns_sd::ResolvedService) -> Option<DiscoveredPeer> {
-    let file_sync_mode = info
-        .get_property_val_str("fs_mode")
-        .and_then(FileSyncMode::from_wire)?;
     let clipboard_mode = info
         .get_property_val_str("clipboard_mode")
         .and_then(ClipboardMode::from_wire)?;
@@ -772,7 +762,6 @@ fn discovered_peer_from_mdns(info: &mdns_sd::ResolvedService) -> Option<Discover
         instance_name,
         device_id,
         protocol_version,
-        file_sync_mode,
         clipboard_mode,
         audio_mode,
         input_mode,
@@ -800,9 +789,6 @@ fn discovered_peer_from_lnd(node: &DiscoveredNode) -> Option<DiscoveredPeer> {
         .get("protocol_version")
         .and_then(|value| value.parse().ok())
         .unwrap_or_default();
-    let file_sync_mode = metadata
-        .get("fs_mode")
-        .and_then(|value| FileSyncMode::from_wire(value))?;
     let clipboard_mode = metadata
         .get("clipboard_mode")
         .and_then(|value| ClipboardMode::from_wire(value))?;
@@ -838,7 +824,6 @@ fn discovered_peer_from_lnd(node: &DiscoveredNode) -> Option<DiscoveredPeer> {
         instance_name,
         device_id,
         protocol_version,
-        file_sync_mode,
         clipboard_mode,
         audio_mode,
         input_mode,
@@ -998,7 +983,7 @@ mod tests {
     };
     use crate::device::{DeviceConfig, LndDiscoveryConfig};
     use crate::input::InputMode;
-    use crate::settings::{AudioMode, ClipboardMode, FileSyncMode};
+    use crate::settings::{AudioMode, ClipboardMode};
     use lnd::{
         DiscoveredNode, DiscoveryFilter, InMemoryRegistry, LeaseInfo, LndClient, ServerConfig,
         build_router,
@@ -1225,7 +1210,6 @@ mod tests {
 
         assert_eq!(peer.device_id, advertisement.device.device_id.to_string());
         assert_eq!(peer.instance_name.as_deref(), Some("worker-a"));
-        assert_eq!(peer.file_sync_mode, FileSyncMode::Both);
         assert_eq!(peer.clipboard_mode, ClipboardMode::Receive);
         assert_eq!(peer.audio_mode, AudioMode::Send);
         assert_eq!(peer.input_mode, InputMode::Receive);
@@ -1246,7 +1230,6 @@ mod tests {
                 identity_private_key: String::new(),
                 identity_public_key: String::new(),
             },
-            file_sync_mode: FileSyncMode::Both,
             clipboard_mode: ClipboardMode::Receive,
             audio_mode: AudioMode::Send,
             input_mode: InputMode::Receive,
@@ -1261,7 +1244,6 @@ mod tests {
             instance_name: Some("worker-a".to_string()),
             device_id: Uuid::nil().to_string(),
             protocol_version: crate::protocol::PROTOCOL_VERSION,
-            file_sync_mode: FileSyncMode::Both,
             clipboard_mode: ClipboardMode::Off,
             audio_mode: AudioMode::Off,
             input_mode: InputMode::Off,

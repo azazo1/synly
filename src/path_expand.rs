@@ -3,10 +3,6 @@ use std::borrow::Cow;
 use std::env;
 use std::path::PathBuf;
 
-pub fn expand_path_string(raw: &str) -> Result<PathBuf> {
-    expand_with(raw, resolve_required_env_var)
-}
-
 pub fn expand_config_path_string(raw: &str) -> Result<PathBuf> {
     expand_with(raw, resolve_env_var_or_empty)
 }
@@ -31,10 +27,6 @@ where
     .map_err(|err| err.cause)?;
 
     Ok(PathBuf::from(expanded.into_owned()))
-}
-
-fn resolve_required_env_var(name: &str) -> Result<String> {
-    env::var(name).with_context(|| format!("环境变量 `{name}` 未定义"))
 }
 
 fn resolve_env_var_or_empty(name: &str) -> Result<String> {
@@ -111,19 +103,19 @@ fn normalize_percent_env_vars(raw: &str) -> Cow<'_, str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{expand_config_path_string, expand_path_string};
+    use super::expand_config_path_string;
     use std::env;
     use std::path::PathBuf;
 
     #[test]
     fn expands_shell_style_env_var() {
-        let path = expand_path_string("$PATH").unwrap();
+        let path = expand_config_path_string("$PATH").unwrap();
         assert_eq!(path, PathBuf::from(env::var("PATH").unwrap()));
     }
 
     #[test]
     fn expands_braced_env_var() {
-        let path = expand_path_string("${PATH}/bin").unwrap();
+        let path = expand_config_path_string("${PATH}/bin").unwrap();
         assert_eq!(
             path,
             PathBuf::from(format!("{}/bin", env::var("PATH").unwrap()))
@@ -132,7 +124,7 @@ mod tests {
 
     #[test]
     fn expands_percent_env_var_when_closed() {
-        let path = expand_path_string("%PATH%/bin").unwrap();
+        let path = expand_config_path_string("%PATH%/bin").unwrap();
         assert_eq!(
             path,
             PathBuf::from(format!("{}/bin", env::var("PATH").unwrap()))
@@ -144,7 +136,7 @@ mod tests {
         let home = env::var("HOME")
             .or_else(|_| env::var("USERPROFILE"))
             .expect("home-like env var should exist during tests");
-        let path = expand_path_string("~/demo").unwrap();
+        let path = expand_config_path_string("~/demo").unwrap();
         assert_eq!(path, PathBuf::from(format!("{home}/demo")));
     }
 
@@ -153,19 +145,10 @@ mod tests {
         let home = env::var("HOME")
             .or_else(|_| env::var("USERPROFILE"))
             .expect("home-like env var should exist during tests");
-        let path = expand_path_string("~/$PATH").unwrap();
+        let path = expand_config_path_string("~/$PATH").unwrap();
         assert_eq!(
             path,
             PathBuf::from(format!("{home}/{}", env::var("PATH").unwrap()))
-        );
-    }
-
-    #[test]
-    fn cli_expansion_errors_when_env_var_is_missing() {
-        let err = expand_path_string("$SYNLY_ENV_SHOULD_NOT_EXIST_4F6CC5D6").unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("环境变量 `SYNLY_ENV_SHOULD_NOT_EXIST_4F6CC5D6` 未定义")
         );
     }
 

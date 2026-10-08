@@ -9,8 +9,7 @@ use crate::protocol::{
     TransferLimits,
 };
 use crate::reconnect::{self, AttemptVerdict, ReconnectPolicy};
-use crate::settings::{AudioMode, ClipboardMode, FileSyncMode};
-use crate::workspace::WorkspaceSummary;
+use crate::settings::{AudioMode, ClipboardMode};
 use anyhow::{Context, Result, anyhow, bail};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
@@ -86,9 +85,8 @@ pub enum ClientEvent {
     },
     Connected {
         remote: DeviceIdentity,
-        agreement: SessionAgreement,
         clipboard_agreement: SessionAgreement,
-        remote_workspace: WorkspaceSummary,
+        remote_capabilities: RuntimeCapabilities,
         remote_address: Option<Ipv4Addr>,
         remote_port: Option<u16>,
     },
@@ -514,13 +512,12 @@ async fn complete_trusted_pairing(
         Frame::Control(message) => message,
         _ => bail!("对端在可信配对中发送了非控制消息"),
     };
-    let (remote, remote_workspace, agreement, clipboard_agreement) = match reply.clone() {
+    let (remote, remote_capabilities, clipboard_agreement) = match reply.clone() {
         ControlMessage::PairDecision {
             accepted,
             message,
             server,
-            workspace,
-            agreement,
+            capabilities,
             clipboard_agreement,
             auth_method,
             server_trusts_client,
@@ -536,8 +533,7 @@ async fn complete_trusted_pairing(
                 accepted,
                 message: message.clone(),
                 server: server.clone(),
-                workspace: workspace.clone(),
-                agreement: agreement.clone(),
+                capabilities,
                 clipboard_agreement: clipboard_agreement.clone(),
                 auth_method,
                 server_trusts_client,
@@ -553,7 +549,7 @@ async fn complete_trusted_pairing(
             if !accepted {
                 bail!("{}", message);
             }
-            (server, workspace, agreement, clipboard_agreement)
+            (server, capabilities, clipboard_agreement)
         }
         ControlMessage::Error { message } => bail!("{}", message),
         other => bail!("意外的可信配对响应: {other:?}"),
@@ -561,9 +557,8 @@ async fn complete_trusted_pairing(
     Ok(AuthenticatedSession {
         stream,
         remote,
-        agreement,
         clipboard_agreement,
-        remote_workspace,
+        remote_capabilities,
     })
 }
 
@@ -734,14 +729,13 @@ async fn connect_bootstrap_inner(
         Frame::Control(message) => message,
         _ => bail!("对端在配对阶段发送了非控制消息"),
     };
-    let (remote, remote_workspace, agreement, clipboard_agreement, server_trusts_client) =
+    let (remote, remote_capabilities, clipboard_agreement, server_trusts_client) =
         match &reply {
             ControlMessage::PairDecision {
                 accepted,
                 message,
                 server,
-                workspace,
-                agreement,
+                capabilities,
                 clipboard_agreement,
                 auth_method,
                 server_trusts_client,
@@ -757,8 +751,7 @@ async fn connect_bootstrap_inner(
                 }
                 (
                     server.clone(),
-                    workspace.clone(),
-                    agreement.clone(),
+                    *capabilities,
                     clipboard_agreement.clone(),
                     *server_trusts_client,
                 )
@@ -791,9 +784,8 @@ async fn connect_bootstrap_inner(
     Ok(AuthenticatedSession {
         stream,
         remote,
-        agreement,
         clipboard_agreement,
-        remote_workspace,
+        remote_capabilities,
     })
 }
 
@@ -801,7 +793,7 @@ fn client_pair_request(config: &ClientConfig) -> PairRequestPayload {
     PairRequestPayload {
         protocol_version: PROTOCOL_VERSION,
         client: client_identity(config),
-        workspace: client_workspace_summary(config.clipboard_mode),
+        capabilities: client_capabilities(config.clipboard_mode),
         request_trust: config.request_trust,
     }
 }
@@ -821,15 +813,8 @@ pub fn client_identity(config: &ClientConfig) -> DeviceIdentity {
     }
 }
 
-pub fn client_workspace_summary(clipboard_mode: ClipboardMode) -> WorkspaceSummary {
-    WorkspaceSummary {
-        file_sync_mode: FileSyncMode::Off,
-        send_description: None,
-        send_layout: None,
-        send_items: Vec::new(),
-        receive_root: None,
-        initial_sync: None,
-        max_folder_depth: None,
+pub fn client_capabilities(clipboard_mode: ClipboardMode) -> RuntimeCapabilities {
+    RuntimeCapabilities {
         clipboard_mode,
         audio_mode: AudioMode::Off,
         input_mode: InputMode::Off,
@@ -839,9 +824,8 @@ pub fn client_workspace_summary(clipboard_mode: ClipboardMode) -> WorkspaceSumma
 struct AuthenticatedSession {
     stream: TlsStream<TcpStream>,
     remote: DeviceIdentity,
-    agreement: SessionAgreement,
     clipboard_agreement: SessionAgreement,
-    remote_workspace: WorkspaceSummary,
+    remote_capabilities: RuntimeCapabilities,
 }
 
 async fn run_session(
@@ -861,9 +845,8 @@ async fn run_session(
     let remote_port = remote_socket.map(|address| address.port());
     listener.on_event(ClientEvent::Connected {
         remote: session.remote.clone(),
-        agreement: session.agreement.clone(),
         clipboard_agreement: session.clipboard_agreement.clone(),
-        remote_workspace: session.remote_workspace.clone(),
+        remote_capabilities: session.remote_capabilities,
         remote_address,
         remote_port,
     });
@@ -878,9 +861,9 @@ async fn run_session(
         input_mode: InputMode::Off,
     };
     let remote_capabilities = RuntimeCapabilities {
-        clipboard_mode: session.remote_workspace.clipboard_mode,
-        audio_mode: session.remote_workspace.audio_mode,
-        input_mode: session.remote_workspace.input_mode,
+        clipboard_mode: session.remote_capabilities.clipboard_mode,
+        audio_mode: session.remote_capabilities.audio_mode,
+        input_mode: session.remote_capabilities.input_mode,
     };
     let mut capability_state = CapabilityState::new(false, local_capabilities, remote_capabilities);
     let can_send = session.clipboard_agreement.client_to_host;
@@ -1002,9 +985,6 @@ async fn run_session(
                     Frame::Control(_) => {
                         tracing::debug!("会话阶段忽略其他控制消息");
                     }
-                    Frame::FileChunk(_, _) => {
-                        tracing::debug!("会话阶段忽略文件块");
-                    }
                 }
             }
             _ = &mut reader_task, if reader_task.is_finished() => {
@@ -1106,7 +1086,7 @@ mod tests {
     use super::{DiscoveredPeer, normalize_pin, rediscovered_peer};
     use crate::discovery::DiscoverySource;
     use crate::input::InputMode;
-    use crate::settings::{AudioMode, ClipboardMode, FileSyncMode};
+    use crate::settings::{AudioMode, ClipboardMode};
     use std::net::Ipv4Addr;
     use uuid::Uuid;
 
@@ -1143,7 +1123,6 @@ mod tests {
             instance_name: None,
             device_id: device_id.to_string(),
             protocol_version: 1,
-            file_sync_mode: FileSyncMode::Off,
             clipboard_mode: ClipboardMode::Both,
             audio_mode: AudioMode::Off,
             input_mode: InputMode::Off,

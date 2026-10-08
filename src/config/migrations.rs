@@ -1,7 +1,7 @@
 use super::schema::GuiState;
 use anyhow::{Context, Result, bail};
 
-pub(super) const MAIN_CONFIG_VERSION: u32 = 4;
+pub(super) const MAIN_CONFIG_VERSION: u32 = 5;
 pub(super) const GUI_STATE_VERSION: u32 = 1;
 pub(super) const IDENTITY_VERSION: u32 = 1;
 pub(super) const TRUSTED_DEVICES_VERSION: u32 = 1;
@@ -45,6 +45,12 @@ pub(super) fn migrate_main_config(raw: &str) -> Result<MainMigration> {
             3 => {
                 insert_main_v4_update_and_dock(&mut document)?;
                 version = 4;
+                set_version(&mut document, version, "config.toml")?;
+                migrated = true;
+            }
+            4 => {
+                remove_workspace_sync_fields(&mut document)?;
+                version = 5;
                 set_version(&mut document, version, "config.toml")?;
                 migrated = true;
             }
@@ -235,6 +241,29 @@ fn insert_main_v4_update_and_dock(document: &mut toml::Value) -> Result<()> {
     Ok(())
 }
 
+fn remove_workspace_sync_fields(document: &mut toml::Value) -> Result<()> {
+    let table = document
+        .as_table_mut()
+        .context("config.toml must contain a TOML table")?;
+    let Some(runtime) = table.get_mut("runtime") else {
+        return Ok(());
+    };
+    let runtime = runtime
+        .as_table_mut()
+        .context("config.toml runtime must be a TOML table")?;
+    for key in [
+        "file_sync_mode",
+        "paths",
+        "initial",
+        "sync_delete",
+        "interval_secs",
+        "max_folder_depth",
+    ] {
+        runtime.remove(key);
+    }
+    Ok(())
+}
+
 fn take_value(
     table: &mut toml::map::Map<String, toml::Value>,
     key: &str,
@@ -264,7 +293,7 @@ mod tests {
         let table = migration.document.as_table().unwrap();
         assert_eq!(
             table.get("version").and_then(toml::Value::as_integer),
-            Some(4)
+            Some(5)
         );
         let ui = table.get("ui").and_then(toml::Value::as_table).unwrap();
         assert!(!ui.contains_key("first_run_completed"));
@@ -287,7 +316,7 @@ mod tests {
 
     #[test]
     fn current_main_config_is_not_migrated() {
-        let migration = migrate_main_config("version = 4\n").unwrap();
+        let migration = migrate_main_config("version = 5\n").unwrap();
         assert!(!migration.migrated);
         assert!(migration.legacy_gui_state.is_none());
     }
@@ -300,7 +329,7 @@ mod tests {
         let table = migration.document.as_table().unwrap();
         assert_eq!(
             table.get("version").and_then(toml::Value::as_integer),
-            Some(4)
+            Some(5)
         );
         let input = table.get("input").and_then(toml::Value::as_table).unwrap();
         assert_eq!(
@@ -329,7 +358,7 @@ mod tests {
         let table = migration.document.as_table().unwrap();
         assert_eq!(
             table.get("version").and_then(toml::Value::as_integer),
-            Some(4)
+            Some(5)
         );
         let input = table.get("input").and_then(toml::Value::as_table).unwrap();
         assert_eq!(
@@ -349,7 +378,7 @@ mod tests {
         let table = migration.document.as_table().unwrap();
         assert_eq!(
             table.get("version").and_then(toml::Value::as_integer),
-            Some(4)
+            Some(5)
         );
         let ui = table.get("ui").and_then(toml::Value::as_table).unwrap();
         assert_eq!(
@@ -366,6 +395,43 @@ mod tests {
     }
 
     #[test]
+    fn main_v4_removes_directory_sync_and_preserves_clipboard_settings() {
+        let migration = migrate_main_config(
+            r#"version = 4
+[runtime]
+role = "host"
+file_sync_mode = "both"
+paths = ["/example/old-folder"]
+initial = "this"
+sync_delete = true
+interval_secs = 3
+max_folder_depth = 2
+clipboard_mode = "both"
+audio_mode = "off"
+[clipboard]
+max_file_bytes = 1048576
+cache_dir = "/example/clipboard-cache"
+"#,
+        )
+        .unwrap();
+        assert!(migration.migrated);
+        assert_eq!(migration.document["version"].as_integer(), Some(5));
+        let runtime = migration.document["runtime"].as_table().unwrap();
+        assert_eq!(runtime.len(), 3);
+        assert_eq!(runtime["role"].as_str(), Some("host"));
+        assert_eq!(runtime["clipboard_mode"].as_str(), Some("both"));
+        assert_eq!(runtime["audio_mode"].as_str(), Some("off"));
+        assert_eq!(
+            migration.document["clipboard"]["max_file_bytes"].as_integer(),
+            Some(1048576)
+        );
+        assert_eq!(
+            migration.document["clipboard"]["cache_dir"].as_str(),
+            Some("/example/clipboard-cache")
+        );
+    }
+
+    #[test]
     fn gui_state_requires_a_version() {
         assert!(migrate_gui_state("first_run_completed = false\n").is_err());
     }
@@ -374,6 +440,6 @@ mod tests {
     fn future_versions_are_rejected() {
         assert!(migrate_identity("version = 2\n").is_err());
         assert!(migrate_trusted_devices("version = 2\n").is_err());
-        assert!(migrate_main_config("version = 5\n").is_err());
+        assert!(migrate_main_config("version = 6\n").is_err());
     }
 }

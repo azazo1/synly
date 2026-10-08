@@ -6,9 +6,7 @@ use crate::core::{AppCommand, AppSettings, AppSnapshot, AppSupervisor};
 use crate::input::{CursorMode, InputMode, InputPlatform, ScreenEdge};
 use crate::runtime_control::{InteractionRequest, InteractionResponse};
 use crate::runtime_options::normalize_pin;
-use crate::settings::{
-    AudioMode, ClipboardMode, ConnectionPreference, FileSyncMode, InitialSyncMode, LogLevel,
-};
+use crate::settings::{AudioMode, ClipboardMode, ConnectionPreference, LogLevel};
 use crate::update::{self, UpdateHandle, UpdatePhase, UpdateSnapshot};
 use anyhow::{Context, Result};
 use slint::{CloseRequestResponse, ComponentHandle, LogicalSize, ModelRc, VecModel};
@@ -331,22 +329,6 @@ fn wire_window_callbacks(
                 match settings_from_window(&window, &current_input) {
                     Ok((runtime, settings, session_pin)) => {
                         window.set_settings_error_text("".into());
-                        let enabling_delete =
-                            runtime.sync_delete && !snapshots.borrow().desired.sync_delete;
-                        if enabling_delete
-                            && rfd::MessageDialog::new()
-                                .set_level(rfd::MessageLevel::Warning)
-                                .set_title("确认启用删除同步")
-                                .set_description(
-                                    "启用后, 对侧删除可能会删除本机工作区中的对应文件. 保存后将立即重新扫描.",
-                                )
-                                .set_buttons(rfd::MessageButtons::YesNo)
-                                .show()
-                                != rfd::MessageDialogResult::Yes
-                        {
-                            window.set_sync_delete(false);
-                            return;
-                        }
                         macos_dock::set_follow_window(window.get_hide_dock_when_hidden());
                         send_command(
                             &commands,
@@ -363,28 +345,6 @@ fn wire_window_callbacks(
                         tracing::error!(error = %error, "GUI 设置校验失败");
                     }
                 }
-            }
-        })
-    });
-
-    let weak = window.as_weak();
-    window.on_choose_path(move || {
-        guard_callback("choose_path", || {
-            let Some(window) = weak.upgrade() else { return };
-            let selected = if window.get_file_mode_index() == 1 {
-                rfd::FileDialog::new().pick_files().unwrap_or_default()
-            } else {
-                rfd::FileDialog::new().pick_folder().into_iter().collect()
-            };
-            if !selected.is_empty() {
-                window.set_path_text(
-                    selected
-                        .iter()
-                        .map(|path| path.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                        .into(),
-                );
             }
         })
     });
@@ -965,10 +925,9 @@ fn apply_snapshot(
             device_id: peer.device_id.clone().into(),
             title: peer.display_name.clone().into(),
             subtitle: format!(
-                "{} | 协议 {} | 文件 {} | 剪贴板 {} | 音频 {} | 输入 {} | {}",
+                "{} | 协议 {} | 剪贴板 {} | 音频 {} | 输入 {} | {}",
                 peer.source,
                 peer.protocol_version,
-                peer.file_mode,
                 peer.clipboard_mode,
                 peer.audio_mode,
                 peer.input_mode,
@@ -1179,31 +1138,12 @@ fn apply_settings_to_window(window: &AppWindow, runtime: &RuntimeConfig, setting
     });
     window.set_instance_name(runtime.instance_name.clone().into());
     window.set_peer_query(runtime.peer_query.clone().into());
-    window.set_path_text(
-        runtime
-            .paths
-            .iter()
-            .map(|path| path.display().to_string())
-            .collect::<Vec<_>>()
-            .join("\n")
-            .into(),
-    );
     window.set_port_text(
         runtime
             .port
             .map(|port| port.to_string())
             .unwrap_or_default()
             .into(),
-    );
-    window.set_file_mode_index(file_mode_index(runtime.file_sync_mode));
-    window.set_initial_index(matches!(runtime.initial, Some(InitialSyncMode::Other)) as i32);
-    window.set_sync_delete(runtime.sync_delete);
-    window.set_interval_secs(runtime.interval_secs.clamp(1, i32::MAX as u64) as i32);
-    window.set_max_depth(
-        runtime
-            .max_folder_depth
-            .map(|depth| depth.min(i32::MAX as usize) as i32)
-            .unwrap_or(-1),
     );
     window.set_clipboard_mode_index(clipboard_mode_index(runtime.clipboard_mode));
     window.set_audio_mode_index(audio_mode_index(runtime.audio_mode));
@@ -1298,21 +1238,6 @@ fn settings_from_window(
     } else {
         Some(port_text.parse().context("监听端口不是有效数字")?)
     };
-    let paths = window
-        .get_path_text()
-        .lines()
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-        .collect();
-    let file_sync_mode = file_mode_from_index(window.get_file_mode_index());
-    let initial = matches!(file_sync_mode, FileSyncMode::Both | FileSyncMode::Auto).then(|| {
-        if window.get_initial_index() == 1 {
-            InitialSyncMode::Other
-        } else {
-            InitialSyncMode::This
-        }
-    });
     let runtime = RuntimeConfig {
         connection: Some(if window.get_connection_index() == 1 {
             ConnectionPreference::Join
@@ -1322,10 +1247,6 @@ fn settings_from_window(
         instance_name: window.get_instance_name().trim().to_string(),
         peer_query: window.get_peer_query().trim().to_string(),
         port,
-        file_sync_mode,
-        paths,
-        initial,
-        sync_delete: window.get_sync_delete(),
         clipboard_mode: clipboard_mode_from_index(window.get_clipboard_mode_index()),
         audio_mode: audio_mode_from_index(window.get_audio_mode_index()),
         audio_layout: audio_layout_from_index(window.get_audio_layout_index()),
@@ -1343,8 +1264,6 @@ fn settings_from_window(
             key_mapping: current_input.key_mapping.clone(),
             cursor_mode: cursor_mode_from_index(window.get_cursor_mode_index()),
         },
-        interval_secs: window.get_interval_secs().max(1) as u64,
-        max_folder_depth: (window.get_max_depth() >= 0).then_some(window.get_max_depth() as usize),
         accept: window.get_accept_untrusted(),
         trust_device: window.get_trust_device(),
         trusted_only: window.get_trusted_only(),
@@ -1495,9 +1414,8 @@ fn runtime_capability_summary(runtime: &RuntimeConfig) -> String {
         None => "未选择角色",
     };
     format!(
-        "{}, 文件 {}, 剪贴板 {}, 音频 {}, 输入 {}",
+        "{}, 剪贴板 {}, 音频 {}, 输入 {}",
         connection,
-        runtime.file_sync_mode.label(),
         runtime.clipboard_mode.label(),
         runtime.audio_mode.label(),
         runtime.input.mode.label()
@@ -1516,26 +1434,6 @@ fn capability_summary(capabilities: crate::protocol::RuntimeCapabilities) -> Str
 fn send_command(commands: &tokio::sync::mpsc::Sender<AppCommand>, command: AppCommand) {
     if let Err(error) = commands.try_send(command) {
         tracing::warn!(error = %error, "GUI 命令队列已满或关闭");
-    }
-}
-
-fn file_mode_index(mode: FileSyncMode) -> i32 {
-    match mode {
-        FileSyncMode::Off => 0,
-        FileSyncMode::Send => 1,
-        FileSyncMode::Receive => 2,
-        FileSyncMode::Both => 3,
-        FileSyncMode::Auto => 4,
-    }
-}
-
-fn file_mode_from_index(index: i32) -> FileSyncMode {
-    match index {
-        1 => FileSyncMode::Send,
-        2 => FileSyncMode::Receive,
-        3 => FileSyncMode::Both,
-        4 => FileSyncMode::Auto,
-        _ => FileSyncMode::Off,
     }
 }
 

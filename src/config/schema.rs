@@ -2,9 +2,7 @@ use crate::audio::AudioLayout;
 use crate::input::{CursorMode, InputMode, KeyMappingConfig, ScreenEdge};
 use crate::path_expand::expand_config_path_string;
 use crate::protocol::TransferLimits;
-use crate::settings::{
-    AudioMode, ClipboardMode, ConnectionPreference, FileSyncMode, InitialSyncMode, LogLevel,
-};
+use crate::settings::{AudioMode, ClipboardMode, ConnectionPreference, LogLevel};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -40,16 +38,10 @@ pub struct RuntimeConfig {
     pub instance_name: String,
     pub peer_query: String,
     pub port: Option<u16>,
-    pub file_sync_mode: FileSyncMode,
-    pub paths: Vec<PathBuf>,
-    pub initial: Option<InitialSyncMode>,
-    pub sync_delete: bool,
     pub clipboard_mode: ClipboardMode,
     pub audio_mode: AudioMode,
     pub audio_layout: AudioLayout,
     pub input: InputConfig,
-    pub interval_secs: u64,
-    pub max_folder_depth: Option<usize>,
     pub accept: bool,
     pub trust_device: bool,
     pub trusted_only: bool,
@@ -206,27 +198,13 @@ impl Default for RuntimeConfig {
             instance_name: String::new(),
             peer_query: String::new(),
             port: None,
-            file_sync_mode: FileSyncMode::Off,
-            paths: Vec::new(),
-            initial: None,
-            sync_delete: false,
             clipboard_mode: ClipboardMode::Off,
             audio_mode: AudioMode::Off,
             audio_layout: AudioLayout::Stereo,
             input: InputConfig::default(),
-            interval_secs: 3,
-            max_folder_depth: None,
             accept: false,
             trust_device: false,
             trusted_only: false,
-        }
-    }
-}
-
-impl RuntimeConfig {
-    pub fn normalize_file_sync_options(&mut self) {
-        if !matches!(self.file_sync_mode, FileSyncMode::Both | FileSyncMode::Auto) {
-            self.initial = None;
         }
     }
 }

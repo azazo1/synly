@@ -6,7 +6,7 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "synly",
     version = crate::BUILD_VERSION,
-    about = "在局域网中发现设备, 通过 PIN 配对, 建立安全连接并持续同步数据"
+    about = "发现设备并建立安全连接, 同步剪贴板, 音频和鼠标键盘控制"
 )]
 pub struct Cli {
     #[command(subcommand)]

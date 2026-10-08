@@ -1,9 +1,8 @@
 use crate::device::{DeviceConfig, TrustedDeviceConfig};
 use crate::protocol::{
-    ControlMessage, DeviceIdentity, PairAuthMethod, PairRequestPayload, SessionAgreement,
+    ControlMessage, DeviceIdentity, PairAuthMethod, PairRequestPayload, RuntimeCapabilities, SessionAgreement,
     encode_payload,
 };
-use crate::workspace::WorkspaceSummary;
 use anyhow::{Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
@@ -459,9 +458,8 @@ pub fn sign_pair_decision(
     accepted: bool,
     message: &str,
     server: &DeviceIdentity,
-    agreement: &SessionAgreement,
     clipboard_agreement: &SessionAgreement,
-    workspace: &WorkspaceSummary,
+    capabilities: &RuntimeCapabilities,
     auth_method: PairAuthMethod,
     server_trusts_client: bool,
     trust_established: bool,
@@ -470,9 +468,8 @@ pub fn sign_pair_decision(
         accepted,
         message,
         server,
-        agreement,
         clipboard_agreement,
-        workspace,
+        capabilities,
         auth_method,
         server_trusts_client,
         trust_established,
@@ -497,8 +494,7 @@ pub fn verify_pair_decision(
             accepted,
             message,
             server,
-            workspace,
-            agreement,
+            capabilities,
             clipboard_agreement,
             auth_method,
             server_trusts_client,
@@ -510,9 +506,8 @@ pub fn verify_pair_decision(
                 accepted: *accepted,
                 message,
                 server,
-                agreement,
                 clipboard_agreement,
-                workspace,
+                capabilities,
                 auth_method: *auth_method,
                 server_trusts_client: *server_trusts_client,
                 trust_established: *trust_established,
@@ -572,9 +567,8 @@ pub fn sign_trusted_pair_decision(
     accepted: bool,
     message: &str,
     server: &DeviceIdentity,
-    agreement: &SessionAgreement,
     clipboard_agreement: &SessionAgreement,
-    workspace: &WorkspaceSummary,
+    capabilities: &RuntimeCapabilities,
     server_trusts_client: bool,
     trust_established: bool,
 ) -> Result<String> {
@@ -582,9 +576,8 @@ pub fn sign_trusted_pair_decision(
         accepted,
         message,
         server,
-        agreement,
         clipboard_agreement,
-        workspace,
+        capabilities,
         auth_method: PairAuthMethod::TrustedDevice,
         server_trusts_client,
         trust_established,
@@ -609,8 +602,7 @@ pub fn verify_trusted_pair_decision(
             accepted,
             message,
             server,
-            workspace,
-            agreement,
+            capabilities,
             clipboard_agreement,
             auth_method,
             server_trusts_client,
@@ -622,9 +614,8 @@ pub fn verify_trusted_pair_decision(
                 accepted: *accepted,
                 message,
                 server,
-                agreement,
                 clipboard_agreement,
-                workspace,
+                capabilities,
                 auth_method: *auth_method,
                 server_trusts_client: *server_trusts_client,
                 trust_established: *trust_established,
@@ -647,9 +638,8 @@ struct DecisionProofPayload<'a> {
     accepted: bool,
     message: &'a str,
     server: &'a DeviceIdentity,
-    agreement: &'a SessionAgreement,
     clipboard_agreement: &'a SessionAgreement,
-    workspace: &'a WorkspaceSummary,
+    capabilities: &'a RuntimeCapabilities,
     auth_method: PairAuthMethod,
     server_trusts_client: bool,
     trust_established: bool,
@@ -1238,9 +1228,8 @@ mod tests {
         ControlMessage, DeviceIdentity, PROTOCOL_VERSION, PairAuthMethod, PairRequestPayload,
         SessionAgreement,
     };
-    use crate::settings::{AudioMode, ClipboardMode, FileSyncMode, InitialSyncMode};
-    use crate::workspace::WorkspaceSummary;
-    use ring::rand::SystemRandom;
+    use crate::settings::{AudioMode, ClipboardMode};
+        use ring::rand::SystemRandom;
     use ring::signature::KeyPair;
     use uuid::Uuid;
 
@@ -1279,14 +1268,7 @@ mod tests {
                 identity_public_key: device.identity_public_key().unwrap().to_string(),
                 tls_root_certificate: device_tls_root_certificate(&device).unwrap(),
             },
-            workspace: WorkspaceSummary {
-                file_sync_mode: FileSyncMode::Both,
-                send_description: Some("demo".into()),
-                send_layout: None,
-                send_items: vec![],
-                receive_root: Some("/tmp".into()),
-                initial_sync: Some(InitialSyncMode::This),
-                max_folder_depth: None,
+            capabilities: RuntimeCapabilities {
                 clipboard_mode: ClipboardMode::Off,
                 audio_mode: AudioMode::Off,
                 input_mode: crate::input::InputMode::Off,
@@ -1312,14 +1294,7 @@ mod tests {
                 identity_public_key: public_key.clone(),
                 tls_root_certificate: device_tls_root_certificate(&device).unwrap(),
             },
-            workspace: WorkspaceSummary {
-                file_sync_mode: FileSyncMode::Both,
-                send_description: Some("demo".into()),
-                send_layout: None,
-                send_items: vec![],
-                receive_root: Some("/tmp".into()),
-                initial_sync: Some(InitialSyncMode::This),
-                max_folder_depth: None,
+            capabilities: RuntimeCapabilities {
                 clipboard_mode: ClipboardMode::Off,
                 audio_mode: AudioMode::Off,
                 input_mode: crate::input::InputMode::Off,
@@ -1354,14 +1329,7 @@ mod tests {
             host_to_client: true,
             client_to_host: false,
         };
-        let workspace = WorkspaceSummary {
-            file_sync_mode: FileSyncMode::Both,
-            send_description: Some("demo".into()),
-            send_layout: None,
-            send_items: vec![],
-            receive_root: Some("/tmp".into()),
-            initial_sync: Some(InitialSyncMode::This),
-            max_folder_depth: None,
+        let capabilities = RuntimeCapabilities {
             clipboard_mode: ClipboardMode::Off,
             audio_mode: AudioMode::Off,
             input_mode: crate::input::InputMode::Off,
@@ -1374,8 +1342,7 @@ mod tests {
             message,
             &server,
             &agreement,
-            &agreement,
-            &workspace,
+            &capabilities,
             PairAuthMethod::Pin,
             true,
             false,
@@ -1385,8 +1352,7 @@ mod tests {
             accepted: true,
             message: message.into(),
             server: server.clone(),
-            workspace: workspace.clone(),
-            agreement: agreement.clone(),
+            capabilities,
             clipboard_agreement: agreement.clone(),
             auth_method: PairAuthMethod::Pin,
             server_trusts_client: true,
@@ -1399,12 +1365,11 @@ mod tests {
             accepted: true,
             message: message.into(),
             server,
-            workspace: WorkspaceSummary {
+            capabilities: RuntimeCapabilities {
                 audio_mode: AudioMode::Send,
-                ..workspace
+                ..capabilities
             },
             clipboard_agreement: agreement.clone(),
-            agreement,
             auth_method: PairAuthMethod::Pin,
             server_trusts_client: false,
             proof,
@@ -1431,14 +1396,7 @@ mod tests {
             host_to_client: true,
             client_to_host: true,
         };
-        let workspace = WorkspaceSummary {
-            file_sync_mode: FileSyncMode::Both,
-            send_description: Some("demo".into()),
-            send_layout: None,
-            send_items: vec![],
-            receive_root: Some("/tmp".into()),
-            initial_sync: Some(InitialSyncMode::This),
-            max_folder_depth: None,
+        let capabilities = RuntimeCapabilities {
             clipboard_mode: ClipboardMode::Both,
             audio_mode: AudioMode::Off,
             input_mode: crate::input::InputMode::Off,
@@ -1451,8 +1409,7 @@ mod tests {
             message,
             &server,
             &agreement,
-            &agreement,
-            &workspace,
+            &capabilities,
             true,
             false,
         )
@@ -1461,8 +1418,7 @@ mod tests {
             accepted: true,
             message: message.into(),
             server: server.clone(),
-            workspace: workspace.clone(),
-            agreement: agreement.clone(),
+            capabilities,
             clipboard_agreement: agreement.clone(),
             auth_method: PairAuthMethod::TrustedDevice,
             server_trusts_client: true,
@@ -1475,12 +1431,11 @@ mod tests {
             accepted: true,
             message: message.into(),
             server,
-            workspace: WorkspaceSummary {
+            capabilities: RuntimeCapabilities {
                 audio_mode: AudioMode::Send,
-                ..workspace
+                ..capabilities
             },
             clipboard_agreement: agreement.clone(),
-            agreement,
             auth_method: PairAuthMethod::TrustedDevice,
             server_trusts_client: false,
             proof,

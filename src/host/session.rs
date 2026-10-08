@@ -76,7 +76,6 @@ pub(crate) fn spawn_host_session(
     let device_id = session.remote.device_id;
     let instance = Uuid::new_v4();
     let session_options = runtime_options_for_profile(options, profile);
-    let workspace = session_options.workspace.clone();
     let (input_socket_tx, input_socket_rx) = mpsc::channel(4);
     let input_inbox = InputSocketInbox::new(input_socket_rx);
     let (input_session_id_tx, _input_session_id) = watch::channel(None);
@@ -92,7 +91,6 @@ pub(crate) fn spawn_host_session(
             notification_peer(&session.remote),
             run_sync_session(
                 session,
-                &workspace,
                 SyncSessionOptions {
                     clipboard_mode: session_options.clipboard_mode,
                     audio_mode: session_options.audio_mode,

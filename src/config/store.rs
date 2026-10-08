@@ -6,9 +6,7 @@ use super::schema::{
 };
 
 use crate::audio::AudioLayout;
-use crate::settings::{
-    AudioMode, ClipboardMode, ConnectionPreference, FileSyncMode, InitialSyncMode,
-};
+use crate::settings::{AudioMode, ClipboardMode, ConnectionPreference};
 use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -53,16 +51,10 @@ struct RuntimeFileConfig {
     instance_name: String,
     peer_query: String,
     port: Option<u16>,
-    file_sync_mode: FileSyncMode,
-    paths: Vec<PathBuf>,
-    initial: Option<InitialSyncMode>,
-    sync_delete: bool,
     clipboard_mode: ClipboardMode,
     audio_mode: AudioMode,
     #[serde(default)]
     audio_layout: AudioLayout,
-    interval_secs: u64,
-    max_folder_depth: Option<usize>,
     accept: bool,
     trust_device: bool,
     trusted_only: bool,
@@ -308,16 +300,10 @@ impl RuntimeFileConfig {
             instance_name: self.instance_name,
             peer_query: self.peer_query,
             port: self.port,
-            file_sync_mode: self.file_sync_mode,
-            paths: self.paths,
-            initial: self.initial,
-            sync_delete: self.sync_delete,
             clipboard_mode: self.clipboard_mode,
             audio_mode: self.audio_mode,
             audio_layout: self.audio_layout,
             input,
-            interval_secs: self.interval_secs,
-            max_folder_depth: self.max_folder_depth,
             accept: self.accept,
             trust_device: self.trust_device,
             trusted_only: self.trusted_only,
@@ -332,15 +318,9 @@ impl From<&RuntimeConfig> for RuntimeFileConfig {
             instance_name: runtime.instance_name.clone(),
             peer_query: runtime.peer_query.clone(),
             port: runtime.port,
-            file_sync_mode: runtime.file_sync_mode,
-            paths: runtime.paths.clone(),
-            initial: runtime.initial,
-            sync_delete: runtime.sync_delete,
             clipboard_mode: runtime.clipboard_mode,
             audio_mode: runtime.audio_mode,
             audio_layout: runtime.audio_layout,
-            interval_secs: runtime.interval_secs,
-            max_folder_depth: runtime.max_folder_depth,
             accept: runtime.accept,
             trust_device: runtime.trust_device,
             trusted_only: runtime.trusted_only,
@@ -576,7 +556,7 @@ mod tests {
         assert!(
             fs::read_to_string(dir.join(CONFIG_FILE_NAME))
                 .unwrap()
-                .contains("version = 4")
+                .contains("version = 5")
         );
         assert!(
             fs::read_to_string(dir.join(GUI_STATE_FILE_NAME))
@@ -644,7 +624,7 @@ mod tests {
 
         let main: toml::Value =
             toml::from_str(&fs::read_to_string(dir.join(CONFIG_FILE_NAME)).unwrap()).unwrap();
-        assert_eq!(main["version"].as_integer(), Some(4));
+        assert_eq!(main["version"].as_integer(), Some(5));
         assert!(
             !main["ui"]
                 .as_table()
@@ -726,7 +706,7 @@ mod tests {
         assert_eq!(loaded.gui_state.window_height, 700);
         let main: toml::Value =
             toml::from_str(&fs::read_to_string(dir.join(CONFIG_FILE_NAME)).unwrap()).unwrap();
-        assert_eq!(main["version"].as_integer(), Some(4));
+        assert_eq!(main["version"].as_integer(), Some(5));
         assert!(!main["ui"].as_table().unwrap().contains_key("window_width"));
         cleanup_dir(&dir);
     }

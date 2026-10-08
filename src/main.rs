@@ -19,7 +19,6 @@ mod runtime_control;
 mod runtime_options;
 mod session;
 mod settings;
-mod sync;
 mod system_notification;
 mod tracing_utils;
 mod update;

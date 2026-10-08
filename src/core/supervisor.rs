@@ -97,8 +97,7 @@ enum InternalEvent {
 }
 
 impl AppSupervisor {
-    pub fn new(mut config: SynlyConfig, force_start: bool) -> (Self, AppSupervisorHandle) {
-        config.runtime.normalize_file_sync_options();
+    pub fn new(config: SynlyConfig, force_start: bool) -> (Self, AppSupervisorHandle) {
         let mut snapshot =
             AppSnapshot::idle(config.runtime.clone(), AppSettings::from_config(&config));
         snapshot.trusted_devices = config.trusted_devices.clone();
@@ -180,11 +179,10 @@ impl AppSupervisor {
     async fn handle_command(&mut self, command: AppCommand) -> bool {
         match command {
             AppCommand::ApplySettings {
-                mut runtime,
+                runtime,
                 mut settings,
                 session_pin,
             } => {
-                runtime.normalize_file_sync_options();
                 settings.device_name = settings.device_name.trim().to_string();
                 let mut candidate = self.config.clone();
                 apply_settings_to_config(&mut candidate, &runtime, &settings);
@@ -336,16 +334,6 @@ impl AppSupervisor {
                 self.update_capabilities();
                 self.update_tuning();
                 self.publish();
-            }
-            AppCommand::SelectPaths(paths) => {
-                self.snapshot.desired.paths = paths;
-                self.config.runtime = self.snapshot.desired.clone();
-                self.save_settings();
-                if self.session.is_some() {
-                    self.restart_session().await;
-                } else {
-                    self.publish();
-                }
             }
             AppCommand::Disconnect => self.stop_session().await,
             AppCommand::DisconnectPeer(device_id) => self.disconnect_peer(device_id).await,
@@ -1085,10 +1073,6 @@ fn requires_reconnect(previous: &RuntimeConfig, next: &RuntimeConfig) -> bool {
     previous.connection != next.connection
         || previous.peer_query != next.peer_query
         || previous.port != next.port
-        || previous.file_sync_mode != next.file_sync_mode
-        || previous.paths != next.paths
-        || previous.initial != next.initial
-        || previous.max_folder_depth != next.max_folder_depth
         || previous.trusted_only != next.trusted_only
 }
 
@@ -1134,7 +1118,6 @@ fn peer_view(peer: &DiscoveredPeer, config: &SynlyConfig) -> DiscoveredPeerView 
         source: peer.source.label().to_string(),
         protocol_version: peer.protocol_version,
         compatible: peer.protocol_version == PROTOCOL_VERSION,
-        file_mode: peer.file_sync_mode.label().to_string(),
         clipboard_mode: peer.clipboard_mode.label().to_string(),
         audio_mode: peer.audio_mode.label().to_string(),
         input_mode: peer.input_mode.label().to_string(),
@@ -1150,7 +1133,7 @@ mod tests {
     };
     use crate::input::InputMode;
     use crate::protocol::CapabilityEpoch;
-    use crate::settings::{AudioMode, ClipboardMode, FileSyncMode};
+    use crate::settings::{AudioMode, ClipboardMode};
 
     #[test]
     fn reconnect_classification_keeps_hot_fields_in_session() {
@@ -1159,14 +1142,8 @@ mod tests {
         hot.clipboard_mode = ClipboardMode::Both;
         hot.audio_mode = AudioMode::Receive;
         hot.input.mode = InputMode::Receive;
-        hot.interval_secs += 1;
-        hot.sync_delete = !hot.sync_delete;
         hot.instance_name = "desk-b".to_string();
         assert!(!requires_reconnect(&current, &hot));
-
-        let mut workspace = current.clone();
-        workspace.file_sync_mode = FileSyncMode::Receive;
-        assert!(requires_reconnect(&current, &workspace));
 
         let mut peer = current.clone();
         peer.peer_query = "peer-b".to_string();
@@ -1371,8 +1348,6 @@ mod tests {
 
     fn test_tuning() -> RuntimeTuning {
         RuntimeTuning {
-            interval_secs: 3,
-            sync_delete: false,
             notifications_enabled: true,
             input_backend_generation: 0,
             device_name: "test-device".to_string(),

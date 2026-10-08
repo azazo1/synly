@@ -14,7 +14,7 @@ use crate::input::{
 };
 use crate::protocol::{
     AudioLayout as ProtocolAudioLayout, CapabilityEpoch, ClipboardPayload, ControlMessage,
-    DeviceIdentity, FileChunkHeader, Frame, FrameReader, FrameWriter, PROTOCOL_VERSION,
+    DeviceIdentity, Frame, FrameReader, FrameWriter, PROTOCOL_VERSION,
     PairAuthMethod, PairRequestPayload, RuntimeCapabilities, SessionAgreement, TransferLimits,
     frame_size_limit_message,
 };
@@ -24,35 +24,22 @@ use crate::runtime_control::{
     RuntimeLifecycle, RuntimePeerSummary, RuntimeTuning,
 };
 use crate::runtime_options::{
-    PairingRuntimeOptions, RuntimeOptions, normalize_pin, require_peer_query, sync_delete_label,
+    PairingRuntimeOptions, RuntimeOptions, normalize_pin, require_peer_query,
 };
 use crate::session::CapabilityState;
-use crate::settings::{
-    AudioMode, ClipboardMode, ConnectionPreference, FileSyncMode, InitialSyncMode,
-};
-use crate::sync::{
-    DeletePolicy, EntryKind, ManifestEntry, ManifestSnapshot, TimestampComparisonContext,
-    WorkspaceSpec, apply_file_metadata, build_apply_plan_with_time, build_incoming_snapshot,
-    build_snapshot, delete_paths_best_effort, ensure_directories, filter_snapshot_by_folder_depth,
-    filter_snapshot_for_incoming_root, resolve_incoming_path, resolve_outgoing_path, watch_targets,
-};
+use crate::settings::{AudioMode, ClipboardMode, ConnectionPreference};
 use crate::system_notification::{
     ConnectionEvent, NotificationPeer, SessionNotifier, SystemNotifier,
 };
 use anyhow::{Context, Result, anyhow, bail};
-use notify::{Config as NotifyConfig, Event, RecommendedWatcher, RecursiveMode, Watcher};
-use rand::RngExt;
-use sha2::{Digest, Sha256};
 use socket2::{SockRef, TcpKeepalive};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::fs::File;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use std::time::Duration;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{self, Instant};
@@ -60,7 +47,6 @@ use tokio_rustls::{TlsStream, client::TlsStream as ClientTlsStream};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-const FILE_STREAM_CHUNK_SIZE: usize = 256 * 1024;
 const PAIRING_TIMEOUT: Duration = Duration::from_secs(90);
 const TLS_UPGRADE_TIMEOUT: Duration = Duration::from_secs(15);
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -72,11 +58,6 @@ const RECONNECT_BASE_DELAY: Duration = Duration::from_secs(2);
 const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(20);
 // 快速直连最多连续重试 3 次, 之后转入发现和正常退避.
 const FAST_DIRECT_RETRIES: u32 = 3;
-const TIMESTAMP_SKEW_TOLERANCE_MS: u64 = 10_000;
-const FUTURE_TIMESTAMP_GUARD_MS: u64 = 10 * 60 * 1_000;
-const CLOCK_SKEW_WARNING_MS: u64 = 60_000;
-const REMOTE_ECHO_SUPPRESSION_TTL: Duration = Duration::from_secs(10);
-const ADVERTISED_SNAPSHOT_CACHE_LIMIT: usize = 8;
 const CAPABILITY_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug)]
@@ -90,71 +71,11 @@ pub(crate) struct AuthenticatedSession {
     pub(crate) role: SessionRole,
     pub(crate) stream: TlsStream<TcpStream>,
     pub(crate) remote: DeviceIdentity,
-    pub(crate) agreement: SessionAgreement,
-    pub(crate) remote_workspace: crate::sync::WorkspaceSummary,
+    pub(crate) remote_capabilities: RuntimeCapabilities,
     pub(crate) remote_socket_addr: SocketAddr,
     pub(crate) audio_master_secret: [u8; 32],
     pub(crate) input_master_secret: [u8; 32],
     pub(crate) capability_profile: SessionCapabilityProfile,
-}
-
-#[derive(Debug)]
-struct PendingRevision {
-    requested_files: usize,
-    remaining_files: BTreeSet<String>,
-    failed_files: BTreeSet<String>,
-    expected_files: BTreeMap<String, ManifestEntry>,
-    delete_paths: Vec<String>,
-    skipped_newer_count: usize,
-    transfer_done: bool,
-}
-
-struct IncomingFileState {
-    file: File,
-    temp_path: PathBuf,
-    final_path: PathBuf,
-    expected_entry: ManifestEntry,
-    hasher: Sha256,
-    written: u64,
-}
-
-#[derive(Clone, Debug)]
-struct AdvertisedSnapshot {
-    revision: u64,
-    snapshot: ManifestSnapshot,
-}
-
-#[derive(Clone, Debug)]
-enum SnapshotLoopControl {
-    ExpectRemoteChanges {
-        expectations: Vec<RemoteEchoExpectation>,
-    },
-    AdoptCurrentSnapshotAsBaselineAndEnable,
-    ForcePublish,
-}
-
-#[derive(Clone, Debug)]
-struct RemoteEchoExpectation {
-    wire_path: String,
-    expected: SnapshotPathExpectation,
-}
-
-#[derive(Clone, Debug)]
-struct PendingRemoteEchoExpectation {
-    expected: SnapshotPathExpectation,
-    expires_at: Instant,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum SnapshotPathExpectation {
-    Exact(ManifestEntry),
-    DirExists,
-    Missing,
-}
-
-#[derive(Default)]
-struct SnapshotEchoSuppressions {
-    paths: BTreeMap<String, PendingRemoteEchoExpectation>,
 }
 
 struct PairDecisionParams<'a> {
@@ -164,11 +85,9 @@ struct PairDecisionParams<'a> {
     message: String,
     device: &'a DeviceConfig,
     instance_name: Option<&'a str>,
-    workspace: &'a WorkspaceSpec,
     clipboard_mode: ClipboardMode,
     audio_mode: AudioMode,
     input_mode: InputMode,
-    agreement: &'a SessionAgreement,
     clipboard_agreement: &'a SessionAgreement,
     auth_method: PairAuthMethod,
     pin: Option<&'a str>,
@@ -186,12 +105,6 @@ enum LocalAudioRole {
 struct AudioPlan {
     role: LocalAudioRole,
     direction: AudioChannelDirection,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum InitialSnapshotPolicy {
-    PublishImmediately,
-    WaitForRemoteSeed,
 }
 
 #[derive(Debug)]
@@ -425,7 +338,6 @@ async fn connect_and_run_session(
         peer,
         run_sync_session(
             session,
-            &options.workspace,
             SyncSessionOptions {
                 clipboard_mode: options.clipboard_mode,
                 audio_mode: options.audio_mode,
@@ -473,11 +385,11 @@ async fn attempt_peer_connection(
     fast_retries_left: &mut u32,
 ) -> AttemptVerdict {
     refresh_runtime_options(config, options, runtime_capabilities, runtime_tuning);
-    let local_workspace_summary = options.workspace.session_summary(
-        options.clipboard_mode,
-        options.audio_mode,
-        options.input_mode,
-    );
+    let local_capabilities = RuntimeCapabilities {
+        clipboard_mode: options.clipboard_mode,
+        audio_mode: options.audio_mode,
+        input_mode: options.input_mode,
+    };
 
     if let Some(SocketAddr::V4(address)) = *direct_target {
         let peer_target = PeerTarget::Direct(address);
@@ -510,7 +422,7 @@ async fn attempt_peer_connection(
     }
 
     if let Some(known_peer) = options.pairing.known_peer.take() {
-        match discovered_peer_target(known_peer, &local_workspace_summary) {
+        match discovered_peer_target(known_peer, &local_capabilities) {
             Ok(peer_target) => {
                 if let PeerTarget::Discovered(peer) = &peer_target {
                     tracing::info!(
@@ -560,7 +472,7 @@ async fn attempt_peer_connection(
         reconnect_query.as_deref(),
         discovery_timeout,
         options.pairing.headless,
-        &local_workspace_summary,
+        &local_capabilities,
         &options.discovery,
     )
     .await
@@ -618,8 +530,6 @@ pub(crate) fn refresh_runtime_options(
     options.instance_name = tuning.instance_name;
     options.discovery = tuning.discovery;
     options.notifications_enabled = tuning.notifications_enabled;
-    options.interval_secs = tuning.interval_secs;
-    options.sync_delete = tuning.sync_delete;
     options.input = tuning.input;
     options.input.mode = capabilities.input_mode;
     options.clipboard = tuning.clipboard;
@@ -953,21 +863,16 @@ async fn handle_trusted_incoming_connection(
 
     let reservation = reserver.reserve(payload.client.device_id);
     let session_options = runtime_options_for_profile(options, reservation.profile());
-    let agreement = negotiate_file_sync_modes(
-        session_options.file_sync_mode,
-        payload.workspace.file_sync_mode,
-    );
     let clipboard_agreement = negotiate_clipboard(
         session_options.clipboard_mode,
-        payload.workspace.clipboard_mode,
+        payload.capabilities.clipboard_mode,
     );
     let audio_compatible =
-        audio_modes_compatible(session_options.audio_mode, payload.workspace.audio_mode);
+        audio_modes_compatible(session_options.audio_mode, payload.capabilities.audio_mode);
     let input_compatible =
-        negotiate_input(session_options.input_mode, payload.workspace.input_mode).is_some();
-    print_pair_request_overview(&payload, &session_options, &agreement, &remote_label)?;
-    if !agreement.any_direction()
-        && !clipboard_agreement.any_direction()
+        negotiate_input(session_options.input_mode, payload.capabilities.input_mode).is_some();
+    print_pair_request_overview(&payload, &session_options, &remote_label)?;
+    if !clipboard_agreement.any_direction()
         && !audio_compatible
         && !input_compatible
     {
@@ -975,7 +880,7 @@ async fn handle_trusted_incoming_connection(
             &mut server_stream,
             transfer_limits,
             Frame::Control(ControlMessage::Error {
-                message: "文件、剪贴板和音频方向都不兼容，本次请求无法建立同步。".to_string(),
+                message: "剪贴板, 音频和输入方向都不兼容, 本次请求无法建立同步.".to_string(),
             }),
         )
         .await?;
@@ -996,11 +901,9 @@ async fn handle_trusted_incoming_connection(
         message,
         device: &device,
         instance_name: session_options.instance_name.as_deref(),
-        workspace: &session_options.workspace,
         clipboard_mode: session_options.clipboard_mode,
         audio_mode: session_options.audio_mode,
         input_mode: session_options.input_mode,
-        agreement: &agreement,
         clipboard_agreement: &clipboard_agreement,
         auth_method: PairAuthMethod::TrustedDevice,
         pin: None,
@@ -1022,8 +925,7 @@ async fn handle_trusted_incoming_connection(
             role: SessionRole::Host,
             stream: tls_stream,
             remote: payload.client,
-            agreement,
-            remote_workspace: payload.workspace,
+            remote_capabilities: payload.capabilities,
             remote_socket_addr: remote_addr,
             audio_master_secret,
             input_master_secret,
@@ -1356,18 +1258,14 @@ async fn handle_bootstrap_incoming_connection(
         crypto::export_input_master_secret_from_server(&server_stream, &request_id)?;
     let reservation = reserver.reserve(payload.client.device_id);
     let session_options = runtime_options_for_profile(options, reservation.profile());
-    let agreement = negotiate_file_sync_modes(
-        session_options.file_sync_mode,
-        payload.workspace.file_sync_mode,
-    );
     let clipboard_agreement = negotiate_clipboard(
         session_options.clipboard_mode,
-        payload.workspace.clipboard_mode,
+        payload.capabilities.clipboard_mode,
     );
     let audio_compatible =
-        audio_modes_compatible(session_options.audio_mode, payload.workspace.audio_mode);
+        audio_modes_compatible(session_options.audio_mode, payload.capabilities.audio_mode);
     let input_compatible =
-        negotiate_input(session_options.input_mode, payload.workspace.input_mode).is_some();
+        negotiate_input(session_options.input_mode, payload.capabilities.input_mode).is_some();
     if !bootstrap_device_name_matches(&client_device_name, &payload.client.device_name) {
         write_frame(
             &mut server_stream,
@@ -1379,9 +1277,8 @@ async fn handle_bootstrap_incoming_connection(
         .await?;
         return Ok(None);
     }
-    print_pair_request_overview(&payload, &session_options, &agreement, &remote_addr_text)?;
-    if !agreement.any_direction()
-        && !clipboard_agreement.any_direction()
+    print_pair_request_overview(&payload, &session_options, &remote_addr_text)?;
+    if !clipboard_agreement.any_direction()
         && !audio_compatible
         && !input_compatible
     {
@@ -1389,7 +1286,7 @@ async fn handle_bootstrap_incoming_connection(
             &mut server_stream,
             transfer_limits,
             Frame::Control(ControlMessage::Error {
-                message: "文件、剪贴板和音频方向都不兼容，本次请求无法建立同步。".to_string(),
+                message: "剪贴板, 音频和输入方向都不兼容, 本次请求无法建立同步.".to_string(),
             }),
         )
         .await?;
@@ -1409,13 +1306,7 @@ async fn handle_bootstrap_incoming_connection(
         } else {
             host_pin.persist();
             let interaction_id = Uuid::new_v4();
-            let mut summary = payload.workspace.summary_lines();
-            summary.push(format!(
-                "剪贴板: {}",
-                payload.workspace.clipboard_mode.label()
-            ));
-            summary.push(format!("音频: {}", payload.workspace.audio_mode.label()));
-            summary.push(format!("输入: {}", payload.workspace.input_mode.label()));
+            let summary = payload.capabilities.summary_lines();
             match options
                 .control
                 .request_interaction(InteractionRequest::AcceptPeer {
@@ -1446,11 +1337,9 @@ async fn handle_bootstrap_incoming_connection(
         message,
         device: &device,
         instance_name: session_options.instance_name.as_deref(),
-        workspace: &session_options.workspace,
         clipboard_mode: session_options.clipboard_mode,
         audio_mode: session_options.audio_mode,
         input_mode: session_options.input_mode,
-        agreement: &agreement,
         clipboard_agreement: &clipboard_agreement,
         auth_method: PairAuthMethod::Pin,
         pin: Some(&pin),
@@ -1484,8 +1373,7 @@ async fn handle_bootstrap_incoming_connection(
             role: SessionRole::Host,
             stream: tls_stream,
             remote: payload.client,
-            agreement,
-            remote_workspace: payload.workspace,
+            remote_capabilities: payload.capabilities,
             remote_socket_addr: remote_addr,
             audio_master_secret,
             input_master_secret,
@@ -1573,11 +1461,11 @@ where
     let payload = PairRequestPayload {
         protocol_version: PROTOCOL_VERSION,
         client: device_identity(device, options.instance_name.as_deref()),
-        workspace: options.workspace.session_summary(
-            options.clipboard_mode,
-            options.audio_mode,
-            options.input_mode,
-        ),
+        capabilities: RuntimeCapabilities {
+            clipboard_mode: options.clipboard_mode,
+            audio_mode: options.audio_mode,
+            input_mode: options.input_mode,
+        },
         request_trust: options.pairing.trust_device,
     };
     let trusted_proof = crypto::sign_trusted_pair_auth(
@@ -1601,13 +1489,12 @@ where
         Frame::Control(message) => message,
         _ => bail!("peer sent a non-control response during trusted pairing"),
     };
-    let (remote, remote_workspace, agreement, _clipboard_agreement) = match reply {
+    let (remote, remote_capabilities, _clipboard_agreement) = match reply {
         ControlMessage::PairDecision {
             accepted,
             message,
             server,
-            workspace,
-            agreement,
+            capabilities,
             clipboard_agreement,
             auth_method,
             server_trusts_client,
@@ -1622,8 +1509,7 @@ where
                 accepted,
                 message: message.clone(),
                 server: server.clone(),
-                workspace: workspace.clone(),
-                agreement: agreement.clone(),
+                capabilities,
                 clipboard_agreement: clipboard_agreement.clone(),
                 auth_method,
                 server_trusts_client,
@@ -1641,7 +1527,7 @@ where
             if !accepted {
                 bail!("{}", message);
             }
-            (server, workspace, agreement, clipboard_agreement)
+            (server, capabilities, clipboard_agreement)
         }
         ControlMessage::Error { message } => bail!("{}", message),
         other => bail!("unexpected trusted pairing response: {other:?}"),
@@ -1651,13 +1537,12 @@ where
     config.save_trusted_devices()?;
 
     let tls_stream: TlsStream<TcpStream> = client_stream.into();
-    print_connected_peer(&remote, &agreement, &remote_workspace, options.input_mode)?;
+    print_connected_peer(&remote, &remote_capabilities, options.input_mode)?;
     Ok(AuthenticatedSession {
         role: SessionRole::Client,
         stream: tls_stream,
         remote,
-        agreement,
-        remote_workspace,
+        remote_capabilities,
         remote_socket_addr,
         audio_master_secret,
         input_master_secret,
@@ -1797,11 +1682,11 @@ async fn connect_to_untrusted_peer(
     let payload = PairRequestPayload {
         protocol_version: PROTOCOL_VERSION,
         client: device_identity(device, options.instance_name.as_deref()),
-        workspace: options.workspace.session_summary(
-            options.clipboard_mode,
-            options.audio_mode,
-            options.input_mode,
-        ),
+        capabilities: RuntimeCapabilities {
+            clipboard_mode: options.clipboard_mode,
+            audio_mode: options.audio_mode,
+            input_mode: options.input_mode,
+        },
         request_trust: options.pairing.trust_device,
     };
     write_frame(
@@ -1821,13 +1706,12 @@ async fn connect_to_untrusted_peer(
         Frame::Control(message) => message,
         _ => bail!("peer sent a non-control response during bootstrap pairing"),
     };
-    let (remote, remote_workspace, agreement) = match &reply {
+    let (remote, remote_capabilities) = match &reply {
         ControlMessage::PairDecision {
             accepted,
             message,
             server,
-            workspace,
-            agreement,
+            capabilities,
             auth_method,
             ..
         } => {
@@ -1839,7 +1723,7 @@ async fn connect_to_untrusted_peer(
             if !accepted {
                 bail!("{}", message);
             }
-            (server.clone(), workspace.clone(), agreement.clone())
+            (server.clone(), *capabilities)
         }
         ControlMessage::Error { message } => bail!("{}", message),
         other => bail!("unexpected bootstrap pairing response: {other:?}"),
@@ -1895,13 +1779,12 @@ async fn connect_to_untrusted_peer(
     }
 
     let tls_stream: TlsStream<TcpStream> = client_stream.into();
-    print_connected_peer(&remote, &agreement, &remote_workspace, options.input_mode)?;
+    print_connected_peer(&remote, &remote_capabilities, options.input_mode)?;
     Ok(AuthenticatedSession {
         role: SessionRole::Client,
         stream: tls_stream,
         remote,
-        agreement,
-        remote_workspace,
+        remote_capabilities,
         remote_socket_addr,
         audio_master_secret,
         input_master_secret,
@@ -2290,40 +2173,24 @@ where
 
 pub(crate) async fn run_sync_session(
     session: AuthenticatedSession,
-    workspace: &WorkspaceSpec,
     options: SyncSessionOptions<'_>,
 ) -> Result<()> {
     tracing::info!(
         peer = %identity_display_name(&session.remote),
         device_id = %short_uuid(&session.remote.device_id),
-        remote_workspace = %session.remote_workspace.summary_lines().join(" | "),
+        remote_capabilities = %session.remote_capabilities.summary_lines().join(" | "),
         "同步会话已开始"
     );
 
-    let local_can_send = allows_local_send(session.role, &session.agreement);
-    let local_can_receive = allows_local_receive(session.role, &session.agreement);
-    let file_can_send = local_can_send
-        && workspace.can_send_files()
-        && session.remote_workspace.can_receive_files();
-    let file_can_receive = local_can_receive
-        && workspace.can_receive_files()
-        && session.remote_workspace.can_send_files();
-    let initial_snapshot_policy = resolve_initial_snapshot_policy(
-        session.role,
-        workspace,
-        &session.remote_workspace,
-        file_can_send,
-        file_can_receive,
-    )?;
     let initial_local_capabilities = options.capability_profile.apply(RuntimeCapabilities {
         clipboard_mode: options.clipboard_mode,
         audio_mode: options.audio_mode,
         input_mode: options.input_mode,
     });
     let initial_remote_capabilities = RuntimeCapabilities {
-        clipboard_mode: session.remote_workspace.clipboard_mode,
-        audio_mode: session.remote_workspace.audio_mode,
-        input_mode: session.remote_workspace.input_mode,
+        clipboard_mode: session.remote_capabilities.clipboard_mode,
+        audio_mode: session.remote_capabilities.audio_mode,
+        input_mode: session.remote_capabilities.input_mode,
     };
     let mut capability_state = CapabilityState::new(
         matches!(session.role, SessionRole::Host),
@@ -2341,7 +2208,6 @@ pub(crate) async fn run_sync_session(
     );
     let mut input_options = current_tuning.input;
     let mut input_backend_generation = current_tuning.input_backend_generation;
-    let mut sync_delete = current_tuning.sync_delete;
     let shutdown = options.control.shutdown().clone();
     let session_shutdown = options.session_shutdown.clone();
     let mut capability_ack_deadline = None;
@@ -2356,7 +2222,7 @@ pub(crate) async fn run_sync_session(
         clipboard = %clipboard_summary_line(
             session.role,
             options.clipboard_mode,
-            session.remote_workspace.clipboard_mode,
+            session.remote_capabilities.clipboard_mode,
         ),
         audio = %audio_summary_line(options.audio_mode, initial_remote_capabilities.audio_mode),
         input = negotiate_input(options.input_mode, initial_remote_capabilities.input_mode)
@@ -2389,31 +2255,6 @@ pub(crate) async fn run_sync_session(
         session_tasks.track(&task);
     }
 
-    let (snapshot_control_tx, snapshot_control_rx) = mpsc::unbounded_channel();
-    let (advertised_snapshot_tx, mut advertised_snapshot_rx) =
-        mpsc::unbounded_channel::<AdvertisedSnapshot>();
-    let snapshot_task = if file_can_send {
-        let outgoing = workspace
-            .outgoing
-            .clone()
-            .context("session negotiated sending, but local workspace has no outgoing selection")?;
-        let sender = tx.clone();
-        let task = tokio::spawn(snapshot_loop(
-            outgoing,
-            sender,
-            tuning.clone(),
-            snapshot_control_rx,
-            matches!(
-                initial_snapshot_policy,
-                InitialSnapshotPolicy::PublishImmediately
-            ),
-            advertised_snapshot_tx,
-        ));
-        session_tasks.track(&task);
-        Some(task)
-    } else {
-        None
-    };
     let mut capability_runtime = CapabilityTaskRuntime::new(options.clipboard_options);
     refresh_capability_tasks(
         &capability_state,
@@ -2484,17 +2325,6 @@ pub(crate) async fn run_sync_session(
         report_capability_state(&options.control, &peer_summary, &capability_state);
     }
 
-    let incoming_root = workspace.incoming_root.clone();
-    let outgoing_spec = workspace.outgoing.clone();
-    let mut pending_revisions = BTreeMap::<u64, PendingRevision>::new();
-    let mut incoming_files = HashMap::<(u64, String), IncomingFileState>::new();
-    let mut advertised_snapshots = BTreeMap::<u64, ManifestSnapshot>::new();
-    let mut last_reported_clock_skew_bucket = None;
-    let waiting_for_initial_remote_seed = matches!(
-        initial_snapshot_policy,
-        InitialSnapshotPolicy::WaitForRemoteSeed
-    );
-    let mut pending_initial_remote_revision = None;
     let disconnected = loop {
         let frame = tokio::select! {
             biased;
@@ -2582,7 +2412,6 @@ pub(crate) async fn run_sync_session(
                     input_backend_generation,
                     next.input_backend_generation,
                 );
-                let enable_delete = !sync_delete && next.sync_delete;
                 if let Some(hub) = &options.clipboard_hub {
                     hub.update_options(next.clipboard.clone());
                 } else {
@@ -2593,10 +2422,6 @@ pub(crate) async fn run_sync_session(
                 }
                 input_options = next.input;
                 input_backend_generation = next.input_backend_generation;
-                sync_delete = next.sync_delete;
-                if enable_delete {
-                    tx.send(Frame::Control(ControlMessage::SnapshotRescanRequest)).await?;
-                }
                 if input_changed {
                     let (generation, capabilities) = capability_state.bump_local();
                     refresh_capability_tasks(
@@ -2640,7 +2465,6 @@ pub(crate) async fn run_sync_session(
                 }
             }
         };
-        drain_advertised_snapshots(&mut advertised_snapshot_rx, &mut advertised_snapshots);
 
         match frame {
             Frame::Control(ControlMessage::CapabilitiesUpdate {
@@ -2784,191 +2608,6 @@ pub(crate) async fn run_sync_session(
                     }
                 }
             }
-            Frame::Control(ControlMessage::SnapshotRescanRequest) => {
-                if file_can_send {
-                    let _ = snapshot_control_tx.send(SnapshotLoopControl::ForcePublish);
-                }
-            }
-            Frame::Control(ControlMessage::SnapshotAdvert {
-                revision,
-                snapshot,
-                sender_time_ms,
-            }) => {
-                if !file_can_receive {
-                    continue;
-                }
-                discard_superseded_revisions(&mut pending_revisions, &mut incoming_files, revision)
-                    .await?;
-                if waiting_for_initial_remote_seed {
-                    pending_initial_remote_revision = Some(revision);
-                }
-                let root = incoming_root.as_ref().context(
-                    "session negotiated receiving, but local workspace has no destination",
-                )?;
-                let snapshot = filter_snapshot_for_incoming_root(root, &snapshot)?;
-                let local_snapshot = filter_snapshot_by_folder_depth(
-                    &build_incoming_snapshot(root)?,
-                    snapshot.layout,
-                    snapshot.max_folder_depth,
-                );
-                let local_now_ms = current_unix_ms();
-                let remote_clock_delta_ms = sender_time_ms as i64 - local_now_ms as i64;
-                maybe_report_clock_skew(
-                    remote_clock_delta_ms,
-                    &mut last_reported_clock_skew_bucket,
-                );
-                let time_context = TimestampComparisonContext {
-                    remote_clock_delta_ms,
-                    local_now_ms: Some(local_now_ms),
-                    remote_now_ms: Some(sender_time_ms),
-                    skew_tolerance_ms: TIMESTAMP_SKEW_TOLERANCE_MS,
-                    future_guard_ms: FUTURE_TIMESTAMP_GUARD_MS,
-                };
-                let skipped_delete_count = if !sync_delete {
-                    let preview_policy = delete_policy(snapshot.layout, true);
-                    build_apply_plan_with_time(
-                        &snapshot,
-                        &local_snapshot,
-                        preview_policy,
-                        time_context,
-                    )
-                    .delete_paths
-                    .len()
-                } else {
-                    0
-                };
-                let delete_policy = delete_policy(snapshot.layout, sync_delete);
-                let mut plan = build_apply_plan_with_time(
-                    &snapshot,
-                    &local_snapshot,
-                    delete_policy,
-                    time_context,
-                );
-                if waiting_for_initial_remote_seed
-                    && pending_initial_remote_revision == Some(revision)
-                {
-                    plan.file_requests.append(&mut plan.skipped_newer_paths);
-                }
-                if file_can_send {
-                    note_remote_snapshot_expectations(
-                        &snapshot_control_tx,
-                        &snapshot,
-                        &local_snapshot,
-                        &plan,
-                    );
-                }
-                ensure_directories(root, &snapshot)?;
-
-                if skipped_delete_count > 0 {
-                    tracing::info!(skipped_delete_count, "检测到对端删除项, 本机未开启删除同步");
-                }
-
-                if !plan.skipped_newer_paths.is_empty() {
-                    print_local_newer_paths(revision, &plan.skipped_newer_paths);
-                    tx.send(Frame::Control(ControlMessage::OverwritePaused {
-                        revision,
-                        paths: plan.skipped_newer_paths.clone(),
-                    }))
-                    .await?;
-                }
-
-                if !plan.unreliable_timestamp_paths.is_empty() {
-                    print_unreliable_timestamp_paths(revision, &plan.unreliable_timestamp_paths);
-                }
-
-                if plan.file_requests.is_empty() {
-                    let delete_report = delete_paths_best_effort(root, &plan.delete_paths);
-                    print_delete_failures(&delete_report);
-                    print_standalone_delete_result(&delete_report, plan.skipped_newer_paths.len());
-                    maybe_activate_initial_sender(
-                        &snapshot_control_tx,
-                        &mut pending_initial_remote_revision,
-                        revision,
-                    );
-                } else {
-                    let expected_files = expected_file_entries(&snapshot, &plan.file_requests)?;
-                    pending_revisions.insert(
-                        revision,
-                        PendingRevision {
-                            requested_files: plan.file_requests.len(),
-                            remaining_files: plan.file_requests.iter().cloned().collect(),
-                            failed_files: BTreeSet::new(),
-                            expected_files,
-                            delete_paths: plan.delete_paths,
-                            skipped_newer_count: plan.skipped_newer_paths.len(),
-                            transfer_done: false,
-                        },
-                    );
-                    tx.send(Frame::Control(ControlMessage::FileRequest {
-                        revision,
-                        paths: plan.file_requests,
-                    }))
-                    .await?;
-                }
-            }
-            Frame::Control(ControlMessage::FileRequest { revision, paths }) => {
-                if !file_can_send {
-                    continue;
-                }
-                let sender = tx.clone();
-                let outgoing = outgoing_spec
-                    .clone()
-                    .context("no outgoing spec available for file request")?;
-                let Some(advertised_snapshot) = advertised_snapshots.get(&revision).cloned() else {
-                    let message = format!("收到未知或已过期的修订版 {revision} 文件请求");
-                    tracing::warn!(revision, %message, "拒绝文件请求");
-                    tx.send(Frame::Control(ControlMessage::TransferAborted {
-                        revision,
-                        message,
-                    }))
-                    .await?;
-                    continue;
-                };
-                tokio::spawn(async move {
-                    if let Err(err) = send_requested_files(
-                        sender.clone(),
-                        outgoing,
-                        advertised_snapshot,
-                        revision,
-                        paths,
-                    )
-                    .await
-                    {
-                        let message = format!("发送修订版 {revision} 失败: {err:#}");
-                        tracing::warn!(revision, error = %err, "发送修订版失败");
-                        let _ = sender
-                            .send(Frame::Control(ControlMessage::TransferAborted {
-                                revision,
-                                message,
-                            }))
-                            .await;
-                    }
-                });
-            }
-            Frame::Control(ControlMessage::OverwritePaused { revision, paths }) => {
-                print_remote_overwrite_paused(revision, &paths);
-            }
-            Frame::Control(ControlMessage::TransferDone { revision }) => {
-                if let Some(pending) = pending_revisions.get_mut(&revision) {
-                    pending.transfer_done = true;
-                }
-                if maybe_finalize_revision(&incoming_root, &mut pending_revisions, revision) {
-                    maybe_activate_initial_sender(
-                        &snapshot_control_tx,
-                        &mut pending_initial_remote_revision,
-                        revision,
-                    );
-                }
-            }
-            Frame::Control(ControlMessage::TransferAborted { revision, message }) => {
-                tracing::warn!(revision, %message, "对端中止修订版传输");
-                abort_revision(&mut pending_revisions, &mut incoming_files, revision).await?;
-                maybe_activate_initial_sender(
-                    &snapshot_control_tx,
-                    &mut pending_initial_remote_revision,
-                    revision,
-                );
-            }
             Frame::Control(ControlMessage::Error { message }) => {
                 tracing::warn!(%message, "对端报告错误");
             }
@@ -3000,25 +2639,6 @@ pub(crate) async fn run_sync_session(
                     tracing::warn!(error = %err, "无法应用远端剪贴板内容");
                 }
             }
-            Frame::FileChunk(header, data) => {
-                if !file_can_receive {
-                    continue;
-                }
-                if !pending_revisions.contains_key(&header.revision) {
-                    continue;
-                }
-                let root = incoming_root
-                    .as_ref()
-                    .context("received file data without a local destination")?;
-                handle_file_chunk(
-                    root,
-                    &mut incoming_files,
-                    &mut pending_revisions,
-                    header,
-                    data,
-                )
-                .await?;
-            }
         }
     };
 
@@ -3032,9 +2652,6 @@ pub(crate) async fn run_sync_session(
             options.input_routes.as_ref(),
         )
         .await;
-    if let Some(task) = snapshot_task {
-        task.abort();
-    }
     reader_task.abort();
     let _ = reader_task.await;
     drop(tx);
@@ -3081,1064 +2698,11 @@ async fn clipboard_sender_loop(
     Ok(())
 }
 
-async fn snapshot_loop(
-    outgoing: crate::sync::OutgoingSpec,
-    tx: mpsc::Sender<Frame>,
-    mut tuning: watch::Receiver<RuntimeTuning>,
-    mut control_rx: mpsc::UnboundedReceiver<SnapshotLoopControl>,
-    publish_initial_snapshot: bool,
-    advertised_snapshot_tx: mpsc::UnboundedSender<AdvertisedSnapshot>,
-) -> Result<()> {
-    let (watch_tx, mut watch_rx) = mpsc::unbounded_channel::<notify::Result<Event>>();
-    let mut watcher = RecommendedWatcher::new(
-        move |event| {
-            let _ = watch_tx.send(event);
-        },
-        NotifyConfig::default(),
-    )
-    .context("failed to start filesystem watcher")?;
-
-    for target in watch_targets(&outgoing)? {
-        let mode = if target.recursive {
-            RecursiveMode::Recursive
-        } else {
-            RecursiveMode::NonRecursive
-        };
-        watcher
-            .watch(&target.path, mode)
-            .with_context(|| format!("failed to watch shared path {}", target.path.display()))?;
-    }
-
-    let mut tuning_open = true;
-    let mut ticker = time::interval(Duration::from_secs(tuning.borrow().interval_secs.max(1)));
-    let mut last_snapshot = None;
-    let mut revision = 1u64;
-    let debounce = Duration::from_millis(300);
-    let mut echo_suppressions = SnapshotEchoSuppressions::default();
-    let mut publishing_enabled = publish_initial_snapshot;
-
-    if publishing_enabled {
-        publish_snapshot_if_changed(
-            &outgoing,
-            &tx,
-            &mut last_snapshot,
-            &mut revision,
-            &mut echo_suppressions,
-            &advertised_snapshot_tx,
-        )
-        .await?;
-    }
-    ticker.tick().await;
-
-    loop {
-        tokio::select! {
-            changed = tuning.changed(), if tuning_open => {
-                if changed.is_err() {
-                    tuning_open = false;
-                    continue;
-                }
-                let interval_secs = tuning.borrow_and_update().interval_secs.max(1);
-                ticker = time::interval(Duration::from_secs(interval_secs));
-                ticker.tick().await;
-                tracing::info!(interval_secs, "文件扫描间隔已更新");
-            }
-            maybe_control = control_rx.recv() => {
-                let Some(control) = maybe_control else {
-                    bail!("snapshot control channel closed unexpectedly");
-                };
-                match control {
-                    SnapshotLoopControl::ExpectRemoteChanges { expectations } => {
-                        echo_suppressions.note_remote_expectations(expectations);
-                    }
-                    SnapshotLoopControl::AdoptCurrentSnapshotAsBaselineAndEnable => {
-                        last_snapshot = Some(build_snapshot(&outgoing)?);
-                        publishing_enabled = true;
-                    }
-                    SnapshotLoopControl::ForcePublish => {
-                        if publishing_enabled {
-                            last_snapshot = None;
-                            publish_snapshot_if_changed(
-                                &outgoing,
-                                &tx,
-                                &mut last_snapshot,
-                                &mut revision,
-                                &mut echo_suppressions,
-                                &advertised_snapshot_tx,
-                            )
-                            .await?;
-                        }
-                    }
-                }
-            }
-            maybe_event = watch_rx.recv() => {
-                let event = match maybe_event {
-                    Some(event) => event,
-                    None => bail!("filesystem watcher channel closed unexpectedly"),
-                };
-
-                if let Err(err) = event {
-                    tracing::warn!(error = %err, "文件监视出错, 等待下一次重扫");
-                    continue;
-                }
-
-                drain_watch_events(&mut watch_rx, debounce).await;
-                if !publishing_enabled {
-                    continue;
-                }
-                publish_snapshot_if_changed(
-                    &outgoing,
-                    &tx,
-                    &mut last_snapshot,
-                    &mut revision,
-                    &mut echo_suppressions,
-                    &advertised_snapshot_tx,
-                )
-                .await?;
-            }
-            _ = ticker.tick() => {
-                if !publishing_enabled {
-                    continue;
-                }
-                publish_snapshot_if_changed(
-                    &outgoing,
-                    &tx,
-                    &mut last_snapshot,
-                    &mut revision,
-                    &mut echo_suppressions,
-                    &advertised_snapshot_tx,
-                )
-                .await?;
-            }
-        }
-    }
-}
-
-async fn publish_snapshot_if_changed(
-    outgoing: &crate::sync::OutgoingSpec,
-    tx: &mpsc::Sender<Frame>,
-    last_snapshot: &mut Option<crate::sync::ManifestSnapshot>,
-    revision: &mut u64,
-    echo_suppressions: &mut SnapshotEchoSuppressions,
-    advertised_snapshot_tx: &mpsc::UnboundedSender<AdvertisedSnapshot>,
-) -> Result<()> {
-    let snapshot = build_snapshot(outgoing)?;
-    if last_snapshot.as_ref() == Some(&snapshot) {
-        return Ok(());
-    }
-
-    if echo_suppressions.matches_only_remote_changes(last_snapshot.as_ref(), &snapshot) {
-        *last_snapshot = Some(snapshot);
-        return Ok(());
-    }
-
-    tx.send(Frame::Control(ControlMessage::SnapshotAdvert {
-        revision: *revision,
-        snapshot: snapshot.clone(),
-        sender_time_ms: current_unix_ms(),
-    }))
-    .await?;
-    let _ = advertised_snapshot_tx.send(AdvertisedSnapshot {
-        revision: *revision,
-        snapshot: snapshot.clone(),
-    });
-    *last_snapshot = Some(snapshot);
-    *revision += 1;
-    Ok(())
-}
-
-async fn drain_watch_events(
-    watch_rx: &mut mpsc::UnboundedReceiver<notify::Result<Event>>,
-    debounce: Duration,
-) {
-    let sleep = time::sleep(debounce);
-    tokio::pin!(sleep);
-
-    loop {
-        tokio::select! {
-            _ = &mut sleep => break,
-            maybe_event = watch_rx.recv() => match maybe_event {
-                Some(Ok(_)) => {
-                    sleep.as_mut().reset(Instant::now() + debounce);
-                }
-                Some(Err(err)) => {
-                    tracing::warn!(error = %err, "文件监视出错, 继续等待变更稳定");
-                    sleep.as_mut().reset(Instant::now() + debounce);
-                }
-                None => break,
-            }
-        }
-    }
-}
-
-impl SnapshotEchoSuppressions {
-    fn note_remote_expectations(&mut self, expectations: Vec<RemoteEchoExpectation>) {
-        let expires_at = Instant::now() + REMOTE_ECHO_SUPPRESSION_TTL;
-        for expectation in expectations {
-            self.paths.insert(
-                expectation.wire_path,
-                PendingRemoteEchoExpectation {
-                    expected: expectation.expected,
-                    expires_at,
-                },
-            );
-        }
-    }
-
-    fn matches_only_remote_changes(
-        &mut self,
-        previous: Option<&ManifestSnapshot>,
-        current: &ManifestSnapshot,
-    ) -> bool {
-        let Some(previous) = previous else {
-            return false;
-        };
-
-        self.prune_expired();
-        let changed_paths = snapshot_changed_paths(previous, current);
-        if changed_paths.is_empty() {
-            return false;
-        }
-
-        for path in &changed_paths {
-            let Some(expectation) = self.paths.get(path) else {
-                return false;
-            };
-            if !expectation_matches(&expectation.expected, current.entries.get(path)) {
-                return false;
-            }
-        }
-
-        for path in changed_paths {
-            self.paths.remove(&path);
-        }
-        true
-    }
-
-    fn prune_expired(&mut self) {
-        let now = Instant::now();
-        self.paths
-            .retain(|_, expectation| expectation.expires_at > now);
-    }
-}
-
-fn note_remote_snapshot_expectations(
-    snapshot_control_tx: &mpsc::UnboundedSender<SnapshotLoopControl>,
-    remote_snapshot: &ManifestSnapshot,
-    local_snapshot: &ManifestSnapshot,
-    plan: &crate::sync::ApplyPlan,
-) {
-    let expectations = build_remote_echo_expectations(remote_snapshot, local_snapshot, plan);
-    if expectations.is_empty() {
-        return;
-    }
-
-    let _ = snapshot_control_tx.send(SnapshotLoopControl::ExpectRemoteChanges { expectations });
-}
-
-fn build_remote_echo_expectations(
-    remote_snapshot: &ManifestSnapshot,
-    local_snapshot: &ManifestSnapshot,
-    plan: &crate::sync::ApplyPlan,
-) -> Vec<RemoteEchoExpectation> {
-    let mut expectations = BTreeMap::<String, SnapshotPathExpectation>::new();
-
-    for path in &plan.file_requests {
-        let Some(remote_entry) = remote_snapshot.entries.get(path) else {
-            continue;
-        };
-        expectations.insert(
-            path.clone(),
-            SnapshotPathExpectation::Exact(remote_entry.clone()),
-        );
-        insert_ancestor_dir_expectations(&mut expectations, remote_snapshot, path);
-    }
-
-    for path in &plan.delete_paths {
-        expectations.insert(path.clone(), SnapshotPathExpectation::Missing);
-        insert_ancestor_dir_expectations(&mut expectations, remote_snapshot, path);
-    }
-
-    for (path, remote_entry) in &remote_snapshot.entries {
-        if remote_entry.kind != EntryKind::Dir {
-            continue;
-        }
-
-        if local_snapshot
-            .entries
-            .get(path)
-            .is_none_or(|local_entry| local_entry.kind != EntryKind::Dir)
-        {
-            expectations
-                .entry(path.clone())
-                .or_insert(SnapshotPathExpectation::DirExists);
-            insert_ancestor_dir_expectations(&mut expectations, remote_snapshot, path);
-        }
-    }
-
-    expectations
-        .into_iter()
-        .map(|(wire_path, expected)| RemoteEchoExpectation {
-            wire_path,
-            expected,
-        })
-        .collect()
-}
-
-fn insert_ancestor_dir_expectations(
-    expectations: &mut BTreeMap<String, SnapshotPathExpectation>,
-    remote_snapshot: &ManifestSnapshot,
-    wire_path: &str,
-) {
-    for ancestor in wire_path_ancestors(wire_path) {
-        if remote_snapshot
-            .entries
-            .get(&ancestor)
-            .is_some_and(|entry| entry.kind == EntryKind::Dir)
-        {
-            expectations
-                .entry(ancestor)
-                .or_insert(SnapshotPathExpectation::DirExists);
-        }
-    }
-}
-
-fn wire_path_ancestors(wire_path: &str) -> Vec<String> {
-    let mut ancestors = Vec::new();
-    let mut components = wire_path.split('/').collect::<Vec<_>>();
-    while components.len() > 1 {
-        components.pop();
-        ancestors.push(components.join("/"));
-    }
-    ancestors
-}
-
-fn snapshot_changed_paths(previous: &ManifestSnapshot, current: &ManifestSnapshot) -> Vec<String> {
-    let changed_paths = previous
-        .entries
-        .keys()
-        .chain(current.entries.keys())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .filter(|path| previous.entries.get(*path) != current.entries.get(*path))
-        .cloned()
-        .collect::<Vec<_>>();
-
-    let mut collapsed = Vec::<String>::new();
-    for path in changed_paths {
-        if collapsed.iter().any(|ancestor| {
-            !current.entries.contains_key(ancestor) && is_wire_path_ancestor(ancestor, &path)
-        }) {
-            continue;
-        }
-        collapsed.push(path);
-    }
-
-    collapsed
-}
-
-fn is_wire_path_ancestor(ancestor: &str, path: &str) -> bool {
-    path != ancestor
-        && path
-            .strip_prefix(ancestor)
-            .is_some_and(|suffix| suffix.starts_with('/'))
-}
-
-fn expectation_matches(
-    expectation: &SnapshotPathExpectation,
-    current_entry: Option<&ManifestEntry>,
-) -> bool {
-    match expectation {
-        SnapshotPathExpectation::Exact(entry) => current_entry == Some(entry),
-        SnapshotPathExpectation::DirExists => {
-            current_entry.is_some_and(|entry| entry.kind == EntryKind::Dir)
-        }
-        SnapshotPathExpectation::Missing => current_entry.is_none(),
-    }
-}
-
-async fn send_requested_files(
-    tx: mpsc::Sender<Frame>,
-    outgoing: crate::sync::OutgoingSpec,
-    advertised_snapshot: ManifestSnapshot,
-    revision: u64,
-    paths: Vec<String>,
-) -> Result<()> {
-    for path in paths {
-        let advertised_entry = advertised_snapshot.entries.get(&path).with_context(|| {
-            format!("requested path `{path}` is not part of revision {revision}")
-        })?;
-        if advertised_entry.kind != EntryKind::File {
-            bail!("requested path `{path}` is not a file in revision {revision}");
-        }
-        send_one_file(&tx, &outgoing, revision, &path, advertised_entry).await?;
-    }
-
-    tx.send(Frame::Control(ControlMessage::TransferDone { revision }))
-        .await?;
-    Ok(())
-}
-
-async fn send_one_file(
-    tx: &mpsc::Sender<Frame>,
-    outgoing: &crate::sync::OutgoingSpec,
-    revision: u64,
-    wire_path: &str,
-    advertised_entry: &ManifestEntry,
-) -> Result<()> {
-    if advertised_entry.kind != EntryKind::File {
-        bail!("requested path {wire_path} is not a file in the advertised snapshot");
-    }
-    let path = resolve_outgoing_path(outgoing, wire_path)?;
-    let metadata = tokio::fs::metadata(&path)
-        .await
-        .with_context(|| format!("failed to inspect {}", path.display()))?;
-    if !metadata.is_file() {
-        bail!("requested path {} is not a regular file", path.display());
-    }
-
-    let expected_hash = advertised_entry
-        .hash
-        .as_deref()
-        .context("advertised file entry is missing a content hash")?;
-
-    let mut file = File::open(&path)
-        .await
-        .with_context(|| format!("failed to open {}", path.display()))?;
-    let mut offset = 0u64;
-    let mut buffer = vec![0u8; FILE_STREAM_CHUNK_SIZE];
-    let mut hasher = Sha256::new();
-
-    if advertised_entry.size == 0 {
-        let actual_hash = format!("{:x}", Sha256::digest([]));
-        if actual_hash != expected_hash {
-            bail!(
-                "共享文件 {} 在修订版 {} 发送前已变化：期望哈希 {}，当前空内容哈希 {}",
-                path.display(),
-                revision,
-                expected_hash,
-                actual_hash
-            );
-        }
-        tx.send(Frame::FileChunk(
-            FileChunkHeader {
-                revision,
-                path: wire_path.to_string(),
-                offset: 0,
-                total_size: 0,
-                modified_ms: advertised_entry.modified_ms,
-                executable: advertised_entry.executable,
-                final_chunk: true,
-            },
-            Vec::new(),
-        ))
-        .await?;
-        return Ok(());
-    }
-
-    while offset < advertised_entry.size {
-        let remaining = advertised_entry.size - offset;
-        let read_limit = usize::try_from(remaining.min(FILE_STREAM_CHUNK_SIZE as u64))
-            .expect("chunk size bound should fit usize");
-        let read = file.read(&mut buffer[..read_limit]).await?;
-        if read == 0 {
-            bail!(
-                "共享文件 {} 在修订版 {} 发送时长度发生变化：期望 {} 字节，实际只读到 {} 字节",
-                path.display(),
-                revision,
-                advertised_entry.size,
-                offset
-            );
-        }
-        hasher.update(&buffer[..read]);
-        let next_offset = offset + read as u64;
-        let final_chunk = next_offset >= advertised_entry.size;
-        tx.send(Frame::FileChunk(
-            FileChunkHeader {
-                revision,
-                path: wire_path.to_string(),
-                offset,
-                total_size: advertised_entry.size,
-                modified_ms: advertised_entry.modified_ms,
-                executable: advertised_entry.executable,
-                final_chunk,
-            },
-            buffer[..read].to_vec(),
-        ))
-        .await?;
-        offset = next_offset;
-    }
-
-    let actual_hash = format!("{:x}", hasher.finalize());
-    if actual_hash != expected_hash {
-        bail!(
-            "共享文件 {} 在修订版 {} 发送时内容发生变化：期望哈希 {}，实际发送哈希 {}",
-            path.display(),
-            revision,
-            expected_hash,
-            actual_hash
-        );
-    }
-
-    Ok(())
-}
-
-async fn handle_file_chunk(
-    root: &Path,
-    incoming_files: &mut HashMap<(u64, String), IncomingFileState>,
-    pending_revisions: &mut BTreeMap<u64, PendingRevision>,
-    header: FileChunkHeader,
-    data: Vec<u8>,
-) -> Result<()> {
-    if pending_revisions
-        .get(&header.revision)
-        .is_some_and(|pending| pending.failed_files.contains(&header.path))
-    {
-        return Ok(());
-    }
-
-    let key = (header.revision, header.path.clone());
-    if header.offset == 0 {
-        let expected_entry = match pending_revisions
-            .get(&header.revision)
-            .and_then(|pending| pending.expected_files.get(&header.path))
-            .cloned()
-        {
-            Some(entry) => entry,
-            None => {
-                report_incoming_file_failure(
-                    root,
-                    incoming_files,
-                    pending_revisions,
-                    header.revision,
-                    &header.path,
-                    None,
-                    None,
-                    anyhow!("missing advertised file metadata for {}", header.path),
-                )
-                .await;
-                return Ok(());
-            }
-        };
-        match begin_incoming_file(root, &header, expected_entry).await {
-            Ok(state) => {
-                incoming_files.insert(key.clone(), state);
-            }
-            Err((final_path, err)) => {
-                report_incoming_file_failure(
-                    root,
-                    incoming_files,
-                    pending_revisions,
-                    header.revision,
-                    &header.path,
-                    final_path,
-                    None,
-                    err,
-                )
-                .await;
-                return Ok(());
-            }
-        }
-    }
-
-    let write_result = {
-        let state = match incoming_files.get_mut(&key) {
-            Some(state) => state,
-            None => {
-                report_incoming_file_failure(
-                    root,
-                    incoming_files,
-                    pending_revisions,
-                    header.revision,
-                    &header.path,
-                    None,
-                    None,
-                    anyhow!("missing transfer state for {}", header.path),
-                )
-                .await;
-                return Ok(());
-            }
-        };
-
-        if state.written != header.offset {
-            Err((
-                Some(state.final_path.clone()),
-                Some(state.temp_path.clone()),
-                anyhow!("incoming chunk metadata mismatch for {}", header.path,),
-            ))
-        } else if header.total_size != state.expected_entry.size
-            || header.modified_ms != state.expected_entry.modified_ms
-            || header.executable != state.expected_entry.executable
-        {
-            Err((
-                Some(state.final_path.clone()),
-                Some(state.temp_path.clone()),
-                anyhow!(
-                    "incoming chunk metadata drifted for {}: expected size={}, modified_ms={}, executable={}, got size={}, modified_ms={}, executable={}",
-                    header.path,
-                    state.expected_entry.size,
-                    state.expected_entry.modified_ms,
-                    state.expected_entry.executable,
-                    header.total_size,
-                    header.modified_ms,
-                    header.executable
-                ),
-            ))
-        } else if let Err(err) = state.file.write_all(&data).await {
-            Err((
-                Some(state.final_path.clone()),
-                Some(state.temp_path.clone()),
-                err.into(),
-            ))
-        } else {
-            state.hasher.update(&data);
-            state.written += data.len() as u64;
-            Ok(())
-        }
-    };
-
-    if let Err((final_path, temp_path, err)) = write_result {
-        report_incoming_file_failure(
-            root,
-            incoming_files,
-            pending_revisions,
-            header.revision,
-            &header.path,
-            final_path,
-            temp_path,
-            err,
-        )
-        .await;
-        return Ok(());
-    }
-
-    if header.final_chunk {
-        let state = match incoming_files.remove(&key) {
-            Some(state) => state,
-            None => {
-                report_incoming_file_failure(
-                    root,
-                    incoming_files,
-                    pending_revisions,
-                    header.revision,
-                    &header.path,
-                    None,
-                    None,
-                    anyhow!("missing final transfer state for {}", header.path),
-                )
-                .await;
-                return Ok(());
-            }
-        };
-        let final_path = Some(state.final_path.clone());
-        let temp_path = Some(state.temp_path.clone());
-
-        if let Err(err) = finalize_incoming_file(state).await {
-            report_incoming_file_failure(
-                root,
-                incoming_files,
-                pending_revisions,
-                header.revision,
-                &header.path,
-                final_path,
-                temp_path,
-                err,
-            )
-            .await;
-            return Ok(());
-        }
-
-        if let Some(pending) = pending_revisions.get_mut(&header.revision) {
-            pending.remaining_files.remove(&header.path);
-            pending.expected_files.remove(&header.path);
-        }
-        let _ = maybe_finalize_revision(
-            &Some(root.to_path_buf()),
-            pending_revisions,
-            header.revision,
-        );
-    }
-
-    Ok(())
-}
-
-fn drain_advertised_snapshots(
-    advertised_snapshot_rx: &mut mpsc::UnboundedReceiver<AdvertisedSnapshot>,
-    advertised_snapshots: &mut BTreeMap<u64, ManifestSnapshot>,
-) {
-    while let Ok(advertised) = advertised_snapshot_rx.try_recv() {
-        advertised_snapshots.insert(advertised.revision, advertised.snapshot);
-    }
-
-    while advertised_snapshots.len() > ADVERTISED_SNAPSHOT_CACHE_LIMIT {
-        let Some(oldest_revision) = advertised_snapshots.keys().next().copied() else {
-            break;
-        };
-        advertised_snapshots.remove(&oldest_revision);
-    }
-}
-
-fn expected_file_entries(
-    snapshot: &ManifestSnapshot,
-    paths: &[String],
-) -> Result<BTreeMap<String, ManifestEntry>> {
-    paths
-        .iter()
-        .map(|path| {
-            let entry = snapshot
-                .entries
-                .get(path)
-                .with_context(|| format!("snapshot is missing requested path `{path}`"))?;
-            if entry.kind != EntryKind::File {
-                bail!("snapshot path `{path}` is not a file");
-            }
-            Ok((path.clone(), entry.clone()))
-        })
-        .collect()
-}
-
-async fn begin_incoming_file(
-    root: &Path,
-    header: &FileChunkHeader,
-    expected_entry: ManifestEntry,
-) -> std::result::Result<IncomingFileState, (Option<PathBuf>, anyhow::Error)> {
-    if expected_entry.kind != EntryKind::File {
-        return Err((
-            None,
-            anyhow!("advertised path {} is not a file", header.path),
-        ));
-    }
-    if header.total_size != expected_entry.size
-        || header.modified_ms != expected_entry.modified_ms
-        || header.executable != expected_entry.executable
-    {
-        return Err((
-            None,
-            anyhow!(
-                "incoming file metadata mismatch for {}: expected size={}, modified_ms={}, executable={}, got size={}, modified_ms={}, executable={}",
-                header.path,
-                expected_entry.size,
-                expected_entry.modified_ms,
-                expected_entry.executable,
-                header.total_size,
-                header.modified_ms,
-                header.executable
-            ),
-        ));
-    }
-
-    let final_path = match resolve_incoming_path(root, &header.path) {
-        Ok(path) => path,
-        Err(err) => return Err((None, err)),
-    };
-
-    if let Some(parent) = final_path.parent()
-        && let Err(err) = tokio::fs::create_dir_all(parent).await
-    {
-        return Err((Some(final_path), err.into()));
-    }
-
-    let temp_path = temp_file_path(&final_path);
-    let _ = tokio::fs::remove_file(&temp_path).await;
-    let file = match File::create(&temp_path).await {
-        Ok(file) => file,
-        Err(err) => return Err((Some(final_path), err.into())),
-    };
-
-    Ok(IncomingFileState {
-        file,
-        temp_path,
-        final_path,
-        expected_entry,
-        hasher: Sha256::new(),
-        written: 0,
-    })
-}
-
-async fn finalize_incoming_file(state: IncomingFileState) -> Result<()> {
-    let IncomingFileState {
-        mut file,
-        temp_path,
-        final_path,
-        expected_entry,
-        hasher,
-        written,
-    } = state;
-
-    file.flush().await?;
-    drop(file);
-
-    if written != expected_entry.size {
-        bail!(
-            "received size mismatch for {}: expected {}, got {}",
-            final_path.display(),
-            expected_entry.size,
-            written
-        );
-    }
-
-    let expected_hash = expected_entry
-        .hash
-        .as_deref()
-        .context("advertised file entry is missing a content hash")?;
-    let actual_hash = format!("{:x}", hasher.finalize());
-    if actual_hash != expected_hash {
-        bail!(
-            "received hash mismatch for {}: expected {}, got {}",
-            final_path.display(),
-            expected_hash,
-            actual_hash
-        );
-    }
-
-    replace_destination(&final_path, &temp_path).await?;
-    apply_file_metadata(
-        &final_path,
-        expected_entry.modified_ms,
-        expected_entry.executable,
-    )?;
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn report_incoming_file_failure(
-    root: &Path,
-    incoming_files: &mut HashMap<(u64, String), IncomingFileState>,
-    pending_revisions: &mut BTreeMap<u64, PendingRevision>,
-    revision: u64,
-    wire_path: &str,
-    final_path: Option<PathBuf>,
-    temp_path: Option<PathBuf>,
-    err: anyhow::Error,
-) {
-    let key = (revision, wire_path.to_string());
-    let mut final_path = final_path;
-    let mut temp_path = temp_path;
-
-    if let Some(state) = incoming_files.remove(&key) {
-        if final_path.is_none() {
-            final_path = Some(state.final_path);
-        }
-        if temp_path.is_none() {
-            temp_path = Some(state.temp_path);
-        }
-    }
-
-    if let Some(temp_path) = temp_path {
-        let _ = tokio::fs::remove_file(temp_path).await;
-    }
-
-    if let Some(pending) = pending_revisions.get_mut(&revision) {
-        pending.remaining_files.remove(wire_path);
-        pending.failed_files.insert(wire_path.to_string());
-        pending.expected_files.remove(wire_path);
-    }
-
-    let target = final_path
-        .as_ref()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| wire_path.to_string());
-    tracing::warn!(%target, revision, error = %err, "无法更新文件");
-
-    let _ = maybe_finalize_revision(&Some(root.to_path_buf()), pending_revisions, revision);
-}
-
-fn maybe_finalize_revision(
-    incoming_root: &Option<PathBuf>,
-    pending_revisions: &mut BTreeMap<u64, PendingRevision>,
-    revision: u64,
-) -> bool {
-    let should_finalize = pending_revisions
-        .get(&revision)
-        .is_some_and(|pending| pending.transfer_done && pending.remaining_files.is_empty());
-
-    if should_finalize
-        && let Some(pending) = pending_revisions.remove(&revision)
-        && let Some(root) = incoming_root
-    {
-        let delete_report = delete_paths_best_effort(root, &pending.delete_paths);
-        print_delete_failures(&delete_report);
-        let updated_files = pending
-            .requested_files
-            .saturating_sub(pending.failed_files.len());
-        print_revision_result(
-            updated_files,
-            pending.failed_files.len(),
-            pending.skipped_newer_count,
-            &delete_report,
-        );
-        return true;
-    }
-
-    false
-}
-
-async fn discard_superseded_revisions(
-    pending_revisions: &mut BTreeMap<u64, PendingRevision>,
-    incoming_files: &mut HashMap<(u64, String), IncomingFileState>,
-    keep_revision: u64,
-) -> Result<()> {
-    let stale_revisions = pending_revisions
-        .keys()
-        .copied()
-        .filter(|revision| *revision < keep_revision)
-        .collect::<Vec<_>>();
-
-    for revision in stale_revisions {
-        abort_revision(pending_revisions, incoming_files, revision).await?;
-    }
-
-    Ok(())
-}
-
-async fn abort_revision(
-    pending_revisions: &mut BTreeMap<u64, PendingRevision>,
-    incoming_files: &mut HashMap<(u64, String), IncomingFileState>,
-    revision: u64,
-) -> Result<()> {
-    pending_revisions.remove(&revision);
-
-    let stale_files = incoming_files
-        .keys()
-        .filter(|(file_revision, _)| *file_revision == revision)
-        .cloned()
-        .collect::<Vec<_>>();
-
-    for key in stale_files {
-        if let Some(state) = incoming_files.remove(&key) {
-            let _ = tokio::fs::remove_file(&state.temp_path).await;
-        }
-    }
-
-    Ok(())
-}
-
-async fn replace_destination(destination: &Path, temp_path: &Path) -> Result<()> {
-    if let Ok(metadata) = tokio::fs::symlink_metadata(destination).await {
-        if metadata.file_type().is_symlink() || metadata.is_file() {
-            tokio::fs::remove_file(destination).await?;
-        } else if metadata.is_dir() {
-            tokio::fs::remove_dir_all(destination).await?;
-        }
-    }
-    tokio::fs::rename(temp_path, destination).await?;
-    Ok(())
-}
-
-fn print_delete_failures(report: &crate::sync::DeleteReport) {
-    for failure in &report.failures {
-        let target = failure
-            .local_path
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .unwrap_or_else(|| failure.wire_path.clone());
-        tracing::warn!(%target, reason = %failure.reason, "无法归档删除项");
-    }
-}
-
-fn print_local_newer_paths(revision: u64, paths: &[String]) {
-    tracing::info!(revision, count = paths.len(), paths = %paths.join(" | "), "本地文件较新, 已暂停覆盖");
-}
-
-fn print_unreliable_timestamp_paths(revision: u64, paths: &[String]) {
-    tracing::warn!(revision, count = paths.len(), paths = %paths.join(" | "), "文件时间戳异常, 已忽略时间戳保护");
-}
-
-fn print_remote_overwrite_paused(revision: u64, paths: &[String]) {
-    tracing::info!(revision, count = paths.len(), paths = %paths.join(" | "), "对端保留了本地较新的文件");
-}
-
-fn print_standalone_delete_result(report: &crate::sync::DeleteReport, skipped_newer: usize) {
-    tracing::info!(
-        skipped_newer,
-        archived = report.archived_count,
-        delete_failures = report.failures.len(),
-        "同步删除结果已应用"
-    );
-}
-
-fn print_revision_result(
-    updated_files: usize,
-    failed_updates: usize,
-    skipped_newer: usize,
-    delete_report: &crate::sync::DeleteReport,
-) {
-    tracing::info!(
-        updated_files,
-        skipped_newer,
-        failed_updates,
-        archived = delete_report.archived_count,
-        delete_failures = delete_report.failures.len(),
-        "同步修订版处理完成"
-    );
-}
-
-fn maybe_report_clock_skew(
-    remote_clock_delta_ms: i64,
-    last_reported_clock_skew_bucket: &mut Option<i64>,
-) {
-    let bucket = clock_skew_bucket(remote_clock_delta_ms);
-    if bucket == *last_reported_clock_skew_bucket {
-        return;
-    }
-
-    *last_reported_clock_skew_bucket = bucket;
-    if bucket.is_some() {
-        tracing::warn!(
-            remote_clock_delta_ms,
-            delta = %format_clock_delta(remote_clock_delta_ms),
-            "检测到两端系统时间偏差, 将修正时间戳比较"
-        );
-    }
-}
-
-fn clock_skew_bucket(remote_clock_delta_ms: i64) -> Option<i64> {
-    let abs_delta_ms = remote_clock_delta_ms.unsigned_abs();
-    if abs_delta_ms < CLOCK_SKEW_WARNING_MS {
-        None
-    } else {
-        Some(remote_clock_delta_ms / CLOCK_SKEW_WARNING_MS as i64)
-    }
-}
-
-fn format_clock_delta(remote_clock_delta_ms: i64) -> String {
-    let abs_delta_ms = remote_clock_delta_ms.unsigned_abs();
-    let sign = if remote_clock_delta_ms >= 0 {
-        "快"
-    } else {
-        "慢"
-    };
-
-    if abs_delta_ms >= 60 * 60 * 1_000 {
-        format!(
-            "{} {:.1} 小时",
-            sign,
-            abs_delta_ms as f64 / (60.0 * 60.0 * 1_000.0)
-        )
-    } else if abs_delta_ms >= 60 * 1_000 {
-        format!(
-            "{} {:.1} 分钟",
-            sign,
-            abs_delta_ms as f64 / (60.0 * 1_000.0)
-        )
-    } else if abs_delta_ms >= 1_000 {
-        format!("{} {:.1} 秒", sign, abs_delta_ms as f64 / 1_000.0)
-    } else {
-        format!("{} {} 毫秒", sign, abs_delta_ms)
-    }
-}
-
-fn current_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as u64)
-        .unwrap_or_default()
-}
-
 async fn choose_peer(
     peer_query: Option<&str>,
     timeout: Duration,
     _headless: bool,
-    local_workspace: &crate::sync::WorkspaceSummary,
+    local_capabilities: &RuntimeCapabilities,
     discovery_config: &crate::config::DiscoveryConfig,
 ) -> Result<PeerTarget> {
     let query = require_peer_query(peer_query)?;
@@ -4147,7 +2711,7 @@ async fn choose_peer(
     }
     let peers = discovery::browse(timeout, discovery_config).await?;
     let peer = select_peer_from_query(&peers, query)?;
-    discovered_peer_target(peer, local_workspace)
+    discovered_peer_target(peer, local_capabilities)
 }
 
 pub(crate) fn known_peer_for_query(
@@ -4165,7 +2729,7 @@ pub(crate) fn known_peer_for_query(
 
 fn discovered_peer_target(
     peer: DiscoveredPeer,
-    local_workspace: &crate::sync::WorkspaceSummary,
+    local_capabilities: &RuntimeCapabilities,
 ) -> Result<PeerTarget> {
     if peer.protocol_version != PROTOCOL_VERSION {
         bail!(
@@ -4174,7 +2738,7 @@ fn discovered_peer_target(
             peer.protocol_version
         );
     }
-    ensure_discovered_peer_modes_match(&peer, local_workspace)?;
+    ensure_discovered_peer_modes_match(&peer, local_capabilities)?;
     Ok(PeerTarget::Discovered(peer))
 }
 
@@ -4269,16 +2833,13 @@ fn preferred_peer_query(peer: &DiscoveredPeer) -> String {
 
 fn discovered_peer_mode_mismatch_message(
     peer: &DiscoveredPeer,
-    local_workspace: &crate::sync::WorkspaceSummary,
+    local_capabilities: &RuntimeCapabilities,
 ) -> Option<String> {
-    let file_agreement =
-        negotiate_file_sync_modes(peer.file_sync_mode, local_workspace.file_sync_mode);
     let clipboard_agreement =
-        negotiate_clipboard(peer.clipboard_mode, local_workspace.clipboard_mode);
-    let audio_compatible = audio_modes_compatible(peer.audio_mode, local_workspace.audio_mode);
-    let input_compatible = negotiate_input(peer.input_mode, local_workspace.input_mode).is_some();
-    if file_agreement.any_direction()
-        || clipboard_agreement.any_direction()
+        negotiate_clipboard(peer.clipboard_mode, local_capabilities.clipboard_mode);
+    let audio_compatible = audio_modes_compatible(peer.audio_mode, local_capabilities.audio_mode);
+    let input_compatible = negotiate_input(peer.input_mode, local_capabilities.input_mode).is_some();
+    if clipboard_agreement.any_direction()
         || audio_compatible
         || input_compatible
     {
@@ -4286,24 +2847,22 @@ fn discovered_peer_mode_mismatch_message(
     }
 
     Some(format!(
-        "找到设备 {}, 但同步模式不匹配: 对端广播为 文件:{} / 剪贴板:{} / 音频:{} / 输入:{}; 本机为 文件:{} / 剪贴板:{} / 音频:{} / 输入:{}. 当前没有任何可用同步方向.",
+        "找到设备 {}, 但同步模式不匹配: 对端广播为 剪贴板:{} / 音频:{} / 输入:{}; 本机为 剪贴板:{} / 音频:{} / 输入:{}. 当前没有任何可用同步方向.",
         peer.display_name(),
-        peer.file_sync_mode.label(),
         peer.clipboard_mode.label(),
         peer.audio_mode.label(),
         peer.input_mode.label(),
-        local_workspace.file_sync_mode.label(),
-        local_workspace.clipboard_mode.label(),
-        local_workspace.audio_mode.label(),
-        local_workspace.input_mode.label(),
+        local_capabilities.clipboard_mode.label(),
+        local_capabilities.audio_mode.label(),
+        local_capabilities.input_mode.label(),
     ))
 }
 
 fn ensure_discovered_peer_modes_match(
     peer: &DiscoveredPeer,
-    local_workspace: &crate::sync::WorkspaceSummary,
+    local_capabilities: &RuntimeCapabilities,
 ) -> Result<()> {
-    if let Some(message) = discovered_peer_mode_mismatch_message(peer, local_workspace) {
+    if let Some(message) = discovered_peer_mode_mismatch_message(peer, local_capabilities) {
         bail!("{message}");
     }
     Ok(())
@@ -4531,22 +3090,14 @@ fn has_trusted_transport_for_device(config: &SynlyConfig, device_id: &Uuid) -> b
 fn print_pair_request_overview(
     payload: &PairRequestPayload,
     options: &RuntimeOptions,
-    agreement: &SessionAgreement,
     remote_addr: &str,
 ) -> Result<()> {
-    let remote_summary = payload.workspace.summary_lines().join(" | ");
-    let mut local_summary = options
-        .workspace
-        .local_summary_lines_with_input(
-            options.clipboard_mode,
-            options.audio_mode,
-            options.input_mode,
-        )
-        .join(" | ");
-    if options.workspace.incoming_root.is_some() {
-        local_summary.push_str(" | 删除同步: ");
-        local_summary.push_str(sync_delete_label(options.sync_delete));
-    }
+    let remote_summary = payload.capabilities.summary_lines().join(" | ");
+    let local_summary = RuntimeCapabilities {
+        clipboard_mode: options.clipboard_mode,
+        audio_mode: options.audio_mode,
+        input_mode: options.input_mode,
+    }.summary_lines().join(" | ");
     tracing::info!(
         peer = %identity_display_name(&payload.client),
         device_id = %short_uuid(&payload.client.device_id),
@@ -4554,13 +3105,12 @@ fn print_pair_request_overview(
         remote_addr,
         remote_summary = %remote_summary,
         local_summary = %local_summary,
-        file = file_sync_agreement_label(SessionRole::Host, agreement),
         clipboard = %clipboard_summary_line(
             SessionRole::Host,
             options.clipboard_mode,
-            payload.workspace.clipboard_mode,
+            payload.capabilities.clipboard_mode,
         ),
-        input = %input_summary_line(options.input_mode, payload.workspace.input_mode),
+        input = %input_summary_line(options.input_mode, payload.capabilities.input_mode),
         "收到同步请求"
     );
     Ok(())
@@ -4568,94 +3118,18 @@ fn print_pair_request_overview(
 
 fn print_connected_peer(
     remote: &DeviceIdentity,
-    agreement: &SessionAgreement,
-    remote_workspace: &crate::sync::WorkspaceSummary,
+    remote_capabilities: &RuntimeCapabilities,
     local_input_mode: InputMode,
 ) -> Result<()> {
     tracing::info!(
         peer = %identity_display_name(remote),
         device_id = %short_uuid(&remote.device_id),
         fingerprint = %crypto::short_identity_fingerprint(&remote.identity_public_key)?,
-        file = file_sync_agreement_label(SessionRole::Client, agreement),
-        audio = remote_workspace.audio_mode.label(),
-        input = %input_summary_line(local_input_mode, remote_workspace.input_mode),
+        audio = remote_capabilities.audio_mode.label(),
+        input = %input_summary_line(local_input_mode, remote_capabilities.input_mode),
         "连接已建立"
     );
     Ok(())
-}
-
-fn negotiate_file_sync_modes(
-    host_mode: FileSyncMode,
-    client_mode: FileSyncMode,
-) -> SessionAgreement {
-    negotiate_sync_directions(
-        host_mode.can_send(),
-        host_mode.can_receive(),
-        client_mode.can_send(),
-        client_mode.can_receive(),
-    )
-}
-
-fn delete_policy(layout: crate::sync::SnapshotLayout, sync_delete: bool) -> DeletePolicy {
-    if !sync_delete {
-        return DeletePolicy::Never;
-    }
-
-    match layout {
-        crate::sync::SnapshotLayout::RootContents => DeletePolicy::MirrorAll,
-        crate::sync::SnapshotLayout::SelectedItems => DeletePolicy::MirrorSelectedItems,
-    }
-}
-
-fn resolve_initial_snapshot_policy(
-    _role: SessionRole,
-    workspace: &WorkspaceSpec,
-    remote_workspace: &crate::sync::WorkspaceSummary,
-    file_can_send: bool,
-    file_can_receive: bool,
-) -> Result<InitialSnapshotPolicy> {
-    if !file_can_send {
-        return Ok(InitialSnapshotPolicy::PublishImmediately);
-    }
-
-    if !file_can_receive {
-        return Ok(InitialSnapshotPolicy::PublishImmediately);
-    }
-
-    let local_initial = workspace
-        .initial_sync
-        .context("本机双向文件同步缺少初始状态来源配置")?;
-    let remote_initial = remote_workspace
-        .initial_sync
-        .context("对端双向文件同步缺少初始状态来源配置")?;
-
-    match (local_initial, remote_initial) {
-        (InitialSyncMode::This, InitialSyncMode::Other) => {
-            Ok(InitialSnapshotPolicy::PublishImmediately)
-        }
-        (InitialSyncMode::Other, InitialSyncMode::This) => {
-            Ok(InitialSnapshotPolicy::WaitForRemoteSeed)
-        }
-        (InitialSyncMode::This, InitialSyncMode::This) => bail!(
-            "双向初始状态冲突: 本机和对端都配置了 initial = this, 请让一端配置 this, 另一端配置 other"
-        ),
-        (InitialSyncMode::Other, InitialSyncMode::Other) => bail!(
-            "双向初始状态冲突: 本机和对端都配置了 initial = other, 请让一端配置 this, 另一端配置 other"
-        ),
-    }
-}
-
-fn maybe_activate_initial_sender(
-    snapshot_control_tx: &mpsc::UnboundedSender<SnapshotLoopControl>,
-    pending_initial_remote_revision: &mut Option<u64>,
-    revision: u64,
-) {
-    if *pending_initial_remote_revision != Some(revision) {
-        return;
-    }
-
-    *pending_initial_remote_revision = None;
-    let _ = snapshot_control_tx.send(SnapshotLoopControl::AdoptCurrentSnapshotAsBaselineAndEnable);
 }
 
 fn allows_local_send(role: SessionRole, agreement: &SessionAgreement) -> bool {
@@ -4673,11 +3147,11 @@ fn allows_local_receive(role: SessionRole, agreement: &SessionAgreement) -> bool
 }
 
 fn signed_pair_decision(params: PairDecisionParams<'_>) -> Result<ControlMessage> {
-    let summary = params.workspace.session_summary(
-        params.clipboard_mode,
-        params.audio_mode,
-        params.input_mode,
-    );
+    let summary = RuntimeCapabilities {
+        clipboard_mode: params.clipboard_mode,
+        audio_mode: params.audio_mode,
+        input_mode: params.input_mode,
+    };
     let server = device_identity(params.device, params.instance_name);
     let proof = match params.auth_method {
         PairAuthMethod::Pin => crypto::sign_pair_decision(
@@ -4687,7 +3161,6 @@ fn signed_pair_decision(params: PairDecisionParams<'_>) -> Result<ControlMessage
             params.accepted,
             &params.message,
             &server,
-            params.agreement,
             params.clipboard_agreement,
             &summary,
             params.auth_method,
@@ -4701,7 +3174,6 @@ fn signed_pair_decision(params: PairDecisionParams<'_>) -> Result<ControlMessage
             params.accepted,
             &params.message,
             &server,
-            params.agreement,
             params.clipboard_agreement,
             &summary,
             params.server_trusts_client,
@@ -4712,8 +3184,7 @@ fn signed_pair_decision(params: PairDecisionParams<'_>) -> Result<ControlMessage
         accepted: params.accepted,
         message: params.message,
         server,
-        workspace: summary,
-        agreement: params.agreement.clone(),
+        capabilities: summary,
         clipboard_agreement: params.clipboard_agreement.clone(),
         auth_method: params.auth_method,
         server_trusts_client: params.server_trusts_client,
@@ -4743,18 +3214,11 @@ pub(crate) fn print_host_ready(device: &DeviceConfig, options: &RuntimeOptions, 
             .expect("device identity public key is missing"),
     )
     .expect("device identity fingerprint is invalid");
-    let mut local_summary = options
-        .workspace
-        .local_summary_lines_with_input(
-            options.clipboard_mode,
-            options.audio_mode,
-            options.input_mode,
-        )
-        .join(" | ");
-    if options.workspace.incoming_root.is_some() {
-        local_summary.push_str(" | 删除同步: ");
-        local_summary.push_str(sync_delete_label(options.sync_delete));
-    }
+    let local_summary = RuntimeCapabilities {
+        clipboard_mode: options.clipboard_mode,
+        audio_mode: options.audio_mode,
+        input_mode: options.input_mode,
+    }.summary_lines().join(" | ");
     let pairing_policy = if options.pairing.trusted_only {
         "仅可信设备"
     } else {
@@ -4785,10 +3249,6 @@ fn direction_label(role: SessionRole, agreement: &SessionAgreement) -> &'static 
         (false, true) => "对端 -> 本机",
         (false, false) => "无可用同步方向",
     }
-}
-
-fn file_sync_agreement_label(role: SessionRole, agreement: &SessionAgreement) -> &'static str {
-    direction_label(role, agreement)
 }
 
 fn negotiate_sync_directions(
@@ -4903,15 +3363,6 @@ fn input_summary_line(local_mode: InputMode, remote_mode: InputMode) -> String {
     }
 }
 
-fn temp_file_path(destination: &Path) -> PathBuf {
-    let suffix = rand::rng().random_range(1000..9999);
-    let file_name = destination
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("synly");
-    destination.with_file_name(format!(".{}.{}.synly.part", file_name, suffix))
-}
-
 fn short_uuid(id: &Uuid) -> String {
     id.to_string().chars().take(8).collect()
 }
@@ -4919,16 +3370,13 @@ fn short_uuid(id: &Uuid) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Advertisement, FILE_STREAM_CHUNK_SIZE, InitialSnapshotPolicy, SessionRole,
-        SessionTaskAbortGuard, SnapshotEchoSuppressions, SnapshotPathExpectation,
-        accept_policy_label, bootstrap_device_name_matches, bootstrap_peer_label,
-        build_remote_echo_expectations, choose_peer, delete_policy, handle_file_chunk,
+        Advertisement, SessionRole, SessionTaskAbortGuard, accept_policy_label,
+        bootstrap_device_name_matches, bootstrap_peer_label, choose_peer,
         identity_display_name, input_task_restart_required, is_connection_shutdown_error,
         known_peer_for_query, parse_direct_peer_addr, peer_matches_query, preferred_peer_query,
-        race_peer_addresses, resolve_audio_plan, resolve_initial_snapshot_policy,
-        run_advertisement_updates, run_with_session_notifications, select_peer_from_query,
-        send_one_file, should_auto_accept_request, should_try_direct_trusted,
-        trusted_transport_for_device, trusted_transport_for_identity,
+        race_peer_addresses, resolve_audio_plan, run_advertisement_updates,
+        run_with_session_notifications, select_peer_from_query, should_auto_accept_request,
+        should_try_direct_trusted, trusted_transport_for_device, trusted_transport_for_identity,
     };
     use crate::audio::AudioChannelDirection;
     use crate::clipboard::ClipboardRuntimeOptions;
@@ -4939,26 +3387,16 @@ mod tests {
     use crate::discovery::DiscoveredPeer;
     use crate::input::{Hotkey, InputMode, InputRuntimeOptions, ScreenEdge};
     use crate::protocol::{
-        DeviceIdentity, FileChunkHeader, Frame, PROTOCOL_VERSION, PairAuthMethod,
+        DeviceIdentity, PROTOCOL_VERSION, PairAuthMethod,
         RuntimeCapabilities,
     };
     use crate::runtime_control::{RuntimeControl, RuntimeTuning};
     use crate::runtime_options::PairingRuntimeOptions;
-    use crate::settings::{AudioMode, ClipboardMode, FileSyncMode, InitialSyncMode};
-    use crate::sync::{
-        ApplyPlan, DeletePolicy, EntryKind, ManifestEntry, ManifestSnapshot, OutgoingSpec,
-        SnapshotLayout, WorkspaceSpec, build_snapshot,
-    };
+    use crate::settings::{AudioMode, ClipboardMode};
     use crate::system_notification::{ConnectionEvent, NotificationPeer, SessionNotifier};
-    use sha2::{Digest, Sha256};
-    use std::collections::{BTreeMap, BTreeSet, HashMap};
-    use std::env;
-    use std::fs;
     use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
-    use std::path::PathBuf;
     use std::sync::Mutex;
     use std::time::Duration;
-    use tokio::sync::mpsc;
     use uuid::Uuid;
 
     #[test]
@@ -4994,86 +3432,6 @@ mod tests {
     }
 
     #[test]
-    fn delete_policy_stays_disabled_when_sync_delete_is_off() {
-        assert!(matches!(
-            delete_policy(SnapshotLayout::RootContents, false),
-            DeletePolicy::Never
-        ));
-        assert!(matches!(
-            delete_policy(SnapshotLayout::SelectedItems, false),
-            DeletePolicy::Never
-        ));
-    }
-
-    #[test]
-    fn delete_policy_mirrors_root_contents_when_enabled() {
-        assert!(matches!(
-            delete_policy(SnapshotLayout::RootContents, true),
-            DeletePolicy::MirrorAll
-        ));
-    }
-
-    #[test]
-    fn delete_policy_limits_selected_items_when_enabled() {
-        assert!(matches!(
-            delete_policy(SnapshotLayout::SelectedItems, true),
-            DeletePolicy::MirrorSelectedItems
-        ));
-    }
-
-    #[test]
-    fn initial_snapshot_policy_publishes_when_local_is_initial_source() {
-        let local = WorkspaceSpec::for_both(PathBuf::from("/tmp/local"))
-            .unwrap()
-            .with_initial_sync(Some(InitialSyncMode::This));
-        let remote = WorkspaceSpec::for_both(PathBuf::from("/tmp/remote"))
-            .unwrap()
-            .with_initial_sync(Some(InitialSyncMode::Other))
-            .session_summary(ClipboardMode::Off, AudioMode::Off, InputMode::Off);
-
-        let policy =
-            resolve_initial_snapshot_policy(SessionRole::Host, &local, &remote, true, true)
-                .unwrap();
-
-        assert_eq!(policy, InitialSnapshotPolicy::PublishImmediately);
-    }
-
-    #[test]
-    fn initial_snapshot_policy_waits_when_remote_is_initial_source() {
-        let local = WorkspaceSpec::for_both(PathBuf::from("/tmp/local"))
-            .unwrap()
-            .with_initial_sync(Some(InitialSyncMode::Other));
-        let remote = WorkspaceSpec::for_both(PathBuf::from("/tmp/remote"))
-            .unwrap()
-            .with_initial_sync(Some(InitialSyncMode::This))
-            .session_summary(ClipboardMode::Off, AudioMode::Off, InputMode::Off);
-
-        let policy =
-            resolve_initial_snapshot_policy(SessionRole::Client, &local, &remote, true, true)
-                .unwrap();
-
-        assert_eq!(policy, InitialSnapshotPolicy::WaitForRemoteSeed);
-    }
-
-    #[test]
-    fn initial_snapshot_policy_rejects_conflicting_initial_sources() {
-        let local = WorkspaceSpec::for_both(PathBuf::from("/tmp/local"))
-            .unwrap()
-            .with_initial_sync(Some(InitialSyncMode::This));
-        let remote = WorkspaceSpec::for_both(PathBuf::from("/tmp/remote"))
-            .unwrap()
-            .with_initial_sync(Some(InitialSyncMode::This))
-            .session_summary(ClipboardMode::Off, AudioMode::Off, InputMode::Off);
-
-        let err = resolve_initial_snapshot_policy(SessionRole::Host, &local, &remote, true, true)
-            .unwrap_err()
-            .to_string();
-
-        assert!(err.contains("双向初始状态冲突"));
-        assert!(err.contains("initial = this"));
-    }
-
-    #[test]
     fn connection_shutdown_errors_are_recognized() {
         let err = anyhow::Error::from(std::io::Error::new(
             std::io::ErrorKind::ConnectionReset,
@@ -5083,245 +3441,6 @@ mod tests {
 
         let err = anyhow::Error::from(std::io::Error::other("other"));
         assert!(!is_connection_shutdown_error(&err));
-    }
-
-    #[test]
-    fn remote_echo_expectations_cover_files_dirs_and_deletes() {
-        let remote = ManifestSnapshot {
-            layout: SnapshotLayout::RootContents,
-            max_folder_depth: None,
-            entries: BTreeMap::from([
-                ("docs".to_string(), dir_entry()),
-                (
-                    "docs/readme.txt".to_string(),
-                    file_entry("remote-readme", 10),
-                ),
-                ("empty".to_string(), dir_entry()),
-            ]),
-        };
-        let local = ManifestSnapshot {
-            layout: SnapshotLayout::RootContents,
-            max_folder_depth: None,
-            entries: BTreeMap::from([("old.txt".to_string(), file_entry("old", 5))]),
-        };
-        let plan = ApplyPlan {
-            file_requests: vec!["docs/readme.txt".to_string()],
-            delete_paths: vec!["old.txt".to_string()],
-            skipped_newer_paths: Vec::new(),
-            unreliable_timestamp_paths: Vec::new(),
-        };
-
-        let expectations = build_remote_echo_expectations(&remote, &local, &plan)
-            .into_iter()
-            .map(|expectation| (expectation.wire_path, expectation.expected))
-            .collect::<BTreeMap<_, _>>();
-
-        assert_eq!(
-            expectations.get("docs/readme.txt"),
-            Some(&SnapshotPathExpectation::Exact(file_entry(
-                "remote-readme",
-                10
-            )))
-        );
-        assert_eq!(
-            expectations.get("docs"),
-            Some(&SnapshotPathExpectation::DirExists)
-        );
-        assert_eq!(
-            expectations.get("empty"),
-            Some(&SnapshotPathExpectation::DirExists)
-        );
-        assert_eq!(
-            expectations.get("old.txt"),
-            Some(&SnapshotPathExpectation::Missing)
-        );
-    }
-
-    #[test]
-    fn snapshot_echo_suppression_consumes_matching_remote_diff() {
-        let previous = ManifestSnapshot {
-            layout: SnapshotLayout::RootContents,
-            max_folder_depth: None,
-            entries: BTreeMap::from([("docs".to_string(), dir_entry())]),
-        };
-        let current = ManifestSnapshot {
-            layout: SnapshotLayout::RootContents,
-            max_folder_depth: None,
-            entries: BTreeMap::from([
-                ("docs".to_string(), dir_entry()),
-                (
-                    "docs/readme.txt".to_string(),
-                    file_entry("remote-readme", 10),
-                ),
-            ]),
-        };
-        let mut suppressions = SnapshotEchoSuppressions::default();
-        suppressions.note_remote_expectations(vec![super::RemoteEchoExpectation {
-            wire_path: "docs/readme.txt".to_string(),
-            expected: SnapshotPathExpectation::Exact(file_entry("remote-readme", 10)),
-        }]);
-
-        assert!(suppressions.matches_only_remote_changes(Some(&previous), &current));
-        assert!(suppressions.paths.is_empty());
-    }
-
-    #[test]
-    fn snapshot_echo_suppression_does_not_hide_unrelated_local_diff() {
-        let previous = ManifestSnapshot {
-            layout: SnapshotLayout::RootContents,
-            max_folder_depth: None,
-            entries: BTreeMap::new(),
-        };
-        let current = ManifestSnapshot {
-            layout: SnapshotLayout::RootContents,
-            max_folder_depth: None,
-            entries: BTreeMap::from([("notes.txt".to_string(), file_entry("local", 5))]),
-        };
-        let mut suppressions = SnapshotEchoSuppressions::default();
-        suppressions.note_remote_expectations(vec![super::RemoteEchoExpectation {
-            wire_path: "docs/readme.txt".to_string(),
-            expected: SnapshotPathExpectation::Exact(file_entry("remote-readme", 10)),
-        }]);
-
-        assert!(!suppressions.matches_only_remote_changes(Some(&previous), &current));
-    }
-
-    #[test]
-    fn snapshot_echo_suppression_requires_expected_entry_match() {
-        let previous = ManifestSnapshot {
-            layout: SnapshotLayout::RootContents,
-            max_folder_depth: None,
-            entries: BTreeMap::new(),
-        };
-        let current = ManifestSnapshot {
-            layout: SnapshotLayout::RootContents,
-            max_folder_depth: None,
-            entries: BTreeMap::from([("docs/readme.txt".to_string(), file_entry("local", 5))]),
-        };
-        let mut suppressions = SnapshotEchoSuppressions::default();
-        suppressions.note_remote_expectations(vec![super::RemoteEchoExpectation {
-            wire_path: "docs/readme.txt".to_string(),
-            expected: SnapshotPathExpectation::Exact(file_entry("remote-readme", 10)),
-        }]);
-
-        assert!(!suppressions.matches_only_remote_changes(Some(&previous), &current));
-    }
-
-    #[tokio::test]
-    async fn send_one_file_streams_large_files_in_multiple_chunks() {
-        let dir = test_dir("file-streaming");
-        fs::create_dir_all(&dir).unwrap();
-        let file_path = dir.join("large.bin");
-        let expected = vec![0x5au8; FILE_STREAM_CHUNK_SIZE * 2 + 37];
-        fs::write(&file_path, &expected).unwrap();
-
-        let outgoing = OutgoingSpec::RootContents {
-            root: dir.clone(),
-            max_folder_depth: None,
-        };
-        let advertised_snapshot = build_snapshot(&outgoing).unwrap();
-        let advertised_entry = advertised_snapshot
-            .entries
-            .get("large.bin")
-            .unwrap()
-            .clone();
-        let (tx, mut rx) = mpsc::channel(16);
-
-        send_one_file(&tx, &outgoing, 1, "large.bin", &advertised_entry)
-            .await
-            .unwrap();
-        drop(tx);
-
-        let mut chunk_count = 0usize;
-        let mut assembled = Vec::new();
-        while let Some(frame) = rx.recv().await {
-            match frame {
-                Frame::FileChunk(header, data) => {
-                    assert_eq!(header.path, "large.bin");
-                    assert_eq!(header.offset, assembled.len() as u64);
-                    assembled.extend_from_slice(&data);
-                    chunk_count += 1;
-                }
-                other => panic!("expected file chunk frame, got {other:?}"),
-            }
-        }
-
-        assert_eq!(assembled, expected);
-        assert!(chunk_count >= 3);
-
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[tokio::test]
-    async fn send_one_file_rejects_drift_from_advertised_snapshot() {
-        let dir = test_dir("file-drift");
-        fs::create_dir_all(&dir).unwrap();
-        let file_path = dir.join("note.txt");
-        fs::write(&file_path, b"before").unwrap();
-
-        let outgoing = OutgoingSpec::RootContents {
-            root: dir.clone(),
-            max_folder_depth: None,
-        };
-        let advertised_snapshot = build_snapshot(&outgoing).unwrap();
-        let advertised_entry = advertised_snapshot.entries.get("note.txt").unwrap().clone();
-
-        fs::write(&file_path, b"after!").unwrap();
-
-        let (tx, _rx) = mpsc::channel(16);
-        let err = send_one_file(&tx, &outgoing, 7, "note.txt", &advertised_entry)
-            .await
-            .unwrap_err()
-            .to_string();
-
-        assert!(err.contains("内容发生变化"));
-
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[tokio::test]
-    async fn handle_file_chunk_rejects_hash_mismatch_against_advertised_entry() {
-        let root = test_dir("incoming-hash-mismatch");
-        fs::create_dir_all(&root).unwrap();
-        let expected_entry = file_entry_for_bytes(b"good", 1234);
-        let wire_path = "demo.txt".to_string();
-        let mut incoming_files = HashMap::new();
-        let mut pending_revisions = BTreeMap::from([(
-            1,
-            super::PendingRevision {
-                requested_files: 1,
-                remaining_files: BTreeSet::from([wire_path.clone()]),
-                failed_files: BTreeSet::new(),
-                expected_files: BTreeMap::from([(wire_path.clone(), expected_entry.clone())]),
-                delete_paths: Vec::new(),
-                skipped_newer_count: 0,
-                transfer_done: true,
-            },
-        )]);
-
-        handle_file_chunk(
-            &root,
-            &mut incoming_files,
-            &mut pending_revisions,
-            FileChunkHeader {
-                revision: 1,
-                path: wire_path.clone(),
-                offset: 0,
-                total_size: expected_entry.size,
-                modified_ms: expected_entry.modified_ms,
-                executable: expected_entry.executable,
-                final_chunk: true,
-            },
-            b"oops".to_vec(),
-        )
-        .await
-        .unwrap();
-
-        assert!(!root.join(&wire_path).exists());
-        assert!(incoming_files.is_empty());
-        assert!(pending_revisions.is_empty());
-
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -5347,7 +3466,6 @@ mod tests {
             device_name: "demo-device".to_string(),
             instance_name: Some("worker-b".to_string()),
             device_id: "ffffeeee-dddd-cccc-bbbb-aaaaaaaaaaaa".to_string(),
-            file_sync_mode: FileSyncMode::Auto,
             clipboard_mode: ClipboardMode::Off,
             audio_mode: AudioMode::Off,
             input_mode: crate::input::InputMode::Off,
@@ -5387,7 +3505,6 @@ mod tests {
             device_name: "demo-device".to_string(),
             instance_name: Some("worker-b".to_string()),
             device_id: "ffffeeee-dddd-cccc-bbbb-aaaaaaaaaaaa".to_string(),
-            file_sync_mode: FileSyncMode::Auto,
             clipboard_mode: ClipboardMode::Off,
             audio_mode: AudioMode::Off,
             input_mode: crate::input::InputMode::Off,
@@ -5444,7 +3561,7 @@ mod tests {
             None,
             Duration::from_millis(1),
             true,
-            &sample_local_workspace_summary(),
+            &sample_local_capabilities(),
             &DiscoveryConfig::default(),
         )
         .await
@@ -5460,7 +3577,7 @@ mod tests {
             Some("192.168.1.20:8080"),
             Duration::from_millis(1),
             true,
-            &sample_local_workspace_summary(),
+            &sample_local_capabilities(),
             &DiscoveryConfig::default(),
         )
         .await
@@ -5744,8 +3861,6 @@ mod tests {
                 input_mode: InputMode::Off,
             },
             RuntimeTuning {
-                interval_secs: 3,
-                sync_delete: false,
                 notifications_enabled: true,
                 input_backend_generation: 0,
                 device_name: "test-device".to_string(),
@@ -5782,7 +3897,6 @@ mod tests {
                     identity_private_key: String::new(),
                     identity_public_key: String::new(),
                 },
-                file_sync_mode: FileSyncMode::Off,
                 clipboard_mode: ClipboardMode::Off,
                 audio_mode: AudioMode::Off,
                 input_mode: InputMode::Off,
@@ -5812,8 +3926,7 @@ mod tests {
             instance_name: Some("worker-a".to_string()),
             device_id: "abcd1234-1111-2222-3333-444455556666".to_string(),
             protocol_version: crate::protocol::PROTOCOL_VERSION,
-            file_sync_mode: FileSyncMode::Both,
-            clipboard_mode: ClipboardMode::Off,
+            clipboard_mode: ClipboardMode::Both,
             audio_mode: AudioMode::Off,
             input_mode: crate::input::InputMode::Off,
             source: crate::discovery::DiscoverySource::Mdns,
@@ -5822,16 +3935,9 @@ mod tests {
         }
     }
 
-    fn sample_local_workspace_summary() -> crate::sync::WorkspaceSummary {
-        crate::sync::WorkspaceSummary {
-            file_sync_mode: FileSyncMode::Both,
-            send_description: None,
-            send_layout: None,
-            send_items: Vec::new(),
-            receive_root: None,
-            initial_sync: Some(InitialSyncMode::This),
-            max_folder_depth: None,
-            clipboard_mode: ClipboardMode::Off,
+    fn sample_local_capabilities() -> RuntimeCapabilities {
+        RuntimeCapabilities {
+            clipboard_mode: ClipboardMode::Both,
             audio_mode: AudioMode::Off,
             input_mode: crate::input::InputMode::Off,
         }
@@ -5885,37 +3991,4 @@ mod tests {
         }
     }
 
-    fn test_dir(prefix: &str) -> PathBuf {
-        env::temp_dir().join(format!("synly-app-{prefix}-{}", Uuid::new_v4()))
-    }
-
-    fn file_entry(hash: &str, modified_ms: u64) -> ManifestEntry {
-        ManifestEntry {
-            kind: EntryKind::File,
-            size: 1,
-            modified_ms,
-            hash: Some(hash.to_string()),
-            executable: false,
-        }
-    }
-
-    fn file_entry_for_bytes(bytes: &[u8], modified_ms: u64) -> ManifestEntry {
-        ManifestEntry {
-            kind: EntryKind::File,
-            size: bytes.len() as u64,
-            modified_ms,
-            hash: Some(format!("{:x}", Sha256::digest(bytes))),
-            executable: false,
-        }
-    }
-
-    fn dir_entry() -> ManifestEntry {
-        ManifestEntry {
-            kind: EntryKind::Dir,
-            size: 0,
-            modified_ms: 1,
-            hash: None,
-            executable: false,
-        }
-    }
 }

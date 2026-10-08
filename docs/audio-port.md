@@ -51,7 +51,7 @@
 - 上游当前 `handleMissingPackets` 使用微秒时钟, 但表达式中的包时长仍是毫秒. synly 显式使用 `packet_duration_ms * 4 + 10 ms` 的时间预算, 不复制单位不一致的问题.
 - 每次出队和 socket 超时都可推进已到期的恢复状态, 避免网络停止后只能等新包到来才能输出已排队数据. 仍要求第二个 FEC 块存在才放弃当前块, 不无限生成静音.
 - 无效 RTP/FEC 被丢弃并记录 debug 诊断; Opus 数据解码失败尝试 PLC. 播放 Backend/Io 错误只触发设备和解码器重建, 首次没有设备也每隔 1 秒重试. 重建期间及其后的恢复窗口丢弃旧积压, 配置和编解码错误则停止链路. Windows WASAPI 播放线程不再内部重建, `Restart` 会关闭旧 ring 并报告错误, 统一进入该流程. 详见 [平台审计](audio-platform-audit.md).
-- Android 的 Rust 客户端当前在 `crates/synly-core/src/client.rs` 的 `client_workspace_summary` 和 `run_session` 中固定协商 `AudioMode::Off`. 桌面音频模块不由 Android 核心编译, 当前 Android 不参与这条音频传输链路. 后续公共协议变更需保持该能力边界一致, 不应仅凭桌面测试宣称 Android 音频已实现.
+- Android 的 Rust 客户端当前在 `crates/synly-core/src/client.rs` 的 `client_capabilities` 和 `run_session` 中固定协商 `AudioMode::Off`. 桌面音频模块不由 Android 核心编译, 当前 Android 不参与这条音频传输链路. 后续公共协议变更需保持该能力边界一致, 不应仅凭桌面测试宣称 Android 音频已实现.
 - 尚未移植上游旧 GeForce Experience 的无 FEC 兼容模式. synly 当前发送端固定使用现代 4+2 数据布局.
 
 ## 许可随附验证

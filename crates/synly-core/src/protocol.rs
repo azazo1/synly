@@ -1,7 +1,6 @@
 use crate::input::InputChannelOffer;
 use crate::input::InputMode;
 use crate::settings::{AudioMode, ClipboardMode};
-use crate::workspace::{ManifestSnapshot, WorkspaceSummary};
 use anyhow::{Context, Result, bail};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -10,7 +9,6 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use uuid::Uuid;
 
 const FRAME_CONTROL: u8 = 1;
-const FRAME_FILE_CHUNK: u8 = 2;
 const FRAME_CLIPBOARD_META: u8 = 3;
 const FRAME_CLIPBOARD_CHUNK: u8 = 4;
 const DEFAULT_MAX_META_LEN: usize = 20 * 1024 * 1024;
@@ -18,7 +16,7 @@ const DEFAULT_MAX_FRAME_DATA_LEN: usize = 128 * 1024 * 1024;
 const DEFAULT_MAX_CLIPBOARD_BINARY_LEN: usize = 100 * 1024 * 1024;
 const CLIPBOARD_STREAM_CHUNK_SIZE: usize = 1024 * 1024;
 
-pub const PROTOCOL_VERSION: u16 = 21;
+pub const PROTOCOL_VERSION: u16 = 22;
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -34,6 +32,16 @@ pub struct RuntimeCapabilities {
     pub clipboard_mode: ClipboardMode,
     pub audio_mode: AudioMode,
     pub input_mode: InputMode,
+}
+
+impl RuntimeCapabilities {
+    pub fn summary_lines(&self) -> Vec<String> {
+        vec![
+            format!("剪贴板同步: {}", self.clipboard_mode.label()),
+            format!("音频同步: {}", self.audio_mode.label()),
+            format!("鼠标键盘同步: {}", self.input_mode.label()),
+        ]
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -80,7 +88,7 @@ pub struct DeviceIdentity {
 pub struct PairRequestPayload {
     pub protocol_version: u16,
     pub client: DeviceIdentity,
-    pub workspace: WorkspaceSummary,
+    pub capabilities: RuntimeCapabilities,
     pub request_trust: bool,
 }
 
@@ -136,8 +144,7 @@ pub enum ControlMessage {
         accepted: bool,
         message: String,
         server: DeviceIdentity,
-        workspace: WorkspaceSummary,
-        agreement: SessionAgreement,
+        capabilities: RuntimeCapabilities,
         clipboard_agreement: SessionAgreement,
         auth_method: PairAuthMethod,
         server_trusts_client: bool,
@@ -163,42 +170,10 @@ pub enum ControlMessage {
         epoch: CapabilityEpoch,
         offer: InputChannelOffer,
     },
-    SnapshotRescanRequest,
-    SnapshotAdvert {
-        revision: u64,
-        snapshot: ManifestSnapshot,
-        sender_time_ms: u64,
-    },
-    FileRequest {
-        revision: u64,
-        paths: Vec<String>,
-    },
-    OverwritePaused {
-        revision: u64,
-        paths: Vec<String>,
-    },
-    TransferDone {
-        revision: u64,
-    },
-    TransferAborted {
-        revision: u64,
-        message: String,
-    },
     Error {
         message: String,
     },
     Goodbye,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct FileChunkHeader {
-    pub revision: u64,
-    pub path: String,
-    pub offset: u64,
-    pub total_size: u64,
-    pub modified_ms: u64,
-    pub executable: bool,
-    pub final_chunk: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -224,7 +199,6 @@ pub struct ClipboardFile {
 #[derive(Clone, Debug)]
 pub enum Frame {
     Control(ControlMessage),
-    FileChunk(FileChunkHeader, Vec<u8>),
     Clipboard(ClipboardPayload),
 }
 
@@ -439,11 +413,6 @@ where
                     decode_payload(&raw.meta, "failed to decode control frame")?;
                 Ok(Frame::Control(message))
             }
-            FRAME_FILE_CHUNK => {
-                let header: FileChunkHeader =
-                    decode_payload(&raw.meta, "failed to decode file header")?;
-                Ok(Frame::FileChunk(header, raw.data))
-            }
             FRAME_CLIPBOARD_META => self.read_clipboard_frame(raw).await,
             FRAME_CLIPBOARD_CHUNK => bail!("unexpected clipboard chunk without clipboard header"),
             other => bail!("unknown frame type {}", other),
@@ -560,15 +529,6 @@ where
                 let meta = encode_payload(&message)?;
                 self.write_raw_frame(FRAME_CONTROL, &meta, &[]).await?;
             }
-            Frame::FileChunk(header, data) => {
-                ensure_len(
-                    "file chunk data",
-                    data.len(),
-                    self.limits.max_frame_data_len,
-                )?;
-                let meta = encode_payload(&header)?;
-                self.write_raw_frame(FRAME_FILE_CHUNK, &meta, &data).await?;
-            }
             Frame::Clipboard(payload) => {
                 let (meta, data) = payload.into_wire()?;
                 ensure_len(
@@ -652,10 +612,9 @@ mod tests {
     use super::{
         CLIPBOARD_STREAM_CHUNK_SIZE, ClipboardFile, ClipboardImage, ClipboardPayload,
         ControlMessage, Frame, FrameReader, FrameWriter, PROTOCOL_VERSION, PairRequestPayload,
-        SessionAgreement, decode_payload, encode_payload,
+        RuntimeCapabilities, SessionAgreement, decode_payload, encode_payload,
     };
-    use crate::settings::{AudioMode, ClipboardMode, FileSyncMode, InitialSyncMode};
-    use crate::workspace::WorkspaceSummary;
+    use crate::settings::ClipboardMode;
     use serde_json::json;
     use tokio::io::duplex;
 
@@ -761,21 +720,10 @@ mod tests {
                 identity_public_key: "pub".to_string(),
                 tls_root_certificate: "cert".to_string(),
             },
-            workspace: WorkspaceSummary {
-                file_sync_mode: FileSyncMode::Both,
-                send_description: Some("demo".to_string()),
-                send_layout: None,
-                send_items: vec!["docs".to_string()],
-                receive_root: Some("/tmp".to_string()),
-                initial_sync: Some(InitialSyncMode::This),
-                max_folder_depth: Some(2),
+            capabilities: RuntimeCapabilities {
                 clipboard_mode: ClipboardMode::Both,
-                audio_mode: AudioMode::Receive,
+                audio_mode: super::AudioMode::Receive,
                 input_mode: crate::input::InputMode::Off,
-            },
-            agreement: SessionAgreement {
-                host_to_client: true,
-                client_to_host: true,
             },
             clipboard_agreement: SessionAgreement {
                 host_to_client: true,
@@ -828,26 +776,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn control_message_roundtrip_overwrite_paused() {
-        let message = ControlMessage::OverwritePaused {
-            revision: 7,
-            paths: vec!["docs/readme.txt".to_string(), "bin/tool".to_string()],
-        };
-
-        let encoded = encode_payload(&message).unwrap();
-        let decoded: ControlMessage =
-            decode_payload(&encoded, "failed to decode control frame").unwrap();
-
-        match decoded {
-            ControlMessage::OverwritePaused { revision, paths } => {
-                assert_eq!(revision, 7);
-                assert_eq!(paths, vec!["docs/readme.txt", "bin/tool"]);
-            }
-            other => panic!("expected overwrite paused, got {other:?}"),
-        }
-    }
-
     #[tokio::test]
     async fn clipboard_frame_roundtrip_streams_large_binary_payload() {
         let payload = ClipboardPayload {
@@ -882,15 +810,10 @@ mod tests {
     }
 
     #[test]
-    fn workspace_summary_rejects_legacy_payload_missing_sync_modes() {
-        let err = serde_json::from_value::<WorkspaceSummary>(json!({
-            "file_sync_mode": "both",
-            "send_description": "demo",
-            "send_layout": "root_contents",
-            "send_items": ["docs"],
-            "receive_root": "/tmp",
-            "initial_sync": "this",
-            "max_folder_depth": 2
+    fn runtime_capabilities_require_clipboard_mode() {
+        let err = serde_json::from_value::<RuntimeCapabilities>(json!({
+            "audio_mode": "off",
+            "input_mode": "off"
         }))
         .unwrap_err()
         .to_string();
@@ -909,14 +832,7 @@ mod tests {
                 "identity_public_key": "pub",
                 "tls_root_certificate": "cert"
             },
-            "workspace": {
-                "file_sync_mode": "both",
-                "send_description": "demo",
-                "send_layout": "root_contents",
-                "send_items": ["docs"],
-                "receive_root": "/tmp",
-                "initial_sync": "this",
-                "max_folder_depth": 2,
+            "capabilities": {
                 "clipboard_mode": "both",
                 "audio_mode": "receive",
                 "input_mode": "off"
@@ -941,21 +857,10 @@ mod tests {
                     "identity_public_key": "pub",
                     "tls_root_certificate": "cert"
                 },
-                "workspace": {
-                    "file_sync_mode": "both",
-                    "send_description": "demo",
-                    "send_layout": "root_contents",
-                    "send_items": ["docs"],
-                    "receive_root": "/tmp",
-                    "initial_sync": "this",
-                    "max_folder_depth": 2,
+                "capabilities": {
                     "clipboard_mode": "both",
                     "audio_mode": "receive",
                     "input_mode": "off"
-                },
-                "agreement": {
-                    "host_to_client": true,
-                    "client_to_host": true
                 },
                 "clipboard_agreement": {
                     "host_to_client": true,

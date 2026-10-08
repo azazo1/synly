@@ -25,8 +25,6 @@ pub enum RuntimeLifecycle {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeTuning {
-    pub interval_secs: u64,
-    pub sync_delete: bool,
     pub notifications_enabled: bool,
     pub input_backend_generation: u64,
     pub device_name: String,
