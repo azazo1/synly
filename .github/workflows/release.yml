@@ -256,6 +256,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config libgtk-3-dev libopus-dev libxdo-dev libsdl2-dev patchelf
 
+      - name: 验证 macOS 蓝牙 SDP 与原生桥接回归
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp/bluetooth-tests
+          clang -fobjc-arc -fblocks -mmacosx-version-min=14.0 -fsanitize=address,undefined -fno-sanitize-recover=all -g -Wall -Wextra -Werror crates/synly-core/native/tests/bridge.m -framework Foundation -framework CoreFoundation -framework CoreBluetooth -framework IOBluetooth -o .tmp/bluetooth-tests/bridge
+          .tmp/bluetooth-tests/bridge
+
       - name: Build release binary
         env:
           SYNLY_BUILD_VERSION: v${{ needs.version.outputs.build_version }}

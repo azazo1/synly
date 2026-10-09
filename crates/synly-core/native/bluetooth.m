@@ -53,17 +53,37 @@ static IOBluetoothDevice *paired_device(const char *address) {
 }
 
 @interface SBQuery : NSObject
+@property(nonatomic, strong) IOBluetoothDevice *device;
 @property(nonatomic) BOOL complete;
 @property(nonatomic) IOReturn status;
+@property(nonatomic) BOOL connectionStarted;
+@property(nonatomic) BOOL connectionComplete;
+@property(nonatomic) IOReturn connectionStatus;
+@property(nonatomic) BOOL sdpStarted;
+@property(nonatomic) BOOL abandoned;
+- (void)connectionComplete:(IOBluetoothDevice *)device status:(IOReturn)status;
 - (void)sdpQueryComplete:(IOBluetoothDevice *)device status:(IOReturn)status;
 @end
 @implementation SBQuery
+- (void)connectionComplete:(IOBluetoothDevice *)device status:(IOReturn)status {
+    if (device != self.device) return;
+    self.connectionStatus = status;
+    self.connectionComplete = YES;
+}
 - (void)sdpQueryComplete:(IOBluetoothDevice *)device status:(IOReturn)status {
-    (void)device;
+    if (device != self.device) return;
     self.status = status;
     self.complete = YES;
 }
 @end
+
+static void retire_query(SBWorker *worker, SBQuery *query) {
+    query.abandoned = YES;
+    // ACL 已连接但回调缺失时仍可能迟到, 不能因 SDP 已完成就释放 callback target.
+    if ((!query.connectionStarted || query.connectionComplete) && (!query.sdpStarted || query.complete)) {
+        [worker.queries removeObject:query];
+    }
+}
 
 static void pump_loop(void) {
     [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
@@ -75,20 +95,46 @@ static int query_channel(IOBluetoothDevice *device, const uint8_t uuid[16], uint
     SBWorker *worker = [SBWorker shared];
     if (worker.queries.count >= 32) return -9;
     SBQuery *query = [SBQuery new];
+    query.device = device;
     [worker.queries addObject:query];
     IOBluetoothSDPUUID *service = [IOBluetoothSDPUUID uuidWithBytes:uuid length:16];
+    // Monterey 及之后的 UUID 过滤查询可能成功返回却不执行, 且 SDP 不再自动建立 ACL.
+    // 先显式连接已配对设备, 再查询全部 SDP 记录, 结果仍严格按 Synly UUID 选择.
+    *stage = 7;
+    if (!device.isConnected) {
+        IOReturn status = [device openConnection:query withPageTimeout:(BluetoothHCIPageTimeout)0x2000 authenticationRequired:YES];
+        query.connectionStarted = status == kIOReturnSuccess;
+        if (status != kIOReturnSuccess && status != kIOBluetoothConnectionAlreadyExists) {
+            retire_query(worker, query);
+            return (int)status;
+        }
+        NSTimeInterval deadline = NSProcessInfo.processInfo.systemUptime + 20.0;
+        // 部分系统可能已连接但不发送 connectionComplete, 同时观察实际连接状态.
+        while (!query.connectionComplete && !device.isConnected && NSProcessInfo.processInfo.systemUptime < deadline) pump_loop();
+        if (!device.isConnected) {
+            if (query.connectionComplete) {
+                retire_query(worker, query);
+                return query.connectionStatus == kIOReturnSuccess ? -5 : (int)query.connectionStatus;
+            }
+            query.abandoned = YES;
+            return -5;
+        }
+    }
+    if (!device.isPaired) { retire_query(worker, query); return -4; }
     *stage = 4;
-    IOReturn status = [device performSDPQuery:query uuids:@[service]];
+    query.sdpStarted = YES;
+    IOReturn status = [device performSDPQuery:query];
     if (status != kIOReturnSuccess) {
-        [worker.queries removeObject:query];
+        query.sdpStarted = NO;
+        retire_query(worker, query);
         return (int)status;
     }
     *stage = 5;
     NSTimeInterval deadline = NSProcessInfo.processInfo.systemUptime + 10.0;
     while (!query.complete && NSProcessInfo.processInfo.systemUptime < deadline) pump_loop();
-    // 超时后仍保留 callback target, 直到系统完成查询, 避免迟到回调访问已释放对象.
-    if (!query.complete) return -5;
-    [worker.queries removeObject:query];
+    // 无 API 可取消 SDP; 保留回调对象和设备到系统完成, 不关闭可能被其它路径使用的 ACL.
+    if (!query.complete) { query.abandoned = YES; return -5; }
+    retire_query(worker, query);
     if (query.status != kIOReturnSuccess) return (int)query.status;
     *stage = 6;
     IOBluetoothSDPServiceRecord *record = [device getServiceRecordForUUID:service];
@@ -308,7 +354,8 @@ static void socket_event(CFSocketRef socket, CFSocketCallBackType kind, CFDataRe
         }
     }
     NSIndexSet *complete = [self.queries indexesOfObjectsPassingTest:^BOOL(SBQuery *query, NSUInteger index, BOOL *stop) {
-        (void)index; (void)stop; return query.complete;
+        (void)index; (void)stop;
+        return query.abandoned && (!query.connectionStarted || query.connectionComplete) && (!query.sdpStarted || query.complete);
     }];
     [self.queries removeObjectsAtIndexes:complete];
 }

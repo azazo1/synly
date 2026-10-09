@@ -7,6 +7,10 @@ use tokio_util::sync::CancellationToken;
 
 const MAX_PEERS: usize = 16;
 const SYSTEM_TIMEOUT: Duration = Duration::from_secs(5);
+// macOS 需先建立 ACL (最多 20 秒), 再查询 SDP (最多 10 秒), 留出调度余量.
+#[cfg(target_os = "macos")]
+const QUERY_TIMEOUT: Duration = Duration::from_secs(35);
+#[cfg(not(target_os = "macos"))]
 const QUERY_TIMEOUT: Duration = Duration::from_secs(12);
 type Work<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
 trait Backend: Send + Sync {

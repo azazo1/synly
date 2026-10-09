@@ -184,12 +184,93 @@ static void receiver_bound(void) {
     close(fd);
 }
 
+@interface FakeSDPRecord : NSObject
+- (IOReturn)getRFCOMMChannelID:(BluetoothRFCOMMChannelID *)channel;
+@end
+@implementation FakeSDPRecord
+- (IOReturn)getRFCOMMChannelID:(BluetoothRFCOMMChannelID *)channel { *channel = 7; return kIOReturnSuccess; }
+@end
+
+// 模拟新 macOS 的过滤查询空操作, 验证实际路径显式连接后只用无过滤 SDP.
+@interface FakeSDPDevice : NSObject
+@property(nonatomic) BOOL connected;
+@property(nonatomic) BOOL serviceAvailable;
+@property(nonatomic) NSUInteger connections;
+@property(nonatomic) NSUInteger queries;
+@property(nonatomic, strong) IOBluetoothSDPUUID *requested;
+@property(nonatomic, strong) FakeSDPRecord *record;
+@property(nonatomic, strong) SBQuery *query;
+- (BOOL)isConnected;
+- (BOOL)isPaired;
+- (IOReturn)openConnection:(id)target withPageTimeout:(BluetoothHCIPageTimeout)timeout authenticationRequired:(BOOL)required;
+- (IOReturn)performSDPQuery:(id)target;
+- (IOReturn)performSDPQuery:(id)target uuids:(NSArray *)uuids;
+- (IOBluetoothSDPServiceRecord *)getServiceRecordForUUID:(IOBluetoothSDPUUID *)uuid;
+@end
+@implementation FakeSDPDevice
+- (BOOL)isConnected { return self.connected; }
+- (BOOL)isPaired { return YES; }
+- (IOReturn)openConnection:(id)target withPageTimeout:(BluetoothHCIPageTimeout)timeout authenticationRequired:(BOOL)required {
+    (void)target;
+    assert(timeout == 0x2000 && required);
+    self.connections += 1;
+    // 模拟底层连接成功但缺失 connectionComplete 回调.
+    self.connected = YES;
+    return kIOReturnSuccess;
+}
+- (IOReturn)performSDPQuery:(id)target {
+    assert(self.connected);
+    self.queries += 1;
+    self.query = target;
+    [self performSelector:@selector(finishQuery) withObject:nil afterDelay:0];
+    return kIOReturnSuccess;
+}
+- (IOReturn)performSDPQuery:(id)target uuids:(NSArray *)uuids {
+    (void)target; (void)uuids;
+    assert(NO && "不能调用新 macOS 上可能空操作的 UUID 过滤查询");
+    return kIOReturnSuccess;
+}
+- (void)finishQuery {
+    [self.query sdpQueryComplete:(IOBluetoothDevice *)self status:kIOReturnSuccess];
+    self.query = nil;
+}
+- (IOBluetoothSDPServiceRecord *)getServiceRecordForUUID:(IOBluetoothSDPUUID *)uuid {
+    self.requested = uuid;
+    return self.serviceAvailable ? (IOBluetoothSDPServiceRecord *)self.record : nil;
+}
+@end
+
+static void service_discovery(void) {
+    run_sync(^{
+        const uint8_t uuid[16] = {0xb3, 0x92, 0x88, 0x3b, 0xe8, 0x5b, 0x4c, 0x92, 0xb1, 0xa0, 0x2c, 0xdf, 0xe0, 0xa7, 0xb6, 0xd4};
+        FakeSDPDevice *device = [FakeSDPDevice new];
+        device.record = [FakeSDPRecord new];
+        device.serviceAvailable = YES;
+        uint8_t channel = 0, stage = 0;
+        assert(query_channel((IOBluetoothDevice *)device, uuid, &channel, &stage) == 0);
+        assert(device.connections == 1 && device.queries == 1 && channel == 7 && stage == 6);
+        assert([device.requested isEqual:[IOBluetoothSDPUUID uuidWithBytes:uuid length:16]]);
+        // SDP 完成后仍保留缺失的 ACL 回调对象, 迟到回调到达后才能安全释放.
+        assert([SBWorker shared].queries.count == 1);
+        SBQuery *pending = [SBWorker shared].queries.firstObject;
+        [pending connectionComplete:(IOBluetoothDevice *)device status:kIOReturnSuccess];
+        retire_query([SBWorker shared], pending);
+        assert([SBWorker shared].queries.count == 0);
+        // 已有 ACL 不重复连接; 没有目标 UUID 时不连接任意其它服务.
+        device.serviceAvailable = NO;
+        assert(query_channel((IOBluetoothDevice *)device, uuid, &channel, &stage) == 0);
+        assert(device.connections == 1 && device.queries == 2 && channel == 0);
+        assert([SBWorker shared].queries.count == 0);
+    });
+}
+
 int main(void) {
     @autoreleasepool {
+        service_discovery();
         security_gate();
         transfer_and_cancel();
         receiver_bound();
-        fprintf(stdout, "native Bluetooth bridge: 3 tests passed\n");
+        fprintf(stdout, "native Bluetooth bridge: 4 tests passed\n");
     }
     return 0;
 }

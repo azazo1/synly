@@ -7,7 +7,13 @@ use std::{future::Future, pin::Pin, sync::{Arc, atomic::{AtomicBool, Ordering}},
 use tokio::{sync::mpsc, task::JoinHandle};
 
 const RETRY_DELAY: Duration = Duration::from_secs(30);
+#[cfg(target_os = "macos")]
+const CANDIDATE_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(not(target_os = "macos"))]
 const CANDIDATE_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(target_os = "macos")]
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(35);
+#[cfg(not(target_os = "macos"))]
 const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(11);
 const MAX_PAIRED: usize = 256;
 

@@ -104,6 +104,7 @@ pub async fn query_service(peer: BluetoothPeer) -> Result<Option<BluetoothEndpoi
             4 => "SDP 请求启动",
             5 => "SDP 对端响应",
             6 => "RFCOMM 通道解析",
+            7 => "已配对设备底层连接",
             _ => "未知阶段",
         };
         tracing::info!(address = %peer.address, phase, status, channel, elapsed_ms = started.elapsed().as_millis() as u64, "macOS 蓝牙服务查询结束");
