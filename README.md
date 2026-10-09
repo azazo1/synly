@@ -1,6 +1,6 @@
 # Synly
 
-Synly 是一个面向局域网的跨平台同步应用. 默认启动 Slint GUI, 可在系统托盘后台运行, 并在当前连接中动态调整剪贴板, 音频和输入方向. 角色和对端等影响会话边界的设置会自动安全断开并重连.
+Synly 是一个支持局域网和系统已配对蓝牙设备连接的跨平台同步应用. 默认启动 Slint GUI, 可在系统托盘后台运行, 并在当前连接中动态调整剪贴板, 音频和输入方向. 角色和对端等影响会话边界的设置会自动安全断开并重连.
 
 Synly 支持 Windows, macOS 和 Linux. 剪贴板同步包含文件传输, 可在三大桌面平台使用. 音频运行时目前支持 Windows 和 macOS. 输入同步目前支持 Windows 和 macOS.
 
@@ -9,13 +9,15 @@ Synly 支持 Windows, macOS 和 Linux. 剪贴板同步包含文件传输, 可在
 - Slint 主窗口和原生系统托盘.
 - 状态, 设备, 输入, 安全, 设置, 日志和 About 页面.
 - mDNS 与 LND 设备发现聚合.
-- Android 客户端通过 mDNS/LND 发现桌面端, 使用同一套 PIN 配对与 mTLS 协议.
-- 未信任设备使用 bootstrap 指纹, SPAKE2 PIN 和临时 mTLS 完成配对.
+- Android 剪贴板客户端支持 mDNS/LND 发现, 已配对蓝牙设备选择和附近设备权限请求.
+- 局域网未信任设备使用 bootstrap 指纹, SPAKE2 PIN 和临时 mTLS 完成配对.
+- Windows/macOS/Android 的安全 RFCOMM 后端源码已接入, 蓝牙首次连接使用明确的应用身份授权, 不要求第二组 PIN.
+- 同一设备可绑定局域网和蓝牙为一个逻辑会话, 输入与剪贴板独立选择允许路径; 音频仅使用局域网 UDP.
 - 可信设备使用身份公钥和长期 mTLS 免 PIN 重连.
 - 剪贴板同步支持文本, RTF, HTML, 图片和受大小限制的文件.
 - 音频支持单向 send 和 receive. 发布包播放使用 SDL2 并随附运行库; 源码日常构建默认仍是平台原生播放.
 - 输入支持单向 send 和 receive, 包含边缘切换和紧急收回热键, 以及面向光标捕获游戏的光标模式(相对增量注入, 支持手动开关与自动检测).
-- 剪贴板, 音频和输入模式使用 protocol 17 capability generation 热协商.
+- 剪贴板, 音频和输入模式使用 protocol 22 capability generation 热协商.
 - 角色, 对侧和监听端口变化会自动重建会话.
 - host 支持多设备同时接入: 剪贴板在多会话间广播并防回音防洪流, 音频/输入由单一活跃会话承载, 活跃会话断开后自动提升已信任设备, UI 支持会话列表, 逐个断开与手动切换活跃会话.
 - 单实例运行, 锁与数据目录绑定. 重复启动会激活已有窗口.
@@ -27,11 +29,22 @@ Synly 支持 Windows, macOS 和 Linux. 剪贴板同步包含文件传输, 可在
 
 ## 安全顺序
 
-未信任设备在 PIN 之前交换一次性 bootstrap 公钥和主动方声明的 device_name. 双方核对 bootstrap 指纹和会话 randomart 后, 使用 PIN 完成 SPAKE2. 设备身份和能力信息只在临时 mTLS 建立后传输, bootstrap 阶段的名称仅用于提示并会在认证后重新校验.
+局域网未信任设备在 PIN 之前交换一次性 bootstrap 公钥和主动方声明的 device_name. 双方核对 bootstrap 指纹和会话 randomart 后, 使用 PIN 完成 SPAKE2. 设备身份和能力信息只在临时 mTLS 建立后传输, bootstrap 阶段的名称仅用于提示并会在认证后重新校验.
 
 固定 PIN 只保存在当前进程内存中. PIN, 密钥, PAKE 数据和剪贴板内容不会写入 tracing 日志.
 
 可信设备可保存对侧身份公钥和 TLS 根证书. 撤销当前对侧信任会立即断开连接, 后续可信重连会被拒绝.
+
+## 蓝牙连接
+
+蓝牙接入使用经典 RFCOMM, 不使用 BLE GATT. Windows/macOS 桌面端和 Android 客户端的后端与 UI 已接入源码; Windows/Android 构建, Android 绑定生成和真实设备互通尚未验证, 当前进度见 [蓝牙设计与验证范围](docs/bluetooth.md).
+
+1. 先在系统蓝牙设置完成设备配对, 在桌面 host 开启 Synly 蓝牙接入.
+2. 桌面设备页选择已配对蓝牙, 或在 Android 首页刷新蓝牙设备. Android 使用时请求附近设备权限; 查询到 Synly 服务后才能选择连接.
+3. 首次连接核对应用身份指纹并明确授权, 可选择保存信任. 系统配对记录, 名称与地址不会自动建立 Synly 信任.
+4. 在输入和剪贴板设置分别选择自动, 蓝牙优先, 仅局域网或仅蓝牙. 策略取双方交集, 没有允许路径时暂停该功能. 输入切换后按紧急收回热键确认, 再移动到边缘重新激活.
+
+蓝牙主控制可添加经过同一身份认证和会话绑定的局域网副承载. 音频只在实际在线的局域网路径可用. 主控制断开时重建会话, 不承诺无感接管或固定输入延迟. Linux 暂不提供蓝牙后端, Android 不提供桌面输入和音频能力.
 
 ## 构建
 
@@ -146,9 +159,9 @@ tar -xzf synly-<version>-linux-<arch>-setup.tar.gz
 
 ### Android
 
-Android 端是剪贴板同步客户端, 仅支持局域网内主动连接桌面 host. 它复用 `crates/synly-core` 的协议与加密实现, 通过 uniffi 生成 Kotlin 绑定, UI 使用 Jetpack Compose. Android 10+ 限制后台应用读取剪贴板, 因此发送剪贴板必须由用户主动触发: 首页快速发送按钮或通知栏操作会通过透明的 `ClipboardReadActivity` 短暂抢占前台焦点完成读取, 读取后立即发送并关闭界面; 应用不会在剪贴板内容变化时自动读取和发送. 前台服务持有网络会话并负责重连.
+Android 端是剪贴板同步客户端, 支持通过局域网或系统已配对蓝牙设备主动连接桌面 host. 它复用 `crates/synly-core` 的协议与加密实现, 通过 uniffi 生成 Kotlin 绑定, UI 使用 Jetpack Compose. Android 10+ 限制后台应用读取剪贴板, 因此发送剪贴板必须由用户主动触发: 首页快速发送按钮或通知栏操作会通过透明的 `ClipboardReadActivity` 短暂抢占前台焦点完成读取, 读取后立即发送并关闭界面; 应用不会在剪贴板内容变化时自动读取和发送. 前台服务持有网络会话并负责重连.
 
-v1 同步范围为文本, HTML 与 PNG 图片, 不支持文件与 RTF. 图片写入剪贴板时通过 FileProvider 提供 content URI. Android 12 及以上每次读取剪贴板时系统可能显示提示, 这是平台行为.
+Android 同步范围为文本, HTML, PNG 图片与受大小限制的文件, 不提供 RTF. 图片和接收文件通过 FileProvider 提供 content URI. Android 12 及以上每次读取剪贴板时系统可能显示提示, 这是平台行为.
 
 构建 Android 核心库与绑定:
 
@@ -171,7 +184,7 @@ just android-build release
 
 如果存在 `secrets/synly-signing.env`, `just android-build` 会自动加载其中的签名配置并构建签名 release APK.
 
-也可以使用 Android Studio 打开 `android/` 目录直接构建. 首次配对时, 在桌面端确认 PIN 与指纹, 手机端输入同一 PIN 并核对指纹; 配对成功后双方会保存长期 mTLS 信任, 之后免 PIN 重连.
+也可以使用 Android Studio 打开 `android/` 目录; 新 FFI 类型需要先重新生成绑定. 局域网首次配对时, 在桌面端确认 PIN 与指纹, 手机端输入同一 PIN 并核对指纹; 蓝牙首次连接通过应用身份授权对话框确认, 不输入第二组 PIN. 保存信任后使用长期 mTLS 重连.
 
 ## GUI 使用
 
