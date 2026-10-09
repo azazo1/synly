@@ -4,7 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-// 错误码 -1..-11 为桥接层错误, 其余非零值为系统 IOReturn.
+// 错误码 -1..-10 为桥接层错误, 其余非零值为系统 IOReturn.
 typedef struct {
     char address[18];
     char name[256];

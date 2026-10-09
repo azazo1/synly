@@ -197,6 +197,7 @@ static void receiver_bound(void) {
 @property(nonatomic) BOOL connected;
 @property(nonatomic) BOOL serviceAvailable;
 @property(nonatomic) BOOL callbackBeforeConnected;
+@property(nonatomic) IOReturn connectionResult;
 @property(nonatomic) NSUInteger connections;
 @property(nonatomic) NSUInteger queries;
 @property(nonatomic, strong) IOBluetoothSDPUUID *requested;
@@ -217,17 +218,16 @@ static void receiver_bound(void) {
     assert(timeout == 0x2000 && !required);
     self.connections += 1;
     if (self.callbackBeforeConnected) {
-        [target connectionComplete:(IOBluetoothDevice *)self status:kIOReturnSuccess];
-        [self performSelector:@selector(markConnected) withObject:nil afterDelay:0];
+        // 系统确认连接, 但 isConnected 始终未刷新, 不应因此阻止 SDP.
+        [target connectionComplete:(IOBluetoothDevice *)self status:self.connectionResult];
     } else {
         // 模拟底层连接成功但缺失 connectionComplete 回调.
         self.connected = YES;
     }
     return kIOReturnSuccess;
 }
-- (void)markConnected { self.connected = YES; }
 - (IOReturn)performSDPQuery:(id)target {
-    assert(self.connected);
+    assert(self.connected || (self.callbackBeforeConnected && self.connectionResult == kIOReturnSuccess));
     self.queries += 1;
     self.query = target;
     [self performSelector:@selector(finishQuery) withObject:nil afterDelay:0];
@@ -275,12 +275,17 @@ static void service_discovery(void) {
         device.connected = NO;
         assert(query_channel((IOBluetoothDevice *)device, uuid, &channel, &stage) == -4);
         assert(device.connections == 1 && device.queries == 2 && channel == 0 && stage == 2);
-        // 当前实例日志暴露的竞态: 成功回调先到, isConnected 稍后才更新.
+        // 当前实例日志暴露的错误门槛: 成功回调后 isConnected 始终为假.
         device.paired = YES;
         device.callbackBeforeConnected = YES;
         device.serviceAvailable = YES;
         assert(query_channel((IOBluetoothDevice *)device, uuid, &channel, &stage) == 0);
-        assert(device.connections == 2 && device.queries == 3 && channel == 7);
+        assert(device.connections == 2 && device.queries == 3 && channel == 7 && !device.connected);
+        assert([SBWorker shared].queries.count == 0);
+        // 错误回调仍必须失败并阻止 SDP, 不能只因收到回调就继续.
+        device.connectionResult = kIOReturnNotResponding;
+        assert(query_channel((IOBluetoothDevice *)device, uuid, &channel, &stage) == kIOReturnNotResponding);
+        assert(device.connections == 3 && device.queries == 3 && channel == 0 && stage == 7);
         assert([SBWorker shared].queries.count == 0);
     });
 }

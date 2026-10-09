@@ -43,7 +43,6 @@ fn check(status: c_int) -> Result<()> {
         -8 => bail!("对端未提供 Synly 蓝牙服务"),
         -9 => bail!("蓝牙服务入口或查询正在使用中"),
         -10 => bail!("系统已配对设备数量超出枚举上限"),
-        -11 => bail!("系统报告连接成功, 但底层链路未就绪"),
         status => bail!("macOS 蓝牙系统接口错误: 0x{:08x}", status as u32),
     }
 }
