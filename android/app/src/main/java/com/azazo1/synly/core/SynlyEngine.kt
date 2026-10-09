@@ -60,9 +60,25 @@ object SynlyEngine {
         }
     }
 
-    private val listener = object : FfiClientListener {
+    private var clientGeneration = 0L
+
+    private fun listener(generation: Long) = object : FfiClientListener {
         override fun onEvent(event: FfiClientEvent) {
-            handleEvent(event)
+            synchronized(SynlyEngine) {
+                if (clientGeneration == generation) handleEvent(event, generation)
+            }
+        }
+    }
+
+    // 与回调使用同一把锁. 新客户端只接收自己的代次, 旧句柄先撤销再停止.
+    private fun retireClient() {
+        clientGeneration += 1
+        val previous = handle
+        handle = null
+        currentTarget = null
+        // FFI stop 等待任务退出, 不可持有回调锁调用, 否则最后一个回调可能相互等待.
+        if (previous != null) scope.launch {
+            runCatching { previous.stop() }.onFailure { SynlyLog.w(TAG, "停止旧客户端失败", it) }
         }
     }
 
@@ -78,6 +94,7 @@ object SynlyEngine {
         }
     }
 
+    @Synchronized
     fun start(context: Context, allowAutoReconnect: Boolean = true) {
         val settings = SettingsStore.load(context)
         val target = settings.lastTarget ?: run {
@@ -92,12 +109,22 @@ object SynlyEngine {
             SynlyLog.i(TAG, "目标设备未变化, 忽略重复连接请求")
             return
         }
+        if (target.bluetoothAddress != null && BluetoothBackend.runtimePermissions().any {
+            context.checkSelfPermission(it) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        }) {
+            publishMessage("附近设备权限未授予, 请在蓝牙设备列表授权后连接")
+            return
+        }
+        retireClient()
+        val generation = clientGeneration
         currentTarget = target
         _uiState.update {
             it.copy(
                 state = FfiClientState.CONNECTING,
                 connectedDevice = null,
+                lastMessage = null,
                 transportSummary = null,
+                bluetoothAvailable = false,
                 targetLabel = targetLabel(context, target),
                 pinRequest = null,
                 bluetoothAuthorization = null,
@@ -105,9 +132,20 @@ object SynlyEngine {
                 canReceive = false,
             )
         }
-        scope.launch { startInternal(context) }
+        scope.launch {
+            synchronized(SynlyEngine) {
+                if (clientGeneration == generation) runCatching { startInternal(context, target, generation) }
+                    .onFailure { error ->
+                        retireClient()
+                        clearUiState()
+                        SynlyLog.e(TAG, "准备客户端配置失败", error)
+                        publishMessage(error.message ?: "准备客户端配置失败")
+                    }
+            }
+        }
     }
 
+    @Synchronized
     fun applyDeviceName(context: Context, newName: String): String {
         val name = newName.trim()
         val settings = SettingsStore.load(context)
@@ -116,20 +154,14 @@ object SynlyEngine {
         if (settings.deviceName != effectiveName) {
             SettingsStore.save(context, settings.copy(deviceName = effectiveName))
         }
-        if (handle != null && effectiveName != identityName) {
-            scope.launch {
-                runCatching { handle?.stop() }
-                handle = null
-                currentTarget = null
-                startInternal(context)
-            }
+        if (currentTarget != null && effectiveName != identityName) {
+            restartClient(context, requireAutoReconnect = false)
         }
         return effectiveName
     }
 
-    private fun startInternal(context: Context) {
+    private fun startInternal(context: Context, target: SynlyTarget, generation: Long) {
         val settings = SettingsStore.load(context)
-        val target = settings.lastTarget ?: return
         _uiState.update { it.copy(targetLabel = targetLabel(context, target)) }
         val identity = IdentityStore.getOrCreate(context)
         val trusted = TrustedDeviceStore.list(context)
@@ -153,46 +185,28 @@ object SynlyEngine {
             bluetoothAddress = target.bluetoothAddress,
         )
         runCatching {
-            handle?.stop()
-            handle = startClient(config, ffiTarget, listener)
-            currentTarget = target
-            SynlyLog.i(TAG, "客户端已启动: ${target.addresses.joinToString()}:${target.port}")
+            handle = startClient(config, ffiTarget, listener(generation))
+            SynlyLog.i(TAG, "客户端已启动: ${target.bluetoothAddress ?: "${target.addresses.joinToString()}:${target.port}"}")
         }.onFailure { error ->
-            handle = null
-            currentTarget = null
+            retireClient()
             SynlyLog.e(TAG, "启动客户端失败", error)
             clearUiState()
             _uiState.update { it.copy(lastMessage = error.message ?: "启动客户端失败") }
         }
     }
 
+    @Synchronized
     fun stop() {
-        val handleToStop = handle
-        handle = null
-        currentTarget = null
+        retireClient()
         clearUiState()
-        if (handleToStop != null) {
-            scope.launch {
-                runCatching { handleToStop.stop() }
-            }
-        }
     }
 
+    @Synchronized
     fun disconnect(context: Context) {
-        val handleToStop = handle
-        handle = null
-        currentTarget = null
+        retireClient()
         val settings = SettingsStore.load(context).copy(lastTarget = null)
         SettingsStore.save(context, settings)
         clearUiState()
-        if (handleToStop != null) {
-            scope.launch {
-                runCatching { handleToStop.stop() }
-                if (handle == null) {
-                    clearUiState()
-                }
-            }
-        }
     }
 
     fun reloadConfiguration(context: Context) {
@@ -203,15 +217,10 @@ object SynlyEngine {
         restartClient(context, requireAutoReconnect = false)
     }
 
+    @Synchronized
     private fun restartClient(context: Context, requireAutoReconnect: Boolean) {
-        val oldHandle = handle
-        handle = null
-        currentTarget = null
-        if (oldHandle != null) {
-            scope.launch {
-                runCatching { oldHandle.stop() }
-            }
-        }
+        retireClient()
+        clearUiState()
         val settings = SettingsStore.load(context)
         if (settings.lastTarget == null || (requireAutoReconnect && !settings.autoReconnect)) {
             clearUiState()
@@ -227,6 +236,7 @@ object SynlyEngine {
                 connectedDevice = null,
                 targetLabel = null,
                 transportSummary = null,
+                bluetoothAvailable = false,
                 pinRequest = null,
                 bluetoothAuthorization = null,
                 canSend = false,
@@ -235,6 +245,7 @@ object SynlyEngine {
         }
     }
 
+    @Synchronized
     fun authorizeBluetooth(requestId: String, accepted: Boolean, remember: Boolean) {
         if (_uiState.value.bluetoothAuthorization?.requestId != requestId) return
         runCatching { handle?.authorizeBluetooth(requestId, accepted, remember) }
@@ -271,6 +282,9 @@ object SynlyEngine {
             .isSuccess && handle != null
     }
 
+    @Synchronized
+    fun hasBluetoothPath(): Boolean = currentTarget?.bluetoothAddress != null || _uiState.value.bluetoothAvailable
+
     fun canSend(): Boolean = _uiState.value.canSend
 
     fun publishMessage(message: String) {
@@ -306,10 +320,26 @@ object SynlyEngine {
         )
     }
 
-    fun connect(context: Context, target: SynlyTarget) {
-        val settings = SettingsStore.load(context).copy(lastTarget = target)
-        SettingsStore.save(context, settings)
+    @Synchronized
+    fun setBluetoothEnabled(context: Context, enabled: Boolean) {
+        val settings = SettingsStore.load(context)
+        if (settings.bluetoothEnabled == enabled) return
+        SettingsStore.save(context, settings.copy(bluetoothEnabled = enabled))
+        if (currentTarget != null) restartClient(context, requireAutoReconnect = false)
+    }
+
+    @Synchronized
+    fun connect(context: Context, target: SynlyTarget): Boolean {
+        if (target.bluetoothAddress != null && BluetoothBackend.runtimePermissions().any {
+            context.checkSelfPermission(it) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        }) {
+            publishMessage("附近设备权限未授予, 请在蓝牙设备列表授权后连接")
+            return false
+        }
+        val settings = SettingsStore.load(context)
+        SettingsStore.save(context, settings.copy(lastTarget = target, bluetoothEnabled = settings.bluetoothEnabled || target.bluetoothAddress != null))
         start(context, allowAutoReconnect = false)
+        return currentTarget == target
     }
 
     fun targetLabel(context: Context, target: SynlyTarget): String {
@@ -328,6 +358,7 @@ object SynlyEngine {
         val context = SynlyApplication.instance ?: return
         val settings = SettingsStore.load(context)
         val target = settings.lastTarget ?: return
+        if (target != currentTarget) return
         if (target.peerDeviceId != null && target.peerDeviceId != remoteDeviceId) return
         if (target.bluetoothAddress != null) {
             val updated = target.copy(peerDeviceId = remoteDeviceId)
@@ -365,7 +396,7 @@ object SynlyEngine {
         SynlyLog.i(TAG, "已记忆最近成功对侧: $normalized:$effectivePort")
     }
 
-    private fun handleEvent(event: FfiClientEvent) {
+    private fun handleEvent(event: FfiClientEvent, generation: Long) {
         if (handle == null && currentTarget == null) return
         when (event) {
             is FfiClientEvent.StateChanged -> {
@@ -395,6 +426,7 @@ object SynlyEngine {
             }
 
             is FfiClientEvent.Connected -> {
+                rememberConnectedAddress(event.remoteAddress, event.remotePort?.toInt(), event.remote.deviceId)
                 _uiState.update {
                     it.copy(
                         state = FfiClientState.CONNECTED,
@@ -407,16 +439,11 @@ object SynlyEngine {
                         canReceive = event.hostToClient,
                     )
                 }
-                rememberConnectedAddress(
-                    event.remoteAddress,
-                    event.remotePort?.toInt(),
-                    event.remote.deviceId,
-                )
             }
 
             is FfiClientEvent.TransportChanged -> {
                 val links = listOfNotNull(if (event.lanAvailable) "局域网" else null, if (event.bluetoothAvailable) "蓝牙" else null).joinToString(" + ")
-                _uiState.update { it.copy(transportSummary = "主控制 ${event.primary} / 已接入 $links / 剪贴板 ${event.clipboardStatus}") }
+                _uiState.update { it.copy(bluetoothAvailable = event.bluetoothAvailable, transportSummary = "主控制 ${event.primary} / 已接入 $links / 剪贴板 ${event.clipboardStatus}") }
             }
 
             is FfiClientEvent.ClipboardReceived -> {
@@ -430,6 +457,11 @@ object SynlyEngine {
                 val deliveryHandle = handle
                 // 文件缓存与系统剪贴板写入离开 FFI 回调线程, 控制和收包继续运行.
                 scope.launch {
+                    val current = synchronized(SynlyEngine) { clientGeneration == generation && handle === deliveryHandle && _uiState.value.canReceive }
+                    if (!current) {
+                        event.deliveryId?.let { id -> runCatching { deliveryHandle?.confirmClipboard(id, false) } }
+                        return@launch
+                    }
                     val applied = context != null && runCatching {
                         ClipboardWriter.applyRemote(context, payload, strict = event.deliveryId != null)
                     }.onFailure { SynlyLog.w(TAG, "应用远端剪贴板失败", it) }.getOrDefault(false)
@@ -437,11 +469,13 @@ object SynlyEngine {
                         runCatching { deliveryHandle?.confirmClipboard(id, applied) }
                             .onFailure { SynlyLog.w(TAG, "发送剪贴板应用回执失败", it) }
                     }
-                    if (applied && handle === deliveryHandle) _uiState.update {
-                        it.copy(
-                            lastReceivedText = event.text?.take(200),
-                            lastReceivedImagePng = event.imagePng,
-                        )
+                    synchronized(SynlyEngine) {
+                        if (applied && clientGeneration == generation && handle === deliveryHandle) _uiState.update {
+                            it.copy(
+                                lastReceivedText = event.text?.take(200),
+                                lastReceivedImagePng = event.imagePng,
+                            )
+                        }
                     }
                 }
             }
@@ -462,6 +496,7 @@ object SynlyEngine {
                         state = null,
                         connectedDevice = null,
                         transportSummary = null,
+                        bluetoothAvailable = false,
                         pinRequest = null,
                         bluetoothAuthorization = null,
                         canSend = false,
@@ -471,18 +506,10 @@ object SynlyEngine {
             }
 
             is FfiClientEvent.PairingFailed -> {
-                // core 在配对终止后不再自动重连, 清空句柄以便下次重新启动
-                handle = null
-                currentTarget = null
-                _uiState.update {
-                    it.copy(
-                        state = null,
-                        targetLabel = null,
-                transportSummary = null,
-                        bluetoothAuthorization = null,
-                        lastMessage = event.message,
-                    )
-                }
+                // core 在配对终止后不再自动重连, 同时撤销旧回调与排队交付.
+                retireClient()
+                clearUiState()
+                publishMessage(event.message)
             }
         }
     }

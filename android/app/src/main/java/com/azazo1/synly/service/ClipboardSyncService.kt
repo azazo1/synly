@@ -79,6 +79,7 @@ class ClipboardSyncService : android.app.Service() {
     private var lastNotificationState: FfiClientState? = null
     private var lastNotificationDevice: String? = null
     private var lastNotificationTarget: String? = null
+    private var lastBluetoothPath: Boolean? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -101,6 +102,11 @@ class ClipboardSyncService : android.app.Service() {
                     val state = ui.state
                     val device = ui.connectedDevice
                     val target = ui.targetLabel
+                    val bluetooth = SynlyEngine.hasBluetoothPath()
+                    if (lastBluetoothPath != bluetooth) {
+                        lastBluetoothPath = bluetooth
+                        evaluateWifiAvailability()
+                    }
                     if (state != lastNotificationState ||
                         device != lastNotificationDevice ||
                         target != lastNotificationTarget
@@ -244,7 +250,7 @@ class ClipboardSyncService : android.app.Service() {
     private suspend fun evaluateWifiAvailability() {
         // 监听不可用时无法判断 Wi-Fi 状态, 保持后台同步而不是误判退出.
         if (networkCallback == null) return
-        if (hasWifiSideNetwork()) {
+        if (SynlyEngine.hasBluetoothPath() || hasWifiSideNetwork()) {
             cancelWifiExit()
         } else {
             scheduleWifiExit()
@@ -257,8 +263,8 @@ class ClipboardSyncService : android.app.Service() {
         wifiExitJob = scope.launch {
             delay(WIFI_LOST_EXIT_DELAY_MS)
             wifiExitJob = null
-            if (hasWifiSideNetwork()) {
-                SynlyLog.i(TAG, "已在限期内恢复 Wi-Fi 或热点, 继续后台同步")
+            if (SynlyEngine.hasBluetoothPath() || hasWifiSideNetwork()) {
+                SynlyLog.i(TAG, "已有蓝牙路径, Wi-Fi 或热点, 继续后台同步")
             } else {
                 SynlyLog.i(TAG, "仍没有 Wi-Fi 与热点, 停止后台同步服务")
                 stopSelf()
@@ -270,7 +276,7 @@ class ClipboardSyncService : android.app.Service() {
         wifiExitJob?.let {
             it.cancel()
             wifiExitJob = null
-            SynlyLog.i(TAG, "已有 Wi-Fi 或热点, 取消自动退出")
+            SynlyLog.i(TAG, "已有蓝牙路径, Wi-Fi 或热点, 取消自动退出")
         }
     }
 

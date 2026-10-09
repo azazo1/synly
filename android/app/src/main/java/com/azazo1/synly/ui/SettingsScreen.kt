@@ -203,6 +203,10 @@ fun SettingsScreen(onBack: () -> Unit) {
             item {
                 Card {
                     Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        BluetoothAccessSetting(settings.bluetoothEnabled, onChanged = { enabled ->
+                            SynlyEngine.setBluetoothEnabled(context, enabled)
+                            settings = SettingsStore.load(context)
+                        }, report = { statusMessage = it })
                         ClipboardPathSetting(settings.clipboardPath) { policy ->
                             settings = settings.copy(clipboardPath = policy)
                             SettingsStore.save(context, settings)

@@ -25,6 +25,7 @@ data class SynlyUiState(
     val connectedDevice: String? = null,
     val targetLabel: String? = null,
     val transportSummary: String? = null,
+    val bluetoothAvailable: Boolean = false,
     val pinRequest: PinRequest? = null,
     val bluetoothAuthorization: BluetoothAuthorization? = null,
     val lastMessage: String? = null,

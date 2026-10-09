@@ -105,6 +105,7 @@ private fun HomeScreen(onOpenSettings: () -> Unit, onOpenLogs: () -> Unit) {
     var pin by remember { mutableStateOf("") }
     var settings by remember { mutableStateOf(SettingsStore.load(context)) }
     val scope = rememberCoroutineScope()
+    val requestBluetoothPermission = rememberBluetoothPermissionRequest(SynlyEngine::publishMessage)
     var batteryIgnored by remember { mutableStateOf(false) }
     var revealReceived by remember { mutableStateOf(false) }
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -156,7 +157,10 @@ private fun HomeScreen(onOpenSettings: () -> Unit, onOpenLogs: () -> Unit) {
                     StatusCard(
                         state = uiState.state,
                         targetLabel = uiState.targetLabel,
-                        onClick = { SynlyEngine.reconnect(context) },
+                        onClick = {
+                            if (SettingsStore.load(context).lastTarget?.bluetoothAddress != null) requestBluetoothPermission { SynlyEngine.reconnect(context) }
+                            else SynlyEngine.reconnect(context)
+                        },
                         modifier = Modifier.weight(1f),
                     )
                     Button(
@@ -179,13 +183,15 @@ private fun HomeScreen(onOpenSettings: () -> Unit, onOpenLogs: () -> Unit) {
                 item { Text(message, color = MaterialTheme.colorScheme.error) }
             }
 
+            item { BluetoothDevices(busy = uiState.state != null, recentTargets = settings.recentTargets) { target -> connectSync(context, target) } }
+
             item {
                 Card {
                     Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Text("局域网设备", style = MaterialTheme.typography.titleMedium)
-                        if (settings.recentTargets.isNotEmpty()) {
+                        if (settings.recentTargets.any { it.bluetoothAddress == null }) {
                             Text("最近连接", style = MaterialTheme.typography.titleSmall)
-                            settings.recentTargets.forEach { target ->
+                            settings.recentTargets.filter { it.bluetoothAddress == null }.forEach { target ->
                                 RecentTargetCard(
                                     label = SynlyEngine.targetLabel(context, target),
                                     target = target,
@@ -528,8 +534,7 @@ private fun maskText(text: String): String {
 }
 
 private fun connectSync(context: Context, target: SynlyTarget) {
-    SynlyEngine.connect(context, target)
-    ClipboardSyncService.start(context)
+    if (SynlyEngine.connect(context, target)) ClipboardSyncService.start(context)
 }
 
 private fun isIgnoringBatteryOptimizations(context: Context): Boolean {
