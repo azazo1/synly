@@ -16,10 +16,20 @@ struct NativePeer {
     name: [c_char; 256],
 }
 
+#[repr(C)]
+#[derive(Default)]
+struct NativeQueryTrace {
+    request_returned: u8,
+    request_on_main: u8,
+    callback_received: u8,
+    callback_on_main: u8,
+    callback_matches_device: u8,
+}
+
 unsafe extern "C" {
     fn synly_bt_available() -> c_int;
     fn synly_bt_paired(peers: *mut NativePeer, capacity: usize, count: *mut usize) -> c_int;
-    fn synly_bt_query(address: *const c_char, uuid: *const u8, channel: *mut u8, stage: *mut u8) -> c_int;
+    fn synly_bt_query(address: *const c_char, uuid: *const u8, channel: *mut u8, stage: *mut u8, trace: *mut NativeQueryTrace) -> c_int;
     fn synly_bt_connect(address: *const c_char, uuid: *const u8, fd: *mut c_int) -> c_int;
     fn synly_bt_listen(
         uuid: *const u8,
@@ -95,8 +105,9 @@ pub async fn query_service(peer: BluetoothPeer) -> Result<Option<BluetoothEndpoi
         let address = CString::new(peer.address.as_str())?;
         let mut channel = 0;
         let mut stage = 0;
+        let mut trace = NativeQueryTrace::default();
         let started = std::time::Instant::now();
-        let status = unsafe { synly_bt_query(address.as_ptr(), SERVICE_UUID_BYTES.as_ptr(), &mut channel, &mut stage) };
+        let status = unsafe { synly_bt_query(address.as_ptr(), SERVICE_UUID_BYTES.as_ptr(), &mut channel, &mut stage, &mut trace) };
         let phase = match stage {
             1 => "控制器状态",
             2 => "系统配对记录",
@@ -107,7 +118,11 @@ pub async fn query_service(peer: BluetoothPeer) -> Result<Option<BluetoothEndpoi
             7 => "已配对设备底层连接",
             _ => "未知阶段",
         };
-        tracing::info!(address = %peer.address, phase, status, channel, elapsed_ms = started.elapsed().as_millis() as u64, "macOS 蓝牙服务查询结束");
+        tracing::info!(address = %peer.address, phase, status, channel,
+            request_returned = trace.request_returned != 0, request_on_main = trace.request_on_main != 0,
+            callback_received = trace.callback_received != 0, callback_on_main = trace.callback_on_main != 0,
+            callback_matches_device = trace.callback_matches_device != 0,
+            elapsed_ms = started.elapsed().as_millis() as u64, "macOS 蓝牙服务查询结束");
         check(status).with_context(|| format!("{phase}失败 (0x{:08x})", status as u32))?;
         Ok((channel != 0).then_some(BluetoothEndpoint { peer, channel: Some(channel) }))
     }).await

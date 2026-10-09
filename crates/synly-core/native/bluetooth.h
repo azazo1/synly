@@ -10,12 +10,21 @@ typedef struct {
     char name[256];
 } SynlyBluetoothPeer;
 
+// 仅记录线程和投递状态, 不包含设备身份或服务记录内容.
+typedef struct {
+    uint8_t request_returned;
+    uint8_t request_on_main;
+    uint8_t callback_received;
+    uint8_t callback_on_main;
+    uint8_t callback_matches_device;
+} SynlyBluetoothQueryTrace;
+
 typedef void (*SynlyBluetoothAccept)(void *context, int fd, const SynlyBluetoothPeer *peer);
 
 int synly_bt_available(void);
 int synly_bt_paired(SynlyBluetoothPeer *peers, size_t capacity, size_t *count);
 // stage 返回失败所在阶段: 1 控制器, 2 配对记录, 3 查询队列, 4 请求启动, 5 对端响应, 6 通道解析, 7 底层连接.
-int synly_bt_query(const char *address, const uint8_t uuid[16], uint8_t *channel, uint8_t *stage);
+int synly_bt_query(const char *address, const uint8_t uuid[16], uint8_t *channel, uint8_t *stage, SynlyBluetoothQueryTrace *trace);
 // 成功后 fd 的所有权交给调用方, 关闭 fd 会取消对应 RFCOMM 通道.
 int synly_bt_connect(const char *address, const uint8_t uuid[16], int *fd);
 int synly_bt_listen(const uint8_t uuid[16], SynlyBluetoothAccept callback, void *context, void **listener);

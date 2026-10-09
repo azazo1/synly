@@ -1,4 +1,4 @@
-// IOBluetooth 只在专用 run loop 中使用, 不占用 UI 或 Tokio 工作线程.
+// 阻塞等待和字节流桥接由专用 run loop 承担; SDP 启动由主线程处理, 回调跨线程发布.
 #import "bluetooth.h"
 #import <Foundation/Foundation.h>
 #import <CoreBluetooth/CoreBluetooth.h>
@@ -12,6 +12,7 @@ static const NSUInteger kReceiveLimit = 64 * 1024;
 
 @interface SBRpc : NSObject
 @property(nonatomic, copy) void (^work)(void);
+@property(atomic) BOOL complete;
 @end
 @implementation SBRpc
 @end
@@ -54,13 +55,20 @@ static IOBluetoothDevice *paired_device(const char *address) {
 
 @interface SBQuery : NSObject
 @property(nonatomic, strong) IOBluetoothDevice *device;
-@property(nonatomic) BOOL complete;
-@property(nonatomic) IOReturn status;
+// 系统可能从主线程投递回调, 完成标志必须原子发布, 不能依赖 worker 的 run loop 隐含同步.
+@property(atomic) BOOL complete;
+@property(atomic) IOReturn status;
 @property(nonatomic) BOOL connectionStarted;
-@property(nonatomic) BOOL connectionComplete;
-@property(nonatomic) IOReturn connectionStatus;
+@property(atomic) BOOL connectionComplete;
+@property(atomic) IOReturn connectionStatus;
 @property(nonatomic) BOOL sdpStarted;
-@property(nonatomic) BOOL abandoned;
+@property(atomic) BOOL abandoned;
+@property(atomic) BOOL requestReturned;
+@property(atomic) IOReturn requestStatus;
+@property(atomic) BOOL requestOnMain;
+@property(atomic) BOOL callbackReceived;
+@property(atomic) BOOL callbackOnMain;
+@property(atomic) BOOL callbackMatchesDevice;
 - (void)connectionComplete:(IOBluetoothDevice *)device status:(IOReturn)status;
 - (void)sdpQueryComplete:(IOBluetoothDevice *)device status:(IOReturn)status;
 @end
@@ -71,7 +79,10 @@ static IOBluetoothDevice *paired_device(const char *address) {
     self.connectionComplete = YES;
 }
 - (void)sdpQueryComplete:(IOBluetoothDevice *)device status:(IOReturn)status {
-    if (device != self.device) return;
+    self.callbackOnMain = NSThread.isMainThread;
+    self.callbackMatchesDevice = device == self.device;
+    self.callbackReceived = YES;
+    if (!self.callbackMatchesDevice) return;
     self.status = status;
     self.complete = YES;
 }
@@ -89,16 +100,7 @@ static void pump_loop(void) {
     [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
 }
 
-static int query_channel(IOBluetoothDevice *device, const uint8_t uuid[16], uint8_t *channel, uint8_t *stage) {
-    *channel = 0;
-    *stage = 2;
-    if (!device.isPaired) return -4;
-    *stage = 3;
-    SBWorker *worker = [SBWorker shared];
-    if (worker.queries.count >= 32) return -9;
-    SBQuery *query = [SBQuery new];
-    query.device = device;
-    [worker.queries addObject:query];
+static int query_channel_run(IOBluetoothDevice *device, const uint8_t uuid[16], uint8_t *channel, uint8_t *stage, SBWorker *worker, SBQuery *query) {
     IOBluetoothSDPUUID *service = [IOBluetoothSDPUUID uuidWithBytes:uuid length:16];
     // Monterey 及之后的 UUID 过滤查询可能成功返回却不执行, 且 SDP 不再自动建立 ACL.
     // 先显式连接已配对设备, 再查询全部 SDP 记录, 结果仍严格按 Synly UUID 选择.
@@ -128,14 +130,33 @@ static int query_channel(IOBluetoothDevice *device, const uint8_t uuid[16], uint
     if (!device.isPaired) { retire_query(worker, query); return -4; }
     *stage = 4;
     query.sdpStarted = YES;
-    IOReturn status = [device performSDPQuery:query];
-    if (status != kIOReturnSuccess) {
+    NSTimeInterval deadline = NSProcessInfo.processInfo.systemUptime + 10.0;
+    // 实机探针确认后台请求的回调仍在主线程. 只把短启动调用安排到主线程, 等待仍在 worker.
+    CFRunLoopPerformBlock(CFRunLoopGetMain(), kCFRunLoopCommonModes, ^{
+        if (query.abandoned) {
+            // 主线程迟迟未处理请求时, 超时后不再发起新的 SDP; 让有界保留队列能够回收.
+            query.status = kIOReturnAborted;
+            query.complete = YES;
+            query.requestReturned = YES;
+            return;
+        }
+        query.requestOnMain = NSThread.isMainThread;
+        query.requestStatus = [device performSDPQuery:query];
+        if (query.requestStatus != kIOReturnSuccess) {
+            query.status = query.requestStatus;
+            query.complete = YES;
+        }
+        query.requestReturned = YES;
+    });
+    CFRunLoopWakeUp(CFRunLoopGetMain());
+    while (!query.requestReturned && NSProcessInfo.processInfo.systemUptime < deadline) pump_loop();
+    if (!query.requestReturned) { query.abandoned = YES; return -5; }
+    if (query.requestStatus != kIOReturnSuccess) {
         query.sdpStarted = NO;
         retire_query(worker, query);
-        return (int)status;
+        return (int)query.requestStatus;
     }
     *stage = 5;
-    NSTimeInterval deadline = NSProcessInfo.processInfo.systemUptime + 10.0;
     while (!query.complete && NSProcessInfo.processInfo.systemUptime < deadline) pump_loop();
     // 无 API 可取消 SDP; 保留回调对象和设备到系统完成, 不关闭可能被其它路径使用的 ACL.
     if (!query.complete) { query.abandoned = YES; return -5; }
@@ -145,11 +166,37 @@ static int query_channel(IOBluetoothDevice *device, const uint8_t uuid[16], uint
     IOBluetoothSDPServiceRecord *record = [device getServiceRecordForUUID:service];
     if (record == nil) return 0;
     BluetoothRFCOMMChannelID found = 0;
-    status = [record getRFCOMMChannelID:&found];
+    IOReturn status = [record getRFCOMMChannelID:&found];
     if (status != kIOReturnSuccess) return (int)status;
     if (found < 1 || found > 30) return -7;
     *channel = found;
     return 0;
+}
+
+static int query_channel_traced(IOBluetoothDevice *device, const uint8_t uuid[16], uint8_t *channel, uint8_t *stage, SynlyBluetoothQueryTrace *trace) {
+    if (trace != NULL) memset(trace, 0, sizeof(*trace));
+    *channel = 0;
+    *stage = 2;
+    if (!device.isPaired) return -4;
+    *stage = 3;
+    SBWorker *worker = [SBWorker shared];
+    if (worker.queries.count >= 32) return -9;
+    SBQuery *query = [SBQuery new];
+    query.device = device;
+    [worker.queries addObject:query];
+    int result = query_channel_run(device, uuid, channel, stage, worker, query);
+    if (trace != NULL) {
+        trace->request_returned = query.requestReturned;
+        trace->request_on_main = query.requestOnMain;
+        trace->callback_received = query.callbackReceived;
+        trace->callback_on_main = query.callbackOnMain;
+        trace->callback_matches_device = query.callbackMatchesDevice;
+    }
+    return result;
+}
+
+static int query_channel(IOBluetoothDevice *device, const uint8_t uuid[16], uint8_t *channel, uint8_t *stage) {
+    return query_channel_traced(device, uuid, channel, stage, NULL);
 }
 
 @interface SBConnection : NSObject <IOBluetoothRFCOMMChannelDelegate>
@@ -348,7 +395,10 @@ static void socket_event(CFSocketRef socket, CFSocketCallBackType kind, CFDataRe
         }
     }
 }
-- (void)execute:(SBRpc *)rpc { rpc.work(); }
+- (void)execute:(SBRpc *)rpc {
+    @try { rpc.work(); }
+    @finally { rpc.complete = YES; }
+}
 - (void)checkConnections:(NSTimer *)timer {
     (void)timer;
     for (SBConnection *connection in self.connections.allValues) {
@@ -371,7 +421,10 @@ static void run_sync(void (^work)(void)) {
     if ([NSThread currentThread] == worker.thread) { work(); return; }
     SBRpc *rpc = [SBRpc new];
     rpc.work = work;
-    [worker performSelector:@selector(execute:) onThread:worker.thread withObject:rpc waitUntilDone:YES];
+    BOOL onMain = NSThread.isMainThread;
+    [worker performSelector:@selector(execute:) onThread:worker.thread withObject:rpc waitUntilDone:!onMain];
+    // 主线程调用 FFI 或原生回归时, 不能用同步等待堵住系统回调的投递线程.
+    if (onMain) while (!rpc.complete) pump_loop();
 }
 
 @interface SBListener : NSObject
@@ -430,7 +483,8 @@ int synly_bt_paired(SynlyBluetoothPeer *peers, size_t capacity, size_t *count) {
     });
     return result;
 }
-int synly_bt_query(const char *address, const uint8_t uuid[16], uint8_t *channel, uint8_t *stage) {
+int synly_bt_query(const char *address, const uint8_t uuid[16], uint8_t *channel, uint8_t *stage, SynlyBluetoothQueryTrace *trace) {
+    if (trace != NULL) memset(trace, 0, sizeof(*trace));
     *channel = 0;
     *stage = 1;
     __block int result;
@@ -440,7 +494,7 @@ int synly_bt_query(const char *address, const uint8_t uuid[16], uint8_t *channel
         *stage = 2;
         IOBluetoothDevice *device = paired_device(address);
         if (device == nil) { result = -4; return; }
-        result = query_channel(device, uuid, channel, stage);
+        result = query_channel_traced(device, uuid, channel, stage, trace);
     });
     return result;
 }
