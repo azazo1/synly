@@ -106,11 +106,13 @@ async fn report_write_stats(stats: Arc<WriteStats>, shutdown: CancellationToken)
         let blocked = stats.blocked_nanos.swap(0, Ordering::Relaxed);
         let slow = stats.slow_writes.swap(0, Ordering::Relaxed);
         let worst = stats.worst_nanos.swap(0, Ordering::Relaxed);
+        // 用微秒而不是毫秒: 亚毫秒的平均值在整数除法下会变成 0, 看不出真实等待.
         tracing::info!(
             writes,
             bytes,
-            blocked_ms_avg = blocked / writes / 1_000_000,
-            blocked_ms_worst = worst / 1_000_000,
+            blocked_us_total = blocked / 1_000,
+            blocked_us_avg = blocked / writes / 1_000,
+            blocked_us_worst = worst / 1_000,
             slow_writes = slow,
             "蓝牙复用写出统计"
         );
