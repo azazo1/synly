@@ -588,7 +588,6 @@ export component AppWindow inherits Window {
                     Button { text: "断开"; enabled: root.session-active; clicked => { root.disconnect(); } }
                 }
                 if root.show-bluetooth-devices: HorizontalLayout {
-                    height: 34px;
                     min-height: 34px;
                     max-height: 34px;
                     vertical-stretch: 0;
@@ -603,7 +602,6 @@ export component AppWindow inherits Window {
                     }
                     Button {
                         text: "系统蓝牙设置";
-                        height: 32px;
                         min-height: 32px;
                         max-height: 32px;
                         clicked => { root.open-bluetooth-settings(); }
@@ -634,7 +632,6 @@ export component AppWindow inherits Window {
                         if root.show-bluetooth-devices: VerticalLayout {
                             spacing: 6px;
                             for peer in root.bluetooth-peers: Rectangle {
-                                height: 64px;
                                 min-height: 64px;
                                 max-height: 64px;
                                 vertical-stretch: 0;
@@ -654,7 +651,6 @@ export component AppWindow inherits Window {
                                         alignment: center;
                                         Button {
                                             text: "蓝牙连接";
-                                            height: 32px;
                                             min-height: 32px;
                                             max-height: 32px;
                                             enabled: peer.connectable && root.bluetooth-can-connect;
