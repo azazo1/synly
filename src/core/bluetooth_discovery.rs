@@ -40,9 +40,15 @@ async fn run(backend: &impl Backend, cancel: CancellationToken, mut changed: imp
             if let Ok(address) = bluetooth::normalize_address(&peer.address) { unique.entry(address.clone()).or_insert(BluetoothPeer { address, name: peer.name }); }
         }
         let total = unique.len(); let mut connected = 0;
-        for peer in unique.into_values().take(MAX_PEERS) {
+        // 配对记录已全部就绪, 先展示完整列表, 再独立更新每项服务查询结果.
+        let peers = unique.into_values().take(MAX_PEERS).collect::<Vec<_>>();
+        for peer in &peers {
+            changed(BluetoothPeerView { address: peer.address.clone(), display_name: if peer.name.is_empty() { peer.address.clone() } else { peer.name.clone() }, connectable: false, detail: "等待查询 Synly 服务".to_owned() });
+        }
+        for peer in peers {
             let mut row = BluetoothPeerView { address: peer.address.clone(), display_name: if peer.name.is_empty() { peer.address.clone() } else { peer.name.clone() }, connectable: false, detail: "查询 Synly 服务中".to_owned() };
             changed(row.clone());
+            let started = std::time::Instant::now();
             row.detail = match tokio::time::timeout(QUERY_TIMEOUT, backend.service(&peer)).await {
                 Ok(Ok(true)) => { row.connectable = true; connected += 1; "Synly 服务可用, 连接后验证应用身份".to_owned() },
                 Ok(Ok(false)) => "未找到 Synly 服务, 请在对端开启蓝牙接入".to_owned(),
@@ -53,6 +59,7 @@ async fn run(backend: &impl Backend, cancel: CancellationToken, mut changed: imp
                 },
                 Err(_) => "服务查询超时, 可稍后刷新".to_owned(),
             };
+            tracing::info!(address = %peer.address, connectable = row.connectable, elapsed_ms = started.elapsed().as_millis(), "蓝牙设备服务查询已完成");
             changed(row);
         }
         tracing::info!(paired = total, connectable = connected, "手动蓝牙设备刷新完成");
@@ -77,7 +84,7 @@ pub(super) fn open_settings() -> Result<()> {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    struct Fake { calls: AtomicUsize, block: bool }
+    struct Fake { calls: AtomicUsize, block_after: Option<usize> }
     impl Backend for Fake {
         fn availability(&self) -> Work<'_, BluetoothAvailability> { Box::pin(async { Ok(BluetoothAvailability::Available) }) }
         fn paired(&self) -> Work<'_, Vec<BluetoothPeer>> { Box::pin(async {
@@ -85,14 +92,14 @@ mod tests {
             peers.push(peers[0].clone()); peers.push(BluetoothPeer { address: "无效".to_owned(), name: "无效".to_owned() }); Ok(peers)
         }) }
         fn service<'a>(&'a self, peer: &'a BluetoothPeer) -> Work<'a, bool> { Box::pin(async move {
-            self.calls.fetch_add(1, Ordering::Relaxed);
-            if self.block { std::future::pending::<()>().await; }
+            let call = self.calls.fetch_add(1, Ordering::Relaxed);
+            if self.block_after.is_some_and(|limit| call >= limit) { std::future::pending::<()>().await; }
             if peer.address.ends_with("01") { anyhow::bail!("设备离线"); } Ok(peer.address.ends_with("00"))
         }) }
     }
     #[tokio::test]
     async fn discovery_caps_service_work_and_never_merges_same_names_or_trusts_addresses() {
-        let fake = Fake { calls: AtomicUsize::new(0), block: false }; let mut rows = std::collections::BTreeMap::new();
+        let fake = Fake { calls: AtomicUsize::new(0), block_after: None }; let mut rows = std::collections::BTreeMap::new();
         run(&fake, CancellationToken::new(), |row| { rows.insert(row.address.clone(), row); }).await.unwrap();
         assert_eq!(fake.calls.load(Ordering::Relaxed), MAX_PEERS); assert_eq!(rows.len(), MAX_PEERS);
         assert_eq!(rows.values().filter(|row| row.connectable).count(), 1);
@@ -100,9 +107,32 @@ mod tests {
     }
     #[tokio::test]
     async fn cancellation_interrupts_inflight_query_without_late_rows() {
-        let fake = Fake { calls: AtomicUsize::new(0), block: true }; let cancel = CancellationToken::new(); let mut rows = 0;
+        let fake = Fake { calls: AtomicUsize::new(0), block_after: Some(0) }; let cancel = CancellationToken::new(); let mut rows = 0;
         let query = run(&fake, cancel.clone(), |_| { rows += 1; });
         let stop = async { tokio::task::yield_now().await; cancel.cancel(); };
-        let (result, ()) = tokio::join!(query, stop); assert!(result.is_err()); assert_eq!(rows, 1);
+        let (result, ()) = tokio::join!(query, stop); assert!(result.is_err()); assert_eq!(rows, MAX_PEERS + 1);
+    }
+    #[tokio::test]
+    async fn ready_peer_is_published_while_another_service_query_is_pending() {
+        let fake = Fake { calls: AtomicUsize::new(0), block_after: Some(1) };
+        let cancel = CancellationToken::new();
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let mut ready_tx = Some(ready_tx);
+        let mut rows = Vec::new();
+        let query = run(&fake, cancel.clone(), |row| {
+            if row.connectable && let Some(sender) = ready_tx.take() { let _ = sender.send(row.clone()); }
+            rows.push(row);
+        });
+        let observer = async {
+            let ready = ready_rx.await.unwrap();
+            assert_eq!(fake.calls.load(Ordering::Relaxed), 2);
+            cancel.cancel();
+            ready
+        };
+        let (result, ready) = tokio::time::timeout(Duration::from_secs(1), async { tokio::join!(query, observer) }).await.unwrap();
+        assert!(result.is_err());
+        assert!(ready.connectable && ready.address.ends_with("00"));
+        assert!(rows[..MAX_PEERS].iter().all(|row| !row.connectable));
+        assert_eq!(rows.iter().filter(|row| row.connectable).count(), 1);
     }
 }

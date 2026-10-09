@@ -278,6 +278,15 @@ jobs:
         shell: bash
         run: cargo build --locked --release --target "${{ matrix.target }}" --features sdl2-audio
 
+      - name: 验证蓝牙发现逐项发布与取消
+        if: matrix.platform == 'linux' && matrix.arch == 'x86_64'
+        env:
+          SYNLY_BUILD_VERSION: v${{ needs.version.outputs.build_version }}
+          SYNLY_BUNDLE_SDL: '1'
+          SYNLY_DISTRIBUTION_FORM: installer
+        shell: bash
+        run: cargo test --locked --release --target "${{ matrix.target }}" --features sdl2-audio --bin synly core::bluetooth_discovery::tests
+
       - name: Validate Linux binary
         if: matrix.platform == 'linux'
         shell: bash

@@ -16,6 +16,7 @@ use std::time::Duration;
 use synly_core::size::{format_human_bytes, parse_human_bytes};
 use uuid::Uuid;
 
+mod bluetooth;
 mod macos_dock;
 mod single_instance;
 mod tray;
@@ -948,12 +949,7 @@ fn apply_snapshot(
         })
         .collect::<Vec<_>>();
     window.set_peers(ModelRc::new(VecModel::from(peers)));
-    window.set_bluetooth_peers(ModelRc::new(VecModel::from(snapshot.bluetooth_peers.iter().map(|peer| BluetoothRow {
-        address: peer.address.clone().into(), title: peer.display_name.clone().into(), subtitle: format!("{} | {}", peer.address, peer.detail).into(), connectable: peer.connectable,
-    }).collect::<Vec<_>>())));
-    window.set_bluetooth_status(snapshot.bluetooth_status.clone().into()); window.set_bluetooth_scanning(snapshot.bluetooth_scanning);
-    window.set_bluetooth_can_refresh(snapshot.sessions.is_empty() && !snapshot.bluetooth_scanning && !matches!(snapshot.lifecycle, crate::core::AppLifecycle::Connecting | crate::core::AppLifecycle::Pairing | crate::core::AppLifecycle::Reconfiguring | crate::core::AppLifecycle::Stopping));
-    window.set_bluetooth_can_connect(matches!(snapshot.lifecycle, crate::core::AppLifecycle::Idle | crate::core::AppLifecycle::Error));
+    bluetooth::apply(window, snapshot);
     let sessions = snapshot
         .sessions
         .iter()
