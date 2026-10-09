@@ -224,12 +224,14 @@ static void socket_event(CFSocketRef socket, CFSocketCallBackType kind, CFDataRe
 - (int)bridgeSocket {
     IOBluetoothDevice *device = [self.channel getDevice];
     if (!device.isPaired) return -4;
-    // 只对已有系统配对请求链路认证, 不为未配对设备启动配对流程.
-    if ([device getEncryptionMode] == kEncryptionDisabled) {
-        IOReturn status = [device requestAuthentication];
-        if (status != kIOReturnSuccess) return (int)status;
-    }
-    if (!device.isPaired || [device getEncryptionMode] == kEncryptionDisabled) return -6;
+    // macOS 不提供可靠的链路加密查询: 实测 macOS 15 上 getEncryptionMode, getLinkType 和
+    // connectionHandle 分别返回 0, 0xff 和 0, 与 isConnected 矛盾, 不能作为安全判定依据.
+    // 因此这里以系统配对记录和实际认证结果为准, 只对已有配对请求认证, 不为未配对设备启动配对;
+    // 机密性由应用层 mTLS 长期身份保证.
+    // 认证失败时原样返回系统 IOReturn, 便于区分权限, 对端离线与链路错误.
+    IOReturn authenticated = [device requestAuthentication];
+    if (authenticated != kIOReturnSuccess) return (int)authenticated;
+    if (!device.isPaired) return -4;
     if (self.closed || self.channel == nil) return -7;
     int pair[2];
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, pair) != 0) return -7;
@@ -391,7 +393,8 @@ static void socket_event(CFSocketRef socket, CFSocketCallBackType kind, CFDataRe
     (void)timer;
     for (SBConnection *connection in self.connections.allValues) {
         IOBluetoothDevice *device = [connection.channel getDevice];
-        if (!device.isPaired || [device getEncryptionMode] == kEncryptionDisabled ||
+        // 系统配对消失或写入停滞时关闭. 链路加密状态在 macOS 上不可靠, 不作为关闭条件.
+        if (!device.isPaired ||
             (connection.pendingWrite != nil && NSProcessInfo.processInfo.systemUptime - connection.writeStarted > 10.0)) {
             [connection close];
         }
@@ -504,8 +507,8 @@ int synly_bt_connect(const char *address, const uint8_t uuid[16], int *fd) {
         IOReturn status = [device openRFCOMMChannelAsync:&channel withChannelID:channelID delegate:connection];
         if (status != kIOReturnSuccess) { result = (int)status; [connection close]; return; }
         connection.channel = channel;
-        // IOBluetooth 的 out 参数返回已 retain 的 channel, ARC 不知道这项旧 API 约定.
-        if (channel != nil) CFRelease((__bridge CFTypeRef)channel);
+        // 旧接口把已 retain 的 channel 写进 autoreleasing out 参数, ARC 已按该约定接管所有权.
+        // 再补一次 CFRelease 会造成过度释放, 系统下次创建通道时会访问已释放对象并崩溃.
         NSTimeInterval deadline = NSProcessInfo.processInfo.systemUptime + 15.0;
         while (!connection.opened && !connection.closed && NSProcessInfo.processInfo.systemUptime < deadline) pump_loop();
         if (!connection.opened || connection.closed) { result = -5; [connection close]; return; }

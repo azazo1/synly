@@ -55,7 +55,8 @@ pub enum BluetoothAvailability {
     Unsupported,
 }
 
-/// 原生后端只能在系统配对和链路加密校验成功后构造连接.
+/// 原生后端只能在系统配对校验和平台安全要求满足后构造连接.
+/// 平台无法可靠校验的链路属性不冒充已校验, 机密性由应用层 mTLS 承担.
 #[derive(Debug)]
 pub struct BluetoothConnection {
     stream: ByteStream,

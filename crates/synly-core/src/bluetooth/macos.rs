@@ -51,7 +51,6 @@ fn check(status: c_int) -> Result<()> {
         -3 => bail!("当前系统没有可用的经典蓝牙控制器"),
         -4 => bail!("设备尚未系统配对, 或系统配对已被移除"),
         -5 => bail!("蓝牙服务查询或连接超时"),
-        -6 => bail!("蓝牙链路未加密, 已拒绝连接"),
         -7 => bail!("无法创建蓝牙服务或字节流"),
         -8 => bail!("对端未提供 Synly 蓝牙服务"),
         -9 => bail!("蓝牙服务入口或查询正在使用中"),
@@ -138,7 +137,7 @@ pub async fn connect(address: String) -> Result<BluetoothConnection> {
         }
     }).await?;
     let stream = UnixStream::from_std(stream).context("无法注册蓝牙异步字节流")?;
-    tracing::info!(%address, "系统已配对且加密的蓝牙链路已连接");
+    tracing::info!(%address, "系统已配对且通过链路认证的蓝牙连接已建立");
     Ok(BluetoothConnection::authenticated(ByteStream::new(stream), BluetoothPeer { name: address.clone(), address }))
 }
 
@@ -166,7 +165,7 @@ impl Listener {
     pub async fn accept(&mut self) -> Result<BluetoothConnection> {
         let incoming = self.incoming.recv().await.context("蓝牙监听器已关闭")?;
         let stream = UnixStream::from_std(incoming.stream).context("无法注册蓝牙异步字节流")?;
-        tracing::info!(address = %incoming.peer.address, "接受系统已配对且加密的蓝牙连接");
+        tracing::info!(address = %incoming.peer.address, "接受系统已配对且通过链路认证的蓝牙连接");
         Ok(BluetoothConnection::authenticated(ByteStream::new(stream), incoming.peer))
     }
 }

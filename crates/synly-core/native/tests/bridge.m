@@ -5,16 +5,20 @@
 
 @interface FakeDevice : NSObject
 @property(nonatomic) BOOL paired;
-@property(nonatomic) BluetoothHCIEncryptionMode encryption;
 @property(nonatomic) NSUInteger authenticationRequests;
+@property(nonatomic) IOReturn authenticationResult;
 - (BOOL)isPaired;
 - (BluetoothHCIEncryptionMode)getEncryptionMode;
 - (IOReturn)requestAuthentication;
 @end
 @implementation FakeDevice
 - (BOOL)isPaired { return self.paired; }
-- (BluetoothHCIEncryptionMode)getEncryptionMode { return self.encryption; }
-- (IOReturn)requestAuthentication { self.authenticationRequests += 1; return kIOReturnSuccess; }
+- (BluetoothHCIEncryptionMode)getEncryptionMode {
+    // 链路加密状态在 macOS 上不可靠, 不应作为安全判定; 被调用说明回归到了旧实现.
+    assert(NO && "macOS 链路加密状态不可查询, 不能用作安全判定");
+    return kEncryptionDisabled;
+}
+- (IOReturn)requestAuthentication { self.authenticationRequests += 1; return self.authenticationResult; }
 @end
 
 @interface FakeChannel : NSObject
@@ -36,9 +40,9 @@
     if (self) {
         _device = [FakeDevice new];
         _device.paired = YES;
-        _device.encryption = (BluetoothHCIEncryptionMode)1;
         _progress = [NSCondition new];
         _sent = [NSMutableData data];
+        _device.authenticationResult = kIOReturnSuccess;
     }
     return self;
 }
@@ -129,12 +133,21 @@ static void security_gate(void) {
         channel.device.paired = NO;
         assert([connection bridgeSocket] == -4);
         assert(channel.device.authenticationRequests == 0);
+        // 认证失败必须拒绝业务链路, 且不注册任何连接.
         channel.device.paired = YES;
-        channel.device.encryption = kEncryptionDisabled;
-        assert([connection bridgeSocket] == -6);
+        channel.device.authenticationResult = kIOReturnNotPermitted;
+        assert([connection bridgeSocket] == kIOReturnNotPermitted);
         assert(channel.device.authenticationRequests == 1);
         assert([SBWorker shared].connections.count == 0);
+        // 认证成功后必须给出字节流, 不因链路加密状态不可查询而拒绝.
+        channel.device.authenticationResult = kIOReturnSuccess;
+        int fd = [connection bridgeSocket];
+        assert(fd >= 0);
+        assert(channel.device.authenticationRequests == 2);
+        assert([SBWorker shared].connections.count == 1);
+        close(fd);
         [connection close];
+        assert([SBWorker shared].connections.count == 0);
     });
 }
 

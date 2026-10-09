@@ -9,7 +9,8 @@ use tokio::sync::Semaphore;
 
 /// 提供者属于受信任的本机平台层, 不从网络消息构造.
 /// create_socket 只能创建安全 RFCOMM socket, 不发起系统配对.
-/// connect_socket 必须验证已配对, 请求认证与加密, 且成功后重新验证配对.
+/// connect_socket 必须验证已配对并请求链路认证, 成功后重新验证配对.
+/// 平台不支持可靠加密查询时, 不把不可信的查询结果当成已校验的加密状态.
 /// close_socket 必须幂等, 且立即打断正在进行的 connect/read/write.
 pub trait Provider: Send + Sync + 'static {
     fn availability(&self) -> Result<BluetoothAvailability>;
