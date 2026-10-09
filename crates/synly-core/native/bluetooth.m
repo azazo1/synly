@@ -91,6 +91,8 @@ static void pump_loop(void) {
 
 static int query_channel(IOBluetoothDevice *device, const uint8_t uuid[16], uint8_t *channel, uint8_t *stage) {
     *channel = 0;
+    *stage = 2;
+    if (!device.isPaired) return -4;
     *stage = 3;
     SBWorker *worker = [SBWorker shared];
     if (worker.queries.count >= 32) return -9;
@@ -102,7 +104,8 @@ static int query_channel(IOBluetoothDevice *device, const uint8_t uuid[16], uint
     // 先显式连接已配对设备, 再查询全部 SDP 记录, 结果仍严格按 Synly UUID 选择.
     *stage = 7;
     if (!device.isConnected) {
-        IOReturn status = [device openConnection:query withPageTimeout:(BluetoothHCIPageTimeout)0x2000 authenticationRequired:YES];
+        // SDP 仅作发现, 不要求链路认证以免扫描触发重新配对; RFCOMM 在 bridgeSocket 独立强制认证/加密.
+        IOReturn status = [device openConnection:query withPageTimeout:(BluetoothHCIPageTimeout)0x2000 authenticationRequired:NO];
         query.connectionStarted = status == kIOReturnSuccess;
         if (status != kIOReturnSuccess && status != kIOBluetoothConnectionAlreadyExists) {
             retire_query(worker, query);

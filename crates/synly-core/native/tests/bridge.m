@@ -193,6 +193,7 @@ static void receiver_bound(void) {
 
 // 模拟新 macOS 的过滤查询空操作, 验证实际路径显式连接后只用无过滤 SDP.
 @interface FakeSDPDevice : NSObject
+@property(nonatomic) BOOL paired;
 @property(nonatomic) BOOL connected;
 @property(nonatomic) BOOL serviceAvailable;
 @property(nonatomic) NSUInteger connections;
@@ -209,10 +210,11 @@ static void receiver_bound(void) {
 @end
 @implementation FakeSDPDevice
 - (BOOL)isConnected { return self.connected; }
-- (BOOL)isPaired { return YES; }
+- (BOOL)isPaired { return self.paired; }
 - (IOReturn)openConnection:(id)target withPageTimeout:(BluetoothHCIPageTimeout)timeout authenticationRequired:(BOOL)required {
     (void)target;
-    assert(timeout == 0x2000 && required);
+    // 服务发现不能主动要求系统认证, 业务连接的安全门槛由 security_gate 单独覆盖.
+    assert(timeout == 0x2000 && !required);
     self.connections += 1;
     // 模拟底层连接成功但缺失 connectionComplete 回调.
     self.connected = YES;
@@ -244,6 +246,7 @@ static void service_discovery(void) {
     run_sync(^{
         const uint8_t uuid[16] = {0xb3, 0x92, 0x88, 0x3b, 0xe8, 0x5b, 0x4c, 0x92, 0xb1, 0xa0, 0x2c, 0xdf, 0xe0, 0xa7, 0xb6, 0xd4};
         FakeSDPDevice *device = [FakeSDPDevice new];
+        device.paired = YES;
         device.record = [FakeSDPRecord new];
         device.serviceAvailable = YES;
         uint8_t channel = 0, stage = 0;
@@ -261,6 +264,11 @@ static void service_discovery(void) {
         assert(query_channel((IOBluetoothDevice *)device, uuid, &channel, &stage) == 0);
         assert(device.connections == 1 && device.queries == 2 && channel == 0);
         assert([SBWorker shared].queries.count == 0);
+        // 配对记录被移除时, 不触发底层连接或 SDP, 也不尝试建立新配对.
+        device.paired = NO;
+        device.connected = NO;
+        assert(query_channel((IOBluetoothDevice *)device, uuid, &channel, &stage) == -4);
+        assert(device.connections == 1 && device.queries == 2 && channel == 0 && stage == 2);
     });
 }
 
