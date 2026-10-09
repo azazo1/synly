@@ -107,6 +107,8 @@ Android 的持续设备通信前台服务使用 connectedDevice, 清单声明 FO
 
 公共 Rust 核心负责 transport, mux, 路由协商与身份认证. 原生层只负责系统蓝牙 API. Android 通过 UniFFI 接入有界数据桥, 后台读取 BluetoothSocket, 取消时关闭 socket 并唤醒阻塞 IO. TCP 的 nodelay 和音频对端 IP 只属于局域网后端.
 
+macOS 原生发送泵允许若干笔 RFCOMM 写同时在路上, 上限为 8 笔, 用 writeAsync 的 refcon 令牌区分完成回调. 单笔串行等于停等, 每个包都要等上一笔写完回调, 输入吞吐会被压成单包大小除以一次写完耗时, 每包延迟也至少是一次往返; 通道自身会缓冲, 只要对端未施加流控就可以继续投递, 让基带合并小包. 对端流控或写队列满时停止读取应用侧数据形成反压. 同时记录协商到的 RFCOMM MTU, 因为它限制单笔写入长度: MTU 明显小于复用分片的 1024 字节时, 一个分片会被拆成多次串行发送.
+
 配置已持久化接入开关和输入路径策略, 通过独立 v6 -> v7 migration 添加蓝牙优先的默认输入策略, v7 -> v8 添加 Auto 剪贴板策略, 不改变剪贴板文件大小/缓存限制. 应用版本未更改. 桌面会话状态 UI 已显示已接入承载和输入/剪贴板/音频路径. 输入接收端的活动标记覆盖真实激活期并在退出/取消时清除, 因此作为接收端被控制时也暂停新的候选扫描. 日志使用 tracing, 记录发现变化, 服务注册, 认证耗时, 路由生效和失败原因, 不记录密钥, attach token 或剪贴板内容.
 
 本机 aarch64-apple-darwin 已通过默认原生音频后端的 release/offline/locked 构建. 组装的应用包已通过 plist 解析, 蓝牙用途说明与 bundle ID 检查, CLI --help 正常退出且没有目录同步选项, 二进制为 arm64 Mach-O. 这是构建验证包, 未安装或启动 GUI, 未注入正式发布版本, 不代表系统蓝牙权限交互或真实互通已验收. DMG 创建未完成: hdiutil 的 APFS 磁盘节点格式化被 workspace-write 沙箱阻止, 详细诊断确认 Operation not permitted; 不将最初的目录非空错误误判为输出目录冲突. Windows/Android 构建与生成绑定仍未验证, 本机没有运行 Android 工具或交叉编译.

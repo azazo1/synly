@@ -9,6 +9,10 @@
 #include <unistd.h>
 
 static const NSUInteger kReceiveLimit = 64 * 1024;
+// 单笔写入从应用侧读取的缓冲上限, 实际长度还受 RFCOMM MTU 限制.
+static const size_t kWriteChunk = 1024;
+// 同时允许在路上的写入笔数. 少量并发即可让基带合并小包, 又不至于在对端造成明显积压.
+static const NSUInteger kMaxInFlightWrites = 8;
 
 @interface SBRpc : NSObject
 @property(nonatomic, copy) void (^work)(void);
@@ -195,8 +199,12 @@ static int query_channel(IOBluetoothDevice *device, const uint8_t uuid[16], uint
 @property(nonatomic) BOOL opened;
 @property(nonatomic) IOReturn openStatus;
 @property(nonatomic, strong) NSMutableData *pendingReceive;
-@property(nonatomic, strong) NSData *pendingWrite;
-@property(nonatomic) NSTimeInterval writeStarted;
+// 在途写按发出顺序保存. 保留 NSData 是为了让 writeAsync 的缓冲区在整笔传输期间有效,
+// 令牌用于把完成回调对应回具体那一笔, 也就允许若干笔同时在路上.
+@property(nonatomic, strong) NSMutableArray<NSData *> *inFlightWrites;
+@property(nonatomic, strong) NSMutableArray<NSNumber *> *inFlightTokens;
+@property(nonatomic) NSTimeInterval oldestWriteStarted;
+@property(nonatomic) NSUInteger nextWriteToken;
 - (int)bridgeSocket;
 - (void)pumpOutbound;
 - (void)pumpInbound;
@@ -218,6 +226,8 @@ static void socket_event(CFSocketRef socket, CFSocketCallBackType kind, CFDataRe
     if (self) {
         _fd = -1;
         _pendingReceive = [NSMutableData data];
+        _inFlightWrites = [NSMutableArray array];
+        _inFlightTokens = [NSMutableArray array];
     }
     return self;
 }
@@ -267,26 +277,37 @@ static void socket_event(CFSocketRef socket, CFSocketCallBackType kind, CFDataRe
     return pair[0];
 }
 - (void)pumpOutbound {
+    if (self.closed || self.socket == NULL || self.channel == nil) return;
+    // 允许多笔写同时在路上. 单笔串行是停等: 每个包都要等上一笔写完回调,
+    // 于是输入吞吐被压成 单包大小 / 一次写完耗时, 每包延迟也至少是一次往返.
+    // 通道自身会缓冲, 只要不触发对端流控就可以继续投递, 让基带合并小包发送.
+    while (!self.closed && self.inFlightWrites.count < kMaxInFlightWrites && !self.channel.isTransmissionPaused) {
+        uint8_t bytes[kWriteChunk];
+        size_t mtu = MIN(sizeof(bytes), (size_t)[self.channel getMTU]);
+        if (mtu == 0) { [self close]; return; }
+        ssize_t size = recv(self.fd, bytes, mtu, 0);
+        if (size == 0) { [self close]; return; }
+        if (size < 0) {
+            if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) { [self close]; return; }
+            // 应用侧暂时没有数据, 保持读回调, 等下一次可读再继续.
+            break;
+        }
+        // NSData 必须在整笔传输期间有效, writeAsync 只借用它的缓冲区.
+        NSData *chunk = [NSData dataWithBytes:bytes length:(NSUInteger)size];
+        NSUInteger token = self.nextWriteToken++;
+        IOReturn status = [self.channel writeAsync:(void *)chunk.bytes length:(UInt16)size refcon:(void *)(uintptr_t)token];
+        if (status != kIOReturnSuccess) { [self close]; return; }
+        if (self.inFlightWrites.count == 0) self.oldestWriteStarted = NSProcessInfo.processInfo.systemUptime;
+        [self.inFlightWrites addObject:chunk];
+        [self.inFlightTokens addObject:@(token)];
+    }
+    // 在途写已满或对端流控时先停止读取应用数据形成反压; 否则重新武装读回调.
     if (self.closed || self.socket == NULL) return;
-    if (self.pendingWrite != nil || self.channel.isTransmissionPaused) {
+    if (self.inFlightWrites.count >= kMaxInFlightWrites || self.channel.isTransmissionPaused) {
         CFSocketDisableCallBacks(self.socket, kCFSocketReadCallBack);
-        return;
-    }
-    uint8_t bytes[1024];
-    size_t mtu = MIN(sizeof(bytes), (size_t)[self.channel getMTU]);
-    if (mtu == 0) { [self close]; return; }
-    ssize_t size = recv(self.fd, bytes, mtu, 0);
-    if (size == 0) { [self close]; return; }
-    if (size < 0) {
-        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) { [self close]; return; }
+    } else {
         CFSocketEnableCallBacks(self.socket, kCFSocketReadCallBack);
-        return;
     }
-    self.pendingWrite = [NSData dataWithBytes:bytes length:(NSUInteger)size];
-    self.writeStarted = NSProcessInfo.processInfo.systemUptime;
-    CFSocketDisableCallBacks(self.socket, kCFSocketReadCallBack);
-    IOReturn status = [self.channel writeAsync:(void *)self.pendingWrite.bytes length:(UInt16)size refcon:NULL];
-    if (status != kIOReturnSuccess) [self close];
 }
 - (void)pumpInbound {
     if (self.closed || self.socket == NULL) return;
@@ -322,18 +343,23 @@ static void socket_event(CFSocketRef socket, CFSocketCallBackType kind, CFDataRe
     (void)channel; [self close];
 }
 - (void)rfcommChannelWriteComplete:(IOBluetoothRFCOMMChannel *)channel refcon:(void *)refcon status:(IOReturn)status {
-    (void)channel; (void)refcon;
+    (void)channel;
     if (self.closed) return;
-    self.pendingWrite = nil;
+    // 用令牌定位这一笔, 因为完成顺序不保证与发出顺序一致.
+    NSUInteger token = (NSUInteger)(uintptr_t)refcon;
+    NSUInteger index = [self.inFlightTokens indexOfObject:@(token)];
+    if (index != NSNotFound) {
+        [self.inFlightTokens removeObjectAtIndex:index];
+        [self.inFlightWrites removeObjectAtIndex:index];
+    }
+    if (self.inFlightWrites.count == 0) self.oldestWriteStarted = 0;
     if (status != kIOReturnSuccess) { [self close]; return; }
     [self pumpOutbound];
-    if (!self.closed && self.pendingWrite == nil && !self.channel.isTransmissionPaused) {
-        CFSocketEnableCallBacks(self.socket, kCFSocketReadCallBack);
-    }
 }
 - (void)rfcommChannelFlowControlChanged:(IOBluetoothRFCOMMChannel *)channel {
     (void)channel;
-    if (!self.closed && self.pendingWrite == nil && !self.channel.isTransmissionPaused) [self pumpOutbound];
+    // 对端流控恢复时必须主动续泵, 否则只剩应用侧新数据到达这一条唤醒路径.
+    if (!self.closed) [self pumpOutbound];
 }
 - (void)close {
     if (self.closed) return;
@@ -341,7 +367,9 @@ static void socket_event(CFSocketRef socket, CFSocketCallBackType kind, CFDataRe
     [self.channel setDelegate:nil];
     [self.channel closeChannel];
     self.channel = nil;
-    self.pendingWrite = nil;
+    [self.inFlightWrites removeAllObjects];
+    [self.inFlightTokens removeAllObjects];
+    self.oldestWriteStarted = 0;
     [self.pendingReceive setLength:0];
     if (self.socket != NULL) {
         CFSocketInvalidate(self.socket);
@@ -393,11 +421,15 @@ static void socket_event(CFSocketRef socket, CFSocketCallBackType kind, CFDataRe
     (void)timer;
     for (SBConnection *connection in self.connections.allValues) {
         IOBluetoothDevice *device = [connection.channel getDevice];
-        // 系统配对消失或写入停滞时关闭. 链路加密状态在 macOS 上不可靠, 不作为关闭条件.
+        // 系统配对消失或最老的一笔写入停滞时关闭. 链路加密状态在 macOS 上不可靠, 不作为关闭条件.
         if (!device.isPaired ||
-            (connection.pendingWrite != nil && NSProcessInfo.processInfo.systemUptime - connection.writeStarted > 10.0)) {
+            (connection.inFlightWrites.count > 0 && connection.oldestWriteStarted > 0.0 &&
+             NSProcessInfo.processInfo.systemUptime - connection.oldestWriteStarted > 10.0)) {
             [connection close];
+            continue;
         }
+        // 兜底续泵: 对端流控与应用侧数据同时静默时, 只能靠这个周期任务恢复发送.
+        [connection pumpOutbound];
     }
     NSIndexSet *complete = [self.queries indexesOfObjectsPassingTest:^BOOL(SBQuery *query, NSUInteger index, BOOL *stop) {
         (void)index; (void)stop;
@@ -559,4 +591,13 @@ void synly_bt_stop_listener(void *listener) {
     if (listener == NULL) return;
     SBListener *entry = CFBridgingRelease(listener);
     run_sync(^{ [entry stop]; });
+}
+int synly_bt_mtu(int fd) {
+    __block int mtu = 0;
+    run_sync(^{
+        SBConnection *connection = [SBWorker shared].connections[@(fd)];
+        if (connection == nil || connection.closed) return;
+        mtu = (int)[connection.channel getMTU];
+    });
+    return mtu;
 }

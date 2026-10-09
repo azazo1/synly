@@ -41,6 +41,7 @@ unsafe extern "C" {
         listener: *mut *mut c_void,
     ) -> c_int;
     fn synly_bt_stop_listener(listener: *mut c_void);
+    fn synly_bt_mtu(fd: c_int) -> c_int;
 }
 
 fn check(status: c_int) -> Result<()> {
@@ -125,25 +126,28 @@ pub async fn query_service(peer: BluetoothPeer) -> Result<Option<BluetoothEndpoi
 }
 
 pub async fn connect(address: String) -> Result<BluetoothConnection> {
-    let stream = lookup({
+    let (stream, mtu) = lookup({
         let address = address.clone();
-        move || -> Result<StdStream> {
+        move || -> Result<(StdStream, c_int)> {
             let address = CString::new(address)?;
             let mut fd = -1;
             check(unsafe { synly_bt_connect(address.as_ptr(), SERVICE_UUID_BYTES.as_ptr(), &mut fd) })?;
             if fd < 0 { bail!("蓝牙连接没有返回有效字节流"); }
+            // 单笔写入长度受 RFCOMM MTU 限制, 偏小会让每个复用分片被拆成多次串行发送.
+            let mtu = unsafe { synly_bt_mtu(fd) };
             // 成功返回时桥接层将 fd 的唯一所有权转移给 Rust.
-            Ok(unsafe { StdStream::from_raw_fd(fd) })
+            Ok((unsafe { StdStream::from_raw_fd(fd) }, mtu))
         }
     }).await?;
     let stream = UnixStream::from_std(stream).context("无法注册蓝牙异步字节流")?;
-    tracing::info!(%address, "系统已配对且通过链路认证的蓝牙连接已建立");
+    tracing::info!(%address, mtu, "系统已配对且通过链路认证的蓝牙连接已建立");
     Ok(BluetoothConnection::authenticated(ByteStream::new(stream), BluetoothPeer { name: address.clone(), address }))
 }
 
 struct Accepted {
     stream: StdStream,
     peer: BluetoothPeer,
+    mtu: c_int,
 }
 
 struct AcceptContext(mpsc::Sender<Accepted>);
@@ -165,7 +169,7 @@ impl Listener {
     pub async fn accept(&mut self) -> Result<BluetoothConnection> {
         let incoming = self.incoming.recv().await.context("蓝牙监听器已关闭")?;
         let stream = UnixStream::from_std(incoming.stream).context("无法注册蓝牙异步字节流")?;
-        tracing::info!(address = %incoming.peer.address, "接受系统已配对且通过链路认证的蓝牙连接");
+        tracing::info!(address = %incoming.peer.address, mtu = incoming.mtu, "接受系统已配对且通过链路认证的蓝牙连接");
         Ok(BluetoothConnection::authenticated(ByteStream::new(stream), incoming.peer))
     }
 }
@@ -177,7 +181,9 @@ unsafe extern "C" fn accepted(context: *mut c_void, fd: c_int, raw_peer: *const 
     let Some(context) = (unsafe { (context as *const AcceptContext).as_ref() }) else { return };
     let Some(raw_peer) = (unsafe { raw_peer.as_ref() }) else { return };
     let Ok(peer) = peer(raw_peer) else { return };
-    if context.0.try_send(Accepted { stream, peer }).is_err() {
+    // 单笔写入长度受 RFCOMM MTU 限制, 记录它便于判断复用分片是否被拆散.
+    let mtu = unsafe { synly_bt_mtu(fd) };
+    if context.0.try_send(Accepted { stream, peer, mtu }).is_err() {
         tracing::warn!("蓝牙待处理连接队列已满或已关闭, 已拒绝新连接");
     }
 }

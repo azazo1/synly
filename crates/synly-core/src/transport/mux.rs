@@ -3,13 +3,18 @@
 use super::stream::ByteStream;
 use anyhow::{Context, Result, bail};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 pub const FRAGMENT_BYTES: usize = 1024;
+
+// 写出阻塞统计的采样周期与"慢写"阈值.
+const WRITE_STATS_INTERVAL: Duration = Duration::from_secs(5);
+const SLOW_WRITE_NANOS: u64 = 1_000_000;
 const LANES: usize = 3;
 const WINDOW_PACKETS: usize = 16;
 const STREAM_BUFFER_BYTES: usize = FRAGMENT_BYTES * WINDOW_PACKETS;
@@ -53,6 +58,65 @@ enum WindowEvent {
     PeerCredit(usize),
 }
 
+/// 复用层写出阻塞统计.
+///
+/// 复用层只用于蓝牙承载, 而应用侧写入最终落到原生桥接的字节流上.
+/// 如果原生发送泵退回单笔串行 (停等), 桥接缓冲会很快填满, 这里的阻塞时长随之上升;
+/// 反之并发发送时写入几乎不等待. 因此这组数字能直接判断发送侧是否成为瓶颈.
+///
+/// todo remove 这是定位蓝牙输入延迟的临时探针, 结论确认后连同周期汇报任务一起删除.
+#[derive(Default)]
+struct WriteStats {
+    writes: AtomicU64,
+    bytes: AtomicU64,
+    blocked_nanos: AtomicU64,
+    slow_writes: AtomicU64,
+    worst_nanos: AtomicU64,
+}
+
+impl WriteStats {
+    fn record(&self, bytes: usize, waited: Duration) {
+        let nanos = waited.as_nanos() as u64;
+        self.writes.fetch_add(1, Ordering::Relaxed);
+        self.bytes.fetch_add(bytes as u64, Ordering::Relaxed);
+        self.blocked_nanos.fetch_add(nanos, Ordering::Relaxed);
+        if nanos >= SLOW_WRITE_NANOS {
+            self.slow_writes.fetch_add(1, Ordering::Relaxed);
+        }
+        self.worst_nanos.fetch_max(nanos, Ordering::Relaxed);
+    }
+}
+
+/// 每周期汇报一次并清零, 避免累计值把近期变化淹没.
+/// todo remove 临时探针, 见 WriteStats.
+async fn report_write_stats(stats: Arc<WriteStats>, shutdown: CancellationToken) {
+    let mut tick = tokio::time::interval(WRITE_STATS_INTERVAL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => return,
+            _ = tick.tick() => {}
+        }
+        let writes = stats.writes.swap(0, Ordering::Relaxed);
+        if writes == 0 {
+            continue;
+        }
+        let bytes = stats.bytes.swap(0, Ordering::Relaxed);
+        let blocked = stats.blocked_nanos.swap(0, Ordering::Relaxed);
+        let slow = stats.slow_writes.swap(0, Ordering::Relaxed);
+        let worst = stats.worst_nanos.swap(0, Ordering::Relaxed);
+        tracing::info!(
+            writes,
+            bytes,
+            blocked_ms_avg = blocked / writes / 1_000_000,
+            blocked_ms_worst = worst / 1_000_000,
+            slow_writes = slow,
+            "蓝牙复用写出统计"
+        );
+    }
+}
+
 /// 只能传入已经认证并加密的连接. 所有帧在进入 TLS 写入器前被拆成小片段.
 pub fn open(stream: ByteStream) -> (MuxChannels, MuxGuard) {
     let shutdown = CancellationToken::new();
@@ -85,11 +149,15 @@ pub fn open(stream: ByteStream) -> (MuxChannels, MuxGuard) {
         shutdown.clone(),
         failure_tx.clone(),
     ));
+    let stats = Arc::new(WriteStats::default());
     tasks.push(spawn_task(
-        schedule(writer, lane_readers, events_rx, windows),
+        schedule(writer, lane_readers, events_rx, windows, Arc::clone(&stats)),
         shutdown.clone(),
         failure_tx,
     ));
+    // 统计汇报失败不影响承载, 因此单独 spawn, 不接入失败通道.
+    // todo remove 临时探针, 见 WriteStats.
+    tasks.push(tokio::spawn(report_write_stats(stats, shutdown.clone())));
     let [control, input, clipboard] = apps.try_into().unwrap_or_else(|_| unreachable!());
     (
         MuxChannels { control, input, clipboard },
@@ -179,6 +247,7 @@ async fn schedule(
     readers: [ReadHalf<DuplexStream>; LANES],
     mut events: mpsc::Receiver<WindowEvent>,
     windows: ReceiveWindows,
+    stats: Arc<WriteStats>,
 ) -> Result<()> {
     let [mut control, mut input, mut clipboard] = readers;
     let mut credits = [WINDOW_PACKETS; LANES];
@@ -221,13 +290,13 @@ async fn schedule(
                 if previous >= WINDOW_PACKETS {
                     bail!("接收窗口信用重复释放");
                 }
-                packet(&mut writer, lane, CREDIT, &[]).await?;
+                packet(&mut writer, &stats, lane, CREDIT, &[]).await?;
             }
             Ready::Lane(lane, n) => {
                 let n = n?;
                 if n == 0 {
                     open[lane] = false;
-                    packet(&mut writer, lane, FINISH, &[]).await?;
+                    packet(&mut writer, &stats, lane, FINISH, &[]).await?;
                     continue;
                 }
                 credits[lane] -= 1;
@@ -236,7 +305,7 @@ async fn schedule(
                     1 => &input_data[..n],
                     _ => &clipboard_data[..n],
                 };
-                packet(&mut writer, lane, DATA, data).await?;
+                packet(&mut writer, &stats, lane, DATA, data).await?;
                 if lane == 2 {
                     burst = 0;
                 } else {
@@ -247,13 +316,15 @@ async fn schedule(
     }
 }
 
-async fn packet(writer: &mut WriteHalf<ByteStream>, lane: usize, kind: u8, data: &[u8]) -> Result<()> {
+async fn packet(writer: &mut WriteHalf<ByteStream>, stats: &WriteStats, lane: usize, kind: u8, data: &[u8]) -> Result<()> {
     let mut packet = Vec::with_capacity(4 + data.len());
     packet.extend_from_slice(&[lane as u8, kind]);
     packet.extend_from_slice(&(data.len() as u16).to_be_bytes());
     packet.extend_from_slice(data);
+    let started = Instant::now();
     writer.write_all(&packet).await?;
     writer.flush().await?;
+    stats.record(packet.len(), started.elapsed());
     Ok(())
 }
 
