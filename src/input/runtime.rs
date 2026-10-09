@@ -382,7 +382,7 @@ where
                         match tx.try_send(Ok(motion.into_message())) {
                             Ok(()) => {}
                             Err(TrySendError::Full(_)) => reader_motion.restore(motion),
-                            Err(TrySendError::Disconnected(_)) => break,
+                            Err(TrySendError::Closed(_)) => break,
                         }
                     }
                     if tx.send(Ok(message)).await.is_err() {

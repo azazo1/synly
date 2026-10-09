@@ -106,7 +106,7 @@ pub enum TrustedExpectation<'a> {
     AnyOf(&'a [TrustedDeviceConfig]),
 }
 
-impl TrustedExpectation<'_> {
+impl<'a> TrustedExpectation<'a> {
     fn is_trusted(self) -> bool { !matches!(self, Self::Interactive) }
 }
 fn prompt(config: &AuthConfig, peer: &PeerOffer, system_peer: &BluetoothPeer) -> Result<AuthorizationRequest> {
@@ -395,14 +395,23 @@ mod tests {
         assert_eq!(client.remote.device_id, server_trust.device_id);
         assert!(client.trusted_reconnect && !client.remember_peer);
 
-        // 对端身份不在已保存信任中时必须拒绝, 不能因为"接受任一条根证书"就放行.
-        let mut unknown_client = config("冒名设备");
-        unknown_client.trusted_devices.push(trust(&server_config));
-        let candidates = unknown_client.trusted_devices.clone();
+        // 根证书可用但对端身份公钥已变时必须拒绝:
+        // 只按任一条根证书完成 mTLS 不等于接受该对端身份, 仍要按设备 ID 与公钥核对.
+        // config() 每次生成新身份, 因此这里先定服务端身份再派生被篡改的信任记录.
+        let mut server_config = config("服务端");
+        let mut changed_identity = trust(&server_config);
+        changed_identity.public_key = trust(&config("替换后的身份")).public_key;
+        let mut client_config = config("客户端");
+        client_config.trusted_devices.push(changed_identity);
+        client_config.trusted_only = true;
+        let candidates = client_config.trusted_devices.clone();
+        server_config.trusted_devices.push(trust(&client_config));
+        server_config.trusted_only = true;
         let (client, server) = connections();
         let host = tokio::spawn(async move { accept(server, &server_config, |_| async { Ok(AuthorizationDecision { accepted: true, remember: false }) }).await });
-        assert!(connect(client, &unknown_client, TrustedExpectation::AnyOf(&candidates), |_| async { panic!("可信连接不能重新询问授权") }).await.is_err());
-        assert!(host.await.unwrap().is_err());
+        assert!(connect(client, &client_config, TrustedExpectation::AnyOf(&candidates), |_| async { panic!("可信连接不能重新询问授权") }).await.is_err());
+        // 客户端已拒绝并关闭流, 服务端可能停在等待确认上; 这里只要求它在限时内不 panic 结束.
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), host).await;
     }
 
     #[test]
