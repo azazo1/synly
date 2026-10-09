@@ -581,7 +581,7 @@ export component AppWindow inherits Window {
                     }
                     Rectangle { horizontal-stretch: 1; }
                     Button {
-                        text: root.show-bluetooth-devices ? (root.bluetooth-scanning ? "取消刷新" : "刷新蓝牙服务") : "刷新";
+                        text: root.bluetooth-scanning && root.show-bluetooth-devices ? "取消刷新" : "刷新";
                         enabled: !root.show-bluetooth-devices || root.bluetooth-scanning || root.bluetooth-can-refresh;
                         clicked => { if root.show-bluetooth-devices { if root.bluetooth-scanning { root.cancel-bluetooth-discovery(); } else { root.refresh-bluetooth(); } } else { root.refresh-discovery(); } }
                     }
@@ -607,7 +607,7 @@ export component AppWindow inherits Window {
                     VerticalLayout {
                         spacing: 6px;
                         if root.show-bluetooth-devices && root.bluetooth-peers.length == 0: Text {
-                            text: root.bluetooth-scanning ? "正在查询系统已配对设备和 Synly 服务..." : root.bluetooth-can-refresh ? "尚无查询结果, 点击上方的刷新蓝牙服务. 如果只在 Synly 内配对过, 请先完成系统蓝牙配对." : "结束当前会话后, 可刷新并查询系统已配对的蓝牙设备.";
+                            text: root.bluetooth-scanning ? "正在查询系统已配对设备和 Synly 服务..." : root.bluetooth-can-refresh ? "尚无查询结果, 点击上方的刷新按钮. 如果只在 Synly 内配对过, 请先完成系统蓝牙配对." : "结束当前会话后, 可刷新并查询系统已配对的蓝牙设备.";
                             wrap: word-wrap;
                             color: #737b77;
                         }
