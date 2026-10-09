@@ -77,17 +77,30 @@ pub async fn paired_devices() -> Result<Vec<BluetoothPeer>> {
     }).await?
 }
 
-pub async fn query_service(peer: BluetoothPeer) -> Result<Option<BluetoothEndpoint>> {
+fn lookup_gate() -> std::sync::Arc<tokio::sync::Semaphore> {
+    static GATE: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    GATE.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(1))).clone()
+}
+
+async fn lookup<T: Send + 'static>(work: impl FnOnce() -> Result<T> + Send + 'static) -> Result<T> {
+    let permit = lookup_gate().acquire_owned().await?;
     tokio::task::spawn_blocking(move || {
+        // 原生 SDP 查询会泵送 runloop, 取消异步等待也不能提前释放查询槽位.
+        let _permit = permit; work()
+    }).await?
+}
+
+pub async fn query_service(peer: BluetoothPeer) -> Result<Option<BluetoothEndpoint>> {
+    lookup(move || {
         let address = CString::new(peer.address.as_str())?;
         let mut channel = 0;
         check(unsafe { synly_bt_query(address.as_ptr(), SERVICE_UUID_BYTES.as_ptr(), &mut channel) })?;
         Ok((channel != 0).then_some(BluetoothEndpoint { peer, channel: Some(channel) }))
-    }).await?
+    }).await
 }
 
 pub async fn connect(address: String) -> Result<BluetoothConnection> {
-    let stream = tokio::task::spawn_blocking({
+    let stream = lookup({
         let address = address.clone();
         move || -> Result<StdStream> {
             let address = CString::new(address)?;
@@ -97,7 +110,7 @@ pub async fn connect(address: String) -> Result<BluetoothConnection> {
             // 成功返回时桥接层将 fd 的唯一所有权转移给 Rust.
             Ok(unsafe { StdStream::from_raw_fd(fd) })
         }
-    }).await??;
+    }).await?;
     let stream = UnixStream::from_std(stream).context("无法注册蓝牙异步字节流")?;
     tracing::info!(%address, "系统已配对且加密的蓝牙链路已连接");
     Ok(BluetoothConnection::authenticated(ByteStream::new(stream), BluetoothPeer { name: address.clone(), address }))
@@ -156,4 +169,21 @@ pub async fn listen() -> Result<Listener> {
         tracing::info!("Synly 蓝牙服务已注册, 等待系统已配对设备接入");
         Ok(Listener { native: native as usize, _context: context, incoming })
     }).await?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn cancelled_query_keeps_native_slot_until_blocking_work_finishes() {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let query = tokio::spawn(lookup(move || { let _ = entered_tx.send(()); release_rx.recv()?; Ok(()) }));
+        entered_rx.await.unwrap(); query.abort(); assert!(query.await.unwrap_err().is_cancelled());
+        assert!(lookup_gate().try_acquire_owned().is_err());
+        let connection = tokio::spawn(lookup(|| Ok(7)));
+        release_tx.send(()).unwrap();
+        assert_eq!(tokio::time::timeout(std::time::Duration::from_secs(1), connection).await.unwrap().unwrap().unwrap(), 7);
+        assert!(lookup_gate().try_acquire_owned().is_ok());
+    }
 }

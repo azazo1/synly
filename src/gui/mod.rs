@@ -259,6 +259,15 @@ fn wire_window_callbacks(
     });
 
     let commands = handle.commands();
+    window.on_refresh_bluetooth(move || { guard_callback("refresh_bluetooth", || { send_command(&commands, AppCommand::RefreshBluetooth); }); });
+    let commands = handle.commands();
+    window.on_cancel_bluetooth_discovery(move || { guard_callback("cancel_bluetooth_discovery", || { send_command(&commands, AppCommand::CancelBluetoothDiscovery); }); });
+    let commands = handle.commands();
+    window.on_open_bluetooth_settings(move || { guard_callback("open_bluetooth_settings", || { send_command(&commands, AppCommand::OpenBluetoothSettings); }); });
+    let commands = handle.commands();
+    window.on_connect_bluetooth(move |address| { guard_callback("connect_bluetooth", || { send_command(&commands, AppCommand::ConnectBluetooth(address.to_string())); }); });
+
+    let commands = handle.commands();
     window.on_connect_peer(move |peer| {
         guard_callback("connect_peer", || {
             send_command(&commands, AppCommand::ConnectPeer(peer.to_string()))
@@ -939,6 +948,12 @@ fn apply_snapshot(
         })
         .collect::<Vec<_>>();
     window.set_peers(ModelRc::new(VecModel::from(peers)));
+    window.set_bluetooth_peers(ModelRc::new(VecModel::from(snapshot.bluetooth_peers.iter().map(|peer| BluetoothRow {
+        address: peer.address.clone().into(), title: peer.display_name.clone().into(), subtitle: format!("{} | {}", peer.address, peer.detail).into(), connectable: peer.connectable,
+    }).collect::<Vec<_>>())));
+    window.set_bluetooth_status(snapshot.bluetooth_status.clone().into()); window.set_bluetooth_scanning(snapshot.bluetooth_scanning);
+    window.set_bluetooth_can_refresh(snapshot.sessions.is_empty() && !snapshot.bluetooth_scanning && !matches!(snapshot.lifecycle, crate::core::AppLifecycle::Connecting | crate::core::AppLifecycle::Pairing | crate::core::AppLifecycle::Reconfiguring | crate::core::AppLifecycle::Stopping));
+    window.set_bluetooth_can_connect(matches!(snapshot.lifecycle, crate::core::AppLifecycle::Idle | crate::core::AppLifecycle::Error));
     let sessions = snapshot
         .sessions
         .iter()

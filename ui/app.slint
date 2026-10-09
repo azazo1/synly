@@ -12,6 +12,13 @@ export struct PeerRow {
     trusted: bool,
 }
 
+export struct BluetoothRow {
+    address: string,
+    title: string,
+    subtitle: string,
+    connectable: bool,
+}
+
 export struct TrustedRow {
     device-id: string,
     title: string,
@@ -147,6 +154,12 @@ export component AppWindow inherits Window {
     in property <string> remote-summary: "";
     in property <string> epoch-summary: "";
     in property <[PeerRow]> peers;
+    in property <[BluetoothRow]> bluetooth-peers;
+    in property <bool> bluetooth-scanning: false;
+    in property <bool> bluetooth-can-refresh: true;
+    in property <bool> bluetooth-can-connect: true;
+    in property <string> bluetooth-status;
+    in-out property <bool> show-bluetooth-devices: false;
     in property <[SessionRow]> sessions;
     in property <[TrustedRow]> trusted-devices;
     in property <string> log-text;
@@ -234,6 +247,10 @@ export component AppWindow inherits Window {
 
     callback start-hosting();
     callback refresh-discovery();
+    callback refresh-bluetooth();
+    callback cancel-bluetooth-discovery();
+    callback open-bluetooth-settings();
+    callback connect-bluetooth(string);
     callback connect-peer(string);
     callback connect-query();
     callback disconnect();
@@ -506,10 +523,25 @@ export component AppWindow inherits Window {
                     height: 34px;
                     Text { text: "设备"; font-size: 22px; font-weight: 680; color: #202523; vertical-alignment: center; }
                     Rectangle { horizontal-stretch: 1; }
-                    Button { text: "刷新"; clicked => { root.refresh-discovery(); } }
+                    Button { text: "局域网"; enabled: root.show-bluetooth-devices; clicked => { root.show-bluetooth-devices = false; } }
+                    Button { text: "已配对蓝牙"; enabled: !root.show-bluetooth-devices; clicked => { root.show-bluetooth-devices = true; } }
+                    Button {
+                        text: root.bluetooth-scanning && root.show-bluetooth-devices ? "取消刷新" : "刷新";
+                        enabled: !root.show-bluetooth-devices || root.bluetooth-scanning || root.bluetooth-can-refresh;
+                        clicked => { if root.show-bluetooth-devices { if root.bluetooth-scanning { root.cancel-bluetooth-discovery(); } else { root.refresh-bluetooth(); } } else { root.refresh-discovery(); } }
+                    }
                     Button { text: "断开"; enabled: root.session-active; clicked => { root.disconnect(); } }
                 }
-                HorizontalLayout {
+                if root.show-bluetooth-devices: HorizontalLayout {
+                    height: 54px;
+                    Text { text: root.bluetooth-status; wrap: word-wrap; color: #555d59; horizontal-stretch: 1; }
+                    Button { text: "系统蓝牙设置"; clicked => { root.open-bluetooth-settings(); } }
+                }
+                if root.show-bluetooth-devices: Text {
+                    text: "请先在系统设置完成配对, 再开启对端 Synly 蓝牙接入. 名称与地址仅作发现线索, 连接后验证应用身份. 运行会话期间暂停手动查询.";
+                    wrap: word-wrap; font-size: 11px; color: #737b77;
+                }
+                if !root.show-bluetooth-devices: HorizontalLayout {
                     height: 34px;
                     spacing: 6px;
                     LineEdit { text <=> root.peer-query; placeholder-text: "设备名, ID 或地址"; horizontal-stretch: 1; }
@@ -518,6 +550,25 @@ export component AppWindow inherits Window {
                 ScrollView {
                     vertical-stretch: 1;
                     VerticalLayout {
+                        spacing: 6px;
+                        if root.show-bluetooth-devices && root.bluetooth-peers.length == 0: Text { text: "没有已查询的蓝牙设备, 点击刷新读取系统配对记录."; wrap: word-wrap; color: #737b77; }
+                        if root.show-bluetooth-devices: VerticalLayout {
+                            spacing: 6px;
+                            for peer in root.bluetooth-peers: Rectangle {
+                                height: 88px;
+                                background: #ffffff; border-color: #d8dcda; border-width: 1px; border-radius: 5px;
+                                HorizontalLayout {
+                                    padding: 9px;
+                                    VerticalLayout {
+                                        horizontal-stretch: 1;
+                                        Text { text: peer.title; font-size: 15px; font-weight: 600; color: #202523; }
+                                        Text { text: peer.subtitle; color: #666c68; font-size: 11px; wrap: word-wrap; }
+                                    }
+                                    Button { text: "蓝牙连接"; enabled: peer.connectable && root.bluetooth-can-connect; clicked => { root.connect-bluetooth(peer.address); } }
+                                }
+                            }
+                        }
+                        if !root.show-bluetooth-devices: VerticalLayout {
                         spacing: 6px;
                         for peer in root.peers: Rectangle {
                             height: 64px;
@@ -537,6 +588,7 @@ export component AppWindow inherits Window {
                                     clicked => { root.connect-peer(peer.device-id); }
                                 }
                             }
+                        }
                         }
                     }
                 }

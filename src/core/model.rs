@@ -53,6 +53,14 @@ pub struct DiscoveredPeerView {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BluetoothPeerView {
+    pub address: String,
+    pub display_name: String,
+    pub connectable: bool,
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PendingInteraction {
     pub request: InteractionRequest,
 }
@@ -100,6 +108,9 @@ pub struct AppSnapshot {
     pub settings: AppSettings,
     pub sessions: Vec<SessionView>,
     pub discovered_peers: Vec<DiscoveredPeerView>,
+    pub bluetooth_peers: Vec<BluetoothPeerView>,
+    pub bluetooth_scanning: bool,
+    pub bluetooth_status: String,
     pub trusted_devices: Vec<TrustedDeviceConfig>,
     pub interaction: Option<PendingInteraction>,
     pub last_error: Option<String>,
@@ -121,6 +132,8 @@ impl AppSnapshot {
             settings,
             sessions: Vec::new(),
             discovered_peers: Vec::new(),
+            bluetooth_peers: Vec::new(), bluetooth_scanning: false,
+            bluetooth_status: "点击刷新查询系统已配对设备的 Synly 服务".to_owned(),
             trusted_devices: Vec::new(),
             interaction: None,
             last_error: None,
@@ -159,6 +172,10 @@ pub enum AppCommand {
     Start,
     StartHosting,
     RefreshDiscovery,
+    RefreshBluetooth,
+    CancelBluetoothDiscovery,
+    OpenBluetoothSettings,
+    ConnectBluetooth(String),
     ConnectPeer(String),
     SetClipboardMode(ClipboardMode),
     SetAudioMode(AudioMode),

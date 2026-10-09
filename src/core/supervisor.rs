@@ -56,6 +56,8 @@ pub struct AppSupervisor {
     session_pin: Option<String>,
     force_start: bool,
     discovery_task: Option<JoinHandle<()>>,
+    bluetooth_discovery: Option<tokio_util::sync::CancellationToken>,
+    bluetooth_epoch: u64,
     discovery_epoch: u64,
     input_backend_generation: u64,
     pending_responses: HashMap<Uuid, oneshot::Sender<crate::runtime_control::InteractionResponse>>,
@@ -76,6 +78,9 @@ struct SessionHandle {
 }
 
 enum InternalEvent {
+    BluetoothPeer { epoch: u64, peer: super::model::BluetoothPeerView },
+    BluetoothFinished { epoch: u64, result: Result<String, String> },
+    BluetoothSettings(Result<(), String>),
     Discovery {
         epoch: u64,
         result: Result<Vec<DiscoveredPeer>, String>,
@@ -121,6 +126,7 @@ impl AppSupervisor {
                 force_start,
                 discovery_task: None,
                 discovery_epoch: 0,
+                bluetooth_discovery: None, bluetooth_epoch: 0,
                 input_backend_generation: 0,
                 pending_responses: HashMap::new(),
                 runtime_active_session: None,
@@ -165,6 +171,7 @@ impl AppSupervisor {
             }
         }
 
+        self.cancel_bluetooth_discovery();
         self.stop_session().await;
         if let Some(task) = self.discovery_task.take() {
             task.abort();
@@ -269,7 +276,27 @@ impl AppSupervisor {
                 tracing::info!("用户请求刷新设备发现");
                 self.spawn_discovery_loop();
             }
+            AppCommand::RefreshBluetooth => self.refresh_bluetooth(),
+            AppCommand::CancelBluetoothDiscovery => {
+                self.cancel_bluetooth_discovery(); self.snapshot.bluetooth_status = "蓝牙刷新已取消".to_owned(); self.publish();
+            }
+            AppCommand::OpenBluetoothSettings => {
+                let internal = self.internal_tx.clone();
+                tokio::task::spawn_blocking(move || { let result = super::bluetooth_discovery::open_settings().map_err(|error| error.to_string()); let _ = internal.send(InternalEvent::BluetoothSettings(result)); });
+            }
+            AppCommand::ConnectBluetooth(address) => {
+                let peer = synly_core::bluetooth::normalize_address(&address).ok().and_then(|address| self.snapshot.bluetooth_peers.iter().find(|peer| peer.address == address && peer.connectable).cloned());
+                if self.session.is_some() { self.snapshot.bluetooth_status = "请先断开当前会话, 再选择蓝牙主连接".to_owned(); self.publish(); }
+                else if let Some(peer) = peer {
+                    self.cancel_bluetooth_discovery();
+                    self.snapshot.desired.connection = Some(ConnectionPreference::Join);
+                    self.snapshot.desired.bluetooth_enabled = true;
+                    self.snapshot.desired.peer_query = format!("bluetooth:{}", peer.address);
+                    self.config.runtime = self.snapshot.desired.clone(); self.save_settings(); self.start_session().await;
+                } else { self.snapshot.bluetooth_status = "该设备没有当前可用的 Synly 服务, 请刷新后重试".to_owned(); self.publish(); }
+            }
             AppCommand::ConnectPeer(peer) => {
+                self.cancel_bluetooth_discovery();
                 self.snapshot.desired.connection = Some(ConnectionPreference::Join);
                 self.snapshot.desired.peer_query = peer;
                 self.config.runtime = self.snapshot.desired.clone();
@@ -463,6 +490,19 @@ impl AppSupervisor {
 
     async fn handle_internal_event(&mut self, event: InternalEvent) {
         match event {
+            InternalEvent::BluetoothPeer { epoch, peer } if epoch == self.bluetooth_epoch && self.snapshot.bluetooth_scanning => {
+                if let Some(previous) = self.snapshot.bluetooth_peers.iter_mut().find(|previous| previous.address == peer.address) { *previous = peer; }
+                else { self.snapshot.bluetooth_peers.push(peer); }
+                self.publish();
+            }
+            InternalEvent::BluetoothFinished { epoch, result } if epoch == self.bluetooth_epoch && self.snapshot.bluetooth_scanning => {
+                self.bluetooth_discovery.take(); self.snapshot.bluetooth_scanning = false;
+                self.snapshot.bluetooth_status = match result { Ok(status) => status, Err(error) => { tracing::warn!(error = %error, "蓝牙设备刷新失败"); format!("蓝牙刷新失败: {error}") } }; self.publish();
+            }
+            InternalEvent::BluetoothPeer { .. } | InternalEvent::BluetoothFinished { .. } => {}
+            InternalEvent::BluetoothSettings(result) => {
+                if let Err(error) = result { self.snapshot.bluetooth_status = format!("无法打开系统蓝牙设置: {error}"); self.publish(); }
+            }
             InternalEvent::Discovery {
                 epoch,
                 result: Ok(peers),
@@ -560,6 +600,7 @@ impl AppSupervisor {
                 self.snapshot.lifecycle = map_lifecycle(lifecycle);
             }
             RuntimeEvent::Connected(peer) => {
+                self.cancel_bluetooth_discovery();
                 if !self
                     .snapshot
                     .sessions
@@ -750,6 +791,7 @@ impl AppSupervisor {
         if self.session.is_some() {
             return;
         }
+        self.cancel_bluetooth_discovery();
         let mut options =
             match runtime_options_from_config(&self.config, self.session_pin.clone(), false) {
                 Ok(options) => options,
@@ -909,6 +951,31 @@ impl AppSupervisor {
         }
         self.input_backend_generation = self.input_backend_generation.saturating_add(1);
         self.update_tuning();
+    }
+
+    fn cancel_bluetooth_discovery(&mut self) {
+        if let Some(cancel) = self.bluetooth_discovery.take() {
+            cancel.cancel(); self.bluetooth_epoch = self.bluetooth_epoch.saturating_add(1);
+            self.snapshot.bluetooth_scanning = false; self.snapshot.bluetooth_status = "蓝牙刷新已停止, 点击刷新重新查询".to_owned();
+        }
+    }
+    fn refresh_bluetooth(&mut self) {
+        if self.snapshot.bluetooth_scanning { return; }
+        if !self.snapshot.sessions.is_empty() || matches!(self.snapshot.lifecycle, AppLifecycle::Connecting | AppLifecycle::Pairing | AppLifecycle::Reconfiguring | AppLifecycle::Stopping) {
+            self.snapshot.bluetooth_status = "会话运行或连接期间暂停手动蓝牙查询, 请先断开".to_owned(); self.publish(); return;
+        }
+        self.bluetooth_epoch = self.bluetooth_epoch.saturating_add(1); let epoch = self.bluetooth_epoch;
+        self.snapshot.bluetooth_peers.clear(); self.snapshot.bluetooth_scanning = true;
+        self.snapshot.bluetooth_status = "查询系统已配对设备和 Synly 服务中, 可取消刷新".to_owned();
+        let cancel = tokio_util::sync::CancellationToken::new(); self.bluetooth_discovery = Some(cancel.clone());
+        let internal = self.internal_tx.clone();
+        tokio::spawn(async move {
+            let output = internal.clone(); let cancel_rows = cancel.clone();
+            let result = super::bluetooth_discovery::browse(cancel, move |peer| {
+                if output.send(InternalEvent::BluetoothPeer { epoch, peer }).is_err() { cancel_rows.cancel(); }
+            }).await.map_err(|error| error.to_string());
+            let _ = internal.send(InternalEvent::BluetoothFinished { epoch, result });
+        }); self.publish();
     }
 
     fn spawn_discovery_loop(&mut self) {
@@ -1400,6 +1467,37 @@ mod tests {
                 max_cache_bytes: None,
                 cache_dir: std::path::PathBuf::from("."),
             },
+        }
+    }
+
+    #[tokio::test]
+    async fn bluetooth_refresh_epochs_reject_late_rows_and_completion_after_cancel_or_connect() {
+        let (mut supervisor, _) = AppSupervisor::new(test_config(), false);
+        let cancel = tokio_util::sync::CancellationToken::new(); supervisor.bluetooth_discovery = Some(cancel.clone());
+        supervisor.bluetooth_epoch = 4; supervisor.snapshot.bluetooth_scanning = true;
+        let row = |address: &str| super::super::model::BluetoothPeerView { address: address.to_owned(), display_name: "同名设备".to_owned(), connectable: false, detail: String::new() };
+        supervisor.handle_internal_event(InternalEvent::BluetoothPeer { epoch: 4, peer: row("AA:BB:CC:DD:EE:00") }).await;
+        supervisor.handle_internal_event(InternalEvent::BluetoothPeer { epoch: 4, peer: row("AA:BB:CC:DD:EE:01") }).await;
+        assert_eq!(supervisor.snapshot.bluetooth_peers.len(), 2);
+        let mut ready = row("AA:BB:CC:DD:EE:00"); ready.connectable = true;
+        supervisor.handle_internal_event(InternalEvent::BluetoothPeer { epoch: 4, peer: ready }).await;
+        assert_eq!(supervisor.snapshot.bluetooth_peers.len(), 2); assert!(supervisor.snapshot.bluetooth_peers[0].connectable);
+        assert!(supervisor.config.trusted_devices.is_empty());
+        supervisor.handle_runtime_event(RuntimeEvent::Connected(crate::runtime_control::RuntimePeerSummary { device_id: Uuid::new_v4(), display_name: "在线".to_owned() }));
+        assert!(cancel.is_cancelled()); assert!(!supervisor.snapshot.bluetooth_scanning);
+        supervisor.handle_internal_event(InternalEvent::BluetoothPeer { epoch: 4, peer: row("AA:BB:CC:DD:EE:02") }).await;
+        supervisor.handle_internal_event(InternalEvent::BluetoothFinished { epoch: 4, result: Ok("迟到".to_owned()) }).await;
+        assert_eq!(supervisor.snapshot.bluetooth_peers.len(), 2); assert_ne!(supervisor.snapshot.bluetooth_status, "迟到");
+        supervisor.refresh_bluetooth(); assert!(!supervisor.snapshot.bluetooth_scanning); assert!(supervisor.bluetooth_discovery.is_none());
+    }
+
+    #[tokio::test]
+    async fn bluetooth_selection_rejects_absent_or_unavailable_services_without_changing_target() {
+        let (mut supervisor, _) = AppSupervisor::new(test_config(), false); let original = supervisor.snapshot.desired.clone();
+        supervisor.snapshot.bluetooth_peers.push(super::super::model::BluetoothPeerView { address: "AA:BB:CC:DD:EE:00".to_owned(), display_name: "同名设备".to_owned(), connectable: false, detail: String::new() });
+        for address in ["无效", "AA:BB:CC:DD:EE:00", "AA:BB:CC:DD:EE:01"] {
+            assert!(!supervisor.handle_command(AppCommand::ConnectBluetooth(address.to_owned())).await);
+            assert!(supervisor.session.is_none()); assert_eq!(supervisor.snapshot.desired, original); assert!(supervisor.config.trusted_devices.is_empty());
         }
     }
 
