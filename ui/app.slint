@@ -184,6 +184,7 @@ export component AppWindow inherits Window {
     in-out property <int> audio-mode-index: 0;
     in-out property <int> audio-layout-index: 0;
     in-out property <int> input-mode-index: 0;
+    in-out property <int> input-path-index: 1;
     in-out property <int> input-edge-index: 1;
     in-out property <string> input-hotkey: "ctrl+alt+shift+esc";
     in-out property <bool> block-switch-on-press: false;
@@ -198,8 +199,10 @@ export component AppWindow inherits Window {
     in-out property <bool> accept-untrusted: false;
     in-out property <bool> trust-device: false;
     in-out property <bool> trusted-only: false;
+    in-out property <bool> bluetooth-enabled: false;
     in-out property <string> fixed-pin;
     in-out property <string> device-name;
+    in-out property <int> clipboard-path-index: 0;
     in-out property <string> clipboard-max-file-text;
     in-out property <string> clipboard-max-cache-text;
     in-out property <string> clipboard-cache-dir;
@@ -371,7 +374,7 @@ export component AppWindow inherits Window {
                                 VerticalLayout {
                                     spacing: 6px;
                                     for session in root.sessions: Rectangle {
-                                        height: 56px;
+                                        height: 76px;
                                         background: #ffffff;
                                         border-color: session.active ? #93c6ad : #d8dcda;
                                         border-width: 1px;
@@ -554,6 +557,9 @@ export component AppWindow inherits Window {
                             spacing: 6px;
                             Text { text: "控制方向"; color: #737b77; font-size: 11px; }
                             ComboBox { model: ["关闭", "发送控制", "接受控制"]; current-index <=> root.input-mode-index; }
+                            Text { text: "输入传输路径"; color: #737b77; font-size: 11px; }
+                            ComboBox { model: ["自动保持健康路径", "蓝牙优先", "仅局域网", "仅蓝牙"]; current-index <=> root.input-path-index; }
+                            Text { text: "双方限制取交集. 切换后按紧急热键确认, 再移动到边缘."; wrap: word-wrap; color: #737b77; font-size: 11px; }
                             Text { text: "屏幕边缘"; color: #737b77; font-size: 11px; }
                             ComboBox { model: ["左侧", "右侧", "顶部", "底部"]; current-index <=> root.input-edge-index; }
                             Text { text: "紧急收回热键"; color: #737b77; font-size: 11px; }
@@ -615,6 +621,7 @@ export component AppWindow inherits Window {
                         CheckBox { text: "自动接受未信任设备"; checked <=> root.accept-untrusted; }
                         CheckBox { text: "配对后建立信任"; checked <=> root.trust-device; }
                         CheckBox { text: "仅允许可信设备"; checked <=> root.trusted-only; }
+                        CheckBox { text: "系统配对蓝牙接入"; checked <=> root.bluetooth-enabled; }
                     }
                     LineEdit {
                         text <=> root.fixed-pin;
@@ -685,13 +692,15 @@ export component AppWindow inherits Window {
                         }
                     }
                     HorizontalLayout {
-                        height: 274px;
+                        height: 332px;
                         spacing: 10px;
                         Panel {
                             title: "剪贴板与传输限制";
                             horizontal-stretch: 1;
                             VerticalLayout {
                                 spacing: 5px;
+                                Text { text: "剪贴板路径"; color: #737b77; font-size: 11px; }
+                                ComboBox { model: ["自动保持健康路径", "蓝牙优先", "仅局域网", "仅蓝牙"]; current-index <=> root.clipboard-path-index; }
                                 LineEdit { text <=> root.clipboard-max-file-text; placeholder-text: "剪贴板单文件上限, 例如 100 MiB"; }
                                 LineEdit { text <=> root.clipboard-max-cache-text; placeholder-text: "剪贴板缓存上限, 例如 512 MiB, 留空不限制"; }
                                 LineEdit { text <=> root.clipboard-cache-dir; placeholder-text: "剪贴板缓存目录, 可选"; }

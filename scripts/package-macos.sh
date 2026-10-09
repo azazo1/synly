@@ -89,6 +89,10 @@ printf '%s\n' \
     '  <string>14.0</string>' \
     '  <key>NSHighResolutionCapable</key>' \
     '  <true/>' \
+    '  <key>NSBluetoothAlwaysUsageDescription</key>' \
+    '  <string>Synly 使用蓝牙连接系统已配对设备, 同步剪贴板并传输输入控制.</string>' \
+    '  <key>NSBluetoothPeripheralUsageDescription</key>' \
+    '  <string>Synly 使用蓝牙连接系统已配对设备.</string>' \
     '</dict>' \
     '</plist>' > "$app_bundle/Contents/Info.plist"
 

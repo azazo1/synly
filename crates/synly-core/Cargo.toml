@@ -27,6 +27,7 @@ ring = "0.17.14"
 rustls = { version = "0.23.37", default-features = false, features = ["std", "ring"] }
 serde = { version = "1.0.228", features = ["derive"] }
 sha2 = "0.10.9"
+socket2 = { version = "0.6.3", features = ["all"] }
 spake2 = "0.4.0"
 tokio = { version = "1.49.0", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring"] }
@@ -37,6 +38,18 @@ uniffi = { version = "0.31", optional = true }
 url = "2.5.7"
 uuid = { version = "1.22.0", features = ["serde", "v4"] }
 x509-parser = "0.18.1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Devices_Bluetooth",
+    "Win32_Networking_WinSock",
+    "Win32_System_Com",
+] }
+windows = { version = "0.62.2", features = ["Devices_Radios", "Foundation_Collections", "Win32_System_WinRT"] }
+
+[build-dependencies]
+cc = "1.2"
 
 [dev-dependencies]
 axum = "0.8.1"

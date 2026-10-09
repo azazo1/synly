@@ -1,3 +1,14 @@
+use synly_core::transport::logical::{LogicalSession, SessionKeys, CandidateExporter, BoundLink};
+use synly_core::transport::routing::TransportKind;
+use synly_core::transport::frames::FrameSender;
+use synly_core::transport::clipboard_route::{ClipboardRoute, RouteContext as ClipboardRouteContext};
+
+mod audio_path;
+pub(crate) mod bluetooth;
+mod clipboard_delivery;
+mod input_route;
+pub(crate) mod lan_admission;
+
 use crate::audio::{self, AudioChannelDirection};
 use crate::clipboard::{ClipboardSync, ClipboardWatcherHandle};
 use crate::config::{DeviceConfig, SynlyConfig, TrustedDeviceConfig};
@@ -16,7 +27,6 @@ use crate::protocol::{
     AudioLayout as ProtocolAudioLayout, CapabilityEpoch, ClipboardPayload, ControlMessage,
     DeviceIdentity, Frame, FrameReader, FrameWriter, PROTOCOL_VERSION,
     PairAuthMethod, PairRequestPayload, RuntimeCapabilities, SessionAgreement, TransferLimits,
-    frame_size_limit_message,
 };
 use crate::reconnect::{AttemptVerdict, ReconnectPolicy, run_auto_reconnect};
 use crate::runtime_control::{
@@ -31,6 +41,7 @@ use crate::settings::{AudioMode, ClipboardMode, ConnectionPreference};
 use crate::system_notification::{
     ConnectionEvent, NotificationPeer, SessionNotifier, SystemNotifier,
 };
+use synly_core::transport::stream::ByteStream;
 use anyhow::{Context, Result, anyhow, bail};
 use socket2::{SockRef, TcpKeepalive};
 use std::collections::{BTreeMap, HashMap};
@@ -66,13 +77,19 @@ pub(crate) enum SessionRole {
     Client,
 }
 
-#[derive(Debug)]
 pub(crate) struct AuthenticatedSession {
     pub(crate) role: SessionRole,
-    pub(crate) stream: TlsStream<TcpStream>,
+    // TLS 认证和 exporter 提取完成后, 会话只依赖承载字节流.
+    pub(crate) stream: ByteStream,
+    pub(crate) require_existing_session: bool,
+    pub(crate) trusted_reconnect: bool,
+    pub(crate) transport: TransportKind,
+    pub(crate) logical: LogicalSession,
+    pub(crate) candidate_exporter: CandidateExporter,
+    pub(crate) secondary_inbox: Option<mpsc::Receiver<BoundLink>>,
     pub(crate) remote: DeviceIdentity,
     pub(crate) remote_capabilities: RuntimeCapabilities,
-    pub(crate) remote_socket_addr: SocketAddr,
+    pub(crate) remote_socket_addr: Option<SocketAddr>,
     pub(crate) audio_master_secret: [u8; 32],
     pub(crate) input_master_secret: [u8; 32],
     pub(crate) capability_profile: SessionCapabilityProfile,
@@ -136,6 +153,7 @@ struct PairingPeerState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum PeerTarget {
     Discovered(DiscoveredPeer),
+    Bluetooth { address: String, device_id: Option<Uuid> },
     Direct(SocketAddrV4),
 }
 
@@ -144,6 +162,7 @@ impl PeerTarget {
         match self {
             Self::Discovered(peer) => preferred_peer_query(peer),
             Self::Direct(address) => address.to_string(),
+            Self::Bluetooth { address, device_id } => device_id.map_or_else(|| format!("bluetooth:{address}"), |id| format!("bluetooth:{address}/{id}")),
         }
     }
 }
@@ -292,7 +311,7 @@ struct PeerReconnectAttempt<'a> {
     runtime_tuning: &'a mut watch::Receiver<RuntimeTuning>,
     notifier: &'a SystemNotifier,
     discovery_timeout: Duration,
-    direct_target: Option<SocketAddr>,
+    direct_target: Option<PeerTarget>,
     fast_retries_left: u32,
 }
 
@@ -319,10 +338,25 @@ async fn connect_and_run_session(
     config: &mut SynlyConfig,
     options: &RuntimeOptions,
     notifier: &SystemNotifier,
-    direct_target: &mut Option<SocketAddr>,
+    direct_target: &mut Option<PeerTarget>,
 ) -> Result<()> {
-    let session = connect_to_peer(peer_target, config, options).await?;
-    *direct_target = Some(session.remote_socket_addr);
+    let mut session = connect_to_peer(peer_target, config, options).await?;
+    let _candidate_task = if options.bluetooth_enabled && session.transport == TransportKind::Lan {
+        match synly_core::bluetooth::candidate::spawn_bluetooth(bluetooth::auth_config(config, options), session.logical.clone(), None, Some(options.control.input_activity())) {
+            Ok((inbox, task)) => { session.secondary_inbox = Some(inbox); Some(task) },
+            Err(error) => { tracing::warn!(error = %error, "蓝牙副承载初始化失败, LAN 主会话继续运行"); None },
+        }
+    } else { None };
+    let _lan_candidate_task = if session.transport == TransportKind::Bluetooth {
+        match synly_core::transport::lan_candidate::spawn_lan(bluetooth::auth_config(config, options), session.logical.clone(), options.discovery.clone(), options.transfer_limits, Some(options.control.input_activity())) {
+            Ok((inbox, task)) => { session.secondary_inbox = Some(inbox); Some(task) },
+            Err(error) => { tracing::warn!(error = %error, "LAN 副承载初始化失败, 蓝牙主会话继续运行"); None },
+        }
+    } else { None };
+    *direct_target = match peer_target {
+        PeerTarget::Bluetooth { address, .. } => Some(PeerTarget::Bluetooth { address: address.clone(), device_id: Some(session.remote.device_id) }),
+        _ => session.remote_socket_addr.and_then(|address| match address { SocketAddr::V4(address) => Some(PeerTarget::Direct(address)), _ => None }),
+    };
     let remote_label = format!(
         "{} ({})",
         identity_display_name(&session.remote),
@@ -381,7 +415,7 @@ async fn attempt_peer_connection(
     runtime_tuning: &mut watch::Receiver<RuntimeTuning>,
     notifier: &SystemNotifier,
     discovery_timeout: Duration,
-    direct_target: &mut Option<SocketAddr>,
+    direct_target: &mut Option<PeerTarget>,
     fast_retries_left: &mut u32,
 ) -> AttemptVerdict {
     refresh_runtime_options(config, options, runtime_capabilities, runtime_tuning);
@@ -391,8 +425,9 @@ async fn attempt_peer_connection(
         input_mode: options.input_mode,
     };
 
-    if let Some(SocketAddr::V4(address)) = *direct_target {
-        let peer_target = PeerTarget::Direct(address);
+    if let Some(peer_target) = direct_target.clone() {
+        if matches!(peer_target, PeerTarget::Bluetooth { .. }) { *reconnect_query = Some(peer_target.reconnect_query()); }
+        let address = peer_target.reconnect_query();
         tracing::info!(address = %address, "使用上次地址快速重连");
         options
             .control
@@ -598,6 +633,7 @@ pub(crate) async fn handle_incoming_connection(
     config: &mut SynlyConfig,
     options: &RuntimeOptions,
     reserver: &ActiveSlotReserver,
+    admission: &lan_admission::LanAdmission,
 ) -> Result<Option<(AuthenticatedSession, SlotReservation)>> {
     let mut first_byte = [0u8; 1];
     let peeked = socket.peek(&mut first_byte).await?;
@@ -606,8 +642,9 @@ pub(crate) async fn handle_incoming_connection(
     }
 
     if first_byte[0] == 0x16 {
-        handle_trusted_incoming_connection(socket, remote_addr, config, options, reserver).await
+        handle_trusted_incoming_connection(socket, remote_addr, config, options, reserver, admission).await
     } else {
+        if admission.full { bail!("host 会话已满, 不能启动新的 PIN 配对"); }
         handle_bootstrap_incoming_connection(
             socket,
             remote_addr,
@@ -627,6 +664,7 @@ async fn connect_to_peer(
 ) -> Result<AuthenticatedSession> {
     let device = config.device.clone();
     match peer {
+        PeerTarget::Bluetooth { address, device_id } => bluetooth::connect(address, *device_id, config, options).await,
         PeerTarget::Discovered(peer) => {
             let trusted_transport = trusted_transport_for_peer(config, peer)?;
             if options.pairing.trusted_only && trusted_transport.is_none() {
@@ -754,15 +792,14 @@ async fn handle_trusted_incoming_connection(
     config: &mut SynlyConfig,
     options: &RuntimeOptions,
     reserver: &ActiveSlotReserver,
+    admission: &lan_admission::LanAdmission,
 ) -> Result<Option<(AuthenticatedSession, SlotReservation)>> {
-    let transfer_limits = options.transfer_limits;
+    let transfer_limits = TransferLimits { max_meta_len: options.transfer_limits.max_meta_len.min(16 * 1024), max_frame_data_len: 0, ..options.transfer_limits };
     let device = config.device.clone();
     let remote_label = remote_addr.to_string();
-    if !has_trusted_transport(config) {
-        bail!("收到 TLS 连接，但本机尚未保存任何可信设备根证书；未信任设备必须先走 bootstrap/PIN");
-    }
-
-    let acceptor = crypto::build_server_acceptor(&device, &config.trusted_devices)?;
+    let trusted = admission.trust_devices(&config.trusted_devices);
+    if trusted.is_empty() { bail!("LAN TLS 连接没有持久信任或在线主会话授权"); }
+    let acceptor = crypto::build_server_acceptor(&device, &trusted)?;
     let mut server_stream = acceptor.accept(socket).await?;
     let frame = read_frame(&mut server_stream, transfer_limits).await?;
     let (request_id, payload, trusted_proof) = match frame {
@@ -808,17 +845,10 @@ async fn handle_trusted_incoming_connection(
         return Ok(None);
     }
 
-    let trusted_device = match config.trusted_device(&payload.client.device_id).cloned() {
-        Some(trusted_device) => trusted_device,
-        None => {
-            write_frame(
-                &mut server_stream,
-                transfer_limits,
-                Frame::Control(ControlMessage::Error {
-                    message: "该设备未处于可信状态，不能走免 PIN 的 mTLS 直连。".to_string(),
-                }),
-            )
-            .await?;
+    let (trusted_device, require_existing_session) = match admission.resolve(&payload.client, &config.trusted_devices) {
+        Ok(resolved) => resolved,
+        Err(error) => {
+            write_frame(&mut server_stream, transfer_limits, Frame::Control(ControlMessage::Error { message: format!("LAN 可信身份准入失败: {error:#}") })).await?;
             return Ok(None);
         }
     };
@@ -872,7 +902,7 @@ async fn handle_trusted_incoming_connection(
     let input_compatible =
         negotiate_input(session_options.input_mode, payload.capabilities.input_mode).is_some();
     print_pair_request_overview(&payload, &session_options, &remote_label)?;
-    if !clipboard_agreement.any_direction()
+    if !require_existing_session && !clipboard_agreement.any_direction()
         && !audio_compatible
         && !input_compatible
     {
@@ -916,17 +946,28 @@ async fn handle_trusted_incoming_connection(
         return Ok(None);
     }
 
-    config.note_trusted_device_session(payload.client.device_id, &payload.client.device_name);
-    config.save_trusted_devices()?;
+    if !require_existing_session {
+        config.note_trusted_device_session(payload.client.device_id, &payload.client.device_name);
+        config.save_trusted_devices()?;
+    }
 
+    let keys = SessionKeys::server(&server_stream, &request_id)?;
+    let logical = keys.logical(device_identity(&config.device, options.instance_name.as_deref()), payload.client.clone(), TransportKind::Lan)?;
+    let candidate_exporter = keys.candidate_exporter();
     let tls_stream: TlsStream<TcpStream> = server_stream.into();
     Ok(Some((
         AuthenticatedSession {
             role: SessionRole::Host,
-            stream: tls_stream,
+            stream: ByteStream::new(tls_stream),
+            require_existing_session,
+            trusted_reconnect: true,
+            transport: TransportKind::Lan,
+            logical,
+            candidate_exporter,
+            secondary_inbox: None,
             remote: payload.client,
             remote_capabilities: payload.capabilities,
-            remote_socket_addr: remote_addr,
+            remote_socket_addr: Some(remote_addr),
             audio_master_secret,
             input_master_secret,
             capability_profile: reservation.profile(),
@@ -1367,14 +1408,23 @@ async fn handle_bootstrap_incoming_connection(
         return Ok(None);
     }
 
+    let keys = SessionKeys::server(&server_stream, &request_id)?;
+    let logical = keys.logical(device_identity(&config.device, options.instance_name.as_deref()), payload.client.clone(), TransportKind::Lan)?;
+    let candidate_exporter = keys.candidate_exporter();
     let tls_stream: TlsStream<TcpStream> = server_stream.into();
     Ok(Some((
         AuthenticatedSession {
             role: SessionRole::Host,
-            stream: tls_stream,
+            stream: ByteStream::new(tls_stream),
+            require_existing_session: false,
+            trusted_reconnect: false,
+            transport: TransportKind::Lan,
+            logical,
+            candidate_exporter,
+            secondary_inbox: None,
             remote: payload.client,
             remote_capabilities: payload.capabilities,
-            remote_socket_addr: remote_addr,
+            remote_socket_addr: Some(remote_addr),
             audio_master_secret,
             input_master_secret,
             capability_profile: reservation.profile(),
@@ -1536,14 +1586,23 @@ where
     config.note_trusted_device_session(remote.device_id, &remote.device_name);
     config.save_trusted_devices()?;
 
+    let keys = SessionKeys::client(&client_stream, &request_id)?;
+    let logical = keys.logical(device_identity(device, options.instance_name.as_deref()), remote.clone(), TransportKind::Lan)?;
+    let candidate_exporter = keys.candidate_exporter();
     let tls_stream: TlsStream<TcpStream> = client_stream.into();
     print_connected_peer(&remote, &remote_capabilities, options.input_mode)?;
     Ok(AuthenticatedSession {
         role: SessionRole::Client,
-        stream: tls_stream,
+        stream: ByteStream::new(tls_stream),
+        require_existing_session: false,
+        trusted_reconnect: true,
+        transport: TransportKind::Lan,
+        logical,
+        candidate_exporter,
+        secondary_inbox: None,
         remote,
         remote_capabilities,
-        remote_socket_addr,
+        remote_socket_addr: Some(remote_socket_addr),
         audio_master_secret,
         input_master_secret,
         capability_profile: SessionCapabilityProfile::Full,
@@ -1778,14 +1837,23 @@ async fn connect_to_untrusted_peer(
         }
     }
 
+    let keys = SessionKeys::client(&client_stream, &request_id)?;
+    let logical = keys.logical(device_identity(device, options.instance_name.as_deref()), remote.clone(), TransportKind::Lan)?;
+    let candidate_exporter = keys.candidate_exporter();
     let tls_stream: TlsStream<TcpStream> = client_stream.into();
     print_connected_peer(&remote, &remote_capabilities, options.input_mode)?;
     Ok(AuthenticatedSession {
         role: SessionRole::Client,
-        stream: tls_stream,
+        stream: ByteStream::new(tls_stream),
+        require_existing_session: false,
+        trusted_reconnect: false,
+        transport: TransportKind::Lan,
+        logical,
+        candidate_exporter,
+        secondary_inbox: None,
         remote,
         remote_capabilities,
-        remote_socket_addr,
+        remote_socket_addr: Some(remote_socket_addr),
         audio_master_secret,
         input_master_secret,
         capability_profile: SessionCapabilityProfile::Full,
@@ -1862,21 +1930,36 @@ struct CapabilityTaskRuntime {
     audio_task: Option<audio::AudioTaskHandle>,
     audio_epoch: Option<CapabilityEpoch>,
     audio_plan: Option<AudioPlan>,
+    audio_lan: Option<audio_path::LanAudioPath>,
+    audio_blocked: Option<(CapabilityEpoch, Option<audio_path::LanAudioPath>)>,
+    audio_deadline: Option<Instant>,
     input_task: Option<tokio::task::JoinHandle<()>>,
     input_epoch: Option<CapabilityEpoch>,
+    pending_mux_input: Option<(Uuid, ByteStream, Instant)>,
+    input_generation: Option<Uuid>,
     input_role: Option<LocalInputRole>,
+    input_route: synly_core::transport::routing::ChannelRoute,
+    input_uses_mux: bool,
+    input_transport: Option<TransportKind>,
+    input_requires_manual: bool,
+    input_blocked: Option<(CapabilityEpoch, Option<TransportKind>)>,
 }
 
 impl CapabilityTaskRuntime {
-    fn new(clipboard_options: &crate::clipboard::ClipboardRuntimeOptions) -> Self {
+    fn new(clipboard_options: &crate::clipboard::ClipboardRuntimeOptions, role: SessionRole) -> Self {
         Self {
             clipboard: ClipboardCapabilityRuntime::new(clipboard_options),
             audio_task: None,
             audio_epoch: None,
             audio_plan: None,
+            audio_lan: None, audio_blocked: None, audio_deadline: None,
             input_task: None,
             input_epoch: None,
+            pending_mux_input: None,
+            input_generation: None,
             input_role: None,
+            input_route: synly_core::transport::routing::ChannelRoute::new(synly_core::transport::routing::FunctionalChannel::Input, matches!(role, SessionRole::Host), synly_core::transport::routing::PathPolicy::PreferBluetooth),
+            input_uses_mux: false, input_transport: None, input_requires_manual: false, input_blocked: None,
         }
     }
 
@@ -1888,6 +1971,7 @@ impl CapabilityTaskRuntime {
         }
         self.audio_epoch = None;
         self.audio_plan = None;
+        self.audio_lan = None; self.audio_deadline = None;
     }
 
     async fn stop_input(
@@ -1895,6 +1979,8 @@ impl CapabilityTaskRuntime {
         input_session_id: Option<&watch::Sender<Option<Uuid>>>,
         input_routes: Option<&Arc<InputRouteRegistry>>,
     ) {
+        self.input_requires_manual |= self.input_task.is_some() || self.input_generation.is_some();
+        self.input_route.cancel();
         if let Some(session_id) = input_session_id {
             if let Some(route_id) = *session_id.borrow()
                 && let Some(routes) = input_routes
@@ -1907,6 +1993,8 @@ impl CapabilityTaskRuntime {
             task.abort();
             let _ = task.await;
         }
+        self.pending_mux_input.take();
+        self.input_generation = None;
         self.input_epoch = None;
         self.input_role = None;
     }
@@ -1926,8 +2014,11 @@ impl CapabilityTaskRuntime {
 struct CapabilityRefreshContext<'a> {
     pub(crate) session_role: SessionRole,
     pub(crate) peer_device_id: Uuid,
-    pub(crate) remote_socket_addr: SocketAddr,
+    pub(crate) input_mux: Option<&'a synly_core::transport::generation::GenerationLane>,
+    pub(crate) input_transport: Option<TransportKind>,
+    pub(crate) remote_socket_addr: Option<SocketAddr>,
     pub(crate) audio_master_secret: [u8; 32],
+    pub(crate) audio_lan: Option<audio_path::LanAudioPath>,
     pub(crate) audio_layout: audio::AudioLayout,
     pub(crate) input_master_secret: [u8; 32],
     pub(crate) input_options: &'a InputRuntimeOptions,
@@ -1937,7 +2028,7 @@ struct CapabilityRefreshContext<'a> {
     pub(crate) input_routes: Option<&'a Arc<InputRouteRegistry>>,
     pub(crate) input_activity: &'a Arc<AtomicBool>,
     pub(crate) clipboard_hub: Option<&'a ClipboardHubHandle>,
-    pub(crate) tx: &'a mpsc::Sender<Frame>,
+    pub(crate) tx: &'a FrameSender,
 }
 
 async fn refresh_capability_tasks(
@@ -1955,6 +2046,7 @@ async fn refresh_capability_tasks(
     );
     let clipboard_can_send = allows_local_send(context.session_role, &clipboard_agreement);
     let clipboard_can_receive = allows_local_receive(context.session_role, &clipboard_agreement);
+    context.tx.set_clipboard_enabled(clipboard_can_send);
     if let Some(hub) = context.clipboard_hub {
         hub.set_receive_enabled(context.peer_device_id, clipboard_can_receive);
     } else {
@@ -1995,69 +2087,36 @@ async fn refresh_capability_tasks(
     runtime.clipboard.can_receive = clipboard_can_receive;
 
     let epoch = state.epoch();
-    let audio_plan = state
-        .audio_ready()
-        .then(|| resolve_audio_plan(context.session_role, local.audio_mode, remote.audio_mode))
-        .flatten();
-    if runtime.audio_epoch != Some(epoch) || runtime.audio_plan != audio_plan {
-        runtime.stop_audio().await;
-        runtime.audio_epoch = Some(epoch);
-        runtime.audio_plan = audio_plan;
-        match audio_plan {
-            Some(AudioPlan {
-                role: LocalAudioRole::Receive,
-                direction,
-            }) => match audio::bind_and_spawn_receiver_with_config(
-                context.audio_master_secret,
-                direction,
-                context.remote_socket_addr.ip(),
-                audio::CodecConfig {
-                    layout: context.audio_layout,
-                    ..audio::CodecConfig::default()
-                },
-            ) {
-                Ok((task, port, channel_id)) => {
-                    context
-                        .tx
-                        .send(Frame::Control(ControlMessage::AudioUdpReady {
-                            epoch,
-                            port,
-                            layout: match context.audio_layout {
-                                audio::AudioLayout::Stereo => ProtocolAudioLayout::Stereo,
-                                audio::AudioLayout::Surround51 => ProtocolAudioLayout::Surround51,
-                                audio::AudioLayout::Surround71 => ProtocolAudioLayout::Surround71,
-                            },
-                            channel_id,
-                        }))
-                        .await?;
-                    runtime.audio_task = Some(task);
-                }
-                Err(err) => {
-                    tracing::warn!(error = %err, "无法启动音频接收通道");
-                }
-            },
-            Some(AudioPlan {
-                role: LocalAudioRole::Send,
-                ..
-            }) => tracing::info!(?epoch, "音频发送端等待对侧接收端口"),
-            None => {}
-        }
-    }
+    audio_path::refresh(state, runtime, &context).await?;
 
     let input_role = state
         .is_local_acknowledged()
         .then(|| negotiate_input(local.input_mode, remote.input_mode))
-        .flatten();
-    if runtime.input_epoch != Some(epoch) || runtime.input_role != input_role {
+        .flatten()
+        .filter(|_| context.input_transport.is_some() && (context.remote_socket_addr.is_some() || context.input_mux.is_some()));
+    if runtime.input_blocked == Some((epoch, context.input_transport)) { return Ok(()); }
+    if runtime.input_epoch != Some(epoch) || runtime.input_role != input_role || runtime.input_uses_mux != context.input_mux.is_some() || runtime.input_transport != context.input_transport {
         runtime
             .stop_input(context.input_session_id, context.input_routes)
             .await;
         context.input_activity.store(false, Ordering::Release);
         runtime.input_epoch = Some(epoch);
         runtime.input_role = input_role;
+        runtime.input_uses_mux = context.input_mux.is_some();
+        runtime.input_transport = context.input_transport;
+        runtime.input_blocked = None;
         if let Some(local_role) = input_role
             && matches!(context.session_role, SessionRole::Host)
         {
+            if let Some(lane) = context.input_mux {
+                let generation = Uuid::new_v4();
+                runtime.pending_mux_input = Some((generation, lane.lease(generation)?, Instant::now() + Duration::from_secs(10)));
+                runtime.input_generation = Some(generation);
+                let route_epoch = runtime.input_route.begin(context.input_transport)?;
+                let message = runtime.input_route.quiesced(route_epoch)?;
+                context.tx.send(Frame::Control(ControlMessage::InputPath { epoch, generation, message })).await?;
+                return Ok(());
+            }
             let channel = InputHostChannel::create()?;
             let session_id = channel.offer().session_id;
             let offer = channel.offer().clone();
@@ -2084,13 +2143,15 @@ async fn refresh_capability_tasks(
             input_options.mode = local.input_mode;
             let input_master_secret = context.input_master_secret;
             let activity = Arc::clone(context.input_activity);
+            let require_manual = runtime.input_requires_manual;
             let task = tokio::spawn(async move {
-                if let Err(err) = input::run_input_session(
+                if let Err(err) = input::run_input_session_with_gate(
                     InputSessionContext::host(channel, inbox),
                     input_master_secret,
                     local_role,
                     input_options,
                     Some(activity),
+                    require_manual,
                 )
                 .await
                 {
@@ -2131,7 +2192,8 @@ fn input_task_restart_required(
     previous_backend_generation: u64,
     next_backend_generation: u64,
 ) -> bool {
-    previous.edge != next.edge
+    previous.path != next.path
+        || previous.edge != next.edge
         || previous.hotkey != next.hotkey
         || previous.reverse_mouse_wheel != next.reverse_mouse_wheel
         || previous.reverse_trackpad != next.reverse_trackpad
@@ -2142,33 +2204,6 @@ fn input_task_restart_required(
         || previous.key_mapping != next.key_mapping
         || previous.cursor_mode != next.cursor_mode
         || previous_backend_generation != next_backend_generation
-}
-
-fn spawn_frame_reader<R>(
-    reader: R,
-    transfer_limits: TransferLimits,
-) -> (mpsc::Receiver<Result<Frame>>, tokio::task::JoinHandle<()>)
-where
-    R: AsyncRead + Unpin + Send + 'static,
-{
-    let (tx, rx) = mpsc::channel(64);
-    let task = tokio::spawn(async move {
-        let mut reader = FrameReader::with_limits(reader, transfer_limits);
-        loop {
-            match reader.read_frame().await {
-                Ok(frame) => {
-                    if tx.send(Ok(frame)).await.is_err() {
-                        break;
-                    }
-                }
-                Err(err) => {
-                    let _ = tx.send(Err(err)).await;
-                    break;
-                }
-            }
-        }
-    });
-    (rx, task)
 }
 
 pub(crate) async fn run_sync_session(
@@ -2182,7 +2217,34 @@ pub(crate) async fn run_sync_session(
         "同步会话已开始"
     );
 
-    let initial_local_capabilities = options.capability_profile.apply(RuntimeCapabilities {
+    let _logical_owner = session.logical.owner()?;
+    let logical = session.logical.clone();
+    let mut secondary_inbox = session.secondary_inbox;
+    let mut secondary = None;
+    let (stream, channels) = synly_core::transport::bluetooth::open(session.stream);
+    let mut bluetooth_channels = Some(channels);
+    let primary_input_mux = bluetooth_channels.as_ref().map(|channels| channels.input.clone());
+    let mut input_mux = primary_input_mux.clone();
+    let mut input_transport = None;
+    let mut remote_input_policy = synly_core::transport::routing::PathPolicy::PreferBluetooth;
+    let mut remote_transport_state = input_route::available(session.transport, None);
+    let mut remote_transport_generation = 0;
+    let mut advertised_transport_state = None;
+    let mut reported_transport_status = None;
+    let mut transport_generation = 0u64;
+    let primary_clipboard_lane = bluetooth_channels.as_mut().expect("已创建主承载").enable_clipboard_routes()?;
+    let mut clipboard_route = ClipboardRoute::new(matches!(session.role, SessionRole::Host), options.transfer_limits);
+    let mut remote_clipboard_policy = synly_core::transport::routing::PathPolicy::Auto;
+    let capability_profile = options.capability_profile;
+    let has_lan = session.remote_socket_addr.is_some();
+    let has_mux_input = input_mux.is_some();
+    let apply_capabilities = |capabilities| {
+        let mut capabilities = capability_profile.apply(capabilities);
+        if !has_lan { capabilities.audio_mode = AudioMode::Off; }
+        if !has_lan && !has_mux_input { capabilities.input_mode = InputMode::Off; }
+        capabilities
+    };
+    let initial_local_capabilities = apply_capabilities(RuntimeCapabilities {
         clipboard_mode: options.clipboard_mode,
         audio_mode: options.audio_mode,
         input_mode: options.input_mode,
@@ -2206,6 +2268,7 @@ pub(crate) async fn run_sync_session(
         current_tuning.input_backend_generation,
         current_tuning.input_backend_generation,
     );
+    let mut clipboard_policy = current_tuning.clipboard.path;
     let mut input_options = current_tuning.input;
     let mut input_backend_generation = current_tuning.input_backend_generation;
     let shutdown = options.control.shutdown().clone();
@@ -2234,13 +2297,9 @@ pub(crate) async fn run_sync_session(
         "运行时能力协商完成"
     );
 
-    let (read_half, write_half) = tokio::io::split(session.stream);
-    let (tx, rx) = mpsc::channel::<Frame>(64);
+    let (tx, mut incoming_frames, frame_io) = synly_core::transport::frames::open_control(stream, options.transfer_limits);
+    let (tx, clipboard_sender_guard) = tx.routed_clipboard();
     let mut session_tasks = SessionTaskAbortGuard::default();
-    let writer_task = tokio::spawn(writer_loop(write_half, rx, options.transfer_limits));
-    session_tasks.track(&writer_task);
-    let (mut incoming_frames, reader_task) = spawn_frame_reader(read_half, options.transfer_limits);
-    session_tasks.track(&reader_task);
     if let Some(hub) = options.clipboard_hub.clone() {
         let rx = hub.subscribe(session.remote.device_id);
         let forward_tx = tx.clone();
@@ -2255,7 +2314,8 @@ pub(crate) async fn run_sync_session(
         session_tasks.track(&task);
     }
 
-    let mut capability_runtime = CapabilityTaskRuntime::new(options.clipboard_options);
+    let mut audio_lan = None;
+    let mut capability_runtime = CapabilityTaskRuntime::new(options.clipboard_options, session.role);
     refresh_capability_tasks(
         &capability_state,
         &mut capability_runtime,
@@ -2263,8 +2323,10 @@ pub(crate) async fn run_sync_session(
         CapabilityRefreshContext {
             session_role: session.role,
             peer_device_id: session.remote.device_id,
+            input_mux: input_mux.as_ref(), input_transport,
             remote_socket_addr,
             audio_master_secret,
+            audio_lan,
             audio_layout: options.audio_layout,
             input_master_secret,
             input_options: &input_options,
@@ -2291,7 +2353,7 @@ pub(crate) async fn run_sync_session(
     report_capability_state(&options.control, &peer_summary, &capability_state);
     let current_capabilities = *capabilities.borrow_and_update();
     let initial_update = capability_state
-        .set_local(options.capability_profile.apply(current_capabilities))
+        .set_local(apply_capabilities(current_capabilities))
         .or_else(|| initial_input_tuning_changed.then(|| capability_state.bump_local()));
     if let Some((generation, capabilities)) = initial_update {
         tx.send(Frame::Control(ControlMessage::CapabilitiesUpdate {
@@ -2307,8 +2369,10 @@ pub(crate) async fn run_sync_session(
             CapabilityRefreshContext {
                 session_role: session.role,
                 peer_device_id: session.remote.device_id,
-                remote_socket_addr,
+                input_mux: input_mux.as_ref(), input_transport,
+            remote_socket_addr,
                 audio_master_secret,
+                audio_lan,
                 audio_layout: options.audio_layout,
                 input_master_secret,
                 input_options: &input_options,
@@ -2325,9 +2389,72 @@ pub(crate) async fn run_sync_session(
         report_capability_state(&options.control, &peer_summary, &capability_state);
     }
 
+    let mut clipboard_delivery = clipboard_delivery::Delivery::default();
     let disconnected = loop {
+        let available = input_route::available(session.transport, secondary.as_ref());
+        if advertised_transport_state != Some((available, input_options.path, clipboard_policy)) {
+            transport_generation = transport_generation.checked_add(1).context("传输状态代次已耗尽")?;
+            tx.send(Frame::Control(ControlMessage::TransportState { generation: transport_generation, available, input_policy: input_options.path, clipboard_policy })).await?;
+            advertised_transport_state = Some((available, input_options.path, clipboard_policy));
+        }
+        capability_runtime.input_route.update_policy(input_options.path);
+        let current = capability_runtime.input_role.and(capability_runtime.input_transport);
+        let (choice, lane) = input_route::select(session.transport, primary_input_mux.as_ref(), secondary.as_ref(), remote_transport_state, input_options.path, remote_input_policy, current);
+        input_transport = (remote_transport_generation > 0).then(|| choice.transport()).flatten();
+        input_mux = if input_transport.is_some() { lane } else { None };
+        audio_lan = audio_path::select(session.transport, remote_socket_addr, session.logical.id(), secondary.as_ref(), if remote_transport_generation > 0 { remote_transport_state } else { Default::default() });
+        refresh_capability_tasks(&capability_state, &mut capability_runtime, &mut session_tasks, CapabilityRefreshContext {
+            session_role: session.role, peer_device_id: session.remote.device_id, input_mux: input_mux.as_ref(), input_transport, remote_socket_addr,
+            audio_master_secret, audio_lan, audio_layout: options.audio_layout, input_master_secret, input_options: &input_options,
+            input_inbox: options.input_inbox.as_ref(), input_session_id: options.input_session_id.as_ref(),
+            input_socket_tx: options.input_socket_tx.as_ref(), input_routes: options.input_routes.as_ref(),
+            input_activity: &input_activity, clipboard_hub: options.clipboard_hub.as_ref(), tx: &tx,
+        }).await?;
+        if remote_transport_generation > 0 {
+            clipboard_route.reconcile(ClipboardRouteContext { capabilities: &capability_state, primary: session.transport, primary_lane: &primary_clipboard_lane, secondary: secondary.as_ref().and_then(ClipboardRouteContext::secondary), remote_links: remote_transport_state, policy: clipboard_policy, remote_policy: remote_clipboard_policy, tx: &tx }).await?;
+        }
+        let clipboard_deadline = clipboard_route.deadline();
+        let audio_deadline = capability_runtime.audio_deadline;
+        let status = crate::runtime_control::TransportStatus {
+            primary: session.transport, available, input: choice,
+            input_running: capability_runtime.input_task.is_some(),
+            clipboard: clipboard_route.transport(),
+            clipboard_choice: clipboard_route.choice(ClipboardRouteContext { capabilities: &capability_state, primary: session.transport, primary_lane: &primary_clipboard_lane, secondary: secondary.as_ref().and_then(ClipboardRouteContext::secondary), remote_links: remote_transport_state, policy: clipboard_policy, remote_policy: remote_clipboard_policy, tx: &tx }),
+            clipboard_switching: clipboard_route.switching(), clipboard_failed: clipboard_route.failed(),
+            audio: capability_runtime.audio_task.as_ref().map(|_| TransportKind::Lan), audio_waiting: capability_runtime.audio_deadline.is_some(),
+            audio_failed: capability_runtime.audio_blocked == Some((capability_state.epoch(), audio_lan)),
+            audio_unavailable: audio_lan.is_none() && resolve_audio_plan(session.role, capability_state.effective_local().audio_mode, capability_state.effective_remote().audio_mode).is_some(),
+            switching: capability_runtime.pending_mux_input.is_some(),
+            failed: capability_runtime.input_blocked.is_some(),
+            requires_manual_activation: capability_runtime.input_requires_manual,
+        };
+        if reported_transport_status != Some(status) {
+            options.control.report(RuntimeEvent::Transport { peer: peer_summary.clone(), status });
+            reported_transport_status = Some(status);
+        }
         let frame = tokio::select! {
             biased;
+            result = audio_path::finish(&mut capability_runtime.audio_task) => {
+                if let Err(error) = result { tracing::warn!(error = %error, "音频 LAN 任务结束"); }
+                if let Some(message) = audio_path::fail(&mut capability_runtime).await { tx.send(Frame::Control(message)).await?; } continue;
+            }
+            _ = async { match audio_deadline { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => {
+                if let Some(message) = audio_path::fail(&mut capability_runtime).await { tx.send(Frame::Control(message)).await?; } continue;
+            }
+            receipt = clipboard_delivery.receipt() => { tx.send(Frame::Control(receipt)).await?; continue; }
+            payload = clipboard_route.incoming() => {
+                match payload {
+                    Ok(transfer) => { if let Some(receipt) = clipboard_delivery.begin(transfer, capability_runtime.clipboard.can_receive, &capability_runtime.clipboard.sync, options.clipboard_hub.as_ref(), session.remote.device_id)? { tx.send(Frame::Control(receipt)).await?; } }
+                    Err(error) => {
+                        tracing::warn!(error = %error, "剪贴板子流失败");
+                        clipboard_route.fail(ClipboardRouteContext { capabilities: &capability_state, primary: session.transport, primary_lane: &primary_clipboard_lane, secondary: secondary.as_ref().and_then(ClipboardRouteContext::secondary), remote_links: remote_transport_state, policy: clipboard_policy, remote_policy: remote_clipboard_policy, tx: &tx }, true).await?;
+                    }
+                }
+                continue;
+            }
+            _ = async { match clipboard_deadline { Some(deadline) => tokio::time::sleep_until(deadline).await, None => std::future::pending().await } } => {
+                clipboard_route.fail(ClipboardRouteContext { capabilities: &capability_state, primary: session.transport, primary_lane: &primary_clipboard_lane, secondary: secondary.as_ref().and_then(ClipboardRouteContext::secondary), remote_links: remote_transport_state, policy: clipboard_policy, remote_policy: remote_clipboard_policy, tx: &tx }, true).await?; continue;
+            }
             _ = shutdown.cancelled() => {
                 capability_runtime
                     .stop_all(
@@ -2366,7 +2493,7 @@ pub(crate) async fn run_sync_session(
                 }
                 let next = *capabilities.borrow_and_update();
                 if let Some((generation, capabilities)) = capability_state
-                    .set_local(options.capability_profile.apply(next))
+                    .set_local(apply_capabilities(next))
                 {
                     refresh_capability_tasks(
                         &capability_state,
@@ -2375,8 +2502,10 @@ pub(crate) async fn run_sync_session(
                         CapabilityRefreshContext {
                             session_role: session.role,
                             peer_device_id: session.remote.device_id,
-                            remote_socket_addr,
+                            input_mux: input_mux.as_ref(), input_transport,
+            remote_socket_addr,
                             audio_master_secret,
+                            audio_lan,
                             audio_layout: options.audio_layout,
                             input_master_secret,
                             input_options: &input_options,
@@ -2412,6 +2541,7 @@ pub(crate) async fn run_sync_session(
                     input_backend_generation,
                     next.input_backend_generation,
                 );
+                clipboard_policy = next.clipboard.path;
                 if let Some(hub) = &options.clipboard_hub {
                     hub.update_options(next.clipboard.clone());
                 } else {
@@ -2421,6 +2551,7 @@ pub(crate) async fn run_sync_session(
                         .update_options(next.clipboard)?;
                 }
                 input_options = next.input;
+                if input_changed { capability_runtime.input_blocked = None; }
                 input_backend_generation = next.input_backend_generation;
                 if input_changed {
                     let (generation, capabilities) = capability_state.bump_local();
@@ -2431,8 +2562,10 @@ pub(crate) async fn run_sync_session(
                         CapabilityRefreshContext {
                             session_role: session.role,
                             peer_device_id: session.remote.device_id,
-                            remote_socket_addr,
+                            input_mux: input_mux.as_ref(), input_transport,
+            remote_socket_addr,
                             audio_master_secret,
+                            audio_lan,
                             audio_layout: options.audio_layout,
                             input_master_secret,
                             input_options: &input_options,
@@ -2455,6 +2588,48 @@ pub(crate) async fn run_sync_session(
                     capability_ack_deadline = Some(Instant::now() + CAPABILITY_ACK_TIMEOUT);
                 }
                 continue;
+            }
+            _ = wait_for_capability_ack(capability_runtime.pending_mux_input.as_ref().map(|pending| pending.2)) => {
+                input_route::fail(&mut capability_runtime, &capability_state, CapabilityRefreshContext {
+                    session_role: session.role, peer_device_id: session.remote.device_id, input_mux: input_mux.as_ref(), input_transport, remote_socket_addr,
+                    audio_master_secret, audio_lan, audio_layout: options.audio_layout, input_master_secret, input_options: &input_options,
+                    input_inbox: options.input_inbox.as_ref(), input_session_id: options.input_session_id.as_ref(),
+                    input_socket_tx: options.input_socket_tx.as_ref(), input_routes: options.input_routes.as_ref(),
+                    input_activity: &input_activity, clipboard_hub: options.clipboard_hub.as_ref(), tx: &tx,
+                }, true).await?;
+                continue;
+            }
+            _ = input_route::task_finished(&mut capability_runtime.input_task) => {
+                input_route::fail(&mut capability_runtime, &capability_state, CapabilityRefreshContext {
+                    session_role: session.role, peer_device_id: session.remote.device_id, input_mux: input_mux.as_ref(), input_transport, remote_socket_addr,
+                    audio_master_secret, audio_lan, audio_layout: options.audio_layout, input_master_secret, input_options: &input_options,
+                    input_inbox: options.input_inbox.as_ref(), input_session_id: options.input_session_id.as_ref(),
+                    input_socket_tx: options.input_socket_tx.as_ref(), input_routes: options.input_routes.as_ref(),
+                    input_activity: &input_activity, clipboard_hub: options.clipboard_hub.as_ref(), tx: &tx,
+                }, true).await?;
+                continue;
+            }
+            candidate = synly_core::transport::logical::receive_secondary(&mut secondary_inbox) => {
+                match candidate {
+                    Some(candidate) => {
+                        let transport = candidate.guard.transport();
+                        if !logical.has(transport) || transport == logical.primary() || secondary.is_some() { bail!("候选链路未绑定或已存在副承载"); }
+                        let mut tunnel = candidate.multiplex(); tunnel.channels.enable_clipboard_routes()?;
+                        secondary = Some(tunnel);
+                        tracing::info!(?transport, session = %logical.id(), "副承载已加入当前逻辑会话, 控制路径保持不变");
+                    }
+                    None => secondary_inbox = None,
+                }
+                continue;
+            }
+            error = synly_core::transport::logical::secondary_failure(&mut secondary) => {
+                let transport = secondary.as_ref().map(|secondary| secondary.transport());
+                secondary.take();
+                tracing::warn!(?transport, %error, "副承载已经移除, 主会话继续运行");
+                continue;
+            }
+            error = synly_core::transport::bluetooth::wait_failure(&mut bluetooth_channels) => {
+                bail!("主承载复用失败: {error}");
             }
             incoming = incoming_frames.recv() => {
                 match incoming {
@@ -2484,8 +2659,10 @@ pub(crate) async fn run_sync_session(
                         CapabilityRefreshContext {
                             session_role: session.role,
                             peer_device_id: session.remote.device_id,
-                            remote_socket_addr,
+                            input_mux: input_mux.as_ref(), input_transport,
+            remote_socket_addr,
                             audio_master_secret,
+                            audio_lan,
                             audio_layout: options.audio_layout,
                             input_master_secret,
                             input_options: &input_options,
@@ -2512,8 +2689,10 @@ pub(crate) async fn run_sync_session(
                         CapabilityRefreshContext {
                             session_role: session.role,
                             peer_device_id: session.remote.device_id,
-                            remote_socket_addr,
+                            input_mux: input_mux.as_ref(), input_transport,
+            remote_socket_addr,
                             audio_master_secret,
+                            audio_lan,
                             audio_layout: options.audio_layout,
                             input_master_secret,
                             input_options: &input_options,
@@ -2530,7 +2709,37 @@ pub(crate) async fn run_sync_session(
                     report_capability_state(&options.control, &peer_summary, &capability_state);
                 }
             }
+            Frame::Control(ControlMessage::TransportState { generation, available, input_policy, clipboard_policy }) => {
+                if generation == 0 || !available.contains(session.transport) { bail!("对端传输状态代次或主承载无效"); }
+                if generation == remote_transport_generation && (available != remote_transport_state || input_policy != remote_input_policy || clipboard_policy != remote_clipboard_policy) { bail!("同一传输代次收到冲突状态"); }
+                if generation > remote_transport_generation {
+                    if available != remote_transport_state || input_policy != remote_input_policy { capability_runtime.input_blocked = None; }
+                    remote_transport_generation = generation; remote_transport_state = available; remote_input_policy = input_policy; remote_clipboard_policy = clipboard_policy;
+                }
+            }
+            Frame::Control(ControlMessage::InputPath { epoch, generation, message }) => {
+                input_route::receive(epoch, generation, message, &capability_state, &mut capability_runtime, &mut session_tasks, CapabilityRefreshContext {
+                    session_role: session.role, peer_device_id: session.remote.device_id, input_mux: input_mux.as_ref(), input_transport, remote_socket_addr,
+                    audio_master_secret, audio_lan, audio_layout: options.audio_layout, input_master_secret, input_options: &input_options,
+                    input_inbox: options.input_inbox.as_ref(), input_session_id: options.input_session_id.as_ref(),
+                    input_socket_tx: options.input_socket_tx.as_ref(), input_routes: options.input_routes.as_ref(),
+                    input_activity: &input_activity, clipboard_hub: options.clipboard_hub.as_ref(), tx: &tx,
+                }).await?;
+            }
+            Frame::Control(ControlMessage::InputPathFailed { epoch, generation }) => {
+                if capability_state.current_epoch(epoch) && capability_runtime.input_generation == Some(generation) {
+                    input_route::fail(&mut capability_runtime, &capability_state, CapabilityRefreshContext {
+                        session_role: session.role, peer_device_id: session.remote.device_id, input_mux: input_mux.as_ref(), input_transport, remote_socket_addr,
+                        audio_master_secret, audio_lan, audio_layout: options.audio_layout, input_master_secret, input_options: &input_options,
+                        input_inbox: options.input_inbox.as_ref(), input_session_id: options.input_session_id.as_ref(),
+                        input_socket_tx: options.input_socket_tx.as_ref(), input_routes: options.input_routes.as_ref(),
+                        input_activity: &input_activity, clipboard_hub: options.clipboard_hub.as_ref(), tx: &tx,
+                    }, false).await?;
+                }
+            }
+            Frame::Control(ControlMessage::InputMuxOffer { .. } | ControlMessage::InputMuxReady { .. }) => { bail!("不再接受未经四阶段提交的输入复用协商"); }
             Frame::Control(ControlMessage::InputChannelOffer { epoch, offer }) => {
+                if input_transport != Some(TransportKind::Lan) || input_mux.is_some() { continue; }
                 if !capability_state.current_epoch(epoch) {
                     tracing::debug!(?epoch, current = ?capability_state.epoch(), "忽略过期输入辅助通道");
                     continue;
@@ -2538,6 +2747,10 @@ pub(crate) async fn run_sync_session(
                 if matches!(session.role, SessionRole::Host) {
                     bail!("host 输入会话收到对侧辅助通道 offer");
                 }
+                let Some(input_address) = remote_socket_addr else {
+                    tracing::warn!("蓝牙会话拒绝 TCP 输入辅助通道 offer");
+                    continue;
+                };
                 let local = capability_state.effective_local();
                 let remote = capability_state.effective_remote();
                 let Some(local_role) = negotiate_input(local.input_mode, remote.input_mode) else {
@@ -2550,13 +2763,15 @@ pub(crate) async fn run_sync_session(
                 let mut task_input_options = input_options.clone();
                 task_input_options.mode = local.input_mode;
                 let activity_for_input = Arc::clone(&input_activity);
+                let require_manual = capability_runtime.input_requires_manual;
                 let task = tokio::spawn(async move {
-                    if let Err(err) = input::run_input_session(
-                        InputSessionContext::client(offer, remote_socket_addr),
+                    if let Err(err) = input::run_input_session_with_gate(
+                        InputSessionContext::client(offer, input_address),
                         input_master_secret,
                         local_role,
                         task_input_options,
                         Some(activity_for_input),
+                        require_manual,
                     )
                     .await
                     {
@@ -2566,47 +2781,13 @@ pub(crate) async fn run_sync_session(
                 session_tasks.track(&task);
                 capability_runtime.input_task = Some(task);
             }
-            Frame::Control(ControlMessage::AudioUdpReady {
-                epoch,
-                port,
-                layout,
-                channel_id,
-            }) => {
-                if !capability_state.current_epoch(epoch) {
-                    tracing::debug!(?epoch, current = ?capability_state.epoch(), "忽略过期音频接收端口");
-                    continue;
+            Frame::Control(ControlMessage::AudioPathFailed { epoch, path_id }) => {
+                if capability_state.current_epoch(epoch) && capability_runtime.audio_lan.is_some_and(|path| path.binding_id == path_id) {
+                    let _ = audio_path::fail(&mut capability_runtime).await;
                 }
-                if let Some(AudioPlan {
-                    role: LocalAudioRole::Send,
-                    direction,
-                }) = capability_runtime.audio_plan
-                    && capability_runtime.audio_task.is_none()
-                {
-                    let remote_audio_addr = SocketAddr::new(remote_socket_addr.ip(), port);
-                    let codec_layout = match layout {
-                        ProtocolAudioLayout::Stereo => audio::AudioLayout::Stereo,
-                        ProtocolAudioLayout::Surround51 => audio::AudioLayout::Surround51,
-                        ProtocolAudioLayout::Surround71 => audio::AudioLayout::Surround71,
-                    };
-                    let codec = audio::CodecConfig {
-                        layout: codec_layout,
-                        ..audio::CodecConfig::default()
-                    };
-                    match audio::spawn_sender_with_config(
-                        audio_master_secret,
-                        channel_id,
-                        direction,
-                        remote_audio_addr,
-                        codec,
-                    ) {
-                        Ok(task) => {
-                            capability_runtime.audio_task = Some(task);
-                        }
-                        Err(err) => {
-                            tracing::warn!(error = %err, "无法启动音频发送通道");
-                        }
-                    }
-                }
+            }
+            Frame::Control(ControlMessage::AudioUdpReady { epoch, path_id, port, layout, channel_id }) => {
+                audio_path::receive(audio_path::Ready { epoch, path_id, port, layout, channel_id }, &capability_state, &mut capability_runtime, audio_master_secret)?;
             }
             Frame::Control(ControlMessage::Error { message }) => {
                 tracing::warn!(%message, "对端报告错误");
@@ -2624,6 +2805,15 @@ pub(crate) async fn run_sync_session(
             | Frame::Control(ControlMessage::PairDecision { .. }) => {
                 bail!("received an unexpected pairing message after session start")
             }
+            Frame::Control(ControlMessage::ClipboardPath { epoch, generation, message }) => {
+                clipboard_route.receive(epoch, generation, message, ClipboardRouteContext { capabilities: &capability_state, primary: session.transport, primary_lane: &primary_clipboard_lane, secondary: secondary.as_ref().and_then(ClipboardRouteContext::secondary), remote_links: remote_transport_state, policy: clipboard_policy, remote_policy: remote_clipboard_policy, tx: &tx }).await?;
+            }
+            Frame::Control(ControlMessage::ClipboardPathFailed { epoch, generation }) => {
+                clipboard_route.remote_failed(epoch, generation, ClipboardRouteContext { capabilities: &capability_state, primary: session.transport, primary_lane: &primary_clipboard_lane, secondary: secondary.as_ref().and_then(ClipboardRouteContext::secondary), remote_links: remote_transport_state, policy: clipboard_policy, remote_policy: remote_clipboard_policy, tx: &tx }).await?;
+            }
+            Frame::Control(ControlMessage::ClipboardApplied { stamp }) => tx.clipboard_receipt(stamp, true),
+            Frame::Control(ControlMessage::ClipboardRejected { stamp }) => tx.clipboard_receipt(stamp, false),
+            Frame::ClipboardTransfer(_) => bail!("剪贴板载荷不能通过主控制子流发送"),
             Frame::Clipboard(payload) => {
                 if !capability_runtime.clipboard.can_receive {
                     continue;
@@ -2652,45 +2842,19 @@ pub(crate) async fn run_sync_session(
             options.input_routes.as_ref(),
         )
         .await;
-    reader_task.abort();
-    let _ = reader_task.await;
+    drop(clipboard_sender_guard);
     drop(tx);
-    match writer_task.await {
-        Ok(Ok(())) => {}
-        Ok(Err(err)) if disconnected && is_connection_shutdown_error(&err) => {}
-        Ok(Err(err)) => return Err(err),
-        Err(err) => return Err(err.into()),
-    }
-    Ok(())
-}
-
-async fn writer_loop<W>(
-    writer: W,
-    mut rx: mpsc::Receiver<Frame>,
-    transfer_limits: TransferLimits,
-) -> Result<()>
-where
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    let mut writer = FrameWriter::with_limits(writer, transfer_limits);
-    while let Some(frame) = rx.recv().await {
-        match writer.write_frame(frame).await {
-            Ok(()) => {}
-            Err(err) => {
-                if let Some(message) = frame_size_limit_message(&err) {
-                    tracing::warn!(%message, "已跳过超出大小限制的内容");
-                    continue;
-                }
-                return Err(err);
-            }
-        }
+    match frame_io.finish().await {
+        Ok(()) => {},
+        Err(error) if disconnected && is_connection_shutdown_error(&error) => {},
+        Err(error) => return Err(error),
     }
     Ok(())
 }
 
 async fn clipboard_sender_loop(
     mut rx: mpsc::UnboundedReceiver<ClipboardPayload>,
-    tx: mpsc::Sender<Frame>,
+    tx: FrameSender,
 ) -> Result<()> {
     while let Some(payload) = rx.recv().await {
         tx.send(Frame::Clipboard(payload)).await?;
@@ -2706,6 +2870,9 @@ async fn choose_peer(
     discovery_config: &crate::config::DiscoveryConfig,
 ) -> Result<PeerTarget> {
     let query = require_peer_query(peer_query)?;
+    if let Some((address, device_id)) = bluetooth::parse_target(query)? {
+        return Ok(PeerTarget::Bluetooth { address, device_id });
+    }
     if let Some(address) = parse_direct_peer_addr(query) {
         return Ok(PeerTarget::Direct(address));
     }
@@ -3399,10 +3566,61 @@ mod tests {
     use std::time::Duration;
     use uuid::Uuid;
 
+    #[tokio::test]
+    async fn lan_candidate_authenticates_at_capacity_without_saving_trust_or_enabling_new_capabilities() {
+        use super::{device_identity, handle_trusted_incoming_connection};
+        use std::sync::Arc;
+        use crate::protocol::{Frame, ControlMessage};
+        use crate::host::{ActiveSlot, ActiveSlotReserver};
+        use synly_core::transport::{logical::{LogicalSession, SessionKeys}, routing::TransportKind, stream::ByteStream};
+        let client = synly_core::identity::generate_device_config("client".to_owned()).unwrap();
+        let mut config = sample_config_with_trusted_devices(Vec::new());
+        config.device = synly_core::identity::generate_device_config("host".to_owned()).unwrap();
+        config.runtime.connection = Some(crate::settings::ConnectionPreference::Host);
+        let options = crate::runtime_options::runtime_options_from_config(&config, None, false).unwrap();
+        let host_peer = device_identity(&config.device, None); let client_peer = device_identity(&client, None);
+        let id = Uuid::new_v4();
+        let host_logical = LogicalSession::new(id, host_peer.clone(), client_peer.clone(), TransportKind::Bluetooth, [9; 32]).unwrap();
+        let client_logical = LogicalSession::new(id, client_peer.clone(), host_peer.clone(), TransportKind::Bluetooth, [9; 32]).unwrap();
+        let _host_owner = host_logical.owner().unwrap(); let _client_owner = client_logical.owner().unwrap();
+        let admission = super::lan_admission::LanAdmission { active: vec![host_logical.clone()], full: true };
+        let slot = Arc::new(Mutex::new(ActiveSlot::with_preferred(None))); let reserver = ActiveSlotReserver::new(slot.clone());
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let host = async {
+            let (socket, address) = listener.accept().await.unwrap();
+            let (session, reservation) = handle_trusted_incoming_connection(socket, address, &mut config, &options, &reserver, &admission).await.unwrap().unwrap();
+            assert!(session.require_existing_session && session.trusted_reconnect);
+            assert!(config.trusted_devices.is_empty());
+            let bound = host_logical.accept(session.stream, &session.remote, TransportKind::Lan, session.candidate_exporter.value()).await.unwrap();
+            drop(reservation); bound
+        };
+        let candidate = async {
+            let socket = tokio::net::TcpStream::connect(address).await.unwrap();
+            let connector = crate::crypto::build_client_connector(&client, &host_peer.tls_root_certificate).unwrap();
+            let mut stream = connector.connect(crate::crypto::server_name().unwrap(), socket).await.unwrap();
+            let request_id = Uuid::new_v4().to_string();
+            let exporter = crate::crypto::export_keying_material_from_client(&stream, &request_id).unwrap();
+            let payload = crate::protocol::PairRequestPayload { protocol_version: crate::protocol::PROTOCOL_VERSION, client: client_peer.clone(), capabilities: crate::protocol::RuntimeCapabilities { clipboard_mode: ClipboardMode::Off, audio_mode: AudioMode::Off, input_mode: InputMode::Off }, request_trust: false };
+            let proof = crate::crypto::sign_trusted_pair_auth(&exporter, client.identity_private_key().unwrap(), &request_id, &payload).unwrap();
+            crate::protocol::FrameWriter::new(&mut stream).write_frame(Frame::Control(ControlMessage::PairRequest { request_id: request_id.clone(), payload, trusted_proof: Some(proof) })).await.unwrap();
+            let Frame::Control(decision) = crate::protocol::FrameReader::new(&mut stream).read_frame().await.unwrap() else { panic!("候选应收到可信决定") };
+            assert!(matches!(decision, ControlMessage::PairDecision { accepted: true, trust_established: false, .. }));
+            crate::crypto::verify_trusted_pair_decision(&decision, &exporter, &request_id, &host_peer.identity_public_key).unwrap();
+            let keys = SessionKeys::client(&stream, &request_id).unwrap();
+            client_logical.connect(ByteStream::new(stream), &host_peer, TransportKind::Lan, keys.candidate_exporter().value()).await.unwrap()
+        };
+        let (a, b) = tokio::time::timeout(Duration::from_secs(3), async { tokio::join!(host, candidate) }).await.unwrap();
+        assert!(host_logical.has(TransportKind::Lan) && client_logical.has(TransportKind::Lan));
+        assert!(config.trusted_devices.is_empty() && slot.lock().unwrap().active().is_none());
+        drop(a); drop(b); assert!(host_logical.is_open() && client_logical.is_open());
+    }
+
     #[test]
     fn input_backend_generation_restarts_the_input_task() {
         let input = InputRuntimeOptions {
             mode: InputMode::Receive,
+            path: synly_core::transport::routing::PathPolicy::PreferBluetooth,
             edge: ScreenEdge::Right,
             hotkey: Hotkey::DEFAULT.parse().unwrap(),
             reverse_mouse_wheel: false,
@@ -3417,6 +3635,9 @@ mod tests {
 
         assert!(!input_task_restart_required(&input, &input, 3, 3));
         assert!(input_task_restart_required(&input, &input, 3, 4));
+        let mut changed_path = input.clone();
+        changed_path.path = synly_core::transport::routing::PathPolicy::LanOnly;
+        assert!(input_task_restart_required(&input, &changed_path, 3, 3));
         let mut changed_mode = input.clone();
         changed_mode.cursor_mode = crate::input::CursorMode::Game;
         assert!(input_task_restart_required(&input, &changed_mode, 3, 3));
@@ -3868,6 +4089,7 @@ mod tests {
                 discovery: DiscoveryConfig::default(),
                 input: InputRuntimeOptions {
                     mode: InputMode::Off,
+                    path: synly_core::transport::routing::PathPolicy::PreferBluetooth,
                     edge: ScreenEdge::Right,
                     hotkey: Hotkey::DEFAULT.parse().unwrap(),
                     reverse_mouse_wheel: false,
@@ -3880,6 +4102,7 @@ mod tests {
                     cursor_mode: crate::input::CursorMode::Desktop,
                 },
                 clipboard: ClipboardRuntimeOptions {
+                    path: synly_core::transport::routing::PathPolicy::Auto,
                     max_file_bytes: 1,
                     max_cache_bytes: None,
                     cache_dir: std::path::PathBuf::from("."),

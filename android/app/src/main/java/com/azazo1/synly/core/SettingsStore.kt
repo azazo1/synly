@@ -4,11 +4,14 @@ import android.content.Context
 import org.json.JSONArray
 import org.json.JSONObject
 import uniffi.synly_core.FfiClipboardMode
+import uniffi.synly_core.FfiPathPolicy
 
 const val DEFAULT_DEVICE_NAME = "Android 手机"
 
 data class SynlySettings(
     val clipboardMode: FfiClipboardMode = FfiClipboardMode.BOTH,
+    val clipboardPath: FfiPathPolicy = FfiPathPolicy.AUTO,
+    val bluetoothEnabled: Boolean = false,
     val mdnsEnabled: Boolean = true,
     val lndEnabled: Boolean = false,
     val lndServerUrl: String? = null,
@@ -26,6 +29,7 @@ data class SynlyTarget(
     val addresses: List<String>,
     val port: Int,
     val peerDeviceId: String? = null,
+    val bluetoothAddress: String? = null,
 )
 
 object SettingsStore {
@@ -34,6 +38,7 @@ object SettingsStore {
 
     fun load(context: Context): SynlySettings {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        SettingsMigrations.apply(prefs)
         val lastTarget = prefs.getString("last_target", null)?.let { raw ->
             runCatching { parseTarget(JSONObject(raw)) }.getOrNull()
         }
@@ -48,6 +53,8 @@ object SettingsStore {
         } ?: lastTarget?.let(::listOf).orEmpty()
         return SynlySettings(
             clipboardMode = parseMode(prefs.getString("clipboard_mode", null)),
+            clipboardPath = parseClipboardPath(prefs.getString("clipboard_path", null)),
+            bluetoothEnabled = prefs.getBoolean("bluetooth_enabled", false),
             mdnsEnabled = prefs.getBoolean("mdns_enabled", true),
             lndEnabled = prefs.getBoolean(
                 "lnd_enabled",
@@ -78,6 +85,8 @@ object SettingsStore {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .edit()
             .putString("clipboard_mode", settings.clipboardMode.name)
+            .putString("clipboard_path", settings.clipboardPath.name)
+            .putBoolean("bluetooth_enabled", settings.bluetoothEnabled)
             .putBoolean("mdns_enabled", settings.mdnsEnabled)
             .putBoolean("lnd_enabled", settings.lndEnabled)
             .putString("lnd_server_url", settings.lndServerUrl.orEmpty())
@@ -100,21 +109,29 @@ object SettingsStore {
             .put("addresses", addresses)
             .put("port", target.port)
             .put("peer_device_id", target.peerDeviceId.orEmpty())
+            .put("bluetooth_address", target.bluetoothAddress.orEmpty())
     }
 
     private fun parseTarget(obj: JSONObject): SynlyTarget? {
-        val addresses = obj.optJSONArray("addresses") ?: return null
-        val port = obj.optInt("port", -1)
-        if (addresses.length() == 0 || port !in 1..65535) return null
+        val addresses = obj.optJSONArray("addresses") ?: JSONArray()
+        val port = obj.optInt("port", 0)
+        val bluetooth = obj.optString("bluetooth_address").trim().takeIf { it.isNotEmpty() }?.uppercase(java.util.Locale.ROOT)
+        if (bluetooth != null && (port !in 0..65535 || !android.bluetooth.BluetoothAdapter.checkBluetoothAddress(bluetooth))) return null
         val parsedAddresses = (0 until addresses.length())
             .map { addresses.optString(it).trim() }
             .filter(String::isNotBlank)
-        if (parsedAddresses.isEmpty()) return null
+        if (bluetooth == null && (parsedAddresses.isEmpty() || port !in 1..65535)) return null
         return SynlyTarget(
             addresses = parsedAddresses,
             port = port,
             peerDeviceId = obj.optString("peer_device_id").takeIf { it.isNotBlank() },
+            bluetoothAddress = bluetooth,
         )
+    }
+
+    private fun parseClipboardPath(raw: String?): FfiPathPolicy {
+        if (raw == null) return FfiPathPolicy.AUTO
+        return runCatching { FfiPathPolicy.valueOf(raw) }.getOrElse { error("clipboard_path 无效, 不自动放宽路径限制") }
     }
 
     private fun parseMode(raw: String?): FfiClipboardMode {

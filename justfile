@@ -63,6 +63,13 @@ audio-notices-test:
 macos-audio-linkage-test:
     bash scripts/tests/macos-audio-linkage.sh
 
+# 使用假蓝牙通道和内存检查器验证 macOS 原生桥接, 不访问真实蓝牙设备.
+[macos]
+bluetooth-native-test:
+    mkdir -p .tmp/bluetooth-tests
+    clang -fobjc-arc -fblocks -mmacosx-version-min=14.0 -fsanitize=address,undefined -fno-sanitize-recover=all -g -Wall -Wextra -Werror crates/synly-core/native/tests/bridge.m -framework Foundation -framework CoreFoundation -framework CoreBluetooth -framework IOBluetooth -o .tmp/bluetooth-tests/bridge
+    .tmp/bluetooth-tests/bridge
+
 # 验证 macOS SDL 随包脚本对原生构建放行, 对缺失库失败.
 [macos]
 macos-sdl-bundle-test:

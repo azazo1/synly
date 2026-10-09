@@ -62,6 +62,20 @@ async fn receiver_rebinding_rotates_keys_before_any_udp_packet() {
     assert!(receiver.decrypt(&packet).is_err());
 }
 
+#[test]
+fn replacing_lan_binding_rotates_udp_keys_even_if_peer_and_channel_id_repeat() {
+    let old_path = uuid::Uuid::new_v4(); let new_path = uuid::Uuid::new_v4(); let channel_id = [8; 32];
+    let old_master = super::crypto::derive_route_secret([7; 32], old_path).unwrap();
+    let new_master = super::crypto::derive_route_secret([7; 32], new_path).unwrap();
+    assert_eq!(new_master, super::crypto::derive_route_secret([7; 32], new_path).unwrap());
+    assert_ne!(new_master, old_master); assert!(super::crypto::derive_route_secret([7; 32], uuid::Uuid::nil()).is_err());
+    let mut sender = AudioEncryptor::new(derive_channel_secret(old_master, channel_id).unwrap(), AudioChannelDirection::HostToClient).unwrap();
+    let mut receiver = AudioDecryptor::new(derive_channel_secret(new_master, channel_id).unwrap(), AudioChannelDirection::HostToClient).unwrap();
+    assert!(receiver.decrypt(&sender.encrypt(b"stale-lan").unwrap()).is_err());
+    let mut sender = AudioEncryptor::new(derive_channel_secret(new_master, channel_id).unwrap(), AudioChannelDirection::HostToClient).unwrap();
+    assert_eq!(receiver.decrypt(&sender.encrypt(b"current-lan").unwrap()).unwrap(), b"current-lan");
+}
+
 fn audio(sequence_number: u16, payload: &[u8]) -> Vec<u8> {
     write_audio_packet(
         RtpHeader {

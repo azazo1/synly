@@ -58,6 +58,7 @@ struct RuntimeFileConfig {
     accept: bool,
     trust_device: bool,
     trusted_only: bool,
+    bluetooth_enabled: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -307,6 +308,7 @@ impl RuntimeFileConfig {
             accept: self.accept,
             trust_device: self.trust_device,
             trusted_only: self.trusted_only,
+            bluetooth_enabled: self.bluetooth_enabled,
         }
     }
 }
@@ -324,6 +326,7 @@ impl From<&RuntimeConfig> for RuntimeFileConfig {
             accept: runtime.accept,
             trust_device: runtime.trust_device,
             trusted_only: runtime.trusted_only,
+            bluetooth_enabled: runtime.bluetooth_enabled,
         }
     }
 }
@@ -535,6 +538,70 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
+    fn clipboard_path_migrates_and_round_trips_without_changing_limits_or_input() {
+        use synly_core::transport::routing::PathPolicy;
+        let dir = unique_test_dir("clipboard-path-migration");
+        let mut config = load_or_create_in_dir(&dir).unwrap();
+        let limits = config.clipboard.clone(); let input = config.runtime.input.clone();
+        let mut legacy: toml::Value = toml::from_str(&toml::to_string(&MainConfigFile::from(&config)).unwrap()).unwrap();
+        legacy["version"] = toml::Value::Integer(7); legacy["clipboard"].as_table_mut().unwrap().remove("path");
+        fs::write(dir.join(CONFIG_FILE_NAME), toml::to_string_pretty(&legacy).unwrap()).unwrap();
+        let migrated = load_or_create_in_dir(&dir).unwrap();
+        assert_eq!(migrated.clipboard, limits); assert_eq!(migrated.runtime.input, input);
+        for policy in [PathPolicy::Auto, PathPolicy::PreferBluetooth, PathPolicy::LanOnly, PathPolicy::BluetoothOnly] {
+            config.clipboard.path = policy; write_toml_atomic(&dir.join(CONFIG_FILE_NAME), &MainConfigFile::from(&config)).unwrap();
+            assert_eq!(load_or_create_in_dir(&dir).unwrap().clipboard, config.clipboard);
+        }
+        // 预先写入的新字段不能被迁移覆盖, 非法枚举不能静默放宽为 Auto.
+        legacy["clipboard"].as_table_mut().unwrap().insert("path".to_owned(), toml::Value::String("bluetooth_only".to_owned()));
+        fs::write(dir.join(CONFIG_FILE_NAME), toml::to_string_pretty(&legacy).unwrap()).unwrap();
+        assert_eq!(load_or_create_in_dir(&dir).unwrap().clipboard.path, PathPolicy::BluetoothOnly);
+        legacy["clipboard"]["path"] = toml::Value::String("invalid_path".to_owned());
+        fs::write(dir.join(CONFIG_FILE_NAME), toml::to_string_pretty(&legacy).unwrap()).unwrap();
+        assert!(load_or_create_in_dir(&dir).is_err());
+        cleanup_dir(&dir);
+    }
+
+    #[test]
+    fn input_path_migrates_and_round_trips_without_changing_clipboard_limits() {
+        use synly_core::transport::routing::PathPolicy;
+        let dir = unique_test_dir("input-path-migration");
+        let mut config = load_or_create_in_dir(&dir).unwrap();
+        let clipboard = config.clipboard.clone();
+        let mut legacy: toml::Value = toml::from_str(&toml::to_string(&MainConfigFile::from(&config)).unwrap()).unwrap();
+        legacy["version"] = toml::Value::Integer(6);
+        legacy["input"].as_table_mut().unwrap().remove("path");
+        fs::write(dir.join(CONFIG_FILE_NAME), toml::to_string_pretty(&legacy).unwrap()).unwrap();
+        let migrated = load_or_create_in_dir(&dir).unwrap();
+        assert_eq!(migrated.runtime.input.path, PathPolicy::PreferBluetooth);
+        assert_eq!(migrated.clipboard, clipboard);
+        for policy in [PathPolicy::Auto, PathPolicy::LanOnly, PathPolicy::BluetoothOnly] {
+            config.runtime.input.path = policy;
+            write_toml_atomic(&dir.join(CONFIG_FILE_NAME), &MainConfigFile::from(&config)).unwrap();
+            assert_eq!(load_or_create_in_dir(&dir).unwrap().runtime.input.path, policy);
+        }
+        cleanup_dir(&dir);
+    }
+
+    #[test]
+    fn bluetooth_setting_migrates_disabled_and_round_trips_enabled() {
+        let dir = unique_test_dir("bluetooth-migration");
+        let mut config = load_or_create_in_dir(&dir).unwrap();
+        assert!(!config.runtime.bluetooth_enabled);
+        let mut legacy: toml::Value = toml::from_str(&toml::to_string(&MainConfigFile::from(&config)).unwrap()).unwrap();
+        legacy["version"] = toml::Value::Integer(5);
+        legacy["runtime"].as_table_mut().unwrap().remove("bluetooth_enabled");
+        fs::write(dir.join(CONFIG_FILE_NAME), toml::to_string_pretty(&legacy).unwrap()).unwrap();
+        let migrated = load_or_create_in_dir(&dir).unwrap();
+        assert!(!migrated.runtime.bluetooth_enabled);
+        assert_eq!(migrated.clipboard.max_file_bytes, config.clipboard.max_file_bytes);
+        config.runtime.bluetooth_enabled = true;
+        write_toml_atomic(&dir.join(CONFIG_FILE_NAME), &MainConfigFile::from(&config)).unwrap();
+        assert!(load_or_create_in_dir(&dir).unwrap().runtime.bluetooth_enabled);
+        cleanup_dir(&dir);
+    }
+
+    #[test]
     fn first_start_creates_four_strict_files() {
         let dir = unique_test_dir("first-start");
         let config = load_or_create_in_dir(&dir).unwrap();
@@ -556,7 +623,7 @@ mod tests {
         assert!(
             fs::read_to_string(dir.join(CONFIG_FILE_NAME))
                 .unwrap()
-                .contains("version = 5")
+                .contains(&format!("version = {}", migrations::MAIN_CONFIG_VERSION))
         );
         assert!(
             fs::read_to_string(dir.join(GUI_STATE_FILE_NAME))
@@ -624,7 +691,7 @@ mod tests {
 
         let main: toml::Value =
             toml::from_str(&fs::read_to_string(dir.join(CONFIG_FILE_NAME)).unwrap()).unwrap();
-        assert_eq!(main["version"].as_integer(), Some(5));
+        assert_eq!(main["version"].as_integer(), Some(i64::from(migrations::MAIN_CONFIG_VERSION)));
         assert!(
             !main["ui"]
                 .as_table()
@@ -706,7 +773,7 @@ mod tests {
         assert_eq!(loaded.gui_state.window_height, 700);
         let main: toml::Value =
             toml::from_str(&fs::read_to_string(dir.join(CONFIG_FILE_NAME)).unwrap()).unwrap();
-        assert_eq!(main["version"].as_integer(), Some(5));
+        assert_eq!(main["version"].as_integer(), Some(i64::from(migrations::MAIN_CONFIG_VERSION)));
         assert!(!main["ui"].as_table().unwrap().contains_key("window_width"));
         cleanup_dir(&dir);
     }

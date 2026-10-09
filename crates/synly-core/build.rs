@@ -10,4 +10,20 @@ fn main() {
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "dev-build".to_string());
     println!("cargo:rustc-env=SYNLY_BUILD_VERSION={version}");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        println!("cargo:rerun-if-changed=native/bluetooth.h");
+        println!("cargo:rerun-if-changed=native/bluetooth.m");
+        cc::Build::new()
+            .file("native/bluetooth.m")
+            .flag("-fobjc-arc")
+            .flag("-fblocks")
+            .flag("-mmacosx-version-min=14.0")
+            .flag("-Wall")
+            .flag("-Wextra")
+            .flag("-Werror")
+            .compile("synly_bluetooth");
+        for framework in ["Foundation", "CoreFoundation", "CoreBluetooth", "IOBluetooth"] {
+            println!("cargo:rustc-link-lib=framework={framework}");
+        }
+    }
 }

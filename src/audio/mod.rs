@@ -15,6 +15,8 @@ mod sdl2;
 mod sender;
 
 pub use config::{AudioLayout, CodecConfig};
+pub(crate) use runtime::crypto::derive_route_secret;
+
 pub use runtime::{
     AudioChannelDirection, AudioTaskHandle, bind_and_spawn_receiver_with_config,
     spawn_sender_with_config,

@@ -366,6 +366,7 @@ impl AppSupervisor {
                 if self.config.revoke_trusted_device(device_id) {
                     self.save_trusted_devices();
                     self.snapshot.trusted_devices = self.config.trusted_devices.clone();
+                    if let Some(session) = &self.session { let _ = session.commands.send(RuntimeCommand::RevokeTrust(device_id)); }
                     let was_preferred = self.config.preferred_active == Some(device_id);
                     if was_preferred {
                         self.config.preferred_active = None;
@@ -572,6 +573,7 @@ impl AppSupervisor {
                         remote_capabilities: None,
                         capability_epoch: None,
                         capabilities_acknowledged: true,
+                        transport: None,
                     });
                 }
                 self.snapshot.lifecycle = AppLifecycle::Connected;
@@ -644,6 +646,9 @@ impl AppSupervisor {
                 }
                 self.sync_active_flags();
                 self.refresh_aggregate_capabilities();
+            }
+            RuntimeEvent::Transport { peer, status } => {
+                if let Some(session) = self.snapshot.sessions.iter_mut().find(|session| session.device_id == peer.device_id) { session.transport = Some(status); }
             }
             RuntimeEvent::Error(error) => self.set_error(error),
         }
@@ -1074,6 +1079,7 @@ fn requires_reconnect(previous: &RuntimeConfig, next: &RuntimeConfig) -> bool {
         || previous.peer_query != next.peer_query
         || previous.port != next.port
         || previous.trusted_only != next.trusted_only
+        || previous.bluetooth_enabled != next.bluetooth_enabled
 }
 
 fn audio_layout_pending(applied: Option<&RuntimeConfig>, desired: &RuntimeConfig) -> bool {
@@ -1148,6 +1154,9 @@ mod tests {
         let mut peer = current.clone();
         peer.peer_query = "peer-b".to_string();
         assert!(requires_reconnect(&current, &peer));
+        let mut bluetooth = current.clone();
+        bluetooth.bluetooth_enabled = true;
+        assert!(requires_reconnect(&current, &bluetooth));
     }
 
     #[test]
@@ -1231,6 +1240,23 @@ mod tests {
     }
 
     #[test]
+    fn transport_status_updates_only_the_authenticated_peer_and_clears_on_disconnect() {
+        use crate::runtime_control::{RuntimePeerSummary, TransportStatus};
+        use synly_core::transport::routing::{TransportKind, AvailableLinks, RouteChoice};
+        let (mut supervisor, _) = AppSupervisor::new(test_config(), false);
+        let peer = RuntimePeerSummary { device_id: Uuid::new_v4(), display_name: "peer".into() };
+        let other = RuntimePeerSummary { device_id: Uuid::new_v4(), display_name: "other".into() };
+        let status = TransportStatus { primary: TransportKind::Lan, available: AvailableLinks { lan: true, bluetooth: true }, input: RouteChoice::Selected(TransportKind::Bluetooth), input_running: true, clipboard: Some(TransportKind::Lan), clipboard_choice: RouteChoice::Selected(TransportKind::Lan), clipboard_switching: false, clipboard_failed: false, audio: Some(TransportKind::Lan), audio_waiting: false, audio_failed: false, audio_unavailable: false, switching: false, failed: false, requires_manual_activation: true };
+        supervisor.handle_runtime_event(RuntimeEvent::Connected(peer.clone()));
+        supervisor.handle_runtime_event(RuntimeEvent::Transport { peer: other, status });
+        assert!(supervisor.snapshot.sessions[0].transport.is_none());
+        supervisor.handle_runtime_event(RuntimeEvent::Transport { peer: peer.clone(), status });
+        assert_eq!(supervisor.snapshot.sessions[0].transport, Some(status));
+        supervisor.handle_runtime_event(RuntimeEvent::Disconnected(peer));
+        assert!(supervisor.snapshot.sessions.is_empty());
+    }
+
+    #[test]
     fn connected_event_preserves_peer_display_name_without_discovery_match() {
         let (mut supervisor, _) = AppSupervisor::new(test_config(), false);
         let peer = crate::runtime_control::RuntimePeerSummary {
@@ -1291,6 +1317,7 @@ mod tests {
             remote_capabilities: None,
             capability_epoch: None,
             capabilities_acknowledged: true,
+            transport: None,
         }];
 
         // join 侧的 runtime 不接收运行时命令, 断开列表里的对端必须直接结束会话.
@@ -1355,6 +1382,7 @@ mod tests {
             discovery: DiscoveryConfig::default(),
             input: crate::input::InputRuntimeOptions {
                 mode: InputMode::Off,
+                path: synly_core::transport::routing::PathPolicy::PreferBluetooth,
                 edge: crate::input::ScreenEdge::Right,
                 hotkey: crate::input::Hotkey::DEFAULT.parse().unwrap(),
                 reverse_mouse_wheel: false,
@@ -1367,6 +1395,7 @@ mod tests {
                 cursor_mode: crate::input::CursorMode::Desktop,
             },
             clipboard: crate::clipboard::ClipboardRuntimeOptions {
+                path: synly_core::transport::routing::PathPolicy::Auto,
                 max_file_bytes: 1,
                 max_cache_bytes: None,
                 cache_dir: std::path::PathBuf::from("."),

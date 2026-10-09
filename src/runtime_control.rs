@@ -40,9 +40,29 @@ pub struct RuntimePeerSummary {
     pub display_name: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TransportStatus {
+    pub primary: synly_core::transport::routing::TransportKind,
+    pub available: synly_core::transport::routing::AvailableLinks,
+    pub input: synly_core::transport::routing::RouteChoice,
+    pub input_running: bool,
+    pub clipboard: Option<synly_core::transport::routing::TransportKind>,
+    pub clipboard_choice: synly_core::transport::routing::RouteChoice,
+    pub clipboard_switching: bool,
+    pub clipboard_failed: bool,
+    pub audio: Option<synly_core::transport::routing::TransportKind>,
+    pub audio_waiting: bool,
+    pub audio_failed: bool,
+    pub audio_unavailable: bool,
+    pub switching: bool,
+    pub failed: bool,
+    pub requires_manual_activation: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeCommand {
     DisconnectPeer(Uuid),
+    RevokeTrust(Uuid),
     SwitchActiveSession(Uuid),
     ClearPreferredActive,
 }
@@ -132,6 +152,7 @@ pub enum RuntimeEvent {
         epoch: CapabilityEpoch,
         acknowledged: bool,
     },
+    Transport { peer: RuntimePeerSummary, status: TransportStatus },
     Error(String),
 }
 

@@ -31,7 +31,7 @@ pub use mapping::{InputPlatform, KeyMappingConfig, validate_key_mapping};
 pub use protocol::KeySnapshot;
 pub use runtime::{
     CursorMode, InputRuntimeOptions, InputSessionContext, InputSocketConnection, InputSocketInbox,
-    run_input_session,
+    run_input_session, run_input_session_with_gate,
 };
 pub use synly_core::input::InputMode;
 

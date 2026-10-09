@@ -45,12 +45,14 @@ pub struct RuntimeConfig {
     pub accept: bool,
     pub trust_device: bool,
     pub trusted_only: bool,
+    pub bluetooth_enabled: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct InputConfig {
     pub mode: InputMode,
+    pub path: synly_core::transport::routing::PathPolicy,
     pub edge: ScreenEdge,
     pub hotkey: String,
     pub elevate_on_start: bool,
@@ -94,6 +96,7 @@ pub struct GuiState {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ClipboardConfig {
+    pub path: synly_core::transport::routing::PathPolicy,
     pub max_file_bytes: u64,
     pub max_cache_bytes: Option<u64>,
     pub cache_dir: Option<PathBuf>,
@@ -117,6 +120,7 @@ impl Default for InputConfig {
     fn default() -> Self {
         Self {
             mode: InputMode::Off,
+            path: synly_core::transport::routing::PathPolicy::PreferBluetooth,
             edge: ScreenEdge::Right,
             hotkey: crate::input::Hotkey::DEFAULT.to_string(),
             elevate_on_start: false,
@@ -135,6 +139,7 @@ impl Default for InputConfig {
 impl Default for ClipboardConfig {
     fn default() -> Self {
         Self {
+            path: synly_core::transport::routing::PathPolicy::Auto,
             max_file_bytes: DEFAULT_CLIPBOARD_MAX_FILE_BYTES,
             max_cache_bytes: None,
             cache_dir: None,
@@ -205,6 +210,7 @@ impl Default for RuntimeConfig {
             accept: false,
             trust_device: false,
             trusted_only: false,
+            bluetooth_enabled: false,
         }
     }
 }

@@ -32,6 +32,16 @@ async fn dropping_audio_task_requests_stop() {
 }
 
 #[tokio::test]
+async fn completed_or_panicked_audio_supervisor_is_collected_once() {
+    for panic in [false, true] {
+        let task = tokio::spawn(async move { assert!(!panic, "模拟音频监督异常"); Err(anyhow::anyhow!("模拟音频设备错误")) });
+        let mut handle = AudioTaskHandle { stop: CancellationToken::new(), task: Some(task) };
+        assert!(handle.wait_finished().await.is_err()); assert!(handle.task.is_none());
+        handle.stop().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn device_initialization_failure_stops_other_stages() {
     let stream = CodecConfig::default().stream_params().unwrap();
     let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();

@@ -13,6 +13,7 @@ const DEFAULT_DISCOVERY_SECS: u64 = 3;
 #[derive(Clone, Debug)]
 pub struct RuntimeOptions {
     pub connection: ConnectionPreference,
+    pub bluetooth_enabled: bool,
     pub instance_name: Option<String>,
     pub clipboard_mode: ClipboardMode,
     pub audio_mode: AudioMode,
@@ -52,6 +53,7 @@ pub fn runtime_options_from_config(
     let pin = pin.as_deref().map(normalize_pin).transpose()?;
     let input = InputRuntimeOptions {
         mode: runtime.input.mode,
+        path: runtime.input.path,
         edge: runtime.input.edge,
         hotkey: runtime.input.hotkey.parse()?,
         reverse_mouse_wheel: runtime.input.reverse_mouse_wheel,
@@ -64,6 +66,7 @@ pub fn runtime_options_from_config(
         cursor_mode: runtime.input.cursor_mode,
     };
     let clipboard = ClipboardRuntimeOptions {
+        path: config.clipboard.path,
         max_file_bytes: config.clipboard.max_file_bytes,
         max_cache_bytes: config.clipboard.max_cache_bytes,
         cache_dir: config.clipboard_cache_dir()?,
@@ -86,6 +89,7 @@ pub fn runtime_options_from_config(
 
     Ok(RuntimeOptions {
         connection,
+        bluetooth_enabled: runtime.bluetooth_enabled,
         instance_name,
         clipboard_mode: runtime.clipboard_mode,
         audio_mode: runtime.audio_mode,
@@ -142,7 +146,7 @@ pub fn require_peer_query(peer_query: Option<&str>) -> Result<&str> {
     match peer_query {
         Some(query) if !query.trim().is_empty() => Ok(query.trim()),
         _ => bail!(
-            "join 模式要求配置 peer_query, 可使用实例名, 设备名, 设备 ID 前缀, IPv4 地址或完整 IPv4:端口"
+            "join 模式要求配置 peer_query, 可使用设备名, 设备 ID, IPv4:端口或 bluetooth:地址/设备UUID"
         ),
     }
 }
@@ -175,6 +179,7 @@ mod tests {
         config.runtime.accept = true;
         config.runtime.trust_device = true;
         config.runtime.trusted_only = true;
+        config.runtime.bluetooth_enabled = true;
 
         let options =
             runtime_options_from_config(&config, Some("123456".to_string()), false).unwrap();
@@ -184,6 +189,7 @@ mod tests {
         assert_eq!(options.pairing.peer_query.as_deref(), Some("demo-device"));
         assert_eq!(options.pairing.pin.as_deref(), Some("123456"));
         assert_eq!(options.input.edge, ScreenEdge::Left);
+        assert!(options.bluetooth_enabled);
     }
 
     #[test]

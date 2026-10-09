@@ -89,6 +89,9 @@ pub(crate) enum HostEvent {
 
 struct HostSessionEntry {
     device_id: Uuid,
+    peer: crate::protocol::DeviceIdentity,
+    logical: synly_core::transport::logical::LogicalSession,
+    attach: mpsc::Sender<synly_core::transport::logical::BoundLink>,
     display_name: String,
     order: u64,
     instance: Uuid,
@@ -107,6 +110,7 @@ async fn trusted_candidates_in_order(
         .filter_map(|candidate| {
             config_guard
                 .trusted_device(&candidate.device_id)
+                .filter(|trusted| synly_core::crypto::public_keys_match(&trusted.public_key, &candidate.peer.identity_public_key))
                 .map(|_| (candidate.device_id, candidate.order))
         })
         .collect();
@@ -115,6 +119,10 @@ async fn trusted_candidates_in_order(
         .into_iter()
         .map(|(device_id, _)| device_id)
         .collect()
+}
+
+async fn accept_bluetooth(listener: &mut Option<synly_core::bluetooth::BluetoothListener>) -> Result<synly_core::bluetooth::BluetoothConnection> {
+    match listener { Some(listener) => listener.accept().await, None => std::future::pending().await }
 }
 
 pub(crate) async fn run_host_runtime(
@@ -168,8 +176,15 @@ pub(crate) async fn run_host_runtime(
 
     print_host_ready(&device, &options, port);
 
+    let mut bluetooth_listener = if options.bluetooth_enabled {
+        match synly_core::bluetooth::listen().await {
+            Ok(listener) => { tracing::info!("系统安全 RFCOMM 监听已启动"); Some(listener) },
+            Err(error) => { tracing::warn!(error = %error, "蓝牙监听不可用, LAN 服务仍继续"); None },
+        }
+    } else { None };
     let preferred_active = config.preferred_active;
     let config = Arc::new(Mutex::new(config));
+    let pairing_shutdown = shutdown.child_token();
     let pairing_slot = Arc::new(Semaphore::new(1));
     let pairing_throttle = Arc::new(Mutex::new(PairingThrottle::default()));
     let active_slot = Arc::new(std::sync::Mutex::new(ActiveSlot::with_preferred(
@@ -187,6 +202,33 @@ pub(crate) async fn run_host_runtime(
         result = async {
             loop {
                 tokio::select! {
+                    accepted = accept_bluetooth(&mut bluetooth_listener) => {
+                        let connection = match accepted {
+                            Ok(connection) => connection,
+                            Err(error) => { tracing::warn!(error = %error, "蓝牙监听失败, 停止该路径"); bluetooth_listener = None; continue; },
+                        };
+                        let active_peers: Vec<_> = sessions.values().filter(|entry| !entry.shutdown.is_cancelled() && entry.logical.is_open()).map(|entry| entry.peer.clone()).collect();
+                        let Ok(permit) = Arc::clone(&pairing_slot).try_acquire_owned() else { continue; };
+                        refresh_runtime_options(&mut *config.lock().await, &mut options, &mut runtime_capabilities, &mut runtime_tuning);
+                        let options = options.clone();
+                        let config_shared = Arc::clone(&config);
+                        let slot_shared = Arc::clone(&active_slot);
+                        let events = host_events_tx.clone();
+                        let pairing_shutdown = pairing_shutdown.clone();
+                        tokio::spawn(async move {
+                            let _permit = permit;
+                            let reserver = ActiveSlotReserver::new(slot_shared);
+                            let mut config_guard = config_shared.lock().await;
+                            let result = tokio::select! {
+                                _ = pairing_shutdown.cancelled() => return,
+                                result = crate::app::bluetooth::accept(connection, &mut config_guard, &options, &reserver, &active_peers) => result,
+                            };
+                            match result {
+                                Ok((session, reservation)) => { let _ = events.send(HostEvent::PairingComplete { session: Box::new(session), reservation }); },
+                                Err(error) => tracing::warn!(error = %error, "蓝牙应用授权失败"),
+                            }
+                        });
+                    }
                     accepted = listener.accept() => {
                         let (mut socket, address) = accepted?;
                         configure_session_socket(&socket)?;
@@ -219,14 +261,11 @@ pub(crate) async fn run_host_runtime(
                             }
                             continue;
                         }
-                        if sessions.len() >= MAX_HOST_SESSIONS {
-                            tracing::warn!(
-                                %address,
-                                session_count = sessions.len(),
-                                "已超过 host 会话上限, 拒绝新连接"
-                            );
-                            continue;
-                        }
+                        let admission = crate::app::lan_admission::LanAdmission {
+                            active: sessions.values().filter(|entry| !entry.shutdown.is_cancelled() && entry.logical.is_open()).map(|entry| entry.logical.clone()).collect(),
+                            full: sessions.len() >= MAX_HOST_SESSIONS,
+                        };
+                        // TLS 候选可以在满额时进入有界认证, 认证后仍只允许挂载现有逻辑会话.
                         refresh_runtime_options(
                             &mut *config.lock().await,
                             &mut options,
@@ -239,6 +278,7 @@ pub(crate) async fn run_host_runtime(
                         let slot_shared = Arc::clone(&active_slot);
                         let permit = Arc::clone(&pairing_slot);
                         let events_tx = host_events_tx.clone();
+                        let pairing_shutdown = pairing_shutdown.clone();
                         tokio::spawn(async move {
                             let mut first_byte = [0u8; 1];
                             let is_tls =
@@ -249,13 +289,13 @@ pub(crate) async fn run_host_runtime(
                                         tracing::warn!(%address, error = %error, "读取连接首字节失败");
                                         return;
                                     }
-                                    // 首字节未在超时内到达, 按可信 mTLS 连接排队处理, 避免误拒.
+                                    // 首字节超时按 TLS 候选尝试准入, 忙时直接退避而不排无界队列.
                                     Err(_) => true,
                                 };
                             let _permit = if is_tls {
-                                match permit.acquire_owned().await {
+                                match permit.try_acquire_owned() {
                                     Ok(permit) => permit,
-                                    Err(_) => return,
+                                    Err(_) => { tracing::debug!(%address, "已有认证处理中, 候选等待下一次重试"); return; },
                                 }
                             } else {
                                 match permit.try_acquire_owned() {
@@ -275,15 +315,16 @@ pub(crate) async fn run_host_runtime(
                             let reserver = ActiveSlotReserver::new(slot_shared);
                             let mut config_guard = config_shared.lock().await;
                             let mut throttle = throttle_shared.lock().await;
-                            let result = handle_incoming_connection(
-                                socket,
-                                address,
-                                &mut throttle,
-                                &mut config_guard,
-                                &pairing_options,
-                                &reserver,
-                            )
-                            .await;
+                            let result = tokio::select! {
+                                _ = pairing_shutdown.cancelled() => return,
+                                result = time::timeout(Duration::from_secs(90), handle_incoming_connection(
+                                    socket, address, &mut throttle, &mut config_guard,
+                                    &pairing_options, &reserver, &admission,
+                                )) => match result {
+                                    Ok(result) => result,
+                                    Err(_) => Err(anyhow::anyhow!("LAN 应用认证超时")),
+                                },
+                            };
                             match result {
                                 Ok(Some((session, reservation))) => {
                                     let _ = events_tx.send(HostEvent::PairingComplete {
@@ -301,12 +342,34 @@ pub(crate) async fn run_host_runtime(
                     event = host_events_rx.recv() => {
                         let Some(event) = event else { break };
                         match event {
-                            HostEvent::PairingComplete { session, reservation } => {
+                            HostEvent::PairingComplete { mut session, reservation } => {
                                 let device_id = session.remote.device_id;
                                 let display_name = identity_display_name(&session.remote);
+                                if session.trusted_reconnect && !session.require_existing_session && !config.lock().await.trusted_device(&device_id).is_some_and(|known| synly_core::crypto::public_keys_match(&known.public_key, &session.remote.identity_public_key)) {
+                                    tracing::warn!(%device_id, "可信重连在准入前已被撤销, 拒绝迟到的认证完成事件");
+                                    continue;
+                                }
+                                if session.require_existing_session && !sessions.get(&device_id).is_some_and(|entry| !entry.shutdown.is_cancelled() && entry.logical.is_open() && entry.logical.matches(&session.remote)) {
+                                    tracing::warn!(%device_id, "临时会话授权已经失效, 拒绝升级为新的主会话");
+                                    continue;
+                                }
                                 if let Some(existing) = sessions.get(&device_id) {
-                                    if !existing.shutdown.is_cancelled() {
-                                        tracing::warn!(%device_id, "该设备已有在线会话, 拒绝重复连接");
+                                    if !existing.shutdown.is_cancelled() && existing.logical.is_open() {
+                                        if !existing.logical.matches(&session.remote) || existing.logical.has(session.transport) {
+                                            tracing::warn!(%device_id, "在线设备身份不匹配或传输重复, 拒绝候选");
+                                            continue;
+                                        }
+                                        let Ok(mailbox) = existing.attach.clone().try_reserve_owned() else { continue; };
+                                        let logical = existing.logical.clone();
+                                        tokio::spawn(async move {
+                                            let result = logical.accept(session.stream, &session.remote, session.transport, session.candidate_exporter.value()).await.and_then(|bound| {
+                                                if session.transport == synly_core::transport::routing::TransportKind::Lan { bound.with_lan_peer(session.remote_socket_addr.ok_or_else(|| anyhow::anyhow!("LAN 候选缺少本机 TCP 对端地址"))?) } else { Ok(bound) }
+                                            });
+                                            match result {
+                                                Ok(bound) => { mailbox.send(bound); },
+                                                Err(error) => tracing::warn!(%device_id, error = %error, "副链路会话绑定失败, 主会话保持不变"),
+                                            }
+                                        });
                                         continue;
                                     }
                                     tracing::info!(%device_id, "旧会话正在退出, 等待结束后接管连接");
@@ -318,6 +381,7 @@ pub(crate) async fn run_host_runtime(
                                         .await;
                                     }
                                 }
+                                if sessions.len() >= MAX_HOST_SESSIONS { continue; }
                                 let old_preferred = active_slot
                                     .lock()
                                     .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -340,6 +404,10 @@ pub(crate) async fn run_host_runtime(
                                         entry.shutdown.cancel();
                                     }
                                 }
+                                let peer = session.remote.clone();
+                                let logical = session.logical.clone();
+                                let (attach, secondary_inbox) = mpsc::channel(1);
+                                session.secondary_inbox = Some(secondary_inbox);
                                 let profile = session.capability_profile;
                                 let order = next_order;
                                 next_order += 1;
@@ -358,6 +426,9 @@ pub(crate) async fn run_host_runtime(
                                     device_id,
                                     HostSessionEntry {
                                         device_id,
+                                        peer,
+                                        logical,
+                                        attach,
                                         display_name,
                                         order,
                                         instance: host_task.instance,
@@ -404,9 +475,15 @@ pub(crate) async fn run_host_runtime(
                     command = commands.recv() => {
                         let Some(command) = command else { break };
                         match command {
+                            RuntimeCommand::RevokeTrust(device_id) => {
+                                if let Some(entry) = sessions.get(&device_id) { entry.logical.close(); entry.shutdown.cancel(); }
+                                config.lock().await.revoke_trusted_device(device_id);
+                                tracing::info!(%device_id, "已撤销 host 运行时信任和全部会话承载");
+                            }
                             RuntimeCommand::DisconnectPeer(device_id) => {
                                 if let Some(entry) = sessions.get(&device_id) {
                                     tracing::info!(%device_id, "收到断开设备请求");
+                                    entry.logical.close();
                                     entry.shutdown.cancel();
                                 }
                             }
@@ -482,6 +559,8 @@ pub(crate) async fn run_host_runtime(
         _ = shutdown.cancelled() => Ok(()),
     };
 
+    pairing_shutdown.cancel();
+    drop(bluetooth_listener);
     advertisement_shutdown.cancel();
     if !advertisement_task.is_finished()
         && tokio::time::timeout(Duration::from_secs(3), &mut advertisement_task)

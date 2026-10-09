@@ -4,6 +4,7 @@ uniffi::setup_scaffolding!();
 #[cfg(feature = "uniffi")]
 pub mod ffi;
 
+pub mod bluetooth;
 pub mod capabilities;
 pub mod client;
 pub mod crypto;
@@ -15,3 +16,4 @@ pub mod protocol;
 pub mod reconnect;
 pub mod settings;
 pub mod size;
+pub mod transport;

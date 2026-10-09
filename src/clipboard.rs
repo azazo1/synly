@@ -1,5 +1,5 @@
 use crate::protocol::{ClipboardFile, ClipboardImage, ClipboardPayload};
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use clipboard_rs::{
     Clipboard, ClipboardContent, ClipboardContext, ClipboardHandler, ClipboardWatcher,
     ClipboardWatcherContext, ContentFormat, WatcherShutdown, common::RustImage,
@@ -20,6 +20,7 @@ const CLIPBOARD_CACHE_BATCH_PREFIX: &str = "batch-";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClipboardRuntimeOptions {
+    pub path: synly_core::transport::routing::PathPolicy,
     pub max_file_bytes: u64,
     pub max_cache_bytes: Option<u64>,
     pub cache_dir: PathBuf,
@@ -107,7 +108,11 @@ impl ClipboardSync {
         Ok(())
     }
 
-    pub async fn apply_remote_payload(&self, payload: ClipboardPayload) -> Result<()> {
+    pub async fn apply_remote_payload(&self, payload: ClipboardPayload) -> Result<()> { self.apply_remote_payload_inner(payload, false).await }
+
+    pub async fn apply_remote_payload_strict(&self, payload: ClipboardPayload) -> Result<()> { self.apply_remote_payload_inner(payload, true).await }
+
+    async fn apply_remote_payload_inner(&self, payload: ClipboardPayload, strict: bool) -> Result<()> {
         let options = self
             .options
             .lock()
@@ -116,6 +121,7 @@ impl ClipboardSync {
         let state = self.state.clone();
 
         tokio::task::spawn_blocking(move || -> Result<()> {
+            if strict { validate_complete_payload(&payload, options.max_file_bytes)?; }
             let mut warnings = Vec::new();
             let payload = sanitize_remote_payload(payload, options.max_file_bytes, &mut warnings);
             emit_warnings(&warnings);
@@ -136,6 +142,7 @@ impl ClipboardSync {
                     &payload,
                     &options.cache_dir,
                     options.max_cache_bytes,
+                    strict,
                 )?;
             }
 
@@ -483,6 +490,7 @@ fn apply_payload_to_clipboard(
     payload: &ClipboardPayload,
     cache_dir: &Path,
     max_cache_bytes: Option<u64>,
+    strict: bool,
 ) -> Result<()> {
     let mut contents = Vec::new();
 
@@ -509,6 +517,7 @@ fn apply_payload_to_clipboard(
         &mut file_warnings,
     )?;
     emit_warnings(&file_warnings);
+    if strict && file_paths.len() != payload.files.len() { bail!("可靠剪贴板文件未全部写入缓存, 不可确认应用成功"); }
     if !file_paths.is_empty() {
         contents.push(ClipboardContent::Files(
             file_paths
@@ -573,6 +582,12 @@ fn write_clipboard_files_to_cache(
 
     prune_clipboard_cache(cache_dir, max_cache_bytes, Some(&batch_dir), warnings)?;
     Ok(written)
+}
+
+fn validate_complete_payload(payload: &ClipboardPayload, max_file_bytes: u64) -> Result<()> {
+    if payload.is_empty() { bail!("可靠剪贴板载荷为空, 不可确认应用成功"); }
+    if payload.files.iter().any(|file| u64::try_from(file.bytes.len()).unwrap_or(u64::MAX) > max_file_bytes) { bail!("可靠剪贴板载荷含超过本机大小上限的文件, 不可部分应用后确认成功"); }
+    Ok(())
 }
 
 fn sanitize_remote_payload(
@@ -894,14 +909,25 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
+    fn reliable_payload_refuses_partial_success_for_oversized_files() {
+        let mut payload = ClipboardPayload { text: Some("正文".to_owned()), rich_text: None, html: None, image: None, files: vec![ClipboardFile { name: "payload.bin".to_owned(), bytes: vec![1, 2, 3] }] };
+        assert!(super::validate_complete_payload(&payload, 2).is_err());
+        assert!(super::validate_complete_payload(&payload, 3).is_ok());
+        payload.files.clear(); assert!(super::validate_complete_payload(&payload, 0).is_ok());
+        payload.text = None; assert!(super::validate_complete_payload(&payload, 3).is_err());
+    }
+
+    #[test]
     fn runtime_limits_update_without_rebuilding_clipboard_sync() {
         let initial = ClipboardRuntimeOptions {
+            path: synly_core::transport::routing::PathPolicy::Auto,
             max_file_bytes: 10,
             max_cache_bytes: Some(20),
             cache_dir: std::path::PathBuf::from("cache-a"),
         };
         let sync = ClipboardSync::new(&initial);
         let updated = ClipboardRuntimeOptions {
+            path: synly_core::transport::routing::PathPolicy::Auto,
             max_file_bytes: 30,
             max_cache_bytes: None,
             cache_dir: std::path::PathBuf::from("cache-b"),

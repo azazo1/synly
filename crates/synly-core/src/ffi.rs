@@ -1,3 +1,5 @@
+pub mod bluetooth;
+
 use crate::client;
 use crate::device::{DeviceConfig, DiscoveryConfig, LndDiscoveryConfig, TrustedDeviceConfig};
 use crate::protocol::{
@@ -105,6 +107,12 @@ pub fn init_tracing(listener: Box<dyn FfiLogListener>) -> Result<(), FfiError> {
 #[uniffi::export]
 pub fn build_version() -> String {
     env!("SYNLY_BUILD_VERSION").to_string()
+}
+
+#[derive(uniffi::Enum)]
+pub enum FfiPathPolicy { Auto, PreferBluetooth, LanOnly, BluetoothOnly }
+impl From<FfiPathPolicy> for crate::transport::routing::PathPolicy {
+    fn from(policy: FfiPathPolicy) -> Self { match policy { FfiPathPolicy::Auto => Self::Auto, FfiPathPolicy::PreferBluetooth => Self::PreferBluetooth, FfiPathPolicy::LanOnly => Self::LanOnly, FfiPathPolicy::BluetoothOnly => Self::BluetoothOnly } }
 }
 
 #[derive(uniffi::Enum)]
@@ -267,8 +275,10 @@ pub struct FfiClientConfig {
     pub max_frame_data_len: u32,
     pub max_clipboard_binary_len: u32,
     pub clipboard_mode: FfiClipboardMode,
+    pub clipboard_path: FfiPathPolicy,
     pub instance_name: Option<String>,
     pub request_trust: bool,
+    pub bluetooth_enabled: bool,
     pub discovery: Option<FfiDiscoveryConfig>,
 }
 
@@ -277,6 +287,7 @@ pub struct FfiClientTarget {
     pub addresses: Vec<String>,
     pub port: u16,
     pub peer_device_id: Option<String>,
+    pub bluetooth_address: Option<String>,
 }
 
 #[derive(uniffi::Record)]
@@ -347,6 +358,16 @@ pub enum FfiClientEvent {
         session_short: String,
         session_randomart: String,
     },
+    BluetoothAuthorizationRequired {
+        request_id: String,
+        remote: FfiDeviceIdentity,
+        system_address: String,
+        system_name: String,
+        fingerprint: String,
+        changed_identity: bool,
+        request_trust: bool,
+        capabilities_summary: String,
+    },
     PairingFailed {
         message: String,
     },
@@ -358,7 +379,9 @@ pub enum FfiClientEvent {
         remote_address: Option<String>,
         remote_port: Option<u16>,
     },
+    TransportChanged { primary: String, lan_available: bool, bluetooth_available: bool, clipboard_status: String },
     ClipboardReceived {
+        delivery_id: Option<String>,
         text: Option<String>,
         html: Option<String>,
         image_png: Option<Vec<u8>>,
@@ -391,6 +414,11 @@ impl From<client::ClientEvent> for FfiClientEvent {
                 session_short,
                 session_randomart,
             },
+            client::ClientEvent::BluetoothAuthorizationRequired { request_id, request } => Self::BluetoothAuthorizationRequired {
+                request_id, remote: request.peer.into(), system_address: request.system_peer.address, system_name: request.system_peer.name,
+                fingerprint: request.fingerprint, changed_identity: request.changed_identity, request_trust: request.request_trust,
+                capabilities_summary: request.capabilities.summary_lines().join(" | "),
+            },
             client::ClientEvent::PairingFailed { message } => Self::PairingFailed { message },
             client::ClientEvent::Connected {
                 remote,
@@ -406,7 +434,24 @@ impl From<client::ClientEvent> for FfiClientEvent {
                 remote_address: remote_address.map(|address| address.to_string()),
                 remote_port,
             },
+            client::ClientEvent::TransportChanged(status) => {
+                use crate::transport::routing::{TransportKind, RouteChoice, PauseReason};
+                let label = |kind| match kind { TransportKind::Lan => "局域网", TransportKind::Bluetooth => "蓝牙" };
+                let clipboard_status = match status.clipboard_choice {
+                    RouteChoice::Paused(PauseReason::PolicyConflict) => "双方策略冲突",
+                    RouteChoice::Paused(PauseReason::TransportUnavailable) => "所需路径不可用",
+                    RouteChoice::Paused(PauseReason::UnsupportedChannel) => "平台不支持",
+                    RouteChoice::Selected(_) => if status.failed { "失败暂停" } else if status.switching { "切换确认中" } else { status.clipboard.map(label).unwrap_or("关闭或等待路径") },
+                };
+                Self::TransportChanged { primary: label(status.primary).to_owned(), lan_available: status.available.lan, bluetooth_available: status.available.bluetooth, clipboard_status: clipboard_status.to_owned() }
+            },
+            client::ClientEvent::ClipboardDelivery { delivery_id, payload } => Self::ClipboardReceived {
+                delivery_id: Some(delivery_id.to_string()), text: payload.text, html: payload.html,
+                image_png: payload.image.map(|image| image.png_bytes),
+                files: payload.files.into_iter().map(|file| FfiClipboardFile { name: file.name, bytes: file.bytes }).collect(),
+            },
             client::ClientEvent::ClipboardReceived(payload) => Self::ClipboardReceived {
+                delivery_id: None,
                 text: payload.text,
                 html: payload.html,
                 image_png: payload.image.map(|image| image.png_bytes),
@@ -489,6 +534,10 @@ pub struct FfiClientHandle {
 
 #[uniffi::export]
 impl FfiClientHandle {
+    pub fn authorize_bluetooth(&self, request_id: String, accepted: bool, remember: bool) -> Result<(), FfiError> {
+        self.inner.authorize_bluetooth(request_id, accepted, remember).map_err(Into::into)
+    }
+
     pub fn submit_pin(&self, pin: String) -> Result<(), FfiError> {
         self.inner.submit_pin(&pin).map_err(Into::into)
     }
@@ -519,6 +568,13 @@ impl FfiClientHandle {
         };
         self.inner.send_clipboard(payload).map_err(Into::into)
     }
+
+    pub fn confirm_clipboard(&self, delivery_id: String, success: bool) -> Result<(), FfiError> {
+        let id = uuid::Uuid::parse_str(&delivery_id).map_err(|error| FfiError::from(anyhow::anyhow!("剪贴板交付 ID 无效: {error}")))?;
+        self.inner.confirm_clipboard(id, success).map_err(Into::into)
+    }
+
+    pub fn set_clipboard_path(&self, policy: FfiPathPolicy) -> Result<(), FfiError> { self.inner.set_clipboard_path(policy.into()).map_err(Into::into) }
 
     pub fn set_clipboard_mode(&self, mode: FfiClipboardMode) -> Result<(), FfiError> {
         self.inner
@@ -587,14 +643,17 @@ pub fn start_client(
             trusted_devices,
             transfer_limits,
             clipboard_mode,
+            clipboard_path: config.clipboard_path.into(),
             instance_name: config.instance_name,
             request_trust: config.request_trust,
+            bluetooth_enabled: config.bluetooth_enabled,
             discovery,
         },
         client::ClientTarget {
             addresses,
             port: target.port,
             peer_device_id,
+            bluetooth_address: target.bluetooth_address,
         },
         Arc::new(bridge),
     )?;

@@ -17,6 +17,12 @@ pub(super) fn derive_channel_secret(
     hkdf_expand(&salt.extract(&master_secret), &[&channel_id])
 }
 
+pub(crate) fn derive_route_secret(master_secret: [u8; 32], binding_id: uuid::Uuid) -> Result<[u8; 32]> {
+    if binding_id.is_nil() { return Err(anyhow!("音频绑定路径 ID 为空")); }
+    let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, b"synly-audio-lan-path-v1");
+    hkdf_expand(&salt.extract(&master_secret), &[binding_id.as_bytes()])
+}
+
 pub(super) struct AudioEncryptor {
     key: LessSafeKey,
     nonce_prefix: [u8; 4],

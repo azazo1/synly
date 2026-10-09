@@ -75,7 +75,7 @@ pub enum PairAuthMethod {
     TrustedDevice,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceIdentity {
     pub device_id: Uuid,
     pub device_name: String,
@@ -160,12 +160,14 @@ pub enum ControlMessage {
     },
     AudioUdpReady {
         epoch: CapabilityEpoch,
+        path_id: Uuid,
         port: u16,
         #[serde(default)]
         layout: AudioLayout,
         // 每次绑定生成新标识, 防止同一 TLS 会话重启音频时复用密钥和 nonce.
         channel_id: [u8; 32],
     },
+    AudioPathFailed { epoch: CapabilityEpoch, path_id: Uuid },
     InputChannelOffer {
         epoch: CapabilityEpoch,
         offer: InputChannelOffer,
@@ -174,6 +176,15 @@ pub enum ControlMessage {
         message: String,
     },
     Goodbye,
+    InputMuxOffer { epoch: CapabilityEpoch, generation: Uuid },
+    InputMuxReady { epoch: CapabilityEpoch, generation: Uuid },
+    TransportState { generation: u64, available: crate::transport::routing::AvailableLinks, input_policy: crate::transport::routing::PathPolicy, clipboard_policy: crate::transport::routing::PathPolicy },
+    InputPath { epoch: CapabilityEpoch, generation: Uuid, message: crate::transport::routing::RouteMessage },
+    InputPathFailed { epoch: CapabilityEpoch, generation: Uuid },
+    ClipboardApplied { stamp: crate::transport::clipboard::ClipboardStamp },
+    ClipboardRejected { stamp: crate::transport::clipboard::ClipboardStamp },
+    ClipboardPath { epoch: CapabilityEpoch, generation: Uuid, message: crate::transport::routing::RouteMessage },
+    ClipboardPathFailed { epoch: CapabilityEpoch, generation: Uuid },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -196,10 +207,23 @@ pub struct ClipboardFile {
     pub bytes: Vec<u8>,
 }
 
+#[derive(Clone)]
+pub struct ClipboardTransfer {
+    pub stamp: crate::transport::clipboard::ClipboardStamp,
+    pub route_epoch: u64,
+    pub payload: std::sync::Arc<ClipboardPayload>,
+}
+impl ClipboardTransfer {
+    pub fn validate(&self) -> Result<()> { self.stamp.validate()?; if self.route_epoch == 0 { bail!("剪贴板路径代次为空"); } Ok(()) }
+}
+impl std::fmt::Debug for ClipboardTransfer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.debug_struct("ClipboardTransfer").field("stamp", &self.stamp).field("route_epoch", &self.route_epoch).finish_non_exhaustive() }
+}
 #[derive(Clone, Debug)]
 pub enum Frame {
     Control(ControlMessage),
     Clipboard(ClipboardPayload),
+    ClipboardTransfer(ClipboardTransfer),
 }
 
 pub struct FrameReader<R> {
@@ -236,6 +260,8 @@ struct ClipboardFileMeta {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ClipboardTransferHeader {
     pub transfer_id: Uuid,
+    pub sequence: u64,
+    pub route_epoch: u64,
     pub payload: ClipboardPayloadMeta,
     pub binary_len: u64,
 }
@@ -291,37 +317,16 @@ impl ClipboardPayload {
             .as_ref()
             .map(|image| image.png_bytes.len())
             .unwrap_or_default();
-        image_len
-            + self
-                .files
-                .iter()
-                .map(|file| file.bytes.len())
-                .sum::<usize>()
+        self.files.iter().fold(image_len, |total, file| total.saturating_add(file.bytes.len()))
     }
 
-    fn into_wire(self) -> Result<(ClipboardPayloadMeta, Vec<u8>)> {
+    fn to_wire(&self) -> Result<(ClipboardPayloadMeta, Vec<u8>)> {
         let mut data = Vec::with_capacity(self.total_binary_size());
-        let image = self
-            .image
-            .map(|image| append_binary(&mut data, image.png_bytes))
-            .transpose()?;
-        let files = self
-            .files
-            .into_iter()
-            .map(|file| {
-                Ok(ClipboardFileMeta {
-                    name: file.name,
-                    data: append_binary(&mut data, file.bytes)?,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let meta = ClipboardPayloadMeta {
-            text: self.text,
-            rich_text: self.rich_text,
-            html: self.html,
-            image,
-            files,
-        };
+        let image = self.image.as_ref().map(|image| append_binary(&mut data, &image.png_bytes)).transpose()?;
+        let files = self.files.iter().map(|file| {
+            Ok(ClipboardFileMeta { name: file.name.clone(), data: append_binary(&mut data, &file.bytes)? })
+        }).collect::<Result<Vec<_>>>()?;
+        let meta = ClipboardPayloadMeta { text: self.text.clone(), rich_text: self.rich_text.clone(), html: self.html.clone(), image, files };
         Ok((meta, data))
     }
 
@@ -375,6 +380,13 @@ struct RawFrame {
     data: Vec<u8>,
 }
 
+fn finish_clipboard(header: ClipboardTransferHeader, binary: Vec<u8>) -> Result<Frame> {
+    let payload = ClipboardPayload::from_wire(header.payload, binary)?;
+    if header.sequence == 0 && header.route_epoch == 0 { return Ok(Frame::Clipboard(payload)); }
+    let transfer = ClipboardTransfer { stamp: crate::transport::clipboard::ClipboardStamp { id: header.transfer_id, sequence: header.sequence }, route_epoch: header.route_epoch, payload: std::sync::Arc::new(payload) };
+    transfer.validate()?; Ok(Frame::ClipboardTransfer(transfer))
+}
+
 impl<R> FrameReader<R> {
     #[allow(dead_code)]
     pub fn new(inner: R) -> Self {
@@ -402,7 +414,16 @@ where
     R: AsyncRead + Unpin,
 {
     pub async fn read_frame(&mut self) -> Result<Frame> {
-        let raw = self.read_raw_frame().await?;
+        self.read_frame_kind(None).await
+    }
+
+    /// 在读取帧体或分配大载荷之前验证其功能通道.
+    pub async fn read_frame_on_lane(&mut self, clipboard: bool) -> Result<Frame> {
+        self.read_frame_kind(Some(if clipboard { FRAME_CLIPBOARD_META } else { FRAME_CONTROL })).await
+    }
+
+    async fn read_frame_kind(&mut self, expected: Option<u8>) -> Result<Frame> {
+        let raw = self.read_raw_frame_kind(expected).await?;
 
         match raw.frame_type {
             FRAME_CONTROL => {
@@ -420,9 +441,14 @@ where
     }
 
     async fn read_raw_frame(&mut self) -> Result<RawFrame> {
+        self.read_raw_frame_kind(None).await
+    }
+
+    async fn read_raw_frame_kind(&mut self, expected: Option<u8>) -> Result<RawFrame> {
         let frame_type = self.inner.read_u8().await?;
+        if expected.is_some_and(|expected| expected != frame_type) { bail!("业务帧功能通道错误"); }
         let meta_len = self.inner.read_u32().await? as usize;
-        let data_len = self.inner.read_u64().await? as usize;
+        let data_len = usize::try_from(self.inner.read_u64().await?).context("incoming frame data length overflowed usize")?;
 
         ensure_len(
             "incoming frame metadata",
@@ -454,6 +480,11 @@ where
 
         let header: ClipboardTransferHeader =
             decode_payload(&raw.meta, "failed to decode clipboard transfer header")?;
+        if header.transfer_id.is_nil() { bail!("剪贴板传输 ID 为空"); }
+        if header.sequence != 0 || header.route_epoch != 0 {
+            crate::transport::clipboard::ClipboardStamp { id: header.transfer_id, sequence: header.sequence }.validate()?;
+            if header.route_epoch == 0 { bail!("剪贴板路径代次为空"); }
+        }
         let binary_len = usize::try_from(header.binary_len)
             .context("clipboard binary length overflowed usize")?;
         ensure_len(
@@ -463,10 +494,7 @@ where
         )?;
 
         if binary_len == 0 {
-            return Ok(Frame::Clipboard(ClipboardPayload::from_wire(
-                header.payload,
-                Vec::new(),
-            )?));
+            return finish_clipboard(header, Vec::new());
         }
 
         let mut binary = Vec::with_capacity(binary_len);
@@ -510,10 +538,7 @@ where
                         expected_offset
                     );
                 }
-                return Ok(Frame::Clipboard(ClipboardPayload::from_wire(
-                    header.payload,
-                    binary,
-                )?));
+                return finish_clipboard(header, binary);
             }
         }
     }
@@ -529,39 +554,32 @@ where
                 let meta = encode_payload(&message)?;
                 self.write_raw_frame(FRAME_CONTROL, &meta, &[]).await?;
             }
-            Frame::Clipboard(payload) => {
-                let (meta, data) = payload.into_wire()?;
-                ensure_len(
-                    "clipboard binary payload",
-                    data.len(),
-                    self.limits.max_clipboard_binary_len,
-                )?;
-                let transfer_id = Uuid::new_v4();
-                let meta = encode_payload(&ClipboardTransferHeader {
-                    transfer_id,
-                    payload: meta,
-                    binary_len: u64::try_from(data.len())
-                        .context("clipboard payload length overflowed u64")?,
-                })?;
-                self.write_raw_frame(FRAME_CLIPBOARD_META, &meta, &[])
-                    .await?;
-
-                for (index, chunk) in data.chunks(CLIPBOARD_STREAM_CHUNK_SIZE).enumerate() {
-                    let offset = index
-                        .checked_mul(CLIPBOARD_STREAM_CHUNK_SIZE)
-                        .context("clipboard chunk offset overflowed")?;
-                    let meta = encode_payload(&ClipboardChunkHeader {
-                        transfer_id,
-                        offset: u64::try_from(offset)
-                            .context("clipboard chunk offset overflowed u64")?,
-                        final_chunk: offset + chunk.len() >= data.len(),
-                    })?;
-                    self.write_raw_frame(FRAME_CLIPBOARD_CHUNK, &meta, chunk)
-                        .await?;
-                }
+            Frame::Clipboard(payload) => self.write_clipboard(&payload, Uuid::new_v4(), 0, 0).await?,
+            Frame::ClipboardTransfer(transfer) => {
+                transfer.validate()?;
+                self.write_clipboard(&transfer.payload, transfer.stamp.id, transfer.stamp.sequence, transfer.route_epoch).await?;
             }
         }
         self.inner.flush().await?;
+        Ok(())
+    }
+
+    async fn write_clipboard(&mut self, payload: &ClipboardPayload, transfer_id: Uuid, sequence: u64, route_epoch: u64) -> Result<()> {
+        ensure_len("clipboard binary payload", payload.total_binary_size(), self.limits.max_clipboard_binary_len)?;
+        // 所有限制必须在元数据头写出前验证, 避免拒绝载荷后留下半帧并损坏下一条控制消息.
+        if payload.total_binary_size() > 0 {
+            ensure_len("frame data", payload.total_binary_size().min(CLIPBOARD_STREAM_CHUNK_SIZE), self.limits.max_frame_data_len)?;
+            let chunk_meta = encode_payload(&ClipboardChunkHeader { transfer_id, offset: 0, final_chunk: false })?;
+            ensure_len("frame metadata", chunk_meta.len(), self.limits.max_meta_len)?;
+        }
+        let (meta, data) = payload.to_wire()?;
+        let meta = encode_payload(&ClipboardTransferHeader { transfer_id, sequence, route_epoch, payload: meta, binary_len: u64::try_from(data.len()).context("clipboard payload length overflowed u64")? })?;
+        self.write_raw_frame(FRAME_CLIPBOARD_META, &meta, &[]).await?;
+        for (index, chunk) in data.chunks(CLIPBOARD_STREAM_CHUNK_SIZE).enumerate() {
+            let offset = index.checked_mul(CLIPBOARD_STREAM_CHUNK_SIZE).context("clipboard chunk offset overflowed")?;
+            let meta = encode_payload(&ClipboardChunkHeader { transfer_id, offset: u64::try_from(offset).context("clipboard chunk offset overflowed u64")?, final_chunk: offset + chunk.len() >= data.len() })?;
+            self.write_raw_frame(FRAME_CLIPBOARD_CHUNK, &meta, chunk).await?;
+        }
         Ok(())
     }
 
@@ -587,9 +605,9 @@ fn ensure_len(context: &'static str, actual: usize, limit: usize) -> Result<()> 
     Ok(())
 }
 
-fn append_binary(data: &mut Vec<u8>, bytes: Vec<u8>) -> Result<ClipboardBinaryMeta> {
+fn append_binary(data: &mut Vec<u8>, bytes: &[u8]) -> Result<ClipboardBinaryMeta> {
     let offset = data.len();
-    data.extend_from_slice(&bytes);
+    data.extend_from_slice(bytes);
     let len = bytes.len();
     let offset = u64::try_from(offset).context("clipboard payload offset overflowed u64")?;
     let len = u64::try_from(len).context("clipboard payload length overflowed u64")?;
@@ -624,8 +642,10 @@ mod tests {
             host_generation: 8,
             client_generation: 3,
         };
+        let path = uuid::Uuid::new_v4();
         let offer = ControlMessage::AudioUdpReady {
             epoch,
+            path_id: path,
             port: 48000,
             layout: super::AudioLayout::Surround51,
             channel_id: [0xa7; 32],
@@ -635,11 +655,13 @@ mod tests {
         match decoded {
             ControlMessage::AudioUdpReady {
                 epoch: actual,
+                path_id,
                 port,
                 layout,
                 channel_id,
             } => {
                 assert_eq!(actual, epoch);
+                assert_eq!(path_id, path);
                 assert_eq!(port, 48000);
                 assert_eq!(layout, super::AudioLayout::Surround51);
                 assert_eq!(channel_id, [0xa7; 32]);
@@ -689,7 +711,7 @@ mod tests {
             ],
         };
 
-        let (meta, data) = payload.clone().into_wire().unwrap();
+        let (meta, data) = payload.to_wire().unwrap();
         let decoded = ClipboardPayload::from_wire(meta, data).unwrap();
         assert_eq!(decoded, payload);
     }
@@ -773,6 +795,37 @@ mod tests {
                 assert_eq!(device_name, "client-device");
             }
             other => panic!("expected bootstrap hello, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_chunk_limit_writes_no_partial_clipboard_header_before_next_control() {
+        let payload = ClipboardPayload { text: None, rich_text: None, html: None, image: None, files: vec![ClipboardFile { name: "payload.bin".to_owned(), bytes: vec![1; 1024] }] };
+        let limits = super::TransferLimits { max_frame_data_len: 512, ..Default::default() };
+        let mut bytes = Vec::new(); let mut writer = super::FrameWriter::with_limits(&mut bytes, limits);
+        assert!(writer.write_frame(super::Frame::Clipboard(payload)).await.is_err());
+        writer.write_frame(super::Frame::Control(ControlMessage::Goodbye)).await.unwrap();
+        assert!(matches!(super::FrameReader::with_limits(bytes.as_slice(), limits).read_frame().await.unwrap(), super::Frame::Control(ControlMessage::Goodbye)));
+    }
+
+    #[tokio::test]
+    async fn reliable_clipboard_wire_preserves_stamp_and_never_returns_partial_delivery() {
+        let stamp = crate::transport::clipboard::ClipboardStamp { id: uuid::Uuid::new_v4(), sequence: 7 };
+        let transfer = super::ClipboardTransfer { stamp, route_epoch: 3, payload: std::sync::Arc::new(ClipboardPayload { text: Some("正文".to_owned()), rich_text: None, html: None, image: None, files: vec![ClipboardFile { name: "payload.bin".to_owned(), bytes: vec![0x51; 256 * 1024] }] }) };
+        let mut bytes = Vec::new(); super::FrameWriter::new(&mut bytes).write_frame(super::Frame::ClipboardTransfer(transfer.clone())).await.unwrap();
+        let super::Frame::ClipboardTransfer(received) = super::FrameReader::new(bytes.as_slice()).read_frame_on_lane(true).await.unwrap() else { panic!("应保留稳定交付身份") };
+        assert_eq!(received.stamp, stamp); assert_eq!(received.route_epoch, 3); assert_eq!(received.payload, transfer.payload);
+        assert!(super::FrameReader::new(&bytes[..bytes.len() - 3]).read_frame_on_lane(true).await.is_err());
+        assert!(super::FrameReader::new(bytes.as_slice()).read_frame_on_lane(false).await.is_err());
+    }
+    #[tokio::test]
+    async fn invalid_clipboard_stamp_is_rejected_without_waiting_for_announced_binary_body() {
+        for (id, sequence, route_epoch) in [(uuid::Uuid::nil(), 1, 1), (uuid::Uuid::new_v4(), 1, 0), (uuid::Uuid::new_v4(), 0, 1)] {
+            let (sender, receiver) = tokio::io::duplex(1024);
+            let header = super::ClipboardTransferHeader { transfer_id: id, sequence, route_epoch, payload: super::ClipboardPayloadMeta { text: None, rich_text: None, html: None, image: None, files: vec![] }, binary_len: 1024 * 1024 };
+            let mut writer = super::FrameWriter::new(sender); writer.write_raw_frame(super::FRAME_CLIPBOARD_META, &super::encode_payload(&header).unwrap(), &[]).await.unwrap();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(1), super::FrameReader::new(receiver).read_frame_on_lane(true)).await.unwrap(); assert!(result.is_err());
+            drop(writer);
         }
     }
 

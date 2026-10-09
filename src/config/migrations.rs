@@ -1,7 +1,7 @@
 use super::schema::GuiState;
 use anyhow::{Context, Result, bail};
 
-pub(super) const MAIN_CONFIG_VERSION: u32 = 5;
+pub(super) const MAIN_CONFIG_VERSION: u32 = 8;
 pub(super) const GUI_STATE_VERSION: u32 = 1;
 pub(super) const IDENTITY_VERSION: u32 = 1;
 pub(super) const TRUSTED_DEVICES_VERSION: u32 = 1;
@@ -51,6 +51,30 @@ pub(super) fn migrate_main_config(raw: &str) -> Result<MainMigration> {
             4 => {
                 remove_workspace_sync_fields(&mut document)?;
                 version = 5;
+                set_version(&mut document, version, "config.toml")?;
+                migrated = true;
+            }
+            5 => {
+                let table = document.as_table_mut().context("config.toml must be a table")?;
+                let runtime = table.entry("runtime".to_owned()).or_insert_with(|| toml::Value::Table(Default::default())).as_table_mut().context("config.toml runtime must be a table")?;
+                runtime.insert("bluetooth_enabled".to_owned(), toml::Value::Boolean(false));
+                version = 6;
+                set_version(&mut document, version, "config.toml")?;
+                migrated = true;
+            }
+            6 => {
+                let table = document.as_table_mut().context("config.toml must be a table")?;
+                let input = table.entry("input".to_owned()).or_insert_with(|| toml::Value::Table(Default::default())).as_table_mut().context("config.toml input must be a table")?;
+                input.entry("path".to_owned()).or_insert_with(|| toml::Value::String("prefer_bluetooth".to_owned()));
+                version = 7;
+                set_version(&mut document, version, "config.toml")?;
+                migrated = true;
+            }
+            7 => {
+                let table = document.as_table_mut().context("config.toml must be a table")?;
+                let clipboard = table.entry("clipboard".to_owned()).or_insert_with(|| toml::Value::Table(Default::default())).as_table_mut().context("config.toml clipboard must be a table")?;
+                clipboard.entry("path".to_owned()).or_insert_with(|| toml::Value::String("auto".to_owned()));
+                version = 8;
                 set_version(&mut document, version, "config.toml")?;
                 migrated = true;
             }
@@ -293,7 +317,7 @@ mod tests {
         let table = migration.document.as_table().unwrap();
         assert_eq!(
             table.get("version").and_then(toml::Value::as_integer),
-            Some(5)
+            Some(i64::from(MAIN_CONFIG_VERSION))
         );
         let ui = table.get("ui").and_then(toml::Value::as_table).unwrap();
         assert!(!ui.contains_key("first_run_completed"));
@@ -316,7 +340,7 @@ mod tests {
 
     #[test]
     fn current_main_config_is_not_migrated() {
-        let migration = migrate_main_config("version = 5\n").unwrap();
+        let migration = migrate_main_config(&format!("version = {MAIN_CONFIG_VERSION}\n")).unwrap();
         assert!(!migration.migrated);
         assert!(migration.legacy_gui_state.is_none());
     }
@@ -329,7 +353,7 @@ mod tests {
         let table = migration.document.as_table().unwrap();
         assert_eq!(
             table.get("version").and_then(toml::Value::as_integer),
-            Some(5)
+            Some(i64::from(MAIN_CONFIG_VERSION))
         );
         let input = table.get("input").and_then(toml::Value::as_table).unwrap();
         assert_eq!(
@@ -358,7 +382,7 @@ mod tests {
         let table = migration.document.as_table().unwrap();
         assert_eq!(
             table.get("version").and_then(toml::Value::as_integer),
-            Some(5)
+            Some(i64::from(MAIN_CONFIG_VERSION))
         );
         let input = table.get("input").and_then(toml::Value::as_table).unwrap();
         assert_eq!(
@@ -378,7 +402,7 @@ mod tests {
         let table = migration.document.as_table().unwrap();
         assert_eq!(
             table.get("version").and_then(toml::Value::as_integer),
-            Some(5)
+            Some(i64::from(MAIN_CONFIG_VERSION))
         );
         let ui = table.get("ui").and_then(toml::Value::as_table).unwrap();
         assert_eq!(
@@ -415,9 +439,10 @@ cache_dir = "/example/clipboard-cache"
         )
         .unwrap();
         assert!(migration.migrated);
-        assert_eq!(migration.document["version"].as_integer(), Some(5));
+        assert_eq!(migration.document["version"].as_integer(), Some(i64::from(MAIN_CONFIG_VERSION)));
         let runtime = migration.document["runtime"].as_table().unwrap();
-        assert_eq!(runtime.len(), 3);
+        assert_eq!(runtime.len(), 4);
+        assert_eq!(runtime["bluetooth_enabled"].as_bool(), Some(false));
         assert_eq!(runtime["role"].as_str(), Some("host"));
         assert_eq!(runtime["clipboard_mode"].as_str(), Some("both"));
         assert_eq!(runtime["audio_mode"].as_str(), Some("off"));
@@ -440,6 +465,6 @@ cache_dir = "/example/clipboard-cache"
     fn future_versions_are_rejected() {
         assert!(migrate_identity("version = 2\n").is_err());
         assert!(migrate_trusted_devices("version = 2\n").is_err());
-        assert!(migrate_main_config("version = 6\n").is_err());
+        assert!(migrate_main_config(&format!("version = {}\n", MAIN_CONFIG_VERSION + 1)).is_err());
     }
 }

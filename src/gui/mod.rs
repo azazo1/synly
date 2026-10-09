@@ -947,7 +947,7 @@ fn apply_snapshot(
             title: session.display_name.clone().into(),
             active: session.active,
             subtitle: format!(
-                "{} | {}",
+                "{} | {} | {}",
                 if session.active {
                     "活跃会话"
                 } else {
@@ -956,7 +956,8 @@ fn apply_snapshot(
                 session
                     .remote_capabilities
                     .map(capability_summary)
-                    .unwrap_or_else(|| "未协商".to_string())
+                    .unwrap_or_else(|| "未协商".to_string()),
+                session.transport.map(transport_summary).unwrap_or_else(|| "路径状态未建立".to_string())
             )
             .into(),
         })
@@ -1149,6 +1150,7 @@ fn apply_settings_to_window(window: &AppWindow, runtime: &RuntimeConfig, setting
     window.set_audio_mode_index(audio_mode_index(runtime.audio_mode));
     window.set_audio_layout_index(audio_layout_index(runtime.audio_layout));
     window.set_input_mode_index(input_mode_index(runtime.input.mode));
+    window.set_input_path_index(input_path_index(runtime.input.path));
     window.set_input_edge_index(input_edge_index(runtime.input.edge));
     window.set_input_hotkey(runtime.input.hotkey.clone().into());
     window.set_block_switch_on_press(runtime.input.block_switch_on_press);
@@ -1164,6 +1166,8 @@ fn apply_settings_to_window(window: &AppWindow, runtime: &RuntimeConfig, setting
     window.set_accept_untrusted(runtime.accept);
     window.set_trust_device(runtime.trust_device);
     window.set_trusted_only(runtime.trusted_only);
+    window.set_bluetooth_enabled(runtime.bluetooth_enabled);
+    window.set_clipboard_path_index(input_path_index(settings.clipboard.path));
     window.set_device_name(settings.device_name.clone().into());
     window
         .set_clipboard_max_file_text(format_human_bytes(settings.clipboard.max_file_bytes).into());
@@ -1252,6 +1256,7 @@ fn settings_from_window(
         audio_layout: audio_layout_from_index(window.get_audio_layout_index()),
         input: crate::config::InputConfig {
             mode: input_mode_from_index(window.get_input_mode_index()),
+            path: input_path_from_index(window.get_input_path_index()),
             edge: input_edge_from_index(window.get_input_edge_index()),
             hotkey: window.get_input_hotkey().trim().to_string(),
             elevate_on_start: current_input.elevate_on_start,
@@ -1267,12 +1272,14 @@ fn settings_from_window(
         accept: window.get_accept_untrusted(),
         trust_device: window.get_trust_device(),
         trusted_only: window.get_trusted_only(),
+        bluetooth_enabled: window.get_bluetooth_enabled(),
     };
     let device_name = window.get_device_name().trim().to_string();
     if device_name.is_empty() {
         anyhow::bail!("设备名不能为空");
     }
     let clipboard = ClipboardConfig {
+        path: input_path_from_index(window.get_clipboard_path_index()),
         max_file_bytes: parse_required_u64(
             window.get_clipboard_max_file_text().as_str(),
             "剪贴板单文件限制",
@@ -1485,6 +1492,38 @@ fn audio_mode_from_index(index: i32) -> AudioMode {
         2 => AudioMode::Receive,
         _ => AudioMode::Off,
     }
+}
+
+fn transport_summary(status: crate::runtime_control::TransportStatus) -> String {
+    use synly_core::transport::routing::{TransportKind, RouteChoice, PauseReason};
+    let label = |kind| match kind { TransportKind::Lan => "局域网", TransportKind::Bluetooth => "蓝牙" };
+    let input = if status.failed { "失败暂停" } else if status.switching { "切换确认中" } else if status.input_running {
+        match status.input { RouteChoice::Selected(kind) => label(kind), RouteChoice::Paused(_) => "暂停" }
+    } else {
+        match status.input {
+            RouteChoice::Paused(PauseReason::PolicyConflict) => "双方策略冲突",
+            RouteChoice::Paused(PauseReason::TransportUnavailable) => "所需路径不可用",
+            RouteChoice::Paused(PauseReason::UnsupportedChannel) => "平台不支持",
+            RouteChoice::Selected(_) => "关闭或等待协商",
+        }
+    };
+    let clipboard = match status.clipboard_choice {
+        RouteChoice::Paused(PauseReason::PolicyConflict) => "双方策略冲突",
+        RouteChoice::Paused(PauseReason::TransportUnavailable) => "所需路径不可用",
+        RouteChoice::Paused(PauseReason::UnsupportedChannel) => "平台不支持",
+        RouteChoice::Selected(_) => if status.clipboard_failed { "失败暂停" } else if status.clipboard_switching { "切换确认中" } else { status.clipboard.map(label).unwrap_or("关闭或等待路径") },
+    };
+    let audio = if status.audio_failed { "失败暂停" } else if status.audio_unavailable { "等待已绑定局域网" } else if status.audio_waiting { "等待 UDP 接收端口" } else if status.audio == Some(TransportKind::Lan) { "局域网 UDP" } else { "关闭或等待协商" };
+    format!("主控制 {} / 已接入 {}{} / 输入 {}{} / 剪贴板 {} / 音频 {}", label(status.primary), if status.available.lan { "局域网 " } else { "" }, if status.available.bluetooth { "蓝牙" } else { "" }, input, if status.requires_manual_activation { "(重建需热键确认)" } else { "" }, clipboard, audio)
+}
+
+fn input_path_index(policy: synly_core::transport::routing::PathPolicy) -> i32 {
+    use synly_core::transport::routing::PathPolicy;
+    match policy { PathPolicy::Auto => 0, PathPolicy::PreferBluetooth => 1, PathPolicy::LanOnly => 2, PathPolicy::BluetoothOnly => 3 }
+}
+fn input_path_from_index(index: i32) -> synly_core::transport::routing::PathPolicy {
+    use synly_core::transport::routing::PathPolicy;
+    match index { 0 => PathPolicy::Auto, 2 => PathPolicy::LanOnly, 3 => PathPolicy::BluetoothOnly, _ => PathPolicy::PreferBluetooth }
 }
 
 fn input_mode_index(mode: InputMode) -> i32 {

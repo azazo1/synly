@@ -1,4 +1,4 @@
-version = 5
+version = 8
 
 # 每台设备的 UUID 和身份密钥由 identity.toml 保存.
 # 首选活跃设备 ID, 由程序写入, host 重启后保持其活跃身份.
@@ -7,6 +7,9 @@ version = 5
 device_name = "workstation"
 
 [clipboard]
+# auto 保持当前健康路径; 也可选 prefer_bluetooth, lan_only, bluetooth_only.
+# 双方允许路径的交集为空时仅暂停剪贴板, 不影响主控制或输入.
+path = "auto"
 max_file_bytes = 104857600
 max_cache_bytes = 536870912
 # 可选. 相对路径基于 dirs::cache_dir()/synly.
@@ -44,9 +47,15 @@ audio_layout = "stereo"
 accept = false
 trust_device = false
 trusted_only = false
+# 系统安全 RFCOMM, 默认关闭. 首次应用身份仍需双方明确授权, 不使用第二组 PIN.
+bluetooth_enabled = false
+# Join 目标可使用 bluetooth:11:22:33:44:55:66/设备UUID, 地址和 UUID 仅作为接入线索.
 
 [input]
 mode = "off"
+# auto 保持健康路径, prefer_bluetooth 优先蓝牙, lan_only/bluetooth_only 禁止其他输入路径.
+# 双方限制取交集. 路径切换后必须按紧急热键确认, 再产生新边缘动作.
+path = "prefer_bluetooth"
 edge = "right"
 hotkey = "ctrl+alt+shift+esc"
 elevate_on_start = false

@@ -1,7 +1,7 @@
 mod capture;
 #[cfg(test)]
 mod channel_tests;
-mod crypto;
+pub(crate) mod crypto;
 mod queue;
 mod receive;
 mod render;
@@ -42,13 +42,13 @@ pub struct AudioTaskHandle {
 }
 
 impl AudioTaskHandle {
+    pub(crate) async fn wait_finished(&mut self) -> Result<()> {
+        let Some(task) = &mut self.task else { return std::future::pending().await; };
+        let result = task.await; self.task = None; result.context("音频监督任务异常退出")?
+    }
     pub async fn stop(mut self) -> Result<()> {
         self.stop.cancel();
-        self.task
-            .take()
-            .context("音频任务句柄丢失")?
-            .await
-            .context("音频监督任务异常退出")?
+        match self.task.take() { Some(task) => task.await.context("音频监督任务异常退出")?, None => Ok(()) }
     }
 }
 

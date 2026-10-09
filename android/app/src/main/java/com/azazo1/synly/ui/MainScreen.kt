@@ -171,6 +171,10 @@ private fun HomeScreen(onOpenSettings: () -> Unit, onOpenLogs: () -> Unit) {
                 }
             }
 
+            uiState.transportSummary?.let { summary ->
+                item { Text(summary, style = MaterialTheme.typography.bodySmall) }
+            }
+
             uiState.lastMessage?.let { message ->
                 item { Text(message, color = MaterialTheme.colorScheme.error) }
             }
@@ -401,6 +405,10 @@ private fun HomeScreen(onOpenSettings: () -> Unit, onOpenLogs: () -> Unit) {
                 }
             }
         }
+    }
+
+    uiState.bluetoothAuthorization?.let { request ->
+        BluetoothAuthorizationDialog(request)
     }
 
     uiState.pinRequest?.let { request ->

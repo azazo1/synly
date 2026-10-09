@@ -203,6 +203,11 @@ fun SettingsScreen(onBack: () -> Unit) {
             item {
                 Card {
                     Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        ClipboardPathSetting(settings.clipboardPath) { policy ->
+                            settings = settings.copy(clipboardPath = policy)
+                            SettingsStore.save(context, settings)
+                            SynlyEngine.setClipboardPath(policy)
+                        }
                         ByteSizeField(
                             valueBytes = settings.maxClipboardBytes,
                             onCommit = { bytes ->
@@ -506,6 +511,7 @@ private fun ConfigImportPreview(backup: ConfigBackup.Backup) {
         Text("将覆盖当前设置, 身份和可信设备", style = MaterialTheme.typography.bodySmall)
         PreviewLine("设备名称", settings.deviceName)
         PreviewLine("剪贴板模式", settings.clipboardMode.name)
+        PreviewLine("剪贴板路径", settings.clipboardPath.label())
         PreviewLine(
             "剪贴板大小上限",
             formatHumanBytes(settings.maxClipboardBytes.toULong()),

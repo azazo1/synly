@@ -8,13 +8,17 @@ import java.io.File
 import java.util.UUID
 
 object ClipboardWriter {
-    fun applyRemote(context: Context, payload: ClipboardPayload): Boolean {
+    fun applyRemote(context: Context, payload: ClipboardPayload, strict: Boolean = false): Boolean {
         if (payload.isEmpty()) return false
+        if (strict) {
+            val binaryBytes = payload.files.sumOf { it.bytes.size.toLong() } + (payload.imagePng?.size?.toLong() ?: 0L)
+            if (binaryBytes > SettingsStore.load(context).maxClipboardBytes) return false
+        }
         val clipboard = context.getSystemService(ClipboardManager::class.java)
         val clip = when {
             payload.files.isNotEmpty() -> {
                 val uris = ClipboardCache.writeRemote(context, payload.files)
-                if (uris.isEmpty()) {
+                if (uris.isEmpty() || (strict && uris.size != payload.files.size)) {
                     null
                 } else {
                     val uriClip = ClipData.newUri(

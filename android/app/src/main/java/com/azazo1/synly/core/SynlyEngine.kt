@@ -18,12 +18,14 @@ import uniffi.synly_core.FfiClientState
 import uniffi.synly_core.FfiClientTarget
 import uniffi.synly_core.FfiClipboardFile
 import uniffi.synly_core.FfiClipboardMode
+import uniffi.synly_core.FfiPathPolicy
 import uniffi.synly_core.FfiDiscoveryConfig
 import uniffi.synly_core.FfiDiscoveredPeer
 import uniffi.synly_core.FfiLogListener
 import uniffi.synly_core.browseDevices
 import uniffi.synly_core.initTracing
 import uniffi.synly_core.startClient
+import uniffi.synly_core.registerBluetoothProvider
 
 object SynlyEngine {
     private const val TAG = "Synly"
@@ -70,6 +72,8 @@ object SynlyEngine {
             if (initialized) return
             runCatching { initTracing(logListener) }
                 .onFailure { SynlyLog.w(TAG, "初始化 tracing 失败", it) }
+            runCatching { registerBluetoothProvider(BluetoothBackend(context.applicationContext)) }
+                .onFailure { SynlyLog.w(TAG, "初始化系统蓝牙提供者失败, 局域网仍可使用", it) }
             initialized = true
         }
     }
@@ -93,8 +97,10 @@ object SynlyEngine {
             it.copy(
                 state = FfiClientState.CONNECTING,
                 connectedDevice = null,
+                transportSummary = null,
                 targetLabel = targetLabel(context, target),
                 pinRequest = null,
+                bluetoothAuthorization = null,
                 canSend = false,
                 canReceive = false,
             )
@@ -134,14 +140,17 @@ object SynlyEngine {
             maxFrameDataLen = 128u * 1024u * 1024u,
             maxClipboardBinaryLen = settings.maxClipboardBytes.toUInt(),
             clipboardMode = settings.clipboardMode,
+            clipboardPath = settings.clipboardPath,
             instanceName = null,
             requestTrust = true,
+            bluetoothEnabled = settings.bluetoothEnabled,
             discovery = discoveryConfig(settings),
         )
         val ffiTarget = FfiClientTarget(
             addresses = target.addresses,
             port = target.port.toUShort(),
             peerDeviceId = target.peerDeviceId,
+            bluetoothAddress = target.bluetoothAddress,
         )
         runCatching {
             handle?.stop()
@@ -217,11 +226,20 @@ object SynlyEngine {
                 state = null,
                 connectedDevice = null,
                 targetLabel = null,
+                transportSummary = null,
                 pinRequest = null,
+                bluetoothAuthorization = null,
                 canSend = false,
                 canReceive = false,
             )
         }
+    }
+
+    fun authorizeBluetooth(requestId: String, accepted: Boolean, remember: Boolean) {
+        if (_uiState.value.bluetoothAuthorization?.requestId != requestId) return
+        runCatching { handle?.authorizeBluetooth(requestId, accepted, remember) }
+            .onFailure { SynlyLog.e(TAG, "提交蓝牙应用授权失败", it) }
+        _uiState.update { it.copy(bluetoothAuthorization = null) }
     }
 
     fun submitPin(pin: String) {
@@ -231,6 +249,10 @@ object SynlyEngine {
 
     fun cancelPin() {
         runCatching { handle?.cancelPin() }
+    }
+
+    fun setClipboardPath(policy: FfiPathPolicy) {
+        runCatching { handle?.setClipboardPath(policy) }.onFailure { SynlyLog.e(TAG, "更新剪贴板路径失败", it) }
     }
 
     fun setClipboardMode(mode: FfiClipboardMode) {
@@ -295,7 +317,7 @@ object SynlyEngine {
             ?.let { id ->
                 TrustedDeviceStore.list(context).firstOrNull { it.deviceId == id }?.deviceName
             }
-        return trustedName ?: "${target.addresses.joinToString(", ")}:${target.port}"
+        return trustedName ?: target.bluetoothAddress?.let { "蓝牙 $it" } ?: "${target.addresses.joinToString(", ")}:${target.port}"
     }
 
     private fun rememberConnectedAddress(
@@ -307,6 +329,13 @@ object SynlyEngine {
         val settings = SettingsStore.load(context)
         val target = settings.lastTarget ?: return
         if (target.peerDeviceId != null && target.peerDeviceId != remoteDeviceId) return
+        if (target.bluetoothAddress != null) {
+            val updated = target.copy(peerDeviceId = remoteDeviceId)
+            val recent = listOf(updated) + settings.recentTargets.filter { it.bluetoothAddress != target.bluetoothAddress }
+            SettingsStore.save(context, settings.copy(lastTarget = updated, recentTargets = recent))
+            currentTarget = updated
+            return
+        }
         val normalized = address?.trim()?.takeIf { it.isNotEmpty() }
             ?: target.addresses.firstOrNull()
             ?: return
@@ -357,6 +386,14 @@ object SynlyEngine {
                 }
             }
 
+            is FfiClientEvent.BluetoothAuthorizationRequired -> {
+                _uiState.update { it.copy(pinRequest = null, bluetoothAuthorization = BluetoothAuthorization(
+                    requestId = event.requestId, displayName = event.remote.deviceName, deviceId = event.remote.deviceId,
+                    fingerprint = event.fingerprint, systemAddress = event.systemAddress,
+                    changedIdentity = event.changedIdentity, capabilitiesSummary = event.capabilitiesSummary,
+                )) }
+            }
+
             is FfiClientEvent.Connected -> {
                 _uiState.update {
                     it.copy(
@@ -364,6 +401,7 @@ object SynlyEngine {
                         connectedDevice = event.remote.deviceName,
                         targetLabel = event.remote.deviceName,
                         pinRequest = null,
+                        bluetoothAuthorization = null,
                         lastMessage = null,
                         canSend = event.clientToHost,
                         canReceive = event.hostToClient,
@@ -376,6 +414,11 @@ object SynlyEngine {
                 )
             }
 
+            is FfiClientEvent.TransportChanged -> {
+                val links = listOfNotNull(if (event.lanAvailable) "局域网" else null, if (event.bluetoothAvailable) "蓝牙" else null).joinToString(" + ")
+                _uiState.update { it.copy(transportSummary = "主控制 ${event.primary} / 已接入 $links / 剪贴板 ${event.clipboardStatus}") }
+            }
+
             is FfiClientEvent.ClipboardReceived -> {
                 val payload = ClipboardPayload(
                     text = event.text,
@@ -384,14 +427,22 @@ object SynlyEngine {
                     files = event.files.map { ClipboardFile(it.name, it.bytes) },
                 )
                 val context = SynlyApplication.instance
-                if (context != null) {
-                    ClipboardWriter.applyRemote(context, payload)
-                }
-                _uiState.update {
-                    it.copy(
-                        lastReceivedText = event.text?.take(200),
-                        lastReceivedImagePng = event.imagePng,
-                    )
+                val deliveryHandle = handle
+                // 文件缓存与系统剪贴板写入离开 FFI 回调线程, 控制和收包继续运行.
+                scope.launch {
+                    val applied = context != null && runCatching {
+                        ClipboardWriter.applyRemote(context, payload, strict = event.deliveryId != null)
+                    }.onFailure { SynlyLog.w(TAG, "应用远端剪贴板失败", it) }.getOrDefault(false)
+                    event.deliveryId?.let { id ->
+                        runCatching { deliveryHandle?.confirmClipboard(id, applied) }
+                            .onFailure { SynlyLog.w(TAG, "发送剪贴板应用回执失败", it) }
+                    }
+                    if (applied && handle === deliveryHandle) _uiState.update {
+                        it.copy(
+                            lastReceivedText = event.text?.take(200),
+                            lastReceivedImagePng = event.imagePng,
+                        )
+                    }
                 }
             }
 
@@ -410,7 +461,9 @@ object SynlyEngine {
                     it.copy(
                         state = null,
                         connectedDevice = null,
+                        transportSummary = null,
                         pinRequest = null,
+                        bluetoothAuthorization = null,
                         canSend = false,
                         canReceive = false,
                     )
@@ -425,6 +478,8 @@ object SynlyEngine {
                     it.copy(
                         state = null,
                         targetLabel = null,
+                transportSummary = null,
+                        bluetoothAuthorization = null,
                         lastMessage = event.message,
                     )
                 }

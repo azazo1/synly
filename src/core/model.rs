@@ -65,6 +65,7 @@ pub struct SessionView {
     pub remote_capabilities: Option<RuntimeCapabilities>,
     pub capability_epoch: Option<CapabilityEpoch>,
     pub capabilities_acknowledged: bool,
+    pub transport: Option<crate::runtime_control::TransportStatus>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

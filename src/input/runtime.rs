@@ -20,7 +20,7 @@ use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::time::{self, Instant, MissedTickBehavior};
-use tokio_rustls::TlsStream;
+use synly_core::transport::stream::AsyncByteStream;
 
 const MOTION_INTERVAL: Duration = Duration::from_micros(8_333);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(250);
@@ -39,6 +39,7 @@ const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InputRuntimeOptions {
     pub mode: InputMode,
+    pub path: synly_core::transport::routing::PathPolicy,
     pub edge: ScreenEdge,
     pub hotkey: Hotkey,
     pub reverse_mouse_wheel: bool,
@@ -99,6 +100,8 @@ impl InputSocketConnection {
 }
 
 pub enum InputSessionContext {
+    /// 已经通过主 TLS 与随机代次绑定, 不再建立辅助 TCP/TLS.
+    Multiplexed { stream: synly_core::transport::stream::ByteStream },
     Host {
         channel: InputHostChannel,
         sockets: InputSocketInbox,
@@ -126,6 +129,18 @@ pub async fn run_input_session(
     options: InputRuntimeOptions,
     input_activity: Option<Arc<AtomicBool>>,
 ) -> Result<()> {
+    run_input_session_with_gate(context, master_secret, local_role, options, input_activity, false).await
+}
+
+/// 功能路径切换后的新连接必须先经过用户热键确认, 不能由残留边缘坐标激活.
+pub async fn run_input_session_with_gate(
+    context: InputSessionContext,
+    master_secret: [u8; 32],
+    local_role: LocalInputRole,
+    options: InputRuntimeOptions,
+    input_activity: Option<Arc<AtomicBool>>,
+    mut require_manual_activation: bool,
+) -> Result<()> {
     if let Some(input_activity) = &input_activity {
         input_activity.store(false, Ordering::Release);
     }
@@ -134,6 +149,11 @@ pub async fn run_input_session(
         platform::start_with_filter(options.mode, options.hotkey, filter_app_events)?;
     tracing::info!(role = ?local_role, "输入同步运行时已启动");
     match context {
+        InputSessionContext::Multiplexed { stream } => {
+            let result = run_established(stream, local_role, &options, &mut platform, input_activity, require_manual_activation).await;
+            cleanup_platform(&platform);
+            result
+        }
         InputSessionContext::Host { channel, sockets } => loop {
             let connection = sockets
                 .recv()
@@ -156,6 +176,7 @@ pub async fn run_input_session(
                         &options,
                         &mut platform,
                         input_activity.clone(),
+                        require_manual_activation,
                     )
                     .await
                     {
@@ -163,7 +184,8 @@ pub async fn run_input_session(
                         if platform_is_terminal(&platform) {
                             return Err(err);
                         }
-                        tracing::warn!(error = %err, "输入辅助连接已断开, 等待重连");
+                        require_manual_activation = true;
+                        tracing::warn!(error = %err, "输入辅助连接已断开, 重连后等待用户手动激活");
                     }
                 }
                 Ok(Err(err)) => {
@@ -193,6 +215,7 @@ pub async fn run_input_session(
                             &options,
                             &mut platform,
                             input_activity.clone(),
+                            require_manual_activation,
                         )
                         .await
                     }
@@ -204,7 +227,8 @@ pub async fn run_input_session(
                     if platform_is_terminal(&platform) {
                         return Err(err);
                     }
-                    tracing::warn!(error = %err, retry_secs = delay.as_secs(), "输入辅助连接将在退避后重连");
+                    require_manual_activation = true;
+                    tracing::warn!(error = %err, retry_secs = delay.as_secs(), "输入辅助连接将在退避后重连, 新连接等待用户手动激活");
                     time::sleep(delay).await;
                     delay = Duration::from_secs(
                         delay
@@ -230,12 +254,13 @@ fn platform_is_terminal(platform: &platform::PlatformHandle) -> bool {
             .load(std::sync::atomic::Ordering::Acquire)
 }
 
-async fn run_established(
-    stream: TlsStream<TcpStream>,
+async fn run_established<T: AsyncByteStream + 'static>(
+    stream: T,
     local_role: LocalInputRole,
     options: &InputRuntimeOptions,
     platform: &mut platform::PlatformHandle,
     input_activity: Option<Arc<AtomicBool>>,
+    require_manual_activation: bool,
 ) -> Result<()> {
     if let Some(input_activity) = &input_activity {
         input_activity.store(false, Ordering::Release);
@@ -257,7 +282,7 @@ async fn run_established(
         layout: local_layout.clone(),
     })
     .await?;
-    let (remote_platform, remote_layout) = match read_message(&mut reader).await? {
+    let (remote_platform, remote_layout) = match time::timeout(AUTH_TIMEOUT, read_message(&mut reader)).await.context("输入布局交换超时")?? {
         InputMessage::Hello { platform, layout } => (platform, layout),
         InputMessage::Proof { .. } => bail!("输入通道认证完成后收到了重复证明"),
         _ => bail!("输入通道在布局交换前收到了事件"),
@@ -283,11 +308,12 @@ async fn run_established(
                 remote_platform,
                 options,
                 input_activity,
+                require_manual_activation,
             )
             .await
         }
         LocalInputRole::Receive => {
-            run_receiver(
+            run_receiver_with_activity(
                 &mut incoming,
                 &incoming_motion,
                 &tx,
@@ -295,6 +321,7 @@ async fn run_established(
                 local_layout,
                 options,
                 platform::foreground_cursor_captured,
+                input_activity,
             )
             .await
         }
@@ -552,6 +579,7 @@ pub(super) async fn run_sender(
         remote_platform,
         options,
         None,
+        false,
     )
     .await
 }
@@ -566,6 +594,7 @@ pub(super) async fn run_sender_with_activity(
     remote_platform: InputPlatform,
     options: &InputRuntimeOptions,
     input_activity: Option<Arc<AtomicBool>>,
+    mut require_manual_activation: bool,
 ) -> Result<()> {
     let local_platform = InputPlatform::current();
     let mut key_mapper = KeyMapper::new(&options.key_mapping, local_platform, remote_platform)?;
@@ -673,6 +702,11 @@ pub(super) async fn run_sender_with_activity(
                                 edge_position: None,
                             });
                             tracing::info!(generation = control.generation, "紧急热键已收回本机控制");
+                        } else if require_manual_activation {
+                            // 清空确认前的位移/位置, 用户确认后还需新的边缘动作.
+                            platform.motion.take();
+                            require_manual_activation = false;
+                            tracing::info!("用户已确认新输入路径, 可以重新移至边缘激活");
                         }
                     }
                     NativeEvent::Key { usage, modifiers: _, down, repeat } if control.active => {
@@ -777,7 +811,7 @@ pub(super) async fn run_sender_with_activity(
                         dx: sample.dx,
                         dy: sample.dy,
                     })?;
-                } else if Instant::now() >= control.cooldown_until {
+                } else if !require_manual_activation && Instant::now() >= control.cooldown_until {
                     let point = match (sample.position_updated, sample.position) {
                         (true, Some(point)) => point,
                         _ if sample.dx != 0 || sample.dy != 0 => {
@@ -1090,6 +1124,7 @@ fn enqueue_message(tx: &mpsc::Sender<InputMessage>, message: InputMessage) -> Re
     })
 }
 
+#[cfg(any(test, feature = "input-receiver-mock"))]
 pub(super) async fn run_receiver(
     incoming: &mut mpsc::Receiver<Result<InputMessage>>,
     incoming_motion: &IncomingMotion,
@@ -1099,6 +1134,22 @@ pub(super) async fn run_receiver(
     options: &InputRuntimeOptions,
     foreground_captured: impl Fn() -> bool,
 ) -> Result<()> {
+    run_receiver_with_activity(incoming, incoming_motion, tx, platform, local_layout, options, foreground_captured, None).await
+}
+struct ReceiverActivity(Option<Arc<AtomicBool>>);
+impl Drop for ReceiverActivity { fn drop(&mut self) { if let Some(flag) = &self.0 { flag.store(false, Ordering::Release); } } }
+#[allow(clippy::too_many_arguments)]
+async fn run_receiver_with_activity(
+    incoming: &mut mpsc::Receiver<Result<InputMessage>>,
+    incoming_motion: &IncomingMotion,
+    tx: &mpsc::Sender<InputMessage>,
+    platform: &mut platform::PlatformHandle,
+    local_layout: super::DesktopLayout,
+    options: &InputRuntimeOptions,
+    foreground_captured: impl Fn() -> bool,
+    input_activity: Option<Arc<AtomicBool>>,
+) -> Result<()> {
+    let activity = ReceiverActivity(input_activity);
     let mut generation = 0u64;
     let mut active = false;
     let mut return_edge = ScreenEdge::Left;
@@ -1127,6 +1178,7 @@ pub(super) async fn run_receiver(
     monitor_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
+        if let Some(flag) = &activity.0 { flag.store(active, Ordering::Release); }
         tokio::select! {
             biased;
             _ = heartbeat.tick() => {
@@ -1733,6 +1785,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn switched_sender_requires_hotkey_and_fresh_motion_before_activation() {
+        let backend = Arc::new(FakeBackend::default()); let layout = backend.layout().unwrap();
+        let motion = Arc::new(MotionAccumulator::default()); let (events_tx, events) = mpsc::channel(1);
+        let mut platform = PlatformHandle { backend: Arc::clone(&backend) as Arc<dyn InputBackend>, events, motion: Arc::clone(&motion), overflowed: Arc::new(AtomicBool::new(false)), failed: Arc::new(AtomicBool::new(false)) };
+        let (_incoming_tx, mut incoming) = mpsc::channel(1); let (outgoing, mut messages) = mpsc::channel(8);
+        let options = test_input_options(ScreenEdge::Left); motion.add_at(0, 0, Point { x: 0, y: 50 });
+        let task = tokio::spawn(async move { super::run_sender_with_activity(&mut incoming, &outgoing, &mut platform, layout, ScreenEdge::Left, InputPlatform::current(), &options, None, true).await });
+        async fn activation(messages: &mut mpsc::Receiver<InputMessage>) { loop { if matches!(messages.recv().await.unwrap(), InputMessage::Activate { .. }) { return; } } }
+        assert!(timeout(Duration::from_millis(40), activation(&mut messages)).await.is_err());
+        assert!(!*backend.capture.lock().unwrap());
+        motion.add_at(5, 0, Point { x: 0, y: 50 });
+        assert!(timeout(Duration::from_millis(20), activation(&mut messages)).await.is_err());
+        events_tx.send(NativeEvent::Emergency).await.unwrap();
+        // 单线程运行时的有界事件队列屏障: 前一热键已被消费, 再检查无新动作时不激活.
+        events_tx.send(NativeEvent::Button { button: 1, down: false }).await.unwrap();
+        assert!(timeout(Duration::from_millis(20), activation(&mut messages)).await.is_err());
+        motion.add_at(0, 0, Point { x: 0, y: 50 });
+        timeout(Duration::from_secs(1), activation(&mut messages)).await.unwrap();
+        assert!(*backend.capture.lock().unwrap());
+        task.abort(); let _ = task.await; assert!(!*backend.capture.lock().unwrap());
+    }
+
+    #[tokio::test]
     async fn sender_blocks_activation_while_pressed_when_option_enabled() {
         let backend = Arc::new(FakeBackend::default());
         *backend.pressed.lock().unwrap() = Some(KeySnapshot {
@@ -2010,6 +2085,7 @@ mod tests {
     fn test_input_options(edge: ScreenEdge) -> InputRuntimeOptions {
         InputRuntimeOptions {
             mode: InputMode::Send,
+            path: synly_core::transport::routing::PathPolicy::PreferBluetooth,
             edge,
             hotkey: Hotkey::DEFAULT.parse().unwrap(),
             reverse_mouse_wheel: false,
@@ -2085,9 +2161,10 @@ mod tests {
         for _ in 0..200 {
             incoming_motion.push(7, 1, 0);
         }
-
+        let activity = Arc::new(AtomicBool::new(false));
+        let receiver_activity = Arc::clone(&activity);
         let task = tokio::spawn(async move {
-            run_receiver(
+            super::run_receiver_with_activity(
                 &mut incoming,
                 &incoming_motion,
                 &outgoing,
@@ -2095,6 +2172,7 @@ mod tests {
                 layout,
                 &test_input_options(ScreenEdge::Left),
                 || false,
+                Some(receiver_activity),
             )
             .await
         });
@@ -2110,9 +2188,10 @@ mod tests {
         })
         .await
         .expect("接收端应在持续运动前确认新的 generation");
-
+        assert!(activity.load(Ordering::Acquire));
         task.abort();
         let _ = task.await;
+        assert!(!activity.load(Ordering::Acquire));
     }
 
     #[tokio::test]

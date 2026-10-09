@@ -4,12 +4,13 @@ import android.content.Context
 import org.json.JSONArray
 import org.json.JSONObject
 import uniffi.synly_core.FfiClipboardMode
+import uniffi.synly_core.FfiPathPolicy
 import uniffi.synly_core.FfiDeviceConfig
 import uniffi.synly_core.FfiTrustedDeviceConfig
 
 object ConfigBackup {
     private const val FORMAT = "synly-config"
-    private const val VERSION = 1
+    private const val VERSION = ConfigBackupMigrations.VERSION
     private const val MAX_CLIPBOARD_BYTES = 100L * 1024 * 1024
     private const val MAX_CLIPBOARD_CACHE_BYTES = 4096L * 1024 * 1024
 
@@ -38,9 +39,7 @@ object ConfigBackup {
         if (root.optString("format") != FORMAT) {
             error("不是 Synly 配置文件")
         }
-        if (root.optInt("version", 0) != VERSION) {
-            error("不支持的配置版本")
-        }
+        ConfigBackupMigrations.apply(root)
         val settings = root.optJSONObject("settings")?.let(::parseSettings) ?: SynlySettings()
         val identity = root.optJSONObject("identity")?.let(::parseIdentity)
         val trustedDevices = parseTrustedDevices(root.optJSONArray("trusted_devices"))
@@ -60,6 +59,8 @@ object ConfigBackup {
     private fun settingsJson(settings: SynlySettings): JSONObject {
         return JSONObject()
             .put("clipboard_mode", settings.clipboardMode.name)
+            .put("clipboard_path", settings.clipboardPath.name)
+            .put("bluetooth_enabled", settings.bluetoothEnabled)
             .put("mdns_enabled", settings.mdnsEnabled)
             .put("lnd_enabled", settings.lndEnabled)
             .put("lnd_server_url", settings.lndServerUrl ?: JSONObject.NULL)
@@ -85,6 +86,8 @@ object ConfigBackup {
         val lastTarget = parseTarget(obj.optJSONObject("last_target"))
         return SynlySettings(
             clipboardMode = clipboardMode,
+            clipboardPath = runCatching { FfiPathPolicy.valueOf(obj.getString("clipboard_path")) }.getOrElse { error("clipboard_path 无效") },
+            bluetoothEnabled = obj.optBoolean("bluetooth_enabled", false),
             mdnsEnabled = obj.optBoolean("mdns_enabled", true),
             lndEnabled = obj.optBoolean("lnd_enabled", false),
             lndServerUrl = obj.optString("lnd_server_url").takeIf { it.isNotBlank() },
@@ -123,15 +126,16 @@ object ConfigBackup {
             .put("addresses", addresses)
             .put("port", target.port)
             .put("peer_device_id", target.peerDeviceId ?: JSONObject.NULL)
+            .put("bluetooth_address", target.bluetoothAddress ?: JSONObject.NULL)
     }
 
     private fun parseTarget(obj: JSONObject?): SynlyTarget? {
         if (obj == null) return null
-        val addresses = obj.optJSONArray("addresses")
-        val port = obj.optInt("port", -1)
-        if (addresses == null || addresses.length() == 0 || port !in 1..65535) {
-            error("last_target 无效")
-        }
+        val addresses = obj.optJSONArray("addresses") ?: JSONArray()
+        val port = obj.optInt("port", 0)
+        val bluetooth = if (obj.isNull("bluetooth_address")) null else obj.optString("bluetooth_address").trim().takeIf { it.isNotEmpty() }?.uppercase(java.util.Locale.ROOT)
+        if (bluetooth != null && (!android.bluetooth.BluetoothAdapter.checkBluetoothAddress(bluetooth) || port !in 0..65535)) error("蓝牙备份端点无效")
+        if (bluetooth == null && (addresses.length() == 0 || port !in 1..65535)) error("LAN 备份端点无效")
         val parsedAddresses = (0 until addresses.length()).map { addresses.getString(it) }
         if (parsedAddresses.any { it.isBlank() }) {
             error("last_target 地址无效")
@@ -139,7 +143,8 @@ object ConfigBackup {
         return SynlyTarget(
             addresses = parsedAddresses,
             port = port,
-            peerDeviceId = obj.optString("peer_device_id").takeIf { it.isNotBlank() },
+            peerDeviceId = obj.optString("peer_device_id").takeIf { !obj.isNull("peer_device_id") && it.isNotBlank() },
+            bluetoothAddress = bluetooth,
         )
     }
 

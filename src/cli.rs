@@ -23,7 +23,7 @@ pub enum Command {
     /// 以 join 角色连接对端, peer 缺省时使用配置中的 peer_query
     #[command(alias = "connect")]
     Join {
-        /// 对端, 可为实例名, 设备名, 设备 ID 前缀, IPv4 地址或 IPv4:端口
+        /// 对端, 可为实例名, 设备名, 设备 ID 前缀, IPv4:端口或 bluetooth:地址/设备UUID
         peer: Option<String>,
     },
     #[command(name = "__input-agent", hide = true)]

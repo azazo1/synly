@@ -1,3 +1,5 @@
+pub(crate) mod bluetooth;
+
 use crate::device::{DeviceConfig, TrustedDeviceConfig};
 use crate::protocol::{
     ControlMessage, DeviceIdentity, PairAuthMethod, PairRequestPayload, RuntimeCapabilities, SessionAgreement,

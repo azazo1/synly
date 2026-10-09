@@ -10,11 +10,23 @@ data class PinRequest(
     val sessionRandomart: String,
 )
 
+data class BluetoothAuthorization(
+    val requestId: String,
+    val displayName: String,
+    val deviceId: String,
+    val fingerprint: String,
+    val systemAddress: String,
+    val changedIdentity: Boolean,
+    val capabilitiesSummary: String,
+)
+
 data class SynlyUiState(
     val state: FfiClientState? = null,
     val connectedDevice: String? = null,
     val targetLabel: String? = null,
+    val transportSummary: String? = null,
     val pinRequest: PinRequest? = null,
+    val bluetoothAuthorization: BluetoothAuthorization? = null,
     val lastMessage: String? = null,
     val lastReceivedText: String? = null,
     val lastReceivedImagePng: ByteArray? = null,

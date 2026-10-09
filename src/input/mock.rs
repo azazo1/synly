@@ -275,6 +275,7 @@ async fn run_mock_worker(
     let (outgoing_tx, outgoing_rx) = mpsc::channel(256);
     let runtime_options = InputRuntimeOptions {
         mode: InputMode::Send,
+        path: synly_core::transport::routing::PathPolicy::PreferBluetooth,
         edge: mock_settings.edge,
         hotkey: mock_settings.hotkey,
         reverse_mouse_wheel: mock_settings.reverse_mouse_wheel,

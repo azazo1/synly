@@ -179,6 +179,7 @@ pub async fn run_receiver_mock(options: ReceiverMockOptions) -> Result<()> {
     let mut finish = Box::pin(finish);
     let input_options = InputRuntimeOptions {
         mode: InputMode::Receive,
+        path: synly_core::transport::routing::PathPolicy::PreferBluetooth,
         edge: ScreenEdge::Left,
         hotkey: options.hotkey,
         reverse_mouse_wheel: false,
