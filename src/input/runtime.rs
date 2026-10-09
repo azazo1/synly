@@ -24,7 +24,9 @@ use synly_core::transport::stream::AsyncByteStream;
 
 const MOTION_INTERVAL: Duration = Duration::from_micros(8_333);
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(250);
-const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(1);
+// 对端可能在一次同步系统调用上停顿较久 (例如 Windows 输入代理刚启动时的握手),
+// 1 秒会把这种停顿误判成链路失效, 因此留出更宽的容忍度.
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(3);
 const ACTIVATION_TIMEOUT: Duration = Duration::from_secs(5);
 const RETURN_COOLDOWN: Duration = Duration::from_millis(300);
 const PRESSED_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
@@ -375,16 +377,13 @@ where
                 Ok(message) => {
                     if !matches!(message, InputMessage::Heartbeat { .. })
                         && let Some(motion) = reader_motion.take()
-                        && tx
-                            .send(Ok(InputMessage::Motion {
-                                generation: motion.generation,
-                                dx: motion.dx,
-                                dy: motion.dy,
-                            }))
-                            .await
-                            .is_err()
                     {
-                        break;
+                        // 通道已满时保留合并后的位移, 不能为了送运动而挡住心跳这类控制消息.
+                        match tx.try_send(Ok(motion.into_message())) {
+                            Ok(()) => {}
+                            Err(TrySendError::Full(_)) => reader_motion.restore(motion),
+                            Err(TrySendError::Disconnected(_)) => break,
+                        }
                     }
                     if tx.send(Ok(message)).await.is_err() {
                         break;
@@ -408,6 +407,12 @@ pub(super) struct CoalescedMotion {
     pub dy: i32,
 }
 
+impl CoalescedMotion {
+    fn into_message(self) -> InputMessage {
+        InputMessage::Motion { generation: self.generation, dx: self.dx, dy: self.dy }
+    }
+}
+
 #[derive(Default)]
 pub(super) struct IncomingMotion {
     pending: StdMutex<Option<CoalescedMotion>>,
@@ -428,6 +433,11 @@ impl IncomingMotion {
                 *pending = Some(CoalescedMotion { generation, dx, dy });
             }
         }
+    }
+
+    /// 投递失败时把刚取出的位移放回, 避免为了等待通道空间而丢掉这段移动.
+    pub(super) fn restore(&self, motion: CoalescedMotion) {
+        self.push(motion.generation, motion.dx, motion.dy);
     }
 
     pub(super) fn take(&self) -> Option<CoalescedMotion> {

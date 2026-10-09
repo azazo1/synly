@@ -90,7 +90,7 @@ fn spawn(mut config: session::AuthConfig, logical: LogicalSession, preferred: Op
 }
 fn active(input: &Option<Arc<AtomicBool>>) -> bool { input.as_ref().is_some_and(|value| value.load(Ordering::Acquire)) }
 async fn authenticate_candidate(connection: BluetoothConnection, config: &session::AuthConfig, expected: &crate::device::TrustedDeviceConfig, logical: &LogicalSession) -> Result<BoundLink> {
-    let authenticated = session::connect(connection, config, Some(expected), |_| async { bail!("副承载不能请求新的应用授权") }).await?;
+    let authenticated = session::connect(connection, config, session::TrustedExpectation::One(expected), |_| async { bail!("副承载不能请求新的应用授权") }).await?;
     if !logical.matches(&authenticated.remote) || !authenticated.trusted_reconnect || authenticated.remember_peer { bail!("副承载认证不能改变主会话身份或持久信任"); }
     let keys = SessionKeys::bluetooth(&authenticated.stream, authenticated.session_id, authenticated.link_master_secret)?;
     logical.connect(ByteStream::new(authenticated.stream), &authenticated.remote, TransportKind::Bluetooth, keys.candidate_exporter().value()).await

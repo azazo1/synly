@@ -362,13 +362,14 @@ async fn connect_bluetooth(
     use crate::bluetooth::{self, session::{self, AuthorizationDecision}};
     let connection = bluetooth::connect(address).await?;
     let expected = target.peer_device_id.and_then(|id| config.trusted_devices.iter().find(|peer| peer.device_id == id)).cloned();
+    let expectation = expected.as_ref().map(|device| session::TrustedExpectation::One(device)).unwrap_or(session::TrustedExpectation::Interactive);
     let auth = session::AuthConfig { device: config.device.clone(), instance_name: config.instance_name.clone(),
         capabilities: client_capabilities(config.clipboard_mode), policies: Default::default(), trusted_devices: config.trusted_devices.clone(),
         request_trust: config.request_trust, trusted_only: false };
     let requested_peer = target.peer_device_id;
     let authorization_config = &mut *config;
     let request_commands = &mut *commands;
-    let authenticated = session::connect(connection, &auth, expected.as_ref(), move |request| async move {
+    let authenticated = session::connect(connection, &auth, expectation, move |request| async move {
         if requested_peer.is_some_and(|id| id != request.peer.device_id) { bail!("蓝牙应用身份与目标设备 ID 不一致"); }
         let request_id = Uuid::new_v4().to_string();
         set_state(state, ClientState::Pairing);

@@ -82,6 +82,33 @@ fn check_trusted(peer: &DeviceIdentity, expected: &TrustedDeviceConfig) -> Resul
     if peer.device_id != expected.device_id { bail!("蓝牙对端应用设备 ID 与已信任身份不一致"); }
     crypto::verify_device_identity(peer, &expected.public_key)
 }
+
+/// 地址目标在握手前无法确定对端设备 ID, 所以只能先接受已保存信任中的任意一条,
+/// 握手完成后再核对对端确实是其中的一条, 不凭地址建立新信任.
+fn check_trusted_any(peer: &DeviceIdentity, candidates: &[TrustedDeviceConfig]) -> Result<()> {
+    let matched = candidates.iter().any(|candidate| {
+        candidate.device_id == peer.device_id
+            && crypto::verify_device_identity(peer, &candidate.public_key).is_ok()
+    });
+    if !matched { bail!("蓝牙对端应用身份不在本机已保存的信任中"); }
+    Ok(())
+}
+
+/// 客户端对蓝牙对端长期身份的预期.
+/// 蓝牙发现只能得到系统地址, 拿不到对端应用设备 ID, 因此除了"已确定具体身份"还有"任一已保存信任".
+#[derive(Clone, Copy)]
+pub enum TrustedExpectation<'a> {
+    /// 没有可复用的信任, 需要交互授权.
+    Interactive,
+    /// 已经确定是这一条信任.
+    One(&'a TrustedDeviceConfig),
+    /// 只知道系统地址: 先按任一条已保存信任完成 mTLS, 再核对对端身份.
+    AnyOf(&'a [TrustedDeviceConfig]),
+}
+
+impl TrustedExpectation<'_> {
+    fn is_trusted(self) -> bool { !matches!(self, Self::Interactive) }
+}
 fn prompt(config: &AuthConfig, peer: &PeerOffer, system_peer: &BluetoothPeer) -> Result<AuthorizationRequest> {
     Ok(AuthorizationRequest {
         peer: peer.identity.clone(), system_peer: system_peer.clone(), capabilities: peer.capabilities,
@@ -111,10 +138,10 @@ fn signed<T: Serialize>(payload: T, purpose: Purpose, config: &AuthConfig, expor
     Ok(Signed { payload, signature })
 }
 
-pub async fn connect<F, Fut>(connection: BluetoothConnection, config: &AuthConfig, expected: Option<&TrustedDeviceConfig>, authorize: F) -> Result<AuthenticatedBluetooth>
+pub async fn connect<F, Fut>(connection: BluetoothConnection, config: &AuthConfig, expected: TrustedExpectation<'_>, authorize: F) -> Result<AuthenticatedBluetooth>
 where F: FnOnce(AuthorizationRequest) -> Fut, Fut: Future<Output = Result<AuthorizationDecision>> {
     let started = std::time::Instant::now();
-    tracing::info!(trusted = expected.is_some(), "开始蓝牙应用身份认证");
+    tracing::info!(trusted = expected.is_trusted(), "开始蓝牙应用身份认证");
     let result = tokio::time::timeout(AUTH_TIMEOUT, connect_inner(connection, config, expected, authorize)).await.map_err(|_| anyhow::anyhow!("蓝牙应用授权超时"))?;
     match &result {
         Ok(_) => tracing::info!(elapsed_ms = started.elapsed().as_millis(), "蓝牙客户端授权完成"),
@@ -123,21 +150,24 @@ where F: FnOnce(AuthorizationRequest) -> Fut, Fut: Future<Output = Result<Author
     result
 }
 
-async fn connect_inner<F, Fut>(mut connection: BluetoothConnection, config: &AuthConfig, expected: Option<&TrustedDeviceConfig>, authorize: F) -> Result<AuthenticatedBluetooth>
+async fn connect_inner<F, Fut>(mut connection: BluetoothConnection, config: &AuthConfig, expected: TrustedExpectation<'_>, authorize: F) -> Result<AuthenticatedBluetooth>
 where F: FnOnce(AuthorizationRequest) -> Fut, Fut: Future<Output = Result<AuthorizationDecision>> {
     let id = Uuid::new_v4();
-    let mode = if expected.is_some() { Mode::Trusted } else { Mode::Authorize };
-    if config.trusted_only && mode == Mode::Authorize { bail!("当前策略只允许已信任应用身份"); }
+    let trusted = expected.is_trusted();
+    let mode = if trusted { Mode::Trusted } else { Mode::Authorize };
+    if config.trusted_only && !trusted { bail!("当前策略只允许已信任应用身份"); }
     let key = (mode == Mode::Authorize).then(crypto::generate_bootstrap_key_material).transpose()?;
     let hello = Hello { version: PROTOCOL_VERSION, request_id: id, mode, ephemeral_key: key.as_ref().map(crypto::BootstrapKeyMaterial::public_key_encoded) };
     connection.stream.write_all(PREAMBLE).await?;
     write(&mut connection.stream, &hello).await?;
-    let connector = if let Some(expected) = expected {
-        crypto::build_client_connector(&config.device, &expected.tls_root_certificate)?
-    } else {
-        let challenge: Challenge = read(&mut connection.stream).await?;
-        if challenge.request_id != id { bail!("蓝牙临时 TLS 挑战标识不匹配"); }
-        crypto::bluetooth::client_connector(&connection, &id.to_string(), key.ok_or_else(|| anyhow::anyhow!("缺少临时 TLS 密钥"))?, &challenge.ephemeral_key)?
+    let connector = match expected {
+        TrustedExpectation::One(device) => crypto::build_client_connector(&config.device, &device.tls_root_certificate)?,
+        TrustedExpectation::AnyOf(devices) => crypto::build_client_connector_for_trusted_devices(&config.device, devices)?,
+        TrustedExpectation::Interactive => {
+            let challenge: Challenge = read(&mut connection.stream).await?;
+            if challenge.request_id != id { bail!("蓝牙临时 TLS 挑战标识不匹配"); }
+            crypto::bluetooth::client_connector(&connection, &id.to_string(), key.ok_or_else(|| anyhow::anyhow!("缺少临时 TLS 密钥"))?, &challenge.ephemeral_key)?
+        }
     };
     let (stream, system_peer) = connection.into_parts();
     let mut stream = connector.connect(crypto::server_name()?, stream).await?;
@@ -148,10 +178,17 @@ where F: FnOnce(AuthorizationRequest) -> Fut, Fut: Future<Output = Result<Author
     if reply.payload.request != local { bail!("蓝牙授权决定未绑定本机身份请求"); }
     crypto::bluetooth::verify(Purpose::Decision, &reply.payload.server.identity, &exporter, &id.to_string(), &reply.payload, &reply.signature)?;
     if !reply.payload.accepted { bail!("对端拒绝了 Synly 蓝牙应用授权"); }
-    let decision = if let Some(expected) = expected {
-        check_trusted(&reply.payload.server.identity, expected)?;
-        AuthorizationDecision { accepted: true, remember: false }
-    } else { authorize(prompt(config, &reply.payload.server, &system_peer)?).await? };
+    let decision = match expected {
+        TrustedExpectation::One(device) => {
+            check_trusted(&reply.payload.server.identity, device)?;
+            AuthorizationDecision { accepted: true, remember: false }
+        }
+        TrustedExpectation::AnyOf(devices) => {
+            check_trusted_any(&reply.payload.server.identity, devices)?;
+            AuthorizationDecision { accepted: true, remember: false }
+        }
+        TrustedExpectation::Interactive => authorize(prompt(config, &reply.payload.server, &system_peer)?).await?,
+    };
     let confirmation = Confirmation { decision: reply.payload, accepted: decision.accepted, remember: decision.accepted && decision.remember };
     write(&mut stream, &signed(confirmation.clone(), Purpose::Confirmation, config, &exporter, id)?).await?;
     if !decision.accepted { bail!("本机拒绝了 Synly 蓝牙应用授权"); }
@@ -163,7 +200,7 @@ where F: FnOnce(AuthorizationRequest) -> Fut, Fut: Future<Output = Result<Author
     let input_master_secret = crypto::export_input_master_secret_from_client(&stream, &id.to_string())?;
     tracing::info!(peer = %confirmation.decision.server.identity.device_id, "蓝牙应用身份授权完成");
     Ok(AuthenticatedBluetooth { stream: stream.into(), remote: confirmation.decision.server.identity, capabilities: confirmation.decision.server.capabilities, policies: confirmation.decision.server.policies,
-        system_peer, session_id: id, link_master_secret, audio_master_secret, input_master_secret, trusted_reconnect: expected.is_some(), remember_peer: confirmation.remember })
+        system_peer, session_id: id, link_master_secret, audio_master_secret, input_master_secret, trusted_reconnect: trusted, remember_peer: confirmation.remember })
 }
 
 pub async fn accept<F, Fut>(connection: BluetoothConnection, config: &AuthConfig, authorize: F) -> Result<AuthenticatedBluetooth>
@@ -258,7 +295,7 @@ mod tests {
             observed.fetch_add(1, Ordering::AcqRel);
             Ok(AuthorizationDecision { accepted: true, remember: true })
         }).await.unwrap() });
-        let mut client = connect(client, &client_config, None, |request| async move {
+        let mut client = connect(client, &client_config, TrustedExpectation::Interactive, |request| async move {
             assert_eq!(request.peer.device_id, server_id); assert!(!request.changed_identity);
             prompts.fetch_add(1, Ordering::AcqRel);
             Ok(AuthorizationDecision { accepted: true, remember: true })
@@ -298,7 +335,7 @@ mod tests {
         let client_config = config("客户端"); let server_config = config("服务端");
         let (client, server) = connections();
         let host = tokio::spawn(async move { accept(server, &server_config, |_| async { Ok(AuthorizationDecision { accepted: true, remember: true }) }).await });
-        assert!(connect(client, &client_config, None, |_| async { Ok(AuthorizationDecision::default()) }).await.is_err());
+        assert!(connect(client, &client_config, TrustedExpectation::Interactive, |_| async { Ok(AuthorizationDecision::default()) }).await.is_err());
         assert!(host.await.unwrap().is_err());
     }
 
@@ -307,7 +344,7 @@ mod tests {
         let client_config = config("客户端"); let server_config = config("服务端");
         let (client, server) = connections();
         let host = tokio::spawn(async move { accept(server, &server_config, |_| async { Ok(AuthorizationDecision::default()) }).await });
-        assert!(connect(client, &client_config, None, |_| async { panic!("服务端拒绝时不能询问客户端授权") }).await.is_err());
+        assert!(connect(client, &client_config, TrustedExpectation::Interactive, |_| async { panic!("服务端拒绝时不能询问客户端授权") }).await.is_err());
         assert!(host.await.unwrap().is_err());
     }
 
@@ -316,7 +353,7 @@ mod tests {
         let client_config = config("客户端"); let mut server_config = config("服务端"); server_config.trusted_only = true;
         let (client, server) = connections();
         let host = tokio::spawn(async move { accept(server, &server_config, |_| async { panic!("仅信任策略不能询问未知身份") }).await });
-        assert!(connect(client, &client_config, None, |_| async { panic!("仅信任策略不能询问未知身份") }).await.is_err());
+        assert!(connect(client, &client_config, TrustedExpectation::Interactive, |_| async { panic!("仅信任策略不能询问未知身份") }).await.is_err());
         assert!(host.await.unwrap().is_err());
         let server_config = config("服务端"); let (mut client, server) = connections();
         client.stream.write_all(PREAMBLE).await.unwrap(); client.stream.write_u16((WIRE_LIMIT + 1) as u16).await.unwrap();
@@ -331,12 +368,41 @@ mod tests {
         client_config.trusted_only = true; server_config.trusted_only = true;
         let (client, server) = connections();
         let host = tokio::spawn(async move { accept(server, &server_config, |_| async { panic!("可信连接不能重新询问授权") }).await.unwrap() });
-        let client = connect(client, &client_config, Some(&expected), |_| async { panic!("可信连接不能重新询问授权") }).await.unwrap();
+        let client = connect(client, &client_config, TrustedExpectation::One(&expected), |_| async { panic!("可信连接不能重新询问授权") }).await.unwrap();
         let server = host.await.unwrap();
         assert_eq!(client.session_id, server.session_id);
         assert_eq!(client.remote.device_id, expected.device_id);
         assert!(!client.remember_peer && !server.remember_peer);
         assert!(client.trusted_reconnect && server.trusted_reconnect);
+    }
+
+    #[tokio::test]
+    async fn address_only_target_reuses_any_saved_trust_and_verifies_the_peer() {
+        // 蓝牙发现只能拿到系统地址, 因此保存多条信任时客户端用 AnyOf, 由完成 mTLS 的对端自证身份.
+        let mut client_config = config("客户端"); let mut server_config = config("服务端");
+        let server_trust = trust(&server_config);
+        let stranger = trust(&config("无关设备"));
+        server_config.trusted_devices.push(trust(&client_config));
+        client_config.trusted_devices.push(server_trust.clone());
+        client_config.trusted_devices.push(stranger);
+        client_config.trusted_only = true; server_config.trusted_only = true;
+        let candidates = client_config.trusted_devices.clone();
+        let (client, server) = connections();
+        let host = tokio::spawn(async move { accept(server, &server_config, |_| async { panic!("可信连接不能重新询问授权") }).await.unwrap() });
+        let client = connect(client, &client_config, TrustedExpectation::AnyOf(&candidates), |_| async { panic!("可信连接不能重新询问授权") }).await.unwrap();
+        let server = host.await.unwrap();
+        assert_eq!(client.session_id, server.session_id);
+        assert_eq!(client.remote.device_id, server_trust.device_id);
+        assert!(client.trusted_reconnect && !client.remember_peer);
+
+        // 对端身份不在已保存信任中时必须拒绝, 不能因为"接受任一条根证书"就放行.
+        let mut unknown_client = config("冒名设备");
+        unknown_client.trusted_devices.push(trust(&server_config));
+        let candidates = unknown_client.trusted_devices.clone();
+        let (client, server) = connections();
+        let host = tokio::spawn(async move { accept(server, &server_config, |_| async { Ok(AuthorizationDecision { accepted: true, remember: false }) }).await });
+        assert!(connect(client, &unknown_client, TrustedExpectation::AnyOf(&candidates), |_| async { panic!("可信连接不能重新询问授权") }).await.is_err());
+        assert!(host.await.unwrap().is_err());
     }
 
     #[test]

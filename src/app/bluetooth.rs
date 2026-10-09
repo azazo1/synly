@@ -62,30 +62,28 @@ fn usable_trusted_device(device: &TrustedDeviceConfig) -> bool {
     !device.public_key.trim().is_empty() && !device.tls_root_certificate.trim().is_empty()
 }
 
-/// 解析蓝牙目标的长期信任身份.
-/// 蓝牙发现只能拿到系统地址, 拿不到对端设备 ID, 因此未指定 ID 时沿用核心客户端的规则:
-/// 只保存一条可用信任才按它建立可信连接, 有多条时无法只凭地址选择, 交给交互授权.
-pub(super) fn expected_trusted_device(trusted: &[TrustedDeviceConfig], id: Option<Uuid>) -> Option<TrustedDeviceConfig> {
+/// 选出可用于蓝牙目标的信任候选.
+/// 已确定设备 ID 时只取该条; 只知道系统地址时返回全部可用信任, 交给会话层按任一完成 mTLS 再核对身份.
+pub(super) fn bluetooth_trust_candidates<'a>(trusted: &'a [TrustedDeviceConfig], id: Option<Uuid>) -> Vec<&'a TrustedDeviceConfig> {
     match id {
-        Some(id) => trusted.iter().find(|device| device.device_id == id).filter(|device| usable_trusted_device(device)).cloned(),
-        None => {
-            let mut usable = trusted.iter().filter(|device| usable_trusted_device(device));
-            let only = usable.next()?;
-            usable.next().is_none().then(|| only.clone())
-        }
+        Some(id) => trusted.iter().find(|device| device.device_id == id).filter(|device| usable_trusted_device(device)).into_iter().collect(),
+        None => trusted.iter().filter(|device| usable_trusted_device(device)).collect(),
     }
 }
 
 pub(super) async fn connect(address: &str, id: Option<Uuid>, config: &mut SynlyConfig, options: &RuntimeOptions) -> Result<AuthenticatedSession> {
     if !options.bluetooth_enabled { return Err(anyhow!(PairingTerminal(anyhow!("蓝牙接入未启用")))); }
-    let expected = expected_trusted_device(&config.trusted_devices, id);
+    let candidates = bluetooth_trust_candidates(&config.trusted_devices, id).into_iter().cloned().collect::<Vec<_>>();
+    let expectation = if candidates.is_empty() { auth::TrustedExpectation::Interactive }
+        else if id.is_some() { auth::TrustedExpectation::One(&candidates[0]) }
+        else { auth::TrustedExpectation::AnyOf(&candidates) };
     // 仅可信策略下交互授权已被禁止, 先在桌面侧给出可操作的说明, 不再打开一条注定被拒的链路.
-    if expected.is_none() && options.pairing.trusted_only {
-        bail!("仅允许可信设备, 但蓝牙目标 {address} 没有可对应的已信任身份; 请取消该限制, 或在设置中重新完成一次配对");
+    if matches!(expectation, auth::TrustedExpectation::Interactive) && options.pairing.trusted_only {
+        bail!("仅允许可信设备, 但本机没有可用于蓝牙的已信任身份; 请取消该限制, 或先完成一次配对并建立长期信任");
     }
     let connection = native::connect(address).await?;
     let auth_config = auth_config(config, options);
-    let authenticated = auth::connect(connection, &auth_config, expected.as_ref(), |request| async move {
+    let authenticated = auth::connect(connection, &auth_config, expectation, |request| async move {
         if id.is_some_and(|id| id != request.peer.device_id) { bail!("蓝牙身份与目标设备 ID 不一致"); }
         authorize(request, options).await
     }).await.map_err(|error| anyhow!(PairingTerminal(error)))?;
@@ -128,21 +126,23 @@ mod tests {
         for value in ["bluetooth:foo", "bluetooth:11:22:33:44:55:66/foo", "bluetooth:11:22:33:44:55:66/00000000-0000-0000-0000-000000000000"] { assert!(parse_target(value).is_err()); }
     }
     #[test]
-    fn trusted_bluetooth_identity_reuses_the_only_usable_record() {
+    fn bluetooth_trust_candidates_follow_the_target_shape() {
         fn device(public_key: &str, certificate: &str) -> TrustedDeviceConfig {
             TrustedDeviceConfig { device_id: Uuid::new_v4(), device_name: "peer".to_owned(), public_key: public_key.to_owned(), tls_root_certificate: certificate.to_owned(), trusted_at_ms: 0, last_seen_ms: 0, successful_sessions: 0 }
         }
-        let only = device("key", "cert");
-        // 设备列表按钮只能给出蓝牙地址, 此时必须复用唯一一条可用信任, 否则仅可信策略会拒绝每次连接.
-        assert_eq!(expected_trusted_device(std::slice::from_ref(&only), None).map(|device| device.device_id), Some(only.device_id));
-        // 多条信任无法只凭地址选择, 不能随便挑一条.
+        let first = device("key-a", "cert-a");
         let second = device("key-b", "cert-b");
-        assert!(expected_trusted_device(&[only.clone(), second.clone()], None).is_none());
-        // 空公钥或空根证书的记录无法建立可信 mTLS, 不参与复用.
-        assert!(expected_trusted_device(&[device("key-c", "")], None).is_none());
-        assert!(expected_trusted_device(&[device("", "cert-d")], None).is_none());
-        // 显式指定设备 ID 时只按该身份解析, 不受记录条数影响.
-        assert_eq!(expected_trusted_device(&[only.clone(), second.clone()], Some(second.device_id)).map(|device| device.device_id), Some(second.device_id));
-        assert!(expected_trusted_device(&[only], Some(Uuid::new_v4())).is_none());
+        // 设备列表只能给出蓝牙地址, 因此必须保留全部可用信任供会话层按任一条完成 mTLS.
+        let all = bluetooth_trust_candidates(&[first.clone(), second.clone()], None);
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].device_id, first.device_id);
+        // 已明确设备 ID 时只取该条, 不能顺手用上别的身份.
+        let only = bluetooth_trust_candidates(&[first.clone(), second.clone()], Some(second.device_id));
+        assert_eq!(only.len(), 1);
+        assert_eq!(only[0].device_id, second.device_id);
+        // 空公钥或空根证书的记录建不出可信 mTLS, 一律排除; 未知 ID 也不能退化成任意身份.
+        assert!(bluetooth_trust_candidates(&[device("key-c", "")], None).is_empty());
+        assert!(bluetooth_trust_candidates(&[device("", "cert-d")], None).is_empty());
+        assert!(bluetooth_trust_candidates(&[first], Some(Uuid::new_v4())).is_empty());
     }
 }
