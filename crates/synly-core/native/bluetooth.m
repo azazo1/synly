@@ -295,11 +295,14 @@ static void socket_event(CFSocketRef socket, CFSocketCallBackType kind, CFDataRe
         // NSData 必须在整笔传输期间有效, writeAsync 只借用它的缓冲区.
         NSData *chunk = [NSData dataWithBytes:bytes length:(NSUInteger)size];
         NSUInteger token = self.nextWriteToken++;
-        IOReturn status = [self.channel writeAsync:(void *)chunk.bytes length:(UInt16)size refcon:(void *)(uintptr_t)token];
-        if (status != kIOReturnSuccess) { [self close]; return; }
+        // 先登记在途写再发起传输: 若系统在 writeAsync 内同步回调完成, 回调才能按令牌找到这一笔;
+        // 反之会留下永远降不下来的在途计数, 发送泵从此不再取数据.
         if (self.inFlightWrites.count == 0) self.oldestWriteStarted = NSProcessInfo.processInfo.systemUptime;
         [self.inFlightWrites addObject:chunk];
         [self.inFlightTokens addObject:@(token)];
+        IOReturn status = [self.channel writeAsync:(void *)chunk.bytes length:(UInt16)size refcon:(void *)(uintptr_t)token];
+        // 失败时 close 会清空在途数组, 不会留下孤立登记.
+        if (status != kIOReturnSuccess) { [self close]; return; }
     }
     // 在途写已满或对端流控时先停止读取应用数据形成反压; 否则重新武装读回调.
     if (self.closed || self.socket == NULL) return;
