@@ -31,7 +31,8 @@ int synly_bt_connect(const char *address, const uint8_t uuid[16], int *fd);
 int synly_bt_listen(const uint8_t uuid[16], SynlyBluetoothAccept callback, void *context, void **listener);
 // 返回后不会再调用该 listener 的 callback, 可以安全释放 context.
 void synly_bt_stop_listener(void *listener);
-// 读取该连接的 RFCOMM MTU. 连接不存在时返回 0.
+// 读取该连接的 RFCOMM MTU, 参数是交给调用方的 fd. 连接不存在时返回 0.
+// MTU 决定单笔写入长度, 偏小会把一个复用分片拆成多次串行发送.
 int synly_bt_mtu(int fd);
 
 #endif
