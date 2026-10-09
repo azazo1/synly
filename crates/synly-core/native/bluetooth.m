@@ -113,11 +113,13 @@ static int query_channel(IOBluetoothDevice *device, const uint8_t uuid[16], uint
         }
         NSTimeInterval deadline = NSProcessInfo.processInfo.systemUptime + 20.0;
         // 部分系统可能已连接但不发送 connectionComplete, 同时观察实际连接状态.
-        while (!query.connectionComplete && !device.isConnected && NSProcessInfo.processInfo.systemUptime < deadline) pump_loop();
+        // 成功回调可能早于 isConnected 更新, 不能把这个短暂窗口当成超时.
+        // 错误回调则立即结束, 原样返回系统状态而不继续等待.
+        while (!device.isConnected && (!query.connectionComplete || query.connectionStatus == kIOReturnSuccess) && NSProcessInfo.processInfo.systemUptime < deadline) pump_loop();
         if (!device.isConnected) {
             if (query.connectionComplete) {
                 retire_query(worker, query);
-                return query.connectionStatus == kIOReturnSuccess ? -5 : (int)query.connectionStatus;
+                return query.connectionStatus == kIOReturnSuccess ? -11 : (int)query.connectionStatus;
             }
             query.abandoned = YES;
             return -5;

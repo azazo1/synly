@@ -196,6 +196,7 @@ static void receiver_bound(void) {
 @property(nonatomic) BOOL paired;
 @property(nonatomic) BOOL connected;
 @property(nonatomic) BOOL serviceAvailable;
+@property(nonatomic) BOOL callbackBeforeConnected;
 @property(nonatomic) NSUInteger connections;
 @property(nonatomic) NSUInteger queries;
 @property(nonatomic, strong) IOBluetoothSDPUUID *requested;
@@ -212,14 +213,19 @@ static void receiver_bound(void) {
 - (BOOL)isConnected { return self.connected; }
 - (BOOL)isPaired { return self.paired; }
 - (IOReturn)openConnection:(id)target withPageTimeout:(BluetoothHCIPageTimeout)timeout authenticationRequired:(BOOL)required {
-    (void)target;
     // 服务发现不能主动要求系统认证, 业务连接的安全门槛由 security_gate 单独覆盖.
     assert(timeout == 0x2000 && !required);
     self.connections += 1;
-    // 模拟底层连接成功但缺失 connectionComplete 回调.
-    self.connected = YES;
+    if (self.callbackBeforeConnected) {
+        [target connectionComplete:(IOBluetoothDevice *)self status:kIOReturnSuccess];
+        [self performSelector:@selector(markConnected) withObject:nil afterDelay:0];
+    } else {
+        // 模拟底层连接成功但缺失 connectionComplete 回调.
+        self.connected = YES;
+    }
     return kIOReturnSuccess;
 }
+- (void)markConnected { self.connected = YES; }
 - (IOReturn)performSDPQuery:(id)target {
     assert(self.connected);
     self.queries += 1;
@@ -269,6 +275,13 @@ static void service_discovery(void) {
         device.connected = NO;
         assert(query_channel((IOBluetoothDevice *)device, uuid, &channel, &stage) == -4);
         assert(device.connections == 1 && device.queries == 2 && channel == 0 && stage == 2);
+        // 当前实例日志暴露的竞态: 成功回调先到, isConnected 稍后才更新.
+        device.paired = YES;
+        device.callbackBeforeConnected = YES;
+        device.serviceAvailable = YES;
+        assert(query_channel((IOBluetoothDevice *)device, uuid, &channel, &stage) == 0);
+        assert(device.connections == 2 && device.queries == 3 && channel == 7);
+        assert([SBWorker shared].queries.count == 0);
     });
 }
 
