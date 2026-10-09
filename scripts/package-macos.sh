@@ -102,14 +102,29 @@ mkdir -p "$dmg_root"
 cp -R "$app_bundle" "$dmg_root/Synly.app"
 ln -s /Applications "$dmg_root/Applications"
 
-printf '[package] creating %s\n' "$dmg_path"
-rm -f "$dmg_path"
-hdiutil create \
-    -volname "Synly $version" \
-    -srcfolder "$dmg_root" \
-    -ov \
-    -format UDZO \
-    "$dmg_path" >/dev/null
+# runner 的磁盘映像 helper 可能短暂繁忙. 有限重试并保留详细诊断, 最终失败仍阻止上传.
+dmg_created=false
+for attempt in 1 2 3; do
+    printf '[package] creating %s, attempt %s/3\n' "$dmg_path" "$attempt"
+    if hdiutil create \
+        -volname "Synly $version" \
+        -srcfolder "$dmg_root" \
+        -ov \
+        -format UDZO \
+        -verbose \
+        "$dmg_path"; then
+        dmg_created=true
+        break
+    fi
+    if [[ "$attempt" -lt 3 ]]; then
+        printf '[package] disk image creation failed, retrying in 5 seconds\n' >&2
+        sleep 5
+    fi
+done
+if [[ "$dmg_created" != true ]]; then
+    printf '[package] disk image creation failed after 3 attempts\n' >&2
+    exit 1
+fi
 
 test -f "$app_bundle/Contents/MacOS/synly"
 test -f "$app_bundle/Contents/Info.plist"

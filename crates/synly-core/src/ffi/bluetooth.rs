@@ -3,18 +3,19 @@
 use super::{FfiError, runtime};
 use crate::bluetooth::{self, BluetoothAvailability, BluetoothPeer};
 
+// Kotlin 异常生成器会实现 Throwable.message, 错误负载字段使用独立名称避免冲突.
 #[derive(Debug, uniffi::Error)]
 pub enum FfiBluetoothError {
-    PermissionDenied { message: String },
-    Disabled { message: String },
-    Unpaired { message: String },
-    Failed { message: String },
+    PermissionDenied { reason: String },
+    Disabled { reason: String },
+    Unpaired { reason: String },
+    Failed { reason: String },
 }
 
 impl std::fmt::Display for FfiBluetoothError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let (Self::PermissionDenied { message } | Self::Disabled { message } | Self::Unpaired { message } | Self::Failed { message }) = self;
-        write!(formatter, "{message}")
+        let (Self::PermissionDenied { reason } | Self::Disabled { reason } | Self::Unpaired { reason } | Self::Failed { reason }) = self;
+        write!(formatter, "{reason}")
     }
 }
 impl std::error::Error for FfiBluetoothError {}
