@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
+pub use macos::{register_macos_paired_helper, write_macos_paired_devices};
+#[cfg(target_os = "macos")]
 use macos as platform;
 #[cfg(windows)]
 mod windows;

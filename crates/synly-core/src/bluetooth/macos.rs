@@ -9,6 +9,9 @@ use std::os::unix::net::UnixStream as StdStream;
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
+mod paired;
+pub use paired::{register as register_macos_paired_helper, write_native as write_macos_paired_devices};
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct NativePeer {
@@ -78,13 +81,7 @@ pub async fn availability() -> Result<BluetoothAvailability> {
 }
 
 pub async fn paired_devices() -> Result<Vec<BluetoothPeer>> {
-    tokio::task::spawn_blocking(|| {
-        let mut peers = [NativePeer { address: [0; 18], name: [0; 256] }; 256];
-        let mut count = 0;
-        check(unsafe { synly_bt_paired(peers.as_mut_ptr(), peers.len(), &mut count) })?;
-        if count > peers.len() { bail!("蓝牙枚举返回了无效的设备数量"); }
-        peers[..count].iter().map(peer).collect()
-    }).await?
+    paired::enumerate().await
 }
 
 fn lookup_gate() -> std::sync::Arc<tokio::sync::Semaphore> {

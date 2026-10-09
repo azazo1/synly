@@ -203,7 +203,6 @@ static void receiver_bound(void) {
 @property(nonatomic) NSUInteger queries;
 @property(nonatomic, strong) IOBluetoothSDPUUID *requested;
 @property(nonatomic, strong) FakeSDPRecord *record;
-@property(nonatomic, strong) SBQuery *query;
 - (BOOL)isConnected;
 - (BOOL)isPaired;
 - (IOReturn)openConnection:(id)target withPageTimeout:(BluetoothHCIPageTimeout)timeout authenticationRequired:(BOOL)required;
@@ -228,24 +227,22 @@ static void receiver_bound(void) {
     return kIOReturnSuccess;
 }
 - (IOReturn)performSDPQuery:(id)target {
-    assert(NSThread.isMainThread);
+    assert(!NSThread.isMainThread);
     assert(self.connected || (self.callbackBeforeConnected && self.connectionResult == kIOReturnSuccess));
     self.queries += 1;
     if (self.queryResult != kIOReturnSuccess) return self.queryResult;
-    self.query = target;
-    [self performSelector:@selector(finishQuery) withObject:nil afterDelay:0];
+    // 与实机一致: worker 发起请求, 回调由真正的主线程投递.
+    CFRunLoopPerformBlock(CFRunLoopGetMain(), kCFRunLoopCommonModes, ^{
+        assert(NSThread.isMainThread);
+        [target sdpQueryComplete:(IOBluetoothDevice *)self status:kIOReturnSuccess];
+    });
+    CFRunLoopWakeUp(CFRunLoopGetMain());
     return kIOReturnSuccess;
 }
 - (IOReturn)performSDPQuery:(id)target uuids:(NSArray *)uuids {
     (void)target; (void)uuids;
     assert(NO && "不能调用新 macOS 上可能空操作的 UUID 过滤查询");
     return kIOReturnSuccess;
-}
-- (void)finishQuery {
-    // 与实机一致: 查询 worker 等待, 完成回调由真正的主线程投递.
-    assert(NSThread.isMainThread);
-    [self.query sdpQueryComplete:(IOBluetoothDevice *)self status:kIOReturnSuccess];
-    self.query = nil;
 }
 - (IOBluetoothSDPServiceRecord *)getServiceRecordForUUID:(IOBluetoothSDPUUID *)uuid {
     self.requested = uuid;
@@ -264,7 +261,7 @@ static void service_discovery(void) {
         SynlyBluetoothQueryTrace trace = {0};
         assert(!NSThread.isMainThread);
         assert(query_channel_traced((IOBluetoothDevice *)device, uuid, &channel, &stage, &trace) == 0);
-        assert(trace.request_returned && trace.request_on_main && trace.callback_received && trace.callback_on_main && trace.callback_matches_device);
+        assert(trace.request_returned && !trace.request_on_main && trace.callback_received && trace.callback_on_main && trace.callback_matches_device);
         assert(device.connections == 1 && device.queries == 1 && channel == 7 && stage == 6);
         assert([device.requested isEqual:[IOBluetoothSDPUUID uuidWithBytes:uuid length:16]]);
         // SDP 完成后仍保留缺失的 ACL 回调对象, 迟到回调到达后才能安全释放.
@@ -295,11 +292,11 @@ static void service_discovery(void) {
         assert(query_channel((IOBluetoothDevice *)device, uuid, &channel, &stage) == kIOReturnNotResponding);
         assert(device.connections == 3 && device.queries == 3 && channel == 0 && stage == 7);
         assert([SBWorker shared].queries.count == 0);
-        // 主线程启动失败与启动后未收到回调分别归类, 不吞掉原始系统状态.
+        // 启动失败与启动后未收到回调分别归类, 不吞掉原始系统状态.
         device.connected = YES;
         device.queryResult = kIOReturnNotPermitted;
         assert(query_channel_traced((IOBluetoothDevice *)device, uuid, &channel, &stage, &trace) == kIOReturnNotPermitted);
-        assert(stage == 4 && trace.request_returned && trace.request_on_main && !trace.callback_received);
+        assert(stage == 4 && trace.request_returned && !trace.request_on_main && !trace.callback_received);
         assert(device.connections == 3 && device.queries == 4 && channel == 0);
         assert([SBWorker shared].queries.count == 0);
     });

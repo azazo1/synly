@@ -131,26 +131,14 @@ static int query_channel_run(IOBluetoothDevice *device, const uint8_t uuid[16], 
     *stage = 4;
     query.sdpStarted = YES;
     NSTimeInterval deadline = NSProcessInfo.processInfo.systemUptime + 10.0;
-    // 实机探针确认后台请求的回调仍在主线程. 只把短启动调用安排到主线程, 等待仍在 worker.
-    CFRunLoopPerformBlock(CFRunLoopGetMain(), kCFRunLoopCommonModes, ^{
-        if (query.abandoned) {
-            // 主线程迟迟未处理请求时, 超时后不再发起新的 SDP; 让有界保留队列能够回收.
-            query.status = kIOReturnAborted;
-            query.complete = YES;
-            query.requestReturned = YES;
-            return;
-        }
-        query.requestOnMain = NSThread.isMainThread;
-        query.requestStatus = [device performSDPQuery:query];
-        if (query.requestStatus != kIOReturnSuccess) {
-            query.status = query.requestStatus;
-            query.complete = YES;
-        }
-        query.requestReturned = YES;
-    });
-    CFRunLoopWakeUp(CFRunLoopGetMain());
-    while (!query.requestReturned && NSProcessInfo.processInfo.systemUptime < deadline) pump_loop();
-    if (!query.requestReturned) { query.abandoned = YES; return -5; }
+    // 实机对照确认 worker 发起 SDP 可成功, 完成回调仍须由主线程事件循环处理.
+    query.requestOnMain = NSThread.isMainThread;
+    query.requestStatus = [device performSDPQuery:query];
+    if (query.requestStatus != kIOReturnSuccess) {
+        query.status = query.requestStatus;
+        query.complete = YES;
+    }
+    query.requestReturned = YES;
     if (query.requestStatus != kIOReturnSuccess) {
         query.sdpStarted = NO;
         retire_query(worker, query);

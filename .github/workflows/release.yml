@@ -265,6 +265,11 @@ jobs:
           clang -fobjc-arc -fblocks -mmacosx-version-min=14.0 -fsanitize=address,undefined -fno-sanitize-recover=all -g -Wall -Wextra -Werror crates/synly-core/native/tests/bridge.m -framework Foundation -framework CoreFoundation -framework CoreBluetooth -framework IOBluetooth -o .tmp/bluetooth-tests/bridge
           .tmp/bluetooth-tests/bridge
 
+      - name: 验证 macOS 配对枚举进程协议与取消清理
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: cargo test --locked --target "${{ matrix.target }}" -p synly-core bluetooth::macos::paired::tests
+
       - name: Build release binary
         env:
           SYNLY_BUILD_VERSION: v${{ needs.version.outputs.build_version }}

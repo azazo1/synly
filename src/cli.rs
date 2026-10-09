@@ -2,6 +2,9 @@ use crate::config::RuntimeConfig;
 use crate::settings::ConnectionPreference;
 use clap::{Parser, Subcommand};
 
+#[cfg(target_os = "macos")]
+pub const BLUETOOTH_PAIRED_HELPER_COMMAND: &str = "__bluetooth-paired";
+
 #[derive(Parser, Debug)]
 #[command(
     name = "synly",
@@ -17,6 +20,10 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// 在独立进程读取系统配对记录, 标准输出仅用于父进程的枚举协议.
+    #[cfg(target_os = "macos")]
+    #[command(name = BLUETOOTH_PAIRED_HELPER_COMMAND, hide = true)]
+    BluetoothPairedDevices,
     /// 以 host 角色监听, 等待对端连接
     #[command(alias = "listen")]
     Host,

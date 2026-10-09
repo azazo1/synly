@@ -35,6 +35,11 @@ const BUILD_VERSION: &str = env!("SYNLY_BUILD_VERSION");
 
 fn main() -> Result<()> {
     let cli = cli::Cli::parse();
+    #[cfg(target_os = "macos")]
+    if matches!(&cli.command, Some(cli::Command::BluetoothPairedDevices)) {
+        // 枚举进程在配置, 日志文件, GUI 和服务初始化之前退出, 不复用主进程的系统设备对象.
+        return synly_core::bluetooth::write_macos_paired_devices(std::io::stdout().lock());
+    }
     if let Some(command) = &cli.command
         && matches!(
             command,
@@ -47,6 +52,8 @@ fn main() -> Result<()> {
     }
     // 先建立日志, 否则配置读取失败时既没有日志也没有可见的错误输出.
     let _tracing_guard = tracing_utils::init_tracing(tracing_utils::BOOTSTRAP_FILTER)?;
+    #[cfg(target_os = "macos")]
+    synly_core::bluetooth::register_macos_paired_helper(std::env::current_exe()?, cli::BLUETOOTH_PAIRED_HELPER_COMMAND)?;
     match paths::log_file_path() {
         Ok(log_path) => {
             tracing::info!(version = BUILD_VERSION, log = %log_path.display(), "Synly 启动")
@@ -88,6 +95,10 @@ fn main() -> Result<()> {
 
 fn run_internal_command(command: &cli::Command) -> Result<()> {
     match command {
+        #[cfg(target_os = "macos")]
+        cli::Command::BluetoothPairedDevices => {
+            anyhow::bail!("蓝牙枚举内部命令必须在配置初始化前处理")
+        }
         cli::Command::InputAgent {
             command_pipe,
             event_pipe,

@@ -22,6 +22,7 @@ typedef struct {
 typedef void (*SynlyBluetoothAccept)(void *context, int fd, const SynlyBluetoothPeer *peer);
 
 int synly_bt_available(void);
+// 仅在独立枚举进程调用, 避免 pairedDevices 影响随后对同一进程缓存实例的 SDP 查询.
 int synly_bt_paired(SynlyBluetoothPeer *peers, size_t capacity, size_t *count);
 // stage 返回失败所在阶段: 1 控制器, 2 配对记录, 3 查询队列, 4 请求启动, 5 对端响应, 6 通道解析, 7 底层连接.
 int synly_bt_query(const char *address, const uint8_t uuid[16], uint8_t *channel, uint8_t *stage, SynlyBluetoothQueryTrace *trace);
