@@ -588,13 +588,33 @@ export component AppWindow inherits Window {
                     Button { text: "断开"; enabled: root.session-active; clicked => { root.disconnect(); } }
                 }
                 if root.show-bluetooth-devices: HorizontalLayout {
-                    height: 54px;
-                    Text { text: !root.bluetooth-can-refresh && !root.bluetooth-scanning ? "连接或会话运行期间暂停手动蓝牙查询, 请先断开当前会话." : root.bluetooth-status; wrap: word-wrap; color: #555d59; horizontal-stretch: 1; }
-                    Button { text: "系统蓝牙设置"; clicked => { root.open-bluetooth-settings(); } }
+                    height: 34px;
+                    min-height: 34px;
+                    max-height: 34px;
+                    vertical-stretch: 0;
+                    spacing: 10px;
+                    Text {
+                        text: !root.bluetooth-can-refresh && !root.bluetooth-scanning ? "连接期间暂停蓝牙查询, 请先断开当前会话." : root.bluetooth-status;
+                        wrap: word-wrap;
+                        vertical-alignment: center;
+                        color: #555d59;
+                        font-size: 12px;
+                        horizontal-stretch: 1;
+                    }
+                    Button {
+                        text: "系统蓝牙设置";
+                        height: 32px;
+                        min-height: 32px;
+                        max-height: 32px;
+                        clicked => { root.open-bluetooth-settings(); }
+                    }
                 }
                 if root.show-bluetooth-devices: Text {
-                    text: "列表仅显示系统已配对设备, Synly 局域网配对不会代替系统蓝牙配对. 请先在系统蓝牙设置配对, 并在对端 Synly 开启蓝牙接入. 连接后仍验证应用身份, 已保存的应用信任可复用.";
-                    wrap: word-wrap; font-size: 11px; color: #737b77;
+                    text: "先完成系统蓝牙配对, 并开启对端 Synly 的蓝牙接入. 局域网配对不等于系统蓝牙配对.";
+                    wrap: word-wrap;
+                    font-size: 11px;
+                    color: #737b77;
+                    vertical-stretch: 0;
                 }
                 if !root.show-bluetooth-devices: HorizontalLayout {
                     height: 34px;
@@ -614,16 +634,33 @@ export component AppWindow inherits Window {
                         if root.show-bluetooth-devices: VerticalLayout {
                             spacing: 6px;
                             for peer in root.bluetooth-peers: Rectangle {
-                                height: 88px;
+                                height: 64px;
+                                min-height: 64px;
+                                max-height: 64px;
+                                vertical-stretch: 0;
                                 background: #ffffff; border-color: #d8dcda; border-width: 1px; border-radius: 5px;
                                 HorizontalLayout {
                                     padding: 9px;
+                                    spacing: 10px;
                                     VerticalLayout {
                                         horizontal-stretch: 1;
-                                        Text { text: peer.title; font-size: 15px; font-weight: 600; color: #202523; }
-                                        Text { text: peer.subtitle; color: #666c68; font-size: 11px; wrap: word-wrap; }
+                                        alignment: center;
+                                        spacing: 3px;
+                                        Text { text: peer.title; font-size: 15px; font-weight: 600; color: #202523; vertical-stretch: 0; }
+                                        Text { text: peer.subtitle; color: #666c68; font-size: 11px; wrap: word-wrap; vertical-stretch: 0; }
                                     }
-                                    Button { text: "蓝牙连接"; enabled: peer.connectable && root.bluetooth-can-connect; clicked => { root.connect-bluetooth(peer.address); } }
+                                    VerticalLayout {
+                                        horizontal-stretch: 0;
+                                        alignment: center;
+                                        Button {
+                                            text: "蓝牙连接";
+                                            height: 32px;
+                                            min-height: 32px;
+                                            max-height: 32px;
+                                            enabled: peer.connectable && root.bluetooth-can-connect;
+                                            clicked => { root.connect-bluetooth(peer.address); }
+                                        }
+                                    }
                                 }
                             }
                         }
