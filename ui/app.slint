@@ -67,6 +67,48 @@ component NavButton inherits Rectangle {
     }
 }
 
+component SegmentedOption inherits Rectangle {
+    in property <string> text;
+    in property <bool> active;
+    callback clicked;
+    forward-focus: keyboard;
+    background: pointer.pressed ? #d4e6da : root.active ? #ffffff : pointer.has-hover ? #e8eeea : transparent;
+    border-radius: 5px;
+    border-width: 1px;
+    border-color: keyboard.has-focus ? #397457 : root.active ? #c2d0c7 : transparent;
+    accessible-role: button;
+    accessible-checkable: true;
+    accessible-checked: root.active;
+    accessible-label: root.text;
+    accessible-action-default => { root.clicked(); }
+
+    Text {
+        text: root.text;
+        width: parent.width;
+        height: parent.height;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        font-size: 13px;
+        font-weight: root.active ? 600 : 400;
+        color: root.active ? #28583e : #5d6861;
+        accessible-role: none;
+    }
+    pointer := TouchArea {
+        clicked => { keyboard.focus(); root.clicked(); }
+    }
+    keyboard := FocusScope {
+        width: 0;
+        height: 0;
+        key-pressed(event) => {
+            if event.text == " " || event.text == "\n" {
+                root.clicked();
+                return accept;
+            }
+            return reject;
+        }
+    }
+}
+
 component Panel inherits Rectangle {
     in property <string> title;
     background: #ffffff;
@@ -521,12 +563,25 @@ export component AppWindow inherits Window {
                 spacing: 10px;
                 HorizontalLayout {
                     height: 34px;
-                    Text { text: "设备"; font-size: 22px; font-weight: 680; color: #202523; vertical-alignment: center; }
+                    spacing: 10px;
+                    Text { text: "设备"; font-size: 22px; font-weight: 680; color: #202523; vertical-alignment: center; horizontal-stretch: 0; }
+                    Rectangle {
+                        width: 224px;
+                        horizontal-stretch: 0;
+                        background: #dfe7e1;
+                        border-color: #cbd5ce;
+                        border-width: 1px;
+                        border-radius: 8px;
+                        HorizontalLayout {
+                            padding: 3px;
+                            spacing: 2px;
+                            SegmentedOption { width: 88px; text: "局域网"; active: !root.show-bluetooth-devices; clicked => { root.show-bluetooth-devices = false; } }
+                            SegmentedOption { width: 128px; text: "已配对蓝牙"; active: root.show-bluetooth-devices; clicked => { root.show-bluetooth-devices = true; } }
+                        }
+                    }
                     Rectangle { horizontal-stretch: 1; }
-                    Button { text: "局域网"; enabled: root.show-bluetooth-devices; clicked => { root.show-bluetooth-devices = false; } }
-                    Button { text: "已配对蓝牙"; enabled: !root.show-bluetooth-devices; clicked => { root.show-bluetooth-devices = true; } }
                     Button {
-                        text: root.bluetooth-scanning && root.show-bluetooth-devices ? "取消刷新" : "刷新";
+                        text: root.show-bluetooth-devices ? (root.bluetooth-scanning ? "取消刷新" : "刷新蓝牙服务") : "刷新";
                         enabled: !root.show-bluetooth-devices || root.bluetooth-scanning || root.bluetooth-can-refresh;
                         clicked => { if root.show-bluetooth-devices { if root.bluetooth-scanning { root.cancel-bluetooth-discovery(); } else { root.refresh-bluetooth(); } } else { root.refresh-discovery(); } }
                     }
@@ -534,11 +589,11 @@ export component AppWindow inherits Window {
                 }
                 if root.show-bluetooth-devices: HorizontalLayout {
                     height: 54px;
-                    Text { text: root.bluetooth-status; wrap: word-wrap; color: #555d59; horizontal-stretch: 1; }
+                    Text { text: !root.bluetooth-can-refresh && !root.bluetooth-scanning ? "连接或会话运行期间暂停手动蓝牙查询, 请先断开当前会话." : root.bluetooth-status; wrap: word-wrap; color: #555d59; horizontal-stretch: 1; }
                     Button { text: "系统蓝牙设置"; clicked => { root.open-bluetooth-settings(); } }
                 }
                 if root.show-bluetooth-devices: Text {
-                    text: "请先在系统设置完成配对, 再开启对端 Synly 蓝牙接入. 名称与地址仅作发现线索, 连接后验证应用身份. 运行会话期间暂停手动查询.";
+                    text: "列表仅显示系统已配对设备, Synly 局域网配对不会代替系统蓝牙配对. 请先在系统蓝牙设置配对, 并在对端 Synly 开启蓝牙接入. 连接后仍验证应用身份, 已保存的应用信任可复用.";
                     wrap: word-wrap; font-size: 11px; color: #737b77;
                 }
                 if !root.show-bluetooth-devices: HorizontalLayout {
@@ -551,7 +606,11 @@ export component AppWindow inherits Window {
                     vertical-stretch: 1;
                     VerticalLayout {
                         spacing: 6px;
-                        if root.show-bluetooth-devices && root.bluetooth-peers.length == 0: Text { text: "没有已查询的蓝牙设备, 点击刷新读取系统配对记录."; wrap: word-wrap; color: #737b77; }
+                        if root.show-bluetooth-devices && root.bluetooth-peers.length == 0: Text {
+                            text: root.bluetooth-scanning ? "正在查询系统已配对设备和 Synly 服务..." : root.bluetooth-can-refresh ? "尚无查询结果, 点击上方的刷新蓝牙服务. 如果只在 Synly 内配对过, 请先完成系统蓝牙配对." : "结束当前会话后, 可刷新并查询系统已配对的蓝牙设备.";
+                            wrap: word-wrap;
+                            color: #737b77;
+                        }
                         if root.show-bluetooth-devices: VerticalLayout {
                             spacing: 6px;
                             for peer in root.bluetooth-peers: Rectangle {
