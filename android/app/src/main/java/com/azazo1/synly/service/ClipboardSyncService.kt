@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ServiceInfo
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -90,9 +91,12 @@ class ClipboardSyncService : android.app.Service() {
         SynlyEngine.init(applicationContext)
         SynlyEngine.start(applicationContext)
         val currentUi = SynlyEngine.uiState.value
+        // 局域网和蓝牙都是外设通信. 已声明的 CHANGE_WIFI_MULTICAST_STATE 满足类型启动前提,
+        // 蓝牙 socket 仍独立要求附近设备权限, 不能以此绕过系统蓝牙授权.
         startForeground(
             NOTIFICATION_ID,
             buildNotification(currentUi.state, currentUi.connectedDevice, currentUi.targetLabel),
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE,
         )
         acquireMulticastLock()
         monitorWifiAvailability()
