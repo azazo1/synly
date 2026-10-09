@@ -16,11 +16,10 @@ use crate::transport::routing::{AvailableLinks, PathPolicy};
 use anyhow::{Context, Result, anyhow, bail};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::mpsc;
 use tokio_rustls::client::TlsStream;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -138,8 +137,7 @@ pub enum ClientCommand {
 pub struct ClientHandle {
     commands: mpsc::UnboundedSender<ClientCommand>,
     state: Arc<std::sync::Mutex<ClientState>>,
-    finished: Arc<AtomicBool>,
-    shutdown: Arc<Notify>,
+    completion: CancellationToken,
     cancellation: CancellationToken,
 }
 
@@ -184,15 +182,10 @@ impl ClientHandle {
 
     pub async fn stop_and_wait(&self) -> Result<()> {
         self.cancellation.cancel();
-        if self.send(ClientCommand::Stop).is_err() {
-            return Ok(());
-        }
-        loop {
-            if self.finished.load(Ordering::Acquire) {
-                return Ok(());
-            }
-            self.shutdown.notified().await;
-        }
+        let _ = self.send(ClientCommand::Stop);
+        // 队列关闭不等于资源清理完成. 持久信号支持多个等待者, 也不会漏掉先发生的完成.
+        self.completion.cancelled().await;
+        Ok(())
     }
 
     fn send(&self, command: ClientCommand) -> Result<()> {
@@ -213,14 +206,14 @@ pub fn start_client(
     let handle = ClientHandle {
         commands: command_tx,
         state: Arc::clone(&state),
-        finished: Arc::new(AtomicBool::new(false)),
-        shutdown: Arc::new(Notify::new()),
+        completion: CancellationToken::new(),
         cancellation: cancellation.clone(),
     };
     let worker_state = Arc::clone(&state);
-    let worker_finished = Arc::clone(&handle.finished);
-    let worker_shutdown = Arc::clone(&handle.shutdown);
+    // 在 spawn 前创建 guard, 工作任务未首次轮询就被丢弃时也必须通知完成.
+    let completion_guard = handle.completion.clone().drop_guard();
     tokio::spawn(async move {
+        let _completion_guard = completion_guard;
         run_client_loop(
             config,
             target,
@@ -230,8 +223,6 @@ pub fn start_client(
             cancellation,
         )
         .await;
-        worker_finished.store(true, Ordering::Release);
-        worker_shutdown.notify_waiters();
     });
     Ok(handle)
 }
@@ -1279,6 +1270,74 @@ mod tests {
     use crate::settings::{AudioMode, ClipboardMode};
     use std::net::Ipv4Addr;
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn stop_waits_for_worker_exit_after_commands_close() {
+        let (commands, receiver) = tokio::sync::mpsc::unbounded_channel();
+        drop(receiver);
+        let completion = tokio_util::sync::CancellationToken::new();
+        let handle = super::ClientHandle {
+            commands, state: std::sync::Arc::new(std::sync::Mutex::new(super::ClientState::Connecting)),
+            completion: completion.clone(), cancellation: tokio_util::sync::CancellationToken::new(),
+        };
+        let waiting = handle.stop_and_wait();
+        tokio::pin!(waiting);
+        // 队列接收端可能先于工作任务的资源清理被丢弃, 关闭队列不等于退出完成.
+        tokio::select! { biased;
+            result = &mut waiting => panic!("任务尚未完成却提前返回: {result:?}"),
+            _ = std::future::ready(()) => {}
+        }
+        completion.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiting).await.unwrap().unwrap();
+    }
+
+    fn lifecycle_client(listener: std::sync::Arc<dyn super::ClientListener>) -> super::ClientHandle {
+        let config = super::ClientConfig {
+            device: crate::identity::generate_device_config("退出测试".to_owned()).unwrap(),
+            trusted_devices: Vec::new(), transfer_limits: crate::protocol::TransferLimits::default(),
+            clipboard_mode: ClipboardMode::Both, clipboard_path: crate::transport::routing::PathPolicy::Auto,
+            instance_name: None, request_trust: false, bluetooth_enabled: false, discovery: None,
+        };
+        super::start_client(config, super::ClientTarget { addresses: Vec::new(), port: 0, peer_device_id: None, bluetooth_address: None }, listener).unwrap()
+    }
+
+    struct ExitListener {
+        entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        cleanup: Option<tokio::sync::oneshot::Sender<()>>,
+        panic: bool,
+    }
+    impl super::ClientListener for ExitListener {
+        fn on_event(&self, _: super::ClientEvent) {
+            if let Some(entered) = self.entered.lock().unwrap().take() { let _ = entered.send(()); }
+            assert!(!self.panic, "模拟外部回调异常退出");
+        }
+    }
+    impl Drop for ExitListener {
+        fn drop(&mut self) { if let Some(cleanup) = self.cleanup.take() { let _ = cleanup.send(()); } }
+    }
+
+    #[tokio::test]
+    async fn concurrent_and_late_stop_waiters_observe_completed_worker_cleanup() {
+        let (cleanup, mut cleaned) = tokio::sync::oneshot::channel();
+        let handle = lifecycle_client(std::sync::Arc::new(ExitListener { entered: std::sync::Mutex::new(None), cleanup: Some(cleanup), panic: false }));
+        let second = handle.clone();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            let (first, other) = tokio::join!(handle.stop_and_wait(), second.stop_and_wait());
+            first.unwrap(); other.unwrap();
+            cleaned.try_recv().expect("完成信号必须发生在工作任务资源清理后");
+            handle.stop_and_wait().await.unwrap();
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_waiter_is_released_after_worker_callback_panics() {
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let (cleanup, mut cleaned) = tokio::sync::oneshot::channel();
+        let handle = lifecycle_client(std::sync::Arc::new(ExitListener { entered: std::sync::Mutex::new(Some(entered)), cleanup: Some(cleanup), panic: true }));
+        tokio::time::timeout(std::time::Duration::from_secs(1), started).await.unwrap().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), handle.stop_and_wait()).await.unwrap().unwrap();
+        cleaned.try_recv().expect("异常退出也必须先释放监听器资源");
+    }
 
     #[test]
     fn removing_or_replacing_active_trust_revokes_only_that_identity() {

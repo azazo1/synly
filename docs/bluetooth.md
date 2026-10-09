@@ -95,6 +95,8 @@ Android 安全 BluetoothSocket 与 UniFFI 提供者声明已接入核心平台�
 
 Android 引擎为每次客户端启动创建独立监听器和代次, 目标切换, 停止, 断开或配对失败先撤销旧代次. 启动任务和 FFI 回调在同一锁下检查代次, 旧 Connected/Disconnected/TrustEstablished 不能修改新客户端状态和持久目标. FFI stop 等待核心退出, 因此在 IO coroutine 中停止捕获的旧句柄, 不持有回调锁等待退出. 排队剪贴板在实际应用前检查代次和接收权限, 应用回执只发给原句柄, 已开始的系统写入不承诺撤回, 迟到结果不更新新客户端 UI. 后台服务根据实际蓝牙可用路径或纯蓝牙目标取消无 Wi-Fi 自动退出; 副承载移除与目标变化会重新评估退出计时. 这些 Android 生命周期分支已进行源码审查, 未在本机执行 Android 工具或测试.
 
+核心客户端的 stop_and_wait 等待独立的持久完成信号, 不把命令队列关闭当作任务已退出. 工作任务拥有完成 guard, 正常返回, panic 或取消时都会在退出清理后触发信号, 多个等待者和完成后的再次等待都可返回, 不存在瞬时通知的检查/注册丢失唤醒窗口. 无硬件测试覆盖队列先关闭仍等待清理, 并发与迟到停止调用, 以及真实核心工作任务中外部监听器 panic 后释放资源并完成等待. 该测试在本机默认 Rust 核心上执行, 不编译 FFI/Android 或跨平台目标.
+
 现有 `just android-build` 会先执行 `android-core`, 从目标动态库重新生成 Kotlin 绑定再构建应用. 新增回调和类型必须经过该步骤; 没有在本机运行 Android 构建, 绑定生成或 Android/JNI 测试, 尚未完成真实设备互通验证.
 
 公共 Rust 核心负责 transport, mux, 路由协商与身份认证. 原生层只负责系统蓝牙 API. Android 通过 UniFFI 接入有界数据桥, 后台读取 BluetoothSocket, 取消时关闭 socket 并唤醒阻塞 IO. TCP 的 nodelay 和音频对端 IP 只属于局域网后端.
