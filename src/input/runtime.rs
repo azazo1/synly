@@ -690,6 +690,20 @@ pub(super) async fn run_sender_with_activity(
                     _ => {}
                 }
             }
+            // 心跳和超时必须先于高频本机输入事件被轮询: 分支带 biased, 本机输入事件持续就绪时
+            // 后面的分支会被饿住, 导致心跳停止发送和对端超时判定被无限推迟.
+            _ = heartbeat.tick() => {
+                enqueue_message(tx, InputMessage::Heartbeat { generation: control.generation })?;
+            }
+            _ = timeout_tick.tick() => {
+                if control.active
+                    && Instant::now().duration_since(last_heartbeat)
+                        >= sender_heartbeat_timeout(control.activation_confirmed)
+                {
+                    let _ = platform.backend.set_capture(false);
+                    bail!("输入辅助通道心跳超时");
+                }
+            }
             Some(event) = platform.events.recv() => {
                 match event {
                     NativeEvent::Emergency => {
@@ -916,9 +930,6 @@ pub(super) async fn run_sender_with_activity(
                     }
                 }
             }
-            _ = heartbeat.tick() => {
-                enqueue_message(tx, InputMessage::Heartbeat { generation: control.generation })?;
-            }
             _ = overflow_poll.tick() => {
                 platform.backend.health_check()?;
                 let secure_input_active = platform.backend.secure_input_state();
@@ -975,15 +986,6 @@ pub(super) async fn run_sender_with_activity(
                     Err(error) => {
                         tracing::warn!(error = %error, "刷新本机按键状态失败, 保留事件累计状态");
                     }
-                }
-            }
-            _ = timeout_tick.tick() => {
-                if control.active
-                    && Instant::now().duration_since(last_heartbeat)
-                        >= sender_heartbeat_timeout(control.activation_confirmed)
-                {
-                    let _ = platform.backend.set_capture(false);
-                    bail!("输入辅助通道心跳超时");
                 }
             }
         }
@@ -1734,6 +1736,70 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn sender_keeps_heartbeating_while_local_events_stay_ready() {
+        let backend = Arc::new(FakeBackend::default());
+        let layout = backend.layout().unwrap();
+        let motion = Arc::new(MotionAccumulator::default());
+        let (events_tx, events) = mpsc::channel(64);
+        let mut platform = PlatformHandle {
+            backend: Arc::clone(&backend) as Arc<dyn InputBackend>,
+            events,
+            motion,
+            overflowed: Arc::new(AtomicBool::new(false)),
+            failed: Arc::new(AtomicBool::new(false)),
+        };
+        let (_incoming_tx, mut incoming) = mpsc::channel(1);
+        let (outgoing, mut messages) = mpsc::channel(64);
+        let options = test_input_options(ScreenEdge::Left);
+        // 未激活时本机按键事件只累计本地状态, 不产生远端消息, 因此这里只统计心跳.
+        let flood = tokio::spawn(async move {
+            let mut sent = 0u32;
+            while events_tx
+                .send(NativeEvent::Button {
+                    button: 1,
+                    down: false,
+                })
+                .await
+                .is_ok()
+            {
+                sent += 1;
+                if sent.is_multiple_of(8) {
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+        let sender = tokio::spawn(async move {
+            run_sender(
+                &mut incoming,
+                &outgoing,
+                &mut platform,
+                layout,
+                ScreenEdge::Left,
+                InputPlatform::current(),
+                &options,
+            )
+            .await
+        });
+        let heartbeats = timeout(Duration::from_millis(1500), async {
+            let mut count = 0u32;
+            while count < 2 {
+                if let InputMessage::Heartbeat { .. } =
+                    messages.recv().await.expect("sender 不应提前停止")
+                {
+                    count += 1;
+                }
+            }
+            count
+        })
+        .await
+        .expect("本机输入事件持续就绪时, 心跳仍须按间隔发送");
+        assert_eq!(heartbeats, 2);
+        flood.abort();
+        sender.abort();
+        let _ = sender.await;
     }
 
     #[tokio::test]
