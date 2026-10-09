@@ -42,7 +42,11 @@ async fn run(backend: &impl Backend, cancel: CancellationToken, mut changed: imp
             row.detail = match tokio::time::timeout(QUERY_TIMEOUT, backend.service(&peer)).await {
                 Ok(Ok(true)) => { row.connectable = true; connected += 1; "Synly 服务可用, 连接后验证应用身份".to_owned() },
                 Ok(Ok(false)) => "未找到 Synly 服务, 请在对端开启蓝牙接入".to_owned(),
-                Ok(Err(error)) => { tracing::debug!(address = %peer.address, error = %error, "已配对设备服务查询失败"); "服务查询失败, 设备可能离线或权限受限".to_owned() },
+                Ok(Err(error)) => {
+                    let detail = format!("{error:#}");
+                    tracing::warn!(address = %peer.address, error = %detail, "已配对设备服务查询失败");
+                    format!("查询失败: {}", detail.chars().take(160).collect::<String>())
+                },
                 Err(_) => "服务查询超时, 可稍后刷新".to_owned(),
             };
             changed(row);

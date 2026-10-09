@@ -133,14 +133,19 @@ fn returned_channel(buffer: &[usize], address: u64) -> io::Result<Option<u8>> {
     Ok(None)
 }
 
+fn query_error(operation: &str, error: io::Error) -> io::Error {
+    // 保留系统码的文字表示和失败 API, 不再把不同的 SDP 错误归为权限或离线.
+    io::Error::new(error.kind(), format!("{operation}: {error}"))
+}
+
 pub(super) fn query_service(address: u64) -> io::Result<Option<u8>> {
-    socket::initialize()?;
-    require_paired(address)?;
+    socket::initialize().map_err(|error| query_error("WSAStartup", error))?;
+    require_paired(address).map_err(|error| query_error("系统配对记录", error))?;
     let target = SOCKADDR_BTH { addressFamily: AF_BTH, btAddr: address, ..Default::default() };
     let mut context = [0u16; 128];
     let mut context_len = context.len() as u32;
     if unsafe { WSAAddressToStringW((&target as *const SOCKADDR_BTH).cast(), size_of::<SOCKADDR_BTH>() as u32, std::ptr::null(), context.as_mut_ptr(), &mut context_len) } == SOCKET_ERROR {
-        return Err(socket::last_error());
+        return Err(query_error("WSAAddressToStringW", socket::last_error()));
     }
     let mut service = SERVICE_GUID;
     let restriction = WSAQUERYSETW {
@@ -153,7 +158,7 @@ pub(super) fn query_service(address: u64) -> io::Result<Option<u8>> {
     let mut handle = std::ptr::null_mut();
     if unsafe { WSALookupServiceBeginW(&restriction, LUP_FLUSHCACHE | LUP_RETURN_ADDR | LUP_RETURN_TYPE, &mut handle) } == SOCKET_ERROR {
         let error = socket::last_error();
-        return if error.raw_os_error() == Some(WSASERVICE_NOT_FOUND) { Ok(None) } else { Err(error) };
+        return if error.raw_os_error() == Some(WSASERVICE_NOT_FOUND) { Ok(None) } else { Err(query_error("WSALookupServiceBeginW", error)) };
     }
     let _lookup = Lookup(handle);
     let mut buffer = vec![0usize; 4096 / size_of::<usize>()];
@@ -163,7 +168,7 @@ pub(super) fn query_service(address: u64) -> io::Result<Option<u8>> {
         unsafe { std::ptr::write(output, WSAQUERYSETW { dwSize: size_of::<WSAQUERYSETW>() as u32, ..Default::default() }) };
         let mut size = std::mem::size_of_val(buffer.as_slice()) as u32;
         if unsafe { WSALookupServiceNextW(handle, LUP_RETURN_ADDR, &mut size, output) } == 0 {
-            if let Some(channel) = returned_channel(&buffer, address)? { return Ok(Some(channel)); }
+            if let Some(channel) = returned_channel(&buffer, address).map_err(|error| query_error("RFCOMM 通道解析", error))? { return Ok(Some(channel)); }
             continue;
         }
         let error = socket::last_error();
@@ -172,7 +177,7 @@ pub(super) fn query_service(address: u64) -> io::Result<Option<u8>> {
             Some(WSAEFAULT) if size as usize > std::mem::size_of_val(buffer.as_slice()) && size <= 64 * 1024 => {
                 buffer.resize((size as usize).div_ceil(size_of::<usize>()), 0);
             }
-            _ => return Err(error),
+            _ => return Err(query_error("WSALookupServiceNextW", error)),
         }
     }
     Err(io::Error::new(io::ErrorKind::InvalidData, "SDP 查询返回了过多的服务记录"))

@@ -19,7 +19,7 @@ struct NativePeer {
 unsafe extern "C" {
     fn synly_bt_available() -> c_int;
     fn synly_bt_paired(peers: *mut NativePeer, capacity: usize, count: *mut usize) -> c_int;
-    fn synly_bt_query(address: *const c_char, uuid: *const u8, channel: *mut u8) -> c_int;
+    fn synly_bt_query(address: *const c_char, uuid: *const u8, channel: *mut u8, stage: *mut u8) -> c_int;
     fn synly_bt_connect(address: *const c_char, uuid: *const u8, fd: *mut c_int) -> c_int;
     fn synly_bt_listen(
         uuid: *const u8,
@@ -94,7 +94,20 @@ pub async fn query_service(peer: BluetoothPeer) -> Result<Option<BluetoothEndpoi
     lookup(move || {
         let address = CString::new(peer.address.as_str())?;
         let mut channel = 0;
-        check(unsafe { synly_bt_query(address.as_ptr(), SERVICE_UUID_BYTES.as_ptr(), &mut channel) })?;
+        let mut stage = 0;
+        let started = std::time::Instant::now();
+        let status = unsafe { synly_bt_query(address.as_ptr(), SERVICE_UUID_BYTES.as_ptr(), &mut channel, &mut stage) };
+        let phase = match stage {
+            1 => "控制器状态",
+            2 => "系统配对记录",
+            3 => "SDP 查询队列",
+            4 => "SDP 请求启动",
+            5 => "SDP 对端响应",
+            6 => "RFCOMM 通道解析",
+            _ => "未知阶段",
+        };
+        tracing::info!(address = %peer.address, phase, status, channel, elapsed_ms = started.elapsed().as_millis() as u64, "macOS 蓝牙服务查询结束");
+        check(status).with_context(|| format!("{phase}失败 (0x{:08x})", status as u32))?;
         Ok((channel != 0).then_some(BluetoothEndpoint { peer, channel: Some(channel) }))
     }).await
 }

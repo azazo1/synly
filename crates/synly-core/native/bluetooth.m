@@ -69,24 +69,28 @@ static void pump_loop(void) {
     [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.01]];
 }
 
-static int query_channel(IOBluetoothDevice *device, const uint8_t uuid[16], uint8_t *channel) {
+static int query_channel(IOBluetoothDevice *device, const uint8_t uuid[16], uint8_t *channel, uint8_t *stage) {
     *channel = 0;
+    *stage = 3;
     SBWorker *worker = [SBWorker shared];
     if (worker.queries.count >= 32) return -9;
     SBQuery *query = [SBQuery new];
     [worker.queries addObject:query];
     IOBluetoothSDPUUID *service = [IOBluetoothSDPUUID uuidWithBytes:uuid length:16];
+    *stage = 4;
     IOReturn status = [device performSDPQuery:query uuids:@[service]];
     if (status != kIOReturnSuccess) {
         [worker.queries removeObject:query];
         return (int)status;
     }
+    *stage = 5;
     NSTimeInterval deadline = NSProcessInfo.processInfo.systemUptime + 10.0;
     while (!query.complete && NSProcessInfo.processInfo.systemUptime < deadline) pump_loop();
     // 超时后仍保留 callback target, 直到系统完成查询, 避免迟到回调访问已释放对象.
     if (!query.complete) return -5;
     [worker.queries removeObject:query];
     if (query.status != kIOReturnSuccess) return (int)query.status;
+    *stage = 6;
     IOBluetoothSDPServiceRecord *record = [device getServiceRecordForUUID:service];
     if (record == nil) return 0;
     BluetoothRFCOMMChannelID found = 0;
@@ -374,14 +378,17 @@ int synly_bt_paired(SynlyBluetoothPeer *peers, size_t capacity, size_t *count) {
     });
     return result;
 }
-int synly_bt_query(const char *address, const uint8_t uuid[16], uint8_t *channel) {
+int synly_bt_query(const char *address, const uint8_t uuid[16], uint8_t *channel, uint8_t *stage) {
+    *channel = 0;
+    *stage = 1;
     __block int result;
     run_sync(^{
         result = availability();
         if (result != 0) return;
+        *stage = 2;
         IOBluetoothDevice *device = paired_device(address);
         if (device == nil) { result = -4; return; }
-        result = query_channel(device, uuid, channel);
+        result = query_channel(device, uuid, channel, stage);
     });
     return result;
 }
@@ -394,7 +401,8 @@ int synly_bt_connect(const char *address, const uint8_t uuid[16], int *fd) {
         IOBluetoothDevice *device = paired_device(address);
         if (device == nil) { result = -4; return; }
         uint8_t channelID = 0;
-        result = query_channel(device, uuid, &channelID);
+        uint8_t stage = 0;
+        result = query_channel(device, uuid, &channelID, &stage);
         if (result != 0) return;
         if (channelID == 0) { result = -8; return; }
         SBConnection *connection = [SBConnection new];
