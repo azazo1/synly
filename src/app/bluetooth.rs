@@ -132,17 +132,22 @@ mod tests {
         }
         let first = device("key-a", "cert-a");
         let second = device("key-b", "cert-b");
+        // 返回的候选借用入参切片, 因此临时数组必须先绑定, 否则借用在语句结束时就失效.
+        let both = [first.clone(), second.clone()];
         // 设备列表只能给出蓝牙地址, 因此必须保留全部可用信任供会话层按任一条完成 mTLS.
-        let all = bluetooth_trust_candidates(&[first.clone(), second.clone()], None);
+        let all = bluetooth_trust_candidates(&both, None);
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].device_id, first.device_id);
         // 已明确设备 ID 时只取该条, 不能顺手用上别的身份.
-        let only = bluetooth_trust_candidates(&[first.clone(), second.clone()], Some(second.device_id));
+        let only = bluetooth_trust_candidates(&both, Some(second.device_id));
         assert_eq!(only.len(), 1);
         assert_eq!(only[0].device_id, second.device_id);
         // 空公钥或空根证书的记录建不出可信 mTLS, 一律排除; 未知 ID 也不能退化成任意身份.
-        assert!(bluetooth_trust_candidates(&[device("key-c", "")], None).is_empty());
-        assert!(bluetooth_trust_candidates(&[device("", "cert-d")], None).is_empty());
-        assert!(bluetooth_trust_candidates(&[first], Some(Uuid::new_v4())).is_empty());
+        let missing_certificate = [device("key-c", "")];
+        let missing_key = [device("", "cert-d")];
+        let single = [first.clone()];
+        assert!(bluetooth_trust_candidates(&missing_certificate, None).is_empty());
+        assert!(bluetooth_trust_candidates(&missing_key, None).is_empty());
+        assert!(bluetooth_trust_candidates(&single, Some(Uuid::new_v4())).is_empty());
     }
 }
