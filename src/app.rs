@@ -2441,10 +2441,10 @@ pub(crate) async fn run_sync_session(
             crate::system_notification::notify_input_reconfirmation(notifications_enabled, &hotkey);
             tracing::info!(hotkey = %hotkey, "输入路径已重建, 已提示用户按热键确认");
         }
-        // 用引用比较: TransportStatus 含 String 已不再是 Copy, 直接写 Some(status) 会把 status 移动掉,
-        // 下一行的上报就拿不到它了.
+        // TransportStatus 含 String 已不再是 Copy, 因此这里一共只有两处按值使用, 都要照顾到:
+        // 先克隆一份交给上报, 再把原值存进已上报状态, 否则第二处会用到已移动的值.
         if reported_transport_status.as_ref() != Some(&status) {
-            options.control.report(RuntimeEvent::Transport { peer: peer_summary.clone(), status });
+            options.control.report(RuntimeEvent::Transport { peer: peer_summary.clone(), status: status.clone() });
             reported_transport_status = Some(status);
         }
         let frame = tokio::select! {
