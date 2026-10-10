@@ -26,6 +26,11 @@
 @property(nonatomic, weak) id target;
 @property(nonatomic, strong) NSCondition *progress;
 @property(nonatomic, strong) NSMutableData *sent;
+// 真实通道会把 writeAsync 的 refcon 原样交回完成回调 (IOBluetooth 头文件如此约定):
+// 桥接层靠这个令牌区分并发在途的每一笔写, 回传 NULL 会让在途计数永远降不下来.
+@property(nonatomic, strong) NSMutableArray<NSValue *> *pendingRefcons;
+// 观察到的最多并发在途笔数. 退回单笔发送时它恒为 1, 因此可以锁住并发发送这条性能行为.
+@property(nonatomic) NSUInteger peakInFlight;
 @property(nonatomic) BOOL closed;
 - (IOBluetoothDevice *)getDevice;
 - (BluetoothRFCOMMMTU)getMTU;
@@ -42,6 +47,7 @@
         _device.paired = YES;
         _progress = [NSCondition new];
         _sent = [NSMutableData data];
+        _pendingRefcons = [NSMutableArray array];
         _device.authenticationResult = kIOReturnSuccess;
     }
     return self;
@@ -51,17 +57,24 @@
 - (BOOL)isTransmissionPaused { return NO; }
 - (IOReturn)setDelegate:(id)target { _target = target; return kIOReturnSuccess; }
 - (IOReturn)writeAsync:(void *)bytes length:(UInt16)size refcon:(void *)refcon {
-    (void)refcon;
     assert(size <= [self getMTU]);
     [self.progress lock];
     [self.sent appendBytes:bytes length:size];
+    [self.pendingRefcons addObject:[NSValue valueWithPointer:refcon]];
+    if (self.pendingRefcons.count > self.peakInFlight) self.peakInFlight = self.pendingRefcons.count;
     [self.progress broadcast];
     [self.progress unlock];
     [self performSelector:@selector(completeWrite) withObject:nil afterDelay:0];
     return kIOReturnSuccess;
 }
 - (void)completeWrite {
-    [self.target rfcommChannelWriteComplete:(IOBluetoothRFCOMMChannel *)self refcon:NULL status:kIOReturnSuccess];
+    // 完成回调按发出顺序到达, 因此先进先出取回各自的 refcon.
+    [self.progress lock];
+    assert(self.pendingRefcons.count > 0);
+    void *refcon = self.pendingRefcons.firstObject.pointerValue;
+    [self.pendingRefcons removeObjectAtIndex:0];
+    [self.progress unlock];
+    [self.target rfcommChannelWriteComplete:(IOBluetoothRFCOMMChannel *)self refcon:refcon status:kIOReturnSuccess];
 }
 - (IOReturn)closeChannel {
     [self.progress lock];
@@ -165,6 +178,8 @@ static void transfer_and_cancel(void) {
     for (NSUInteger i = 0; i < payload.length; ++i) ((uint8_t *)payload.mutableBytes)[i] = (uint8_t)i;
     send_all(fd, payload);
     wait_sent(channel, payload);
+    // 发送必须并发: 单笔串行是停等, 正是导致蓝牙输入帧率低且延迟高的原因.
+    assert(channel.peakInFlight > 1);
     run_sync(^{
         [connection rfcommChannelData:connection.channel data:payload.mutableBytes length:payload.length];
     });
