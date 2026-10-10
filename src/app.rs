@@ -2231,8 +2231,8 @@ pub(crate) async fn run_sync_session(
     let mut remote_transport_generation = 0;
     let mut advertised_transport_state = None;
     let mut reported_transport_status = None;
-    // 输入重建后的"需按热键确认"只在首次出现时提醒一次, 反复提醒会变成噪音.
-    let mut reported_input_gate = false;
+    // 输入重建后"需按热键确认"的上一轮状态, 用于只在门槛上升沿提醒一次, 而不是每轮重复提醒.
+    let mut input_reconfirm_announced = false;
     let mut transport_generation = 0u64;
     let primary_clipboard_lane = bluetooth_channels.as_mut().expect("已创建主承载").enable_clipboard_routes()?;
     let mut clipboard_route = ClipboardRoute::new(matches!(session.role, SessionRole::Host), options.transfer_limits);
@@ -2419,6 +2419,9 @@ pub(crate) async fn run_sync_session(
         }
         let clipboard_deadline = clipboard_route.deadline();
         let audio_deadline = capability_runtime.audio_deadline;
+        // 手动激活门槛只约束正在遥控对端的那台机器: 被控端从不读取这个门槛, 也没有热键要求,
+        // 因此被控端既不提醒, 也不在状态栏显示确认提示, 避免给出无法照做的指引.
+        let input_reconfirm_required = matches!(capability_runtime.input_role, Some(LocalInputRole::Send)) && capability_runtime.input_requires_manual;
         let status = crate::runtime_control::TransportStatus {
             primary: session.transport, available, input: choice,
             input_running: capability_runtime.input_task.is_some(),
@@ -2430,17 +2433,19 @@ pub(crate) async fn run_sync_session(
             audio_unavailable: audio_lan.is_none() && resolve_audio_plan(session.role, capability_state.effective_local().audio_mode, capability_state.effective_remote().audio_mode).is_some(),
             switching: capability_runtime.pending_mux_input.is_some(),
             failed: capability_runtime.input_blocked.is_some(),
-            requires_manual_activation: capability_runtime.input_requires_manual,
+            requires_manual_activation: input_reconfirm_required,
             // 运行时选项里保存的是已解析的 Hotkey, 界面需要可读文本.
             input_hotkey: input_options.hotkey.to_string(),
         };
-        if capability_runtime.input_requires_manual && !reported_input_gate {
-            reported_input_gate = true;
+        // 按上升沿提醒: 门槛每次从无到有都提示一次, 因为同一会话内可能因链路重建或改设置再次要求确认.
+        // 若只在会话内提醒一次, 之后热键被改了也不会再告知, 用户就会以为提示里的键才是当前生效的键.
+        if input_reconfirm_required && !input_reconfirm_announced {
             let hotkey = input_options.hotkey.to_string();
             let notifications_enabled = options.control.tuning().borrow().notifications_enabled;
             crate::system_notification::notify_input_reconfirmation(notifications_enabled, &hotkey);
             tracing::info!(hotkey = %hotkey, "输入路径已重建, 已提示用户按热键确认");
         }
+        input_reconfirm_announced = input_reconfirm_required;
         // TransportStatus 含 String 已不再是 Copy, 因此这里一共只有两处按值使用, 都要照顾到:
         // 先克隆一份交给上报, 再把原值存进已上报状态, 否则第二处会用到已移动的值.
         if reported_transport_status.as_ref() != Some(&status) {
