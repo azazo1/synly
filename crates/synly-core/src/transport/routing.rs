@@ -16,6 +16,16 @@ impl PathPolicy {
     fn allowed(self) -> u8 {
         match self { Self::LanOnly => 1, Self::BluetoothOnly => 2, Self::Auto | Self::PreferBluetooth => 3 }
     }
+
+    /// 该策略是否允许指定承载.
+    /// 自动与蓝牙优先都允许两种承载, 区别只在于是否主动要求蓝牙.
+    pub fn allows(self, kind: TransportKind) -> bool {
+        match (self, kind) {
+            (Self::LanOnly, TransportKind::Bluetooth) => false,
+            (Self::BluetoothOnly, TransportKind::Lan) => false,
+            _ => true,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,7 +72,9 @@ pub fn choose_route(channel: FunctionalChannel, local: PathPolicy, remote: PathP
     let allowed = allowed & supported;
     if allowed == 0 { return RouteChoice::Paused(PauseReason::UnsupportedChannel); }
     let usable = |kind| available.contains(kind) && allowed & match kind { TransportKind::Lan => 1, TransportKind::Bluetooth => 2 } != 0;
-    let prefer_bluetooth = local == PathPolicy::PreferBluetooth || remote == PathPolicy::PreferBluetooth;
+    // 只有双方都选蓝牙优先才主动切到蓝牙. 自动的含义是"保持当前可用路径, 不主动切换",
+    // 因此不能被对端的单方偏好在使用过程中改写成蓝牙, 否则自动模式就形同虚设.
+    let prefer_bluetooth = local == PathPolicy::PreferBluetooth && remote == PathPolicy::PreferBluetooth;
     if prefer_bluetooth && usable(TransportKind::Bluetooth) { return RouteChoice::Selected(TransportKind::Bluetooth); }
     if let Some(current) = current.filter(|kind| usable(*kind)) { return RouteChoice::Selected(current); }
     for kind in [TransportKind::Lan, TransportKind::Bluetooth] {
@@ -265,7 +277,10 @@ mod tests {
         assert_eq!(choose_route(FunctionalChannel::Clipboard, PathPolicy::BluetoothOnly, PathPolicy::Auto, AvailableLinks { lan: true, bluetooth: false }, None), RouteChoice::Paused(PauseReason::TransportUnavailable));
         assert_eq!(choose_route(FunctionalChannel::Audio, PathPolicy::BluetoothOnly, PathPolicy::Auto, links, None), RouteChoice::Paused(PauseReason::UnsupportedChannel));
         assert_eq!(choose_route(FunctionalChannel::Clipboard, PathPolicy::Auto, PathPolicy::Auto, links, Some(TransportKind::Bluetooth)), RouteChoice::Selected(TransportKind::Bluetooth));
-        assert_eq!(choose_route(FunctionalChannel::Input, PathPolicy::Auto, PathPolicy::PreferBluetooth, links, Some(TransportKind::Lan)), RouteChoice::Selected(TransportKind::Bluetooth));
+        // 单方蓝牙优先不能改写对方的自动模式: 自动保持当前路径, 这里应停在已有的局域网路径.
+        assert_eq!(choose_route(FunctionalChannel::Input, PathPolicy::Auto, PathPolicy::PreferBluetooth, links, Some(TransportKind::Lan)), RouteChoice::Selected(TransportKind::Lan));
+        // 双方都选蓝牙优先才切到蓝牙.
+        assert_eq!(choose_route(FunctionalChannel::Input, PathPolicy::PreferBluetooth, PathPolicy::PreferBluetooth, links, Some(TransportKind::Lan)), RouteChoice::Selected(TransportKind::Bluetooth));
     }
 
     #[test]
