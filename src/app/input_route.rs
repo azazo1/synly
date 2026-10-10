@@ -8,10 +8,20 @@ pub(super) fn available(primary: TransportKind, secondary: Option<&SecondaryTunn
     if let Some(secondary) = secondary { match secondary.transport() { TransportKind::Lan => links.lan = true, TransportKind::Bluetooth => links.bluetooth = true } }
     links
 }
-pub(super) fn select(primary: TransportKind, primary_lane: Option<&GenerationLane>, secondary: Option<&SecondaryTunnel>, remote: AvailableLinks, local_policy: synly_core::transport::routing::PathPolicy, remote_policy: synly_core::transport::routing::PathPolicy, current: Option<TransportKind>) -> (synly_core::transport::routing::RouteChoice, Option<GenerationLane>) {
+/// 选择输入承载.
+/// `switch_allowed` 为 false 表示当前正在控制对端, 此时只允许"当前承载已不可用或不再被双方策略允许"
+/// 造成的切换; 单纯由偏好变化引起的切换会拆掉正在使用的输入子流, 并且强制重新做热键确认,
+/// 因此推迟到空闲后再评估.
+pub(super) fn select(primary: TransportKind, primary_lane: Option<&GenerationLane>, secondary: Option<&SecondaryTunnel>, remote: AvailableLinks, local_policy: synly_core::transport::routing::PathPolicy, remote_policy: synly_core::transport::routing::PathPolicy, current: Option<TransportKind>, switch_allowed: bool) -> (synly_core::transport::routing::RouteChoice, Option<GenerationLane>) {
     let local = available(primary, secondary);
     let shared = AvailableLinks { lan: local.lan && remote.lan, bluetooth: local.bluetooth && remote.bluetooth };
     let choice = synly_core::transport::routing::choose_route(FunctionalChannel::Input, local_policy, remote_policy, shared, current);
+    let choice = if switch_allowed { choice } else {
+        match current.filter(|kind| shared.contains(*kind) && local_policy.allows(*kind) && remote_policy.allows(*kind)) {
+            Some(current) if choice.transport() != Some(current) => RouteChoice::Selected(current),
+            _ => choice,
+        }
+    };
     let lane = match choice.transport() {
         Some(kind) if kind == primary => primary_lane.cloned(),
         Some(kind) => secondary.filter(|secondary| secondary.transport() == kind).map(|secondary| secondary.channels.input.clone()),

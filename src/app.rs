@@ -2399,7 +2399,9 @@ pub(crate) async fn run_sync_session(
         }
         capability_runtime.input_route.update_policy(input_options.path);
         let current = capability_runtime.input_role.and(capability_runtime.input_transport);
-        let (choice, lane) = input_route::select(session.transport, primary_input_mux.as_ref(), secondary.as_ref(), remote_transport_state, input_options.path, remote_input_policy, current);
+        // 正在控制对端时不因偏好变化切换承载: 切换会拆掉输入子流并强制重新热键确认.
+        let switch_allowed = !input_activity.load(Ordering::Acquire);
+        let (choice, lane) = input_route::select(session.transport, primary_input_mux.as_ref(), secondary.as_ref(), remote_transport_state, input_options.path, remote_input_policy, current, switch_allowed);
         input_transport = (remote_transport_generation > 0).then(|| choice.transport()).flatten();
         input_mux = if input_transport.is_some() { lane } else { None };
         audio_lan = audio_path::select(session.transport, remote_socket_addr, session.logical.id(), secondary.as_ref(), if remote_transport_generation > 0 { remote_transport_state } else { Default::default() });
