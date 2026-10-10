@@ -1,6 +1,6 @@
 //! 输入路径握手与副承载选择, 主控制连接始终保持不变.
 use super::*;
-use synly_core::transport::routing::{AvailableLinks, RouteMessage, FunctionalChannel};
+use synly_core::transport::routing::{AvailableLinks, PathPolicy, RouteChoice, RouteMessage, FunctionalChannel};
 use synly_core::transport::{logical::SecondaryTunnel, generation::GenerationLane};
 
 pub(super) fn available(primary: TransportKind, secondary: Option<&SecondaryTunnel>) -> AvailableLinks {
@@ -12,14 +12,15 @@ pub(super) fn available(primary: TransportKind, secondary: Option<&SecondaryTunn
 /// `switch_allowed` 为 false 表示当前正在控制对端, 此时只允许"当前承载已不可用或不再被双方策略允许"
 /// 造成的切换; 单纯由偏好变化引起的切换会拆掉正在使用的输入子流, 并且强制重新做热键确认,
 /// 因此推迟到空闲后再评估.
-pub(super) fn select(primary: TransportKind, primary_lane: Option<&GenerationLane>, secondary: Option<&SecondaryTunnel>, remote: AvailableLinks, local_policy: synly_core::transport::routing::PathPolicy, remote_policy: synly_core::transport::routing::PathPolicy, current: Option<TransportKind>, switch_allowed: bool) -> (synly_core::transport::routing::RouteChoice, Option<GenerationLane>) {
+pub(super) fn select(primary: TransportKind, primary_lane: Option<&GenerationLane>, secondary: Option<&SecondaryTunnel>, remote: AvailableLinks, local_policy: PathPolicy, remote_policy: PathPolicy, current: Option<TransportKind>, switch_allowed: bool) -> (RouteChoice, Option<GenerationLane>) {
     let local = available(primary, secondary);
     let shared = AvailableLinks { lan: local.lan && remote.lan, bluetooth: local.bluetooth && remote.bluetooth };
     let choice = synly_core::transport::routing::choose_route(FunctionalChannel::Input, local_policy, remote_policy, shared, current);
+    // 正在控制时保持当前承载: 只要它仍可用且仍被双方策略允许, 就不因偏好变化改道.
     let choice = if switch_allowed { choice } else {
         match current.filter(|kind| shared.contains(*kind) && local_policy.allows(*kind) && remote_policy.allows(*kind)) {
-            Some(current) if choice.transport() != Some(current) => RouteChoice::Selected(current),
-            _ => choice,
+            Some(current) => RouteChoice::Selected(current),
+            None => choice,
         }
     };
     let lane = match choice.transport() {
@@ -143,11 +144,24 @@ mod tests {
     fn selection_respects_policies_and_never_invents_a_secondary() {
         use synly_core::transport::routing::{PathPolicy, PauseReason, RouteChoice};
         let remote = AvailableLinks { lan: true, bluetooth: true };
-        assert_eq!(select(TransportKind::Lan, None, None, remote, PathPolicy::BluetoothOnly, PathPolicy::Auto, None).0, RouteChoice::Paused(PauseReason::TransportUnavailable));
-        assert_eq!(select(TransportKind::Lan, None, None, remote, PathPolicy::BluetoothOnly, PathPolicy::LanOnly, None).0, RouteChoice::Paused(PauseReason::PolicyConflict));
-        assert_eq!(select(TransportKind::Lan, None, None, remote, PathPolicy::PreferBluetooth, PathPolicy::Auto, None).0.transport(), Some(TransportKind::Lan));
-        assert_eq!(select(TransportKind::Bluetooth, None, None, remote, PathPolicy::LanOnly, PathPolicy::Auto, None).0.transport(), None);
-        assert_eq!(select(TransportKind::Bluetooth, None, None, remote, PathPolicy::Auto, PathPolicy::Auto, Some(TransportKind::Bluetooth)).0.transport(), Some(TransportKind::Bluetooth));
+        assert_eq!(select(TransportKind::Lan, None, None, remote, PathPolicy::BluetoothOnly, PathPolicy::Auto, None, true).0, RouteChoice::Paused(PauseReason::TransportUnavailable));
+        assert_eq!(select(TransportKind::Lan, None, None, remote, PathPolicy::BluetoothOnly, PathPolicy::LanOnly, None, true).0, RouteChoice::Paused(PauseReason::PolicyConflict));
+        assert_eq!(select(TransportKind::Lan, None, None, remote, PathPolicy::PreferBluetooth, PathPolicy::Auto, None, true).0.transport(), Some(TransportKind::Lan));
+        assert_eq!(select(TransportKind::Bluetooth, None, None, remote, PathPolicy::LanOnly, PathPolicy::Auto, None, true).0.transport(), None);
+        assert_eq!(select(TransportKind::Bluetooth, None, None, remote, PathPolicy::Auto, PathPolicy::Auto, Some(TransportKind::Bluetooth), true).0.transport(), Some(TransportKind::Bluetooth));
+    }
+    #[test]
+    fn selection_keeps_the_current_carrier_while_control_is_active() {
+        use synly_core::transport::routing::PathPolicy;
+        let remote = AvailableLinks { lan: true, bluetooth: true };
+        // 双方都是蓝牙优先时, 选路本身会切到蓝牙.
+        assert_eq!(select(TransportKind::Lan, None, None, remote, PathPolicy::PreferBluetooth, PathPolicy::PreferBluetooth, Some(TransportKind::Lan), true).0.transport(), Some(TransportKind::Bluetooth));
+        // 正在控制对端时保持当前承载, 不因偏好变化中断正在使用的输入子流.
+        assert_eq!(select(TransportKind::Lan, None, None, remote, PathPolicy::PreferBluetooth, PathPolicy::PreferBluetooth, Some(TransportKind::Lan), false).0.transport(), Some(TransportKind::Lan));
+        // 当前承载不再被双方策略允许时必须切走, 不能因为正在控制就停在非法路径上.
+        assert_eq!(select(TransportKind::Lan, None, None, remote, PathPolicy::BluetoothOnly, PathPolicy::BluetoothOnly, Some(TransportKind::Lan), false).0.transport(), Some(TransportKind::Bluetooth));
+        // 当前承载在本机不可用时同样必须切走.
+        assert_eq!(select(TransportKind::Bluetooth, None, None, AvailableLinks { lan: false, bluetooth: true }, PathPolicy::Auto, PathPolicy::Auto, Some(TransportKind::Lan), false).0.transport(), Some(TransportKind::Bluetooth));
     }
     #[tokio::test]
     async fn completed_task_is_consumed_before_state_release() {
