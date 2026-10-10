@@ -2431,13 +2431,15 @@ pub(crate) async fn run_sync_session(
             switching: capability_runtime.pending_mux_input.is_some(),
             failed: capability_runtime.input_blocked.is_some(),
             requires_manual_activation: capability_runtime.input_requires_manual,
-            input_hotkey: input_options.hotkey.clone(),
+            // 运行时选项里保存的是已解析的 Hotkey, 界面需要可读文本.
+            input_hotkey: input_options.hotkey.to_string(),
         };
         if capability_runtime.input_requires_manual && !reported_input_gate {
             reported_input_gate = true;
+            let hotkey = input_options.hotkey.to_string();
             let notifications_enabled = options.control.tuning().borrow().notifications_enabled;
-            crate::system_notification::notify_input_reconfirmation(notifications_enabled, &input_options.hotkey);
-            tracing::info!(hotkey = %input_options.hotkey, "输入路径已重建, 已提示用户按热键确认");
+            crate::system_notification::notify_input_reconfirmation(notifications_enabled, &hotkey);
+            tracing::info!(hotkey = %hotkey, "输入路径已重建, 已提示用户按热键确认");
         }
         // 用引用比较: TransportStatus 含 String 已不再是 Copy, 直接写 Some(status) 会把 status 移动掉,
         // 下一行的上报就拿不到它了.
