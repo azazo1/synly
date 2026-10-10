@@ -40,7 +40,7 @@ pub struct RuntimePeerSummary {
     pub display_name: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TransportStatus {
     pub primary: synly_core::transport::routing::TransportKind,
     pub available: synly_core::transport::routing::AvailableLinks,
@@ -57,6 +57,8 @@ pub struct TransportStatus {
     pub switching: bool,
     pub failed: bool,
     pub requires_manual_activation: bool,
+    /// 当前的输入紧急热键, 用于把"需要按键确认"提示写成用户能直接照做的一句话.
+    pub input_hotkey: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -2231,6 +2231,8 @@ pub(crate) async fn run_sync_session(
     let mut remote_transport_generation = 0;
     let mut advertised_transport_state = None;
     let mut reported_transport_status = None;
+    // 输入重建后的"需按热键确认"只在首次出现时提醒一次, 反复提醒会变成噪音.
+    let mut reported_input_gate = false;
     let mut transport_generation = 0u64;
     let primary_clipboard_lane = bluetooth_channels.as_mut().expect("已创建主承载").enable_clipboard_routes()?;
     let mut clipboard_route = ClipboardRoute::new(matches!(session.role, SessionRole::Host), options.transfer_limits);
@@ -2429,8 +2431,17 @@ pub(crate) async fn run_sync_session(
             switching: capability_runtime.pending_mux_input.is_some(),
             failed: capability_runtime.input_blocked.is_some(),
             requires_manual_activation: capability_runtime.input_requires_manual,
+            input_hotkey: input_options.hotkey.clone(),
         };
-        if reported_transport_status != Some(status) {
+        if capability_runtime.input_requires_manual && !reported_input_gate {
+            reported_input_gate = true;
+            let notifications_enabled = options.control.tuning().borrow().notifications_enabled;
+            crate::system_notification::notify_input_reconfirmation(notifications_enabled, &input_options.hotkey);
+            tracing::info!(hotkey = %input_options.hotkey, "输入路径已重建, 已提示用户按热键确认");
+        }
+        // 用引用比较: TransportStatus 含 String 已不再是 Copy, 直接写 Some(status) 会把 status 移动掉,
+        // 下一行的上报就拿不到它了.
+        if reported_transport_status.as_ref() != Some(&status) {
             options.control.report(RuntimeEvent::Transport { peer: peer_summary.clone(), status });
             reported_transport_status = Some(status);
         }

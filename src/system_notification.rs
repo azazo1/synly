@@ -185,6 +185,32 @@ pub fn notify_interaction(
     }
 }
 
+/// 输入路径重建后必须由用户按热键确认才能重新控制对端, 这里主动说明要按什么,
+/// 否则用户只会看到"输入过不去"而不知道原因.
+pub fn notify_input_reconfirmation(enabled: bool, hotkey: &str) {
+    if !enabled {
+        return;
+    }
+    let body = format!("输入路径已重建. 按 {hotkey} 确认后, 再把鼠标移到屏幕边缘即可重新控制对端.");
+    if let Err(error) = std::thread::Builder::new()
+        .name("synly-input-reconfirm-notification".to_string())
+        .spawn(move || {
+            let result = Notification::new()
+                .appname("Synly")
+                .summary("需要确认输入路径")
+                .body(&body)
+                .show();
+            if let Err(err) = result
+                && !NOTIFICATION_ERROR_REPORTED.swap(true, Ordering::Relaxed)
+            {
+                tracing::warn!(error = %err, "无法发送系统提醒, 后续错误将不再重复显示");
+            }
+        })
+    {
+        tracing::warn!(error = %error, "无法启动输入确认提醒线程");
+    }
+}
+
 impl SessionNotifier for SystemNotifier {
     fn notify(&self, event: ConnectionEvent, peer: &NotificationPeer) {
         if !self.tuning.borrow().notifications_enabled {

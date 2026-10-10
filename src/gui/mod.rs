@@ -968,7 +968,7 @@ fn apply_snapshot(
                     .remote_capabilities
                     .map(capability_summary)
                     .unwrap_or_else(|| "未协商".to_string()),
-                session.transport.map(transport_summary).unwrap_or_else(|| "路径状态未建立".to_string())
+                session.transport.as_ref().map(transport_summary).unwrap_or_else(|| "路径状态未建立".to_string())
             )
             .into(),
         })
@@ -1505,7 +1505,7 @@ fn audio_mode_from_index(index: i32) -> AudioMode {
     }
 }
 
-fn transport_summary(status: crate::runtime_control::TransportStatus) -> String {
+fn transport_summary(status: &crate::runtime_control::TransportStatus) -> String {
     use synly_core::transport::routing::{TransportKind, RouteChoice, PauseReason};
     let label = |kind| match kind { TransportKind::Lan => "局域网", TransportKind::Bluetooth => "蓝牙" };
     let input = if status.failed { "失败暂停" } else if status.switching { "切换确认中" } else if status.input_running {
@@ -1525,7 +1525,9 @@ fn transport_summary(status: crate::runtime_control::TransportStatus) -> String 
         RouteChoice::Selected(_) => if status.clipboard_failed { "失败暂停" } else if status.clipboard_switching { "切换确认中" } else { status.clipboard.map(label).unwrap_or("关闭或等待路径") },
     };
     let audio = if status.audio_failed { "失败暂停" } else if status.audio_unavailable { "等待已绑定局域网" } else if status.audio_waiting { "等待 UDP 接收端口" } else if status.audio == Some(TransportKind::Lan) { "局域网 UDP" } else { "关闭或等待协商" };
-    format!("主控制 {} / 已接入 {}{} / 输入 {}{} / 剪贴板 {} / 音频 {}", label(status.primary), if status.available.lan { "局域网 " } else { "" }, if status.available.bluetooth { "蓝牙" } else { "" }, input, if status.requires_manual_activation { "(重建需热键确认)" } else { "" }, clipboard, audio)
+    // 需要人工确认时把热键直接写出来, 否则用户只看到"输入暂停"而不知道该按什么.
+    let reconfirm = if status.requires_manual_activation { format!(" [输入已重建, 按 {} 确认后可再次移至边缘]", status.input_hotkey) } else { String::new() };
+    format!("主控制 {} / 已接入 {}{} / 输入 {}{} / 剪贴板 {} / 音频 {}", label(status.primary), if status.available.lan { "局域网 " } else { "" }, if status.available.bluetooth { "蓝牙" } else { "" }, input, reconfirm, clipboard, audio)
 }
 
 fn input_path_index(policy: synly_core::transport::routing::PathPolicy) -> i32 {

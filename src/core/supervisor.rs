@@ -1313,11 +1313,11 @@ mod tests {
         let (mut supervisor, _) = AppSupervisor::new(test_config(), false);
         let peer = RuntimePeerSummary { device_id: Uuid::new_v4(), display_name: "peer".into() };
         let other = RuntimePeerSummary { device_id: Uuid::new_v4(), display_name: "other".into() };
-        let status = TransportStatus { primary: TransportKind::Lan, available: AvailableLinks { lan: true, bluetooth: true }, input: RouteChoice::Selected(TransportKind::Bluetooth), input_running: true, clipboard: Some(TransportKind::Lan), clipboard_choice: RouteChoice::Selected(TransportKind::Lan), clipboard_switching: false, clipboard_failed: false, audio: Some(TransportKind::Lan), audio_waiting: false, audio_failed: false, audio_unavailable: false, switching: false, failed: false, requires_manual_activation: true };
+        let status = TransportStatus { primary: TransportKind::Lan, available: AvailableLinks { lan: true, bluetooth: true }, input: RouteChoice::Selected(TransportKind::Bluetooth), input_running: true, clipboard: Some(TransportKind::Lan), clipboard_choice: RouteChoice::Selected(TransportKind::Lan), clipboard_switching: false, clipboard_failed: false, audio: Some(TransportKind::Lan), audio_waiting: false, audio_failed: false, audio_unavailable: false, switching: false, failed: false, requires_manual_activation: true, input_hotkey: "ctrl+alt+shift+esc".to_owned() };
         supervisor.handle_runtime_event(RuntimeEvent::Connected(peer.clone()));
-        supervisor.handle_runtime_event(RuntimeEvent::Transport { peer: other, status });
+        supervisor.handle_runtime_event(RuntimeEvent::Transport { peer: other, status: status.clone() });
         assert!(supervisor.snapshot.sessions[0].transport.is_none());
-        supervisor.handle_runtime_event(RuntimeEvent::Transport { peer: peer.clone(), status });
+        supervisor.handle_runtime_event(RuntimeEvent::Transport { peer: peer.clone(), status: status.clone() });
         assert_eq!(supervisor.snapshot.sessions[0].transport, Some(status));
         supervisor.handle_runtime_event(RuntimeEvent::Disconnected(peer));
         assert!(supervisor.snapshot.sessions.is_empty());
