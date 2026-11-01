@@ -392,7 +392,11 @@ impl HubTask {
                                 return now + MIN_APPLY_INTERVAL;
                             }
                             Err(error) => {
-                                tracing::warn!(error = %error, %source, "应用远端剪贴板内容失败");
+                                tracing::warn!(error = %error, %source, "应用远端剪贴板内容失败, 仍向其它会话中继");
+                                // 本机剪贴板写不进去时仍然中继: 其它会话的剪贴板与本机无关.
+                                // 仍记录签名与单源节奏, 避免失败路径绕过防洪流和回音抑制.
+                                self.policy.record(SourceKey::Remote(source), &payload, now);
+                                self.broadcast(payload, Some(source));
                                 ClipboardApplyOutcome::Failed
                             }
                         }
@@ -620,6 +624,29 @@ mod tests {
             recv_payload(&mut second_rx).await,
             Some(text_payload("from-first"))
         );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_local_application_still_relays_to_other_subscribers() {
+        let sink = Arc::new(FakeSink::default());
+        sink.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (hub, task) = new_hub_with_sink(sink.clone());
+        let origin = Uuid::new_v4();
+        let peer = Uuid::new_v4();
+        let _origin_rx = hub.subscribe(origin);
+        let mut peer_rx = hub.subscribe(peer);
+        hub.set_receive_enabled(peer, true);
+
+        // 本机写不进系统剪贴板时, 其它会话仍应收到这次更新; 回执仍如实报告失败.
+        assert_eq!(
+            hub.ingest_tracked(origin, text_payload("relay"))
+                .await
+                .unwrap(),
+            ClipboardApplyOutcome::Failed
+        );
+        assert_eq!(recv_payload(&mut peer_rx).await, Some(text_payload("relay")));
+        assert!(sink.applied.lock().unwrap().is_empty());
         task.abort();
     }
 

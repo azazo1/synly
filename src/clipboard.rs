@@ -18,6 +18,31 @@ use url::Url;
 
 const CLIPBOARD_CACHE_BATCH_PREFIX: &str = "batch-";
 
+/// Windows 上同一进程内并发打开剪贴板时, 后一个线程的 EmptyClipboard 会返回
+/// ERROR_CLIPBOARD_NOT_OPEN(1418): 监听线程读取结束时的 CloseClipboard 会关掉
+/// 应用远端载荷线程刚打开的剪贴板. 因此本进程的读与写必须串行执行.
+#[cfg(windows)]
+static CLIPBOARD_ACCESS: Mutex<()> = Mutex::new(());
+
+#[cfg(windows)]
+fn with_clipboard_access<T>(operation: impl FnOnce() -> T) -> T {
+    let _guard = CLIPBOARD_ACCESS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    operation()
+}
+
+#[cfg(not(windows))]
+fn with_clipboard_access<T>(operation: impl FnOnce() -> T) -> T {
+    operation()
+}
+
+// 串行化之后仍可能被其它进程短暂占用, 例如输入法与剪贴板管理器.
+#[cfg(windows)]
+const APPLY_ATTEMPTS: u32 = 5;
+#[cfg(windows)]
+const APPLY_BACKOFF: Duration = Duration::from_millis(60);
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClipboardRuntimeOptions {
     pub path: synly_core::transport::routing::PathPolicy,
@@ -121,37 +146,39 @@ impl ClipboardSync {
         let state = self.state.clone();
 
         tokio::task::spawn_blocking(move || -> Result<()> {
-            if strict { validate_complete_payload(&payload, options.max_file_bytes)?; }
-            let mut warnings = Vec::new();
-            let payload = sanitize_remote_payload(payload, options.max_file_bytes, &mut warnings);
-            emit_warnings(&warnings);
+            with_clipboard_access(move || -> Result<()> {
+                if strict { validate_complete_payload(&payload, options.max_file_bytes)?; }
+                let mut warnings = Vec::new();
+                let payload = sanitize_remote_payload(payload, options.max_file_bytes, &mut warnings);
+                emit_warnings(&warnings);
 
-            if payload.is_empty() {
-                return Ok(());
-            }
+                if payload.is_empty() {
+                    return Ok(());
+                }
 
-            let ctx = ClipboardContext::new().map_err(clipboard_error)?;
-            let already_matches = capture_clipboard(&ctx, options.max_file_bytes)
-                .payload
-                .as_ref()
-                == Some(&payload);
+                let ctx = ClipboardContext::new().map_err(clipboard_error)?;
+                let already_matches = capture_clipboard(&ctx, options.max_file_bytes)
+                    .payload
+                    .as_ref()
+                    == Some(&payload);
 
-            if !already_matches {
-                apply_payload_to_clipboard(
-                    &ctx,
-                    &payload,
-                    &options.cache_dir,
-                    options.max_cache_bytes,
-                    strict,
-                )?;
-            }
+                if !already_matches {
+                    apply_payload_to_clipboard(
+                        &ctx,
+                        &payload,
+                        &options.cache_dir,
+                        options.max_cache_bytes,
+                        strict,
+                    )?;
+                }
 
-            let signature = payload_signature(&payload);
-            let mut guard = state
-                .lock()
-                .map_err(|_| anyhow!("clipboard sync state poisoned"))?;
-            guard.note_remote_payload(signature, !already_matches);
-            Ok(())
+                let signature = payload_signature(&payload);
+                let mut guard = state
+                    .lock()
+                    .map_err(|_| anyhow!("clipboard sync state poisoned"))?;
+                guard.note_remote_payload(signature, !already_matches);
+                Ok(())
+            })
         })
         .await
         .context("clipboard apply task failed")??;
@@ -174,10 +201,12 @@ impl ClipboardSync {
             .map_err(|_| anyhow!("clipboard runtime options poisoned"))?
             .max_file_bytes;
         tokio::task::spawn_blocking(move || -> Result<Option<ClipboardPayload>> {
-            let ctx = ClipboardContext::new().map_err(clipboard_error)?;
-            let captured = capture_clipboard(&ctx, max_file_bytes);
-            emit_warnings(&captured.warnings);
-            Ok(captured.payload)
+            with_clipboard_access(move || -> Result<Option<ClipboardPayload>> {
+                let ctx = ClipboardContext::new().map_err(clipboard_error)?;
+                let captured = capture_clipboard(&ctx, max_file_bytes);
+                emit_warnings(&captured.warnings);
+                Ok(captured.payload)
+            })
         })
         .await
         .context("clipboard read task failed")?
@@ -244,7 +273,7 @@ impl ClipboardHandler for LocalClipboardHandler {
             Ok(options) => options.max_file_bytes,
             Err(_) => return,
         };
-        let captured = capture_clipboard(&self.ctx, max_file_bytes);
+        let captured = with_clipboard_access(|| capture_clipboard(&self.ctx, max_file_bytes));
         emit_warnings(&captured.warnings);
 
         let Some(payload) = captured.payload else {
@@ -492,23 +521,6 @@ fn apply_payload_to_clipboard(
     max_cache_bytes: Option<u64>,
     strict: bool,
 ) -> Result<()> {
-    let mut contents = Vec::new();
-
-    if let Some(text) = &payload.text {
-        contents.push(ClipboardContent::Text(text.clone()));
-    }
-    if let Some(rich_text) = &payload.rich_text {
-        contents.push(ClipboardContent::Rtf(rich_text.clone()));
-    }
-    if let Some(html) = &payload.html {
-        contents.push(ClipboardContent::Html(html.clone()));
-    }
-    if let Some(image) = &payload.image {
-        let image =
-            clipboard_rs::RustImageData::from_bytes(&image.png_bytes).map_err(clipboard_error)?;
-        contents.push(ClipboardContent::Image(image));
-    }
-
     let mut file_warnings = Vec::new();
     let file_paths = write_clipboard_files_to_cache(
         cache_dir,
@@ -518,20 +530,77 @@ fn apply_payload_to_clipboard(
     )?;
     emit_warnings(&file_warnings);
     if strict && file_paths.len() != payload.files.len() { bail!("可靠剪贴板文件未全部写入缓存, 不可确认应用成功"); }
-    if !file_paths.is_empty() {
-        contents.push(ClipboardContent::Files(
-            file_paths
-                .iter()
-                .map(|path| path.to_string_lossy().to_string())
-                .collect(),
-        ));
-    }
 
-    if contents.is_empty() {
-        return Ok(());
-    }
+    // 缓存只落一次; 剪贴板内容每次尝试都重建, 因为 ClipboardContent 不可克隆,
+    // 图片也需要重新解码. 重试不会重复复制缓存文件.
+    let build_contents = || -> Result<Vec<ClipboardContent>> {
+        let mut contents = Vec::new();
+        if let Some(text) = &payload.text {
+            contents.push(ClipboardContent::Text(text.clone()));
+        }
+        if let Some(rich_text) = &payload.rich_text {
+            contents.push(ClipboardContent::Rtf(rich_text.clone()));
+        }
+        if let Some(html) = &payload.html {
+            contents.push(ClipboardContent::Html(html.clone()));
+        }
+        if let Some(image) = &payload.image {
+            let image = clipboard_rs::RustImageData::from_bytes(&image.png_bytes)
+                .map_err(clipboard_error)?;
+            contents.push(ClipboardContent::Image(image));
+        }
+        if !file_paths.is_empty() {
+            contents.push(ClipboardContent::Files(
+                file_paths
+                    .iter()
+                    .map(|path| path.to_string_lossy().to_string())
+                    .collect(),
+            ));
+        }
+        Ok(contents)
+    };
 
-    ctx.set(contents).map_err(clipboard_error)
+    set_clipboard_contents(ctx, build_contents)
+}
+
+fn set_clipboard_contents(
+    ctx: &ClipboardContext,
+    build: impl Fn() -> Result<Vec<ClipboardContent>>,
+) -> Result<()> {
+    // Windows 的剪贴板写入会被其它进程短暂占用, 串行化本进程访问之后仍需有限退避重试.
+    #[cfg(windows)]
+    {
+        let mut last_error = None;
+        for attempt in 0..APPLY_ATTEMPTS {
+            let contents = build()?;
+            if contents.is_empty() {
+                return Ok(());
+            }
+            match ctx.set(contents) {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    let error = clipboard_error(error);
+                    tracing::debug!(attempt, error = %error, "Windows 剪贴板写入失败, 稍后重试");
+                    last_error = Some(error);
+                    if attempt + 1 < APPLY_ATTEMPTS {
+                        thread::sleep(APPLY_BACKOFF.saturating_mul(attempt + 1));
+                    }
+                }
+            }
+        }
+        match last_error {
+            Some(error) => Err(error),
+            None => Err(anyhow!("剪贴板写入没有可执行的尝试")),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let contents = build()?;
+        if contents.is_empty() {
+            return Ok(());
+        }
+        ctx.set(contents).map_err(clipboard_error)
+    }
 }
 
 fn write_clipboard_files_to_cache(

@@ -2048,7 +2048,9 @@ async fn refresh_capability_tasks(
     let clipboard_can_receive = allows_local_receive(context.session_role, &clipboard_agreement);
     context.tx.set_clipboard_enabled(clipboard_can_send);
     if let Some(hub) = context.clipboard_hub {
-        hub.set_receive_enabled(context.peer_device_id, clipboard_can_receive);
+        // receive_enabled 决定中枢是否把广播发往这个会话, 对应 host -> client 方向,
+        // 因此这里要用本机的发送能力, 而不是本机的接收能力.
+        hub.set_receive_enabled(context.peer_device_id, clipboard_can_send);
     } else {
         if runtime.clipboard.can_send && !clipboard_can_send {
             runtime.clipboard.stop_sender();
