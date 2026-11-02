@@ -57,7 +57,7 @@ pub struct TransportStatus {
     pub switching: bool,
     pub failed: bool,
     pub requires_manual_activation: bool,
-    /// 当前的输入紧急热键, 用于把"需要按键确认"提示写成用户能直接照做的一句话.
+    /// 当前的重置输入流热键, 用于把"需要按键确认"提示写成用户能直接照做的一句话.
     pub input_hotkey: String,
 }
 

@@ -105,10 +105,14 @@ pub(crate) async fn accept(connection: native::BluetoothConnection, config: &mut
     Ok((session, reservation))
 }
 
-pub(super) fn spawn_input(stream: ByteStream, role: LocalInputRole, options: InputRuntimeOptions, master_secret: [u8; 32], activity: Arc<std::sync::atomic::AtomicBool>, epoch: CapabilityEpoch, require_manual: bool) -> tokio::task::JoinHandle<()> {
+pub(super) fn spawn_input(stream: ByteStream, role: LocalInputRole, options: InputRuntimeOptions, master_secret: [u8; 32], signals: input::InputSessionSignals, epoch: CapabilityEpoch, require_manual: bool) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(error) = input::run_input_session_with_gate(InputSessionContext::Multiplexed { stream }, master_secret, role, options, Some(activity), require_manual).await {
-            tracing::warn!(error = %error, ?epoch, "蓝牙输入子流已经停止, 需要重新建立代次并手动激活");
+        if let Err(error) = input::run_input_session_with_gate(InputSessionContext::Multiplexed { stream }, master_secret, role, options, signals, require_manual).await {
+            if input::is_input_reset(&error) {
+                tracing::info!(?epoch, "蓝牙输入子流已按用户请求结束, 等待上层重建");
+            } else {
+                tracing::warn!(error = %error, ?epoch, "蓝牙输入子流已经停止, 需要重新建立代次并手动激活");
+            }
         }
     })
 }

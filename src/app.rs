@@ -21,7 +21,7 @@ use crate::host::{
 };
 use crate::input::{
     self, InputHostChannel, InputMode, InputRuntimeOptions, InputSessionContext,
-    InputSocketConnection, InputSocketInbox, LocalInputRole, negotiate_input,
+    InputSessionSignals, InputSocketConnection, InputSocketInbox, LocalInputRole, negotiate_input,
 };
 use crate::protocol::{
     AudioLayout as ProtocolAudioLayout, CapabilityEpoch, ClipboardPayload, ControlMessage,
@@ -1937,6 +1937,7 @@ struct CapabilityTaskRuntime {
     input_epoch: Option<CapabilityEpoch>,
     pending_mux_input: Option<(Uuid, ByteStream, Instant)>,
     input_generation: Option<Uuid>,
+    input_reset: Option<Arc<AtomicBool>>,
     input_role: Option<LocalInputRole>,
     input_route: synly_core::transport::routing::ChannelRoute,
     input_uses_mux: bool,
@@ -1957,6 +1958,7 @@ impl CapabilityTaskRuntime {
             input_epoch: None,
             pending_mux_input: None,
             input_generation: None,
+            input_reset: None,
             input_role: None,
             input_route: synly_core::transport::routing::ChannelRoute::new(synly_core::transport::routing::FunctionalChannel::Input, matches!(role, SessionRole::Host), synly_core::transport::routing::PathPolicy::PreferBluetooth),
             input_uses_mux: false, input_transport: None, input_requires_manual: false, input_blocked: None,
@@ -1993,6 +1995,7 @@ impl CapabilityTaskRuntime {
             task.abort();
             let _ = task.await;
         }
+        self.input_reset.take();
         self.pending_mux_input.take();
         self.input_generation = None;
         self.input_epoch = None;
@@ -2144,7 +2147,11 @@ async fn refresh_capability_tasks(
             let mut input_options = context.input_options.clone();
             input_options.mode = local.input_mode;
             let input_master_secret = context.input_master_secret;
-            let activity = Arc::clone(context.input_activity);
+            let reset = Arc::new(AtomicBool::new(false));
+            let signals = InputSessionSignals::with_reset(
+                Some(Arc::clone(context.input_activity)),
+                Some(Arc::clone(&reset)),
+            );
             let require_manual = runtime.input_requires_manual;
             let task = tokio::spawn(async move {
                 if let Err(err) = input::run_input_session_with_gate(
@@ -2152,19 +2159,29 @@ async fn refresh_capability_tasks(
                     input_master_secret,
                     local_role,
                     input_options,
-                    Some(activity),
+                    signals,
                     require_manual,
                 )
                 .await
                 {
-                    tracing::error!(error = %err, ?epoch, "输入辅助会话失败");
+                    log_input_session_end(&err, epoch);
                 }
             });
             tasks.track(&task);
             runtime.input_task = Some(task);
+            runtime.input_reset = Some(reset);
         }
     }
     Ok(())
+}
+
+/// 输入子流结束分两种: 用户主动重置只需要 info, 意外失败要保留 error.
+fn log_input_session_end(err: &anyhow::Error, epoch: CapabilityEpoch) {
+    if input::is_input_reset(err) {
+        tracing::info!(?epoch, "输入子流已按用户请求结束, 等待上层重建");
+    } else {
+        tracing::error!(error = %err, ?epoch, "输入辅助会话失败");
+    }
 }
 
 async fn wait_for_capability_ack(deadline: Option<Instant>) {
@@ -2622,13 +2639,24 @@ pub(crate) async fn run_sync_session(
                 continue;
             }
             _ = input_route::task_finished(&mut capability_runtime.input_task) => {
-                input_route::fail(&mut capability_runtime, &capability_state, CapabilityRefreshContext {
-                    session_role: session.role, peer_device_id: session.remote.device_id, input_mux: input_mux.as_ref(), input_transport, remote_socket_addr,
-                    audio_master_secret, audio_lan, audio_layout: options.audio_layout, input_master_secret, input_options: &input_options,
-                    input_inbox: options.input_inbox.as_ref(), input_session_id: options.input_session_id.as_ref(),
-                    input_socket_tx: options.input_socket_tx.as_ref(), input_routes: options.input_routes.as_ref(),
-                    input_activity: &input_activity, clipboard_hub: options.clipboard_hub.as_ref(), tx: &tx,
-                }, true).await?;
+                if capability_runtime.input_reset.take().is_some_and(|flag| flag.load(Ordering::Acquire)) {
+                    input_route::reset(&mut capability_runtime, &capability_state, &mut session_tasks, CapabilityRefreshContext {
+                        session_role: session.role, peer_device_id: session.remote.device_id, input_mux: input_mux.as_ref(), input_transport, remote_socket_addr,
+                        audio_master_secret, audio_lan, audio_layout: options.audio_layout, input_master_secret, input_options: &input_options,
+                        input_inbox: options.input_inbox.as_ref(), input_session_id: options.input_session_id.as_ref(),
+                        input_socket_tx: options.input_socket_tx.as_ref(), input_routes: options.input_routes.as_ref(),
+                        input_activity: &input_activity, clipboard_hub: options.clipboard_hub.as_ref(), tx: &tx,
+                    }, true).await?;
+                    input_reconfirm_announced = false;
+                } else {
+                    input_route::fail(&mut capability_runtime, &capability_state, CapabilityRefreshContext {
+                        session_role: session.role, peer_device_id: session.remote.device_id, input_mux: input_mux.as_ref(), input_transport, remote_socket_addr,
+                        audio_master_secret, audio_lan, audio_layout: options.audio_layout, input_master_secret, input_options: &input_options,
+                        input_inbox: options.input_inbox.as_ref(), input_session_id: options.input_session_id.as_ref(),
+                        input_socket_tx: options.input_socket_tx.as_ref(), input_routes: options.input_routes.as_ref(),
+                        input_activity: &input_activity, clipboard_hub: options.clipboard_hub.as_ref(), tx: &tx,
+                    }, true).await?;
+                }
                 continue;
             }
             candidate = synly_core::transport::logical::receive_secondary(&mut secondary_inbox) => {
@@ -2748,6 +2776,18 @@ pub(crate) async fn run_sync_session(
                     input_activity: &input_activity, clipboard_hub: options.clipboard_hub.as_ref(), tx: &tx,
                 }).await?;
             }
+            Frame::Control(ControlMessage::InputReset { epoch }) => {
+                if capability_state.current_epoch(epoch) {
+                    input_route::reset(&mut capability_runtime, &capability_state, &mut session_tasks, CapabilityRefreshContext {
+                        session_role: session.role, peer_device_id: session.remote.device_id, input_mux: input_mux.as_ref(), input_transport, remote_socket_addr,
+                        audio_master_secret, audio_lan, audio_layout: options.audio_layout, input_master_secret, input_options: &input_options,
+                        input_inbox: options.input_inbox.as_ref(), input_session_id: options.input_session_id.as_ref(),
+                        input_socket_tx: options.input_socket_tx.as_ref(), input_routes: options.input_routes.as_ref(),
+                        input_activity: &input_activity, clipboard_hub: options.clipboard_hub.as_ref(), tx: &tx,
+                    }, false).await?;
+                    input_reconfirm_announced = false;
+                }
+            }
             Frame::Control(ControlMessage::InputPathFailed { epoch, generation }) => {
                 if capability_state.current_epoch(epoch) && capability_runtime.input_generation == Some(generation) {
                     input_route::fail(&mut capability_runtime, &capability_state, CapabilityRefreshContext {
@@ -2784,7 +2824,11 @@ pub(crate) async fn run_sync_session(
                 }
                 let mut task_input_options = input_options.clone();
                 task_input_options.mode = local.input_mode;
-                let activity_for_input = Arc::clone(&input_activity);
+                let reset = Arc::new(AtomicBool::new(false));
+                let signals = InputSessionSignals::with_reset(
+                    Some(Arc::clone(&input_activity)),
+                    Some(Arc::clone(&reset)),
+                );
                 let require_manual = capability_runtime.input_requires_manual;
                 let task = tokio::spawn(async move {
                     if let Err(err) = input::run_input_session_with_gate(
@@ -2792,16 +2836,17 @@ pub(crate) async fn run_sync_session(
                         input_master_secret,
                         local_role,
                         task_input_options,
-                        Some(activity_for_input),
+                        signals,
                         require_manual,
                     )
                     .await
                     {
-                        tracing::error!(error = %err, ?epoch, "输入辅助会话失败");
+                        log_input_session_end(&err, epoch);
                     }
                 });
                 session_tasks.track(&task);
                 capability_runtime.input_task = Some(task);
+                capability_runtime.input_reset = Some(reset);
             }
             Frame::Control(ControlMessage::AudioPathFailed { epoch, path_id }) => {
                 if capability_state.current_epoch(epoch) && capability_runtime.audio_lan.is_some_and(|path| path.binding_id == path_id) {

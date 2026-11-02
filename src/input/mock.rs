@@ -35,7 +35,7 @@ impl Default for ScreenMockOptions {
     fn default() -> Self {
         Self {
             edge: ScreenEdge::Right,
-            hotkey: Hotkey::DEFAULT.parse().expect("默认紧急热键必须有效"),
+            hotkey: Hotkey::DEFAULT.parse().expect("默认重置热键必须有效"),
             width: 1280,
             height: 720,
         }

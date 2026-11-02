@@ -124,6 +124,51 @@ impl InputSessionContext {
     }
 }
 
+/// 输入子流与上层会话共享的状态: 是否正在控制对端, 以及用户是否请求重置连接.
+#[derive(Clone, Default)]
+pub struct InputSessionSignals {
+    activity: Option<Arc<AtomicBool>>,
+    reset: Option<Arc<AtomicBool>>,
+}
+
+impl InputSessionSignals {
+    pub fn activity(activity: Option<Arc<AtomicBool>>) -> Self {
+        Self { activity, reset: None }
+    }
+
+    pub fn with_reset(activity: Option<Arc<AtomicBool>>, reset: Option<Arc<AtomicBool>>) -> Self {
+        Self { activity, reset }
+    }
+
+    fn set_activity(&self, active: bool) {
+        if let Some(flag) = &self.activity {
+            flag.store(active, Ordering::Release);
+        }
+    }
+
+    fn request_reset(&self) {
+        if let Some(flag) = &self.reset {
+            flag.store(true, Ordering::Release);
+        }
+    }
+}
+
+/// 用户按下重置热键后结束本次输入子流, 由上层重新建立链路.
+#[derive(Debug)]
+pub struct InputResetRequested;
+
+impl std::fmt::Display for InputResetRequested {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("用户请求重置输入流连接")
+    }
+}
+
+impl std::error::Error for InputResetRequested {}
+
+pub fn is_input_reset(error: &anyhow::Error) -> bool {
+    error.is::<InputResetRequested>()
+}
+
 pub async fn run_input_session(
     context: InputSessionContext,
     master_secret: [u8; 32],
@@ -131,7 +176,15 @@ pub async fn run_input_session(
     options: InputRuntimeOptions,
     input_activity: Option<Arc<AtomicBool>>,
 ) -> Result<()> {
-    run_input_session_with_gate(context, master_secret, local_role, options, input_activity, false).await
+    run_input_session_with_gate(
+        context,
+        master_secret,
+        local_role,
+        options,
+        InputSessionSignals::activity(input_activity),
+        false,
+    )
+    .await
 }
 
 /// 功能路径切换后的新连接必须先经过用户热键确认, 不能由残留边缘坐标激活.
@@ -140,19 +193,17 @@ pub async fn run_input_session_with_gate(
     master_secret: [u8; 32],
     local_role: LocalInputRole,
     options: InputRuntimeOptions,
-    input_activity: Option<Arc<AtomicBool>>,
+    signals: InputSessionSignals,
     mut require_manual_activation: bool,
 ) -> Result<()> {
-    if let Some(input_activity) = &input_activity {
-        input_activity.store(false, Ordering::Release);
-    }
+    signals.set_activity(false);
     let filter_app_events = options.filter_app_events && matches!(local_role, LocalInputRole::Send);
     let mut platform =
         platform::start_with_filter(options.mode, options.hotkey, filter_app_events)?;
     tracing::info!(role = ?local_role, "输入同步运行时已启动");
     match context {
         InputSessionContext::Multiplexed { stream } => {
-            let result = run_established(stream, local_role, &options, &mut platform, input_activity, require_manual_activation).await;
+            let result = run_established(stream, local_role, &options, &mut platform, &signals, require_manual_activation).await;
             cleanup_platform(&platform);
             result
         }
@@ -177,13 +228,13 @@ pub async fn run_input_session_with_gate(
                         local_role,
                         &options,
                         &mut platform,
-                        input_activity.clone(),
+                        &signals,
                         require_manual_activation,
                     )
                     .await
                     {
                         cleanup_platform(&platform);
-                        if platform_is_terminal(&platform) {
+                        if platform_is_terminal(&platform) || is_input_reset(&err) {
                             return Err(err);
                         }
                         require_manual_activation = true;
@@ -216,7 +267,7 @@ pub async fn run_input_session_with_gate(
                             local_role,
                             &options,
                             &mut platform,
-                            input_activity.clone(),
+                            &signals,
                             require_manual_activation,
                         )
                         .await
@@ -226,7 +277,7 @@ pub async fn run_input_session_with_gate(
                 };
                 cleanup_platform(&platform);
                 if let Err(err) = established {
-                    if platform_is_terminal(&platform) {
+                    if platform_is_terminal(&platform) || is_input_reset(&err) {
                         return Err(err);
                     }
                     require_manual_activation = true;
@@ -261,12 +312,10 @@ async fn run_established<T: AsyncByteStream + 'static>(
     local_role: LocalInputRole,
     options: &InputRuntimeOptions,
     platform: &mut platform::PlatformHandle,
-    input_activity: Option<Arc<AtomicBool>>,
+    signals: &InputSessionSignals,
     require_manual_activation: bool,
 ) -> Result<()> {
-    if let Some(input_activity) = &input_activity {
-        input_activity.store(false, Ordering::Release);
-    }
+    signals.set_activity(false);
     let local_layout = platform.backend.layout()?;
     let local_platform = InputPlatform::current();
     let (mut reader, mut writer) = tokio::io::split(stream);
@@ -309,7 +358,7 @@ async fn run_established<T: AsyncByteStream + 'static>(
                 options.edge,
                 remote_platform,
                 options,
-                input_activity,
+                signals,
                 require_manual_activation,
             )
             .await
@@ -323,7 +372,7 @@ async fn run_established<T: AsyncByteStream + 'static>(
                 local_layout,
                 options,
                 platform::foreground_cursor_captured,
-                input_activity,
+                signals,
             )
             .await
         }
@@ -534,7 +583,7 @@ struct SenderControl {
     cooldown_until: Instant,
     local_pressed: PressedState,
     pending_return_request: Option<(u64, f32)>,
-    input_activity: Option<Arc<AtomicBool>>,
+    signals: InputSessionSignals,
 }
 
 impl SenderControl {
@@ -542,11 +591,9 @@ impl SenderControl {
         platform: &platform::PlatformHandle,
         layout: super::DesktopLayout,
         edge: ScreenEdge,
-        input_activity: Option<Arc<AtomicBool>>,
+        signals: InputSessionSignals,
     ) -> Self {
-        if let Some(input_activity) = &input_activity {
-            input_activity.store(false, Ordering::Release);
-        }
+        signals.set_activity(false);
         Self {
             generation: 0,
             active: false,
@@ -555,15 +602,13 @@ impl SenderControl {
             cooldown_until: Instant::now(),
             local_pressed: PressedState::default(),
             pending_return_request: None,
-            input_activity,
+            signals,
         }
     }
 
     fn deactivate(&mut self) {
         self.active = false;
-        if let Some(input_activity) = &self.input_activity {
-            input_activity.store(false, Ordering::Release);
-        }
+        self.signals.set_activity(false);
         self.activation_confirmed = false;
         self.cooldown_until = Instant::now() + RETURN_COOLDOWN;
         self.pending_return_request = None;
@@ -580,6 +625,7 @@ pub(super) async fn run_sender(
     remote_platform: InputPlatform,
     options: &InputRuntimeOptions,
 ) -> Result<()> {
+    let signals = InputSessionSignals::default();
     run_sender_with_activity(
         incoming,
         tx,
@@ -588,7 +634,7 @@ pub(super) async fn run_sender(
         source_edge,
         remote_platform,
         options,
-        None,
+        &signals,
         false,
     )
     .await
@@ -603,13 +649,13 @@ pub(super) async fn run_sender_with_activity(
     source_edge: ScreenEdge,
     remote_platform: InputPlatform,
     options: &InputRuntimeOptions,
-    input_activity: Option<Arc<AtomicBool>>,
-    mut require_manual_activation: bool,
+    signals: &InputSessionSignals,
+    require_manual_activation: bool,
 ) -> Result<()> {
     let local_platform = InputPlatform::current();
     let mut key_mapper = KeyMapper::new(&options.key_mapping, local_platform, remote_platform)?;
     let mut control =
-        SenderControl::new(platform, local_layout.clone(), source_edge, input_activity);
+        SenderControl::new(platform, local_layout.clone(), source_edge, signals.clone());
     let mut last_heartbeat = Instant::now();
     let mut motion_tick = time::interval(MOTION_INTERVAL);
     motion_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -725,13 +771,14 @@ pub(super) async fn run_sender_with_activity(
                                 generation: control.generation,
                                 edge_position: None,
                             });
-                            tracing::info!(generation = control.generation, "紧急热键已收回本机控制");
-                        } else if require_manual_activation {
-                            // 清空确认前的位移/位置, 用户确认后还需新的边缘动作.
-                            platform.motion.take();
-                            require_manual_activation = false;
-                            tracing::info!("用户已确认新输入路径, 可以重新移至边缘激活");
+                            tracing::info!(generation = control.generation, "重置热键已收回本机控制");
                         }
+                        // 无论是否处于确认门槛, 用户按下热键都结束本次子流并由上层重建连接.
+                        // 上层会清掉确认门槛, 因此重建后再次移至屏幕边缘即可重新控制.
+                        platform.motion.take();
+                        signals.request_reset();
+                        tracing::info!(generation = control.generation, "用户请求重置输入流连接");
+                        return Err(InputResetRequested.into());
                     }
                     NativeEvent::Key { usage, modifiers: _, down, repeat } if control.active => {
                         control.local_pressed.key(usage, down, repeat);
@@ -924,9 +971,7 @@ pub(super) async fn run_sender_with_activity(
                         })?;
                         platform.backend.set_capture(true)?;
                         control.active = true;
-                        if let Some(input_activity) = &control.input_activity {
-                            input_activity.store(true, Ordering::Release);
-                        }
+                        control.signals.set_activity(true);
                         control.activation_confirmed = false;
                         last_heartbeat = Instant::now();
                         control.recovery.arm(edge_position);
@@ -1146,10 +1191,25 @@ pub(super) async fn run_receiver(
     options: &InputRuntimeOptions,
     foreground_captured: impl Fn() -> bool,
 ) -> Result<()> {
-    run_receiver_with_activity(incoming, incoming_motion, tx, platform, local_layout, options, foreground_captured, None).await
+    let signals = InputSessionSignals::default();
+    run_receiver_with_activity(
+        incoming,
+        incoming_motion,
+        tx,
+        platform,
+        local_layout,
+        options,
+        foreground_captured,
+        &signals,
+    )
+    .await
 }
-struct ReceiverActivity(Option<Arc<AtomicBool>>);
-impl Drop for ReceiverActivity { fn drop(&mut self) { if let Some(flag) = &self.0 { flag.store(false, Ordering::Release); } } }
+struct ReceiverActivity<'a>(&'a InputSessionSignals);
+impl Drop for ReceiverActivity<'_> {
+    fn drop(&mut self) {
+        self.0.set_activity(false);
+    }
+}
 #[allow(clippy::too_many_arguments)]
 async fn run_receiver_with_activity(
     incoming: &mut mpsc::Receiver<Result<InputMessage>>,
@@ -1159,9 +1219,10 @@ async fn run_receiver_with_activity(
     local_layout: super::DesktopLayout,
     options: &InputRuntimeOptions,
     foreground_captured: impl Fn() -> bool,
-    input_activity: Option<Arc<AtomicBool>>,
+    signals: &InputSessionSignals,
 ) -> Result<()> {
-    let activity = ReceiverActivity(input_activity);
+    let _activity = ReceiverActivity(signals);
+    signals.set_activity(false);
     let mut generation = 0u64;
     let mut active = false;
     let mut return_edge = ScreenEdge::Left;
@@ -1190,7 +1251,7 @@ async fn run_receiver_with_activity(
     monitor_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
     loop {
-        if let Some(flag) = &activity.0 { flag.store(active, Ordering::Release); }
+        signals.set_activity(active);
         tokio::select! {
             biased;
             _ = heartbeat.tick() => {
@@ -1435,8 +1496,12 @@ async fn run_receiver_with_activity(
                                 generation,
                                 edge_position,
                             });
-                            tracing::info!(generation, "接收端紧急热键已停止远程控制");
+                            tracing::info!(generation, "接收端重置热键已停止远程控制");
                         }
+                        // 释放消息已经排队, 结束本次子流并由上层重新建立连接.
+                        signals.request_reset();
+                        tracing::info!(generation, "用户请求重置输入流连接");
+                        return Err(InputResetRequested.into());
                     }
                     NativeEvent::SecureDesktop {
                         active: secure,
@@ -1473,7 +1538,7 @@ async fn run_receiver_with_activity(
                         }
                     }
                     NativeEvent::ReliableQueueOverflow => {
-                        bail!("本机紧急热键事件队列已满")
+                        bail!("本机重置热键事件队列已满")
                     }
                     NativeEvent::Failed(message) => {
                         bail!("本机输入注入后端失败: {message}")
@@ -1861,26 +1926,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn switched_sender_requires_hotkey_and_fresh_motion_before_activation() {
+    async fn switched_sender_waits_and_hotkey_requests_input_reset() {
         let backend = Arc::new(FakeBackend::default()); let layout = backend.layout().unwrap();
         let motion = Arc::new(MotionAccumulator::default()); let (events_tx, events) = mpsc::channel(1);
         let mut platform = PlatformHandle { backend: Arc::clone(&backend) as Arc<dyn InputBackend>, events, motion: Arc::clone(&motion), overflowed: Arc::new(AtomicBool::new(false)), failed: Arc::new(AtomicBool::new(false)) };
         let (_incoming_tx, mut incoming) = mpsc::channel(1); let (outgoing, mut messages) = mpsc::channel(8);
         let options = test_input_options(ScreenEdge::Left); motion.add_at(0, 0, Point { x: 0, y: 50 });
-        let task = tokio::spawn(async move { super::run_sender_with_activity(&mut incoming, &outgoing, &mut platform, layout, ScreenEdge::Left, InputPlatform::current(), &options, None, true).await });
+        let reset = Arc::new(AtomicBool::new(false));
+        let signals = super::InputSessionSignals::with_reset(None, Some(Arc::clone(&reset)));
+        let task = tokio::spawn(async move { super::run_sender_with_activity(&mut incoming, &outgoing, &mut platform, layout, ScreenEdge::Left, InputPlatform::current(), &options, &signals, true).await });
         async fn activation(messages: &mut mpsc::Receiver<InputMessage>) { loop { if matches!(messages.recv().await.unwrap(), InputMessage::Activate { .. }) { return; } } }
+        // 确认门槛未解除前, 边缘动作和残留坐标都不能激活.
         assert!(timeout(Duration::from_millis(40), activation(&mut messages)).await.is_err());
         assert!(!*backend.capture.lock().unwrap());
         motion.add_at(5, 0, Point { x: 0, y: 50 });
         assert!(timeout(Duration::from_millis(20), activation(&mut messages)).await.is_err());
         events_tx.send(NativeEvent::Emergency).await.unwrap();
-        // 单线程运行时的有界事件队列屏障: 前一热键已被消费, 再检查无新动作时不激活.
-        events_tx.send(NativeEvent::Button { button: 1, down: false }).await.unwrap();
-        assert!(timeout(Duration::from_millis(20), activation(&mut messages)).await.is_err());
-        motion.add_at(0, 0, Point { x: 0, y: 50 });
-        timeout(Duration::from_secs(1), activation(&mut messages)).await.unwrap();
-        assert!(*backend.capture.lock().unwrap());
-        task.abort(); let _ = task.await; assert!(!*backend.capture.lock().unwrap());
+        let session = timeout(Duration::from_secs(1), task).await.expect("重置热键应结束发送端");
+        assert!(session.expect("发送端任务不应 panic").is_err(), "重置热键应返回重建请求");
+        assert!(reset.load(Ordering::Acquire));
+        assert!(!*backend.capture.lock().unwrap());
     }
 
     #[tokio::test]
@@ -2239,6 +2304,7 @@ mod tests {
         }
         let activity = Arc::new(AtomicBool::new(false));
         let receiver_activity = Arc::clone(&activity);
+        let signals = super::InputSessionSignals::activity(Some(receiver_activity));
         let task = tokio::spawn(async move {
             super::run_receiver_with_activity(
                 &mut incoming,
@@ -2248,7 +2314,7 @@ mod tests {
                 layout,
                 &test_input_options(ScreenEdge::Left),
                 || false,
-                Some(receiver_activity),
+                &signals,
             )
             .await
         });

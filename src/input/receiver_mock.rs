@@ -417,7 +417,7 @@ pub async fn run_controller_mock_interactive(options: InteractiveControllerOptio
                             }
                         }
                         platform::NativeEvent::Emergency => {
-                            tracing::info!("紧急热键已触发, 结束交互控制");
+                            tracing::info!("重置热键已触发, 结束交互控制");
                             return Ok(());
                         }
                         platform::NativeEvent::Failed(message) => {

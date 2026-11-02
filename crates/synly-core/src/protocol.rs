@@ -185,6 +185,8 @@ pub enum ControlMessage {
     ClipboardRejected { stamp: crate::transport::clipboard::ClipboardStamp },
     ClipboardPath { epoch: CapabilityEpoch, generation: Uuid, message: crate::transport::routing::RouteMessage },
     ClipboardPathFailed { epoch: CapabilityEpoch, generation: Uuid },
+    /// 对端请求重建输入子流: 收到后停止当前输入任务, 由 host 重新发起四阶段协商.
+    InputReset { epoch: CapabilityEpoch },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

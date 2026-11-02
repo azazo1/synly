@@ -33,6 +33,23 @@ pub(super) fn select(primary: TransportKind, primary_lane: Option<&GenerationLan
 pub(super) async fn task_finished(task: &mut Option<tokio::task::JoinHandle<()>>) {
     match task { Some(handle) => { let _ = handle.await; task.take(); }, None => std::future::pending().await }
 }
+/// 用户按下重置热键后丢弃当前输入子流, 通知对端并由 host 重新发起四阶段协商.
+/// 重置是用户的显式动作, 新子流不再要求先按热键确认, 直接移到屏幕边缘即可重新控制.
+pub(super) async fn reset(runtime: &mut CapabilityTaskRuntime, state: &CapabilityState, tasks: &mut SessionTaskAbortGuard, context: CapabilityRefreshContext<'_>, notify_peer: bool) -> Result<()> {
+    let epoch = state.epoch();
+    runtime.stop_input(context.input_session_id, context.input_routes).await;
+    context.input_activity.store(false, Ordering::Release);
+    runtime.input_blocked = None;
+    runtime.input_requires_manual = false;
+    if notify_peer
+        && let Err(error) = context.tx.send(Frame::Control(ControlMessage::InputReset { epoch })).await
+    {
+        // 通知失败不阻止本端重建: 对端会在输入通道断开后自行暂停, 并接受随后到达的新路径方案.
+        tracing::warn!(error = %error, ?epoch, "无法通知对端重置输入子流, 继续在本端重建");
+    }
+    tracing::info!(?epoch, "输入子流已按用户请求重置, 重新协商输入路径");
+    refresh_capability_tasks(state, runtime, tasks, context).await
+}
 pub(super) async fn fail(runtime: &mut CapabilityTaskRuntime, state: &CapabilityState, context: CapabilityRefreshContext<'_>, notify: bool) -> Result<()> {
     let epoch = state.epoch(); let generation = runtime.input_generation;
     runtime.input_requires_manual = true;
@@ -76,8 +93,10 @@ pub(super) async fn receive(epoch: CapabilityEpoch, generation: Uuid, message: R
     if runtime.input_route.is_switching() { return Ok(()); }
     let (_, stream, _) = runtime.pending_mux_input.take().context("路径提交缺少已准备的输入租约")?;
     let mut tuning = context.input_options.clone(); tuning.mode = local.input_mode;
-    let task = bluetooth::spawn_input(stream, role, tuning, context.input_master_secret, Arc::clone(context.input_activity), epoch, runtime.input_requires_manual);
-    tasks.track(&task); runtime.input_task = Some(task);
+    let reset = Arc::new(AtomicBool::new(false));
+    let signals = InputSessionSignals::with_reset(Some(Arc::clone(context.input_activity)), Some(Arc::clone(&reset)));
+    let task = bluetooth::spawn_input(stream, role, tuning, context.input_master_secret, signals, epoch, runtime.input_requires_manual);
+    tasks.track(&task); runtime.input_task = Some(task); runtime.input_reset = Some(reset);
     tracing::info!(?epoch, transport = ?runtime.input_transport, route_epoch = message.epoch(), manual = runtime.input_requires_manual, "输入复用路径已完成四阶段提交");
     Ok(())
 }
